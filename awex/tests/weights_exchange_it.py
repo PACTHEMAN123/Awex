@@ -395,7 +395,7 @@ if __name__ == "__main__":
         "-b",
         "--comm_backend",
         required=True,
-        help="file|nccl|hccl|astate",
+        help="file|nccl|nccl_device|hccl|astate",
     )
     parser.add_argument(
         "--device-backend",

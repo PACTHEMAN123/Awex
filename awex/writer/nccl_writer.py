@@ -24,6 +24,7 @@ import torch.distributed as dist
 
 from awex import logging
 from awex.transfer.nccl_comm import batch_send_recv, nccl_build_send_ops
+from awex.transfer.nccl_device import NCCLDeviceTransport
 from awex.transfer.transfer_plan import (
     TransferPlanBuilder,
     compute_transfer_plan_hash,
@@ -48,6 +49,7 @@ logger = logging.getLogger(__name__)
 class NCCLWeightsWriter(WeightsExchangeShardingWriter):
     def _initialize(self):
         super()._initialize()
+        self.device_transport = None
         logger.info(
             f"Start to initialize NCCL weights writer for rank {self.transfer_rank}"
         )
@@ -116,6 +118,12 @@ class NCCLWeightsWriter(WeightsExchangeShardingWriter):
         self._set_device()
         self._init_weights_exchange_process_group()
         self._shake_hands_with_reader()
+        if self.comm_backend == "nccl_device":
+            self.device_transport = NCCLDeviceTransport(
+                self.weights_update_group,
+                self.transfer_rank,
+                self.transfer_world_size,
+            )
 
         logger.info(
             f"Finished initializing NCCL weights writer for rank {self.transfer_rank}"
@@ -159,7 +167,9 @@ class NCCLWeightsWriter(WeightsExchangeShardingWriter):
             rank=self.transfer_rank,
             world_size=self.transfer_world_size,
             group_name="weights_exchange",
-            backend=self.comm_backend,
+            backend=(
+                "nccl" if self.comm_backend == "nccl_device" else self.comm_backend
+            ),
             role="train",
         )
         logger.info(f"Initialized NCCL weights writer for rank {self.transfer_rank}")
@@ -219,54 +229,61 @@ class NCCLWeightsWriter(WeightsExchangeShardingWriter):
         start_time = time.time()
         parameters = None
         p2p_op_list = None
+        using_device_transport = self.device_transport is not None
         try:
             if self.enable_mem_debug:
                 print_current_gpu_status(f"writer-{self.transfer_rank} before convert")
             parameters = self.convert_parameters(
                 required_names=self.required_param_names
             )
-            logger.info("Writer: Converting parameters completed, building send ops")
+            logger.info("Writer: Converting parameters completed")
             if self.enable_mem_debug:
                 print_current_gpu_status(f"writer-{self.transfer_rank} after convert")
-            p2p_op_list, _, send_traj_list = nccl_build_send_ops(
-                parameters,
-                self.transfer_plan,
-                self.weights_update_group,
-                -1,
-                self.use_batch_send_recv,
-            )
-            logger.info(
-                f"Writer: Built {len(p2p_op_list)} send operations to "
-                f"{len(self.transfer_plan.operations)} ranks"
-            )
-            if self.enable_mem_debug:
-                total_send_bytes = sum(
-                    int(op.tensor.numel()) * int(op.tensor.element_size())
-                    for op in p2p_op_list
-                )
-                logger.info(
-                    "[Writer %s][MEM] built send ops: count=%s total_send_bytes=%s",
-                    self.transfer_rank,
-                    len(p2p_op_list),
-                    total_send_bytes,
-                )
-                print_current_gpu_status(
-                    f"writer-{self.transfer_rank} after build_send_ops"
-                )
-
-            # Execute all sends via batch_send_recv to get consistent interleaving
-            # and per-peer stream assignment without relying directly on
-            # batch_isend_irecv.
-            logger.info(
-                f"Writer: Executing {len(p2p_op_list)} send ops via batch_send_recv"
-            )
-            if self.use_batch_send_recv:
-                batch_send_recv(
-                    send_ops=p2p_op_list, recv_ops=[], blocking=True, use_group=True
+            if using_device_transport:
+                logger.info("Writer: submitting device task batch")
+                self.device_transport.send(
+                    parameters, self.transfer_plan, step_id
                 )
             else:
-                self._send_recv_one_by_one(p2p_op_list, send_traj_list)
-            device_util.synchronize(device_id=device_util.current_device())
+                logger.info("Writer: building legacy NCCL send ops")
+                p2p_op_list, _, send_traj_list = nccl_build_send_ops(
+                    parameters,
+                    self.transfer_plan,
+                    self.weights_update_group,
+                    -1,
+                    self.use_batch_send_recv,
+                )
+                logger.info(
+                    f"Writer: Built {len(p2p_op_list)} send operations to "
+                    f"{len(self.transfer_plan.operations)} ranks"
+                )
+                if self.enable_mem_debug:
+                    total_send_bytes = sum(
+                        int(op.tensor.numel()) * int(op.tensor.element_size())
+                        for op in p2p_op_list
+                    )
+                    logger.info(
+                        "[Writer %s][MEM] built send ops: count=%s total_send_bytes=%s",
+                        self.transfer_rank,
+                        len(p2p_op_list),
+                        total_send_bytes,
+                    )
+                    print_current_gpu_status(
+                        f"writer-{self.transfer_rank} after build_send_ops"
+                    )
+                logger.info(
+                    f"Writer: Executing {len(p2p_op_list)} send ops via batch_send_recv"
+                )
+                if self.use_batch_send_recv:
+                    batch_send_recv(
+                        send_ops=p2p_op_list,
+                        recv_ops=[],
+                        blocking=True,
+                        use_group=True,
+                    )
+                else:
+                    self._send_recv_one_by_one(p2p_op_list, send_traj_list)
+                device_util.synchronize(device_id=device_util.current_device())
             if self.enable_mem_debug:
                 print_current_gpu_status(f"writer-{self.transfer_rank} after send")
             duration = time.time() - start_time

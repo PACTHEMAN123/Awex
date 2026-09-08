@@ -25,7 +25,9 @@ class InferenceConfigValidationError(ValueError):
     pass
 
 
-_VALID_COMM_BACKENDS: frozenset = frozenset({"file", "nccl", "hccl", "astate"})
+_VALID_COMM_BACKENDS: frozenset = frozenset(
+    {"file", "nccl", "nccl_device", "hccl", "astate"}
+)
 _VALID_IPC_BACKENDS: frozenset = frozenset({"cpu", "cuda"})
 
 
@@ -63,7 +65,7 @@ class InferenceConfig:
     engine_rank: int = 0
     # the address of the meta server: `ip:port`
     meta_server_addr: Optional[str] = None
-    # weights exchange communication backend (file/nccl/hccl/astate)
+    # weights exchange communication backend (file/nccl/nccl_device/hccl/astate)
     comm_backend: str = "file"
     # how much steps with weights validation, if enabled, weights update will use both file and transfer and
     # compare the weights
@@ -100,6 +102,11 @@ class InferenceConfig:
         if self.comm_backend not in _VALID_COMM_BACKENDS:
             errors.append(
                 f"comm_backend must be one of {sorted(_VALID_COMM_BACKENDS)}, got {self.comm_backend!r}"
+            )
+
+        if self.comm_backend == "nccl_device" and self.enable_colocate_mode:
+            errors.append(
+                "comm_backend='nccl_device' does not support colocate mode yet"
             )
 
         # weights_exchange_ipc_backend must be one of the known values

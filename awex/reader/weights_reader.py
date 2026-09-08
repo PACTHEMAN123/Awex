@@ -271,7 +271,7 @@ class WeightsReader(WeightExchangeReader):
                 infer_engine_config["comm_backend"] = weights_comm_backend
             else:
                 infer_engine_config.comm_backend = weights_comm_backend
-        if weights_comm_backend in ("nccl", "hccl"):
+        if weights_comm_backend in ("nccl", "nccl_device", "hccl"):
             from awex.reader.nccl_reader import NCCLWorkerWeightsReader
 
             cls = NCCLWorkerWeightsReader

@@ -509,7 +509,7 @@ class WeightsExchangeShardingWriter(WeightExchangeWriter):
 def get_weights_exchange_writer(train_engine) -> WeightExchangeWriter:
     if train_engine.comm_backend == "file":
         return FileWeightExchangeWriter(train_engine)
-    elif train_engine.comm_backend in ("nccl", "hccl"):
+    elif train_engine.comm_backend in ("nccl", "nccl_device", "hccl"):
         from awex.writer.nccl_writer import NCCLWeightsWriter
 
         return NCCLWeightsWriter(train_engine)

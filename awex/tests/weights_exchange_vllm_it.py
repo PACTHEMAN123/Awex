@@ -468,7 +468,7 @@ if __name__ == "__main__":
         "-b",
         "--comm_backend",
         default="file",
-        help="Weight exchange communication backend (file/nccl/hccl).",
+        help="Weight exchange communication backend (file/nccl/nccl_device/hccl).",
     )
     parser.add_argument(
         "--model-path",

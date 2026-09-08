@@ -25,6 +25,7 @@ import torch.distributed as dist
 from awex import logging
 from awex.reader.weights_reader import WorkerWeightsReader
 from awex.transfer.nccl_comm import batch_send_recv, nccl_build_recv_ops
+from awex.transfer.nccl_device import NCCLDeviceTransport
 from awex.transfer.transfer_plan import (
     TransferPlanBuilder,
     compute_transfer_plan_hash,
@@ -52,6 +53,7 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
         self.send_ranks_sample = None
         self.num_to_recvs = None
         self.rank_coordinate = None
+        self.device_transport = None
 
     def initialize(self):
         super().initialize()
@@ -108,6 +110,12 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
         self._set_device()
         self._init_weights_exchange_process_group()
         self._shake_hands_with_writer()
+        if self.comm_backend == "nccl_device":
+            self.device_transport = NCCLDeviceTransport(
+                self.weights_update_group,
+                self.transfer_rank,
+                self.world_size,
+            )
 
         self.send_ranks = list(self.transfer_plan.operations.keys())
         self.send_ranks_sample = (
@@ -205,7 +213,9 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
             rank=self.transfer_rank,
             world_size=self.world_size,
             group_name="weights_exchange",
-            backend=self.backend,
+            backend=(
+                "nccl" if self.comm_backend == "nccl_device" else self.backend
+            ),
             role="inference",
         )
         logger.info(
@@ -348,31 +358,40 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
         self._init_weights_exchange_process_group()
         start_time = time.time()
 
-        # Build receive ops once for logging, then execute them via
-        # batch_send_recv to keep scheduling consistent with the writer.
-        p2p_op_list, non_contiguous_tensor_pairs, recv_traj_list = nccl_build_recv_ops(
-            self.parameters,
-            self.transfer_plan,
-            self.weights_update_group,
-            self.use_batch_send_recv,
-        )
-        logger.info(
-            f"Reader: Built {len(p2p_op_list)} recv operations from "
-            f"{len(self.transfer_plan.operations)} training ranks"
-        )
-
-        logger.info(
-            f"Reader: Executing {len(p2p_op_list)} recv ops via batch_send_recv"
-        )
-        if self.use_batch_send_recv:
-            batch_send_recv(
-                send_ops=[], recv_ops=p2p_op_list, blocking=True, use_group=True
+        p2p_op_list = None
+        if self.device_transport is not None:
+            logger.info("Reader: submitting device task batch")
+            self.device_transport.recv(
+                self.parameters, self.transfer_plan, step_id
             )
         else:
-            self._send_recv_one_by_one(p2p_op_list, recv_traj_list)
+            # Build receive ops once for logging, then execute them via
+            # batch_send_recv to keep scheduling consistent with the writer.
+            p2p_op_list, non_contiguous_tensor_pairs, recv_traj_list = (
+                nccl_build_recv_ops(
+                    self.parameters,
+                    self.transfer_plan,
+                    self.weights_update_group,
+                    self.use_batch_send_recv,
+                )
+            )
+            logger.info(
+                f"Reader: Built {len(p2p_op_list)} recv operations from "
+                f"{len(self.transfer_plan.operations)} training ranks"
+            )
 
-        self._sync_non_contiguous_tensor_pairs(non_contiguous_tensor_pairs)
-        device_util.synchronize(device_id=device_util.current_device())
+            logger.info(
+                f"Reader: Executing {len(p2p_op_list)} recv ops via batch_send_recv"
+            )
+            if self.use_batch_send_recv:
+                batch_send_recv(
+                    send_ops=[], recv_ops=p2p_op_list, blocking=True, use_group=True
+                )
+            else:
+                self._send_recv_one_by_one(p2p_op_list, recv_traj_list)
+
+            self._sync_non_contiguous_tensor_pairs(non_contiguous_tensor_pairs)
+            device_util.synchronize(device_id=device_util.current_device())
         duration = time.time() - start_time
         logger.info(
             f"Finished receiving weights for step {step_id} using NCCL "
