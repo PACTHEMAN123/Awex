@@ -40,10 +40,19 @@ logger = logging.getLogger(__name__)
 
 enable_debug_mode = False
 
-tp_size = 1
+DEFAULT_VLLM_TP_SIZE = 1
+
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
 vllm_inference_config = {
     "model_path": "/home/model/Qwen3-0.6B",
-    "tp_size": tp_size,
+    "tp_size": DEFAULT_VLLM_TP_SIZE,
     "pp_size": 1,
     "dp_size": 1,
     "ep_size": 1,
@@ -56,19 +65,22 @@ vllm_inference_config = {
 
 class VLLMWeightsExchangeIT:
     """
-    Goal: Megatron (main process) uses the FIRST visible GPU.
-          vLLM (child process) uses the SECOND visible GPU (or next tp_size GPUs).
+    Megatron ranks use the first train_tp_size visible GPUs. The vLLM child
+    process, started only by training rank 0, uses the next inference TP GPUs.
 
     Key rule: Do NOT rely on changing os.environ["CUDA_VISIBLE_DEVICES"] in the same process
               after torch.cuda has been touched. Instead:
-      - Main process: torch.cuda.set_device(0) to pin Megatron to GPU-0 (logical index).
-      - Child process: pass env["CUDA_VISIBLE_DEVICES"]="1" (or list) to vLLM subprocess.
+      - Each training process is pinned by LOCAL_RANK.
+      - The child process receives its own CUDA_VISIBLE_DEVICES list.
+
+    Launch train_tp_size > 1 with torchrun and one process per training TP rank.
     """
 
     def __init__(
         self,
         inference_config=None,
         comm_backend=None,
+        train_tp_size=1,
         use_mbridge=False,
         host="127.0.0.1",
         port=8000,
@@ -78,13 +90,24 @@ class VLLMWeightsExchangeIT:
     ):
         self.comm_backend = comm_backend
         self.device_backend = device_util.get_device_type()
-        ip, port_meta = start_meta_server()
-        self.meta_server_addr = f"{ip}:{port_meta}"
+        self.train_tp_size = train_tp_size
+        self.rank = int(os.environ.get("RANK", "0"))
+        self.local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        self.world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        self.is_driver = self.rank == 0
+        if self.world_size != self.train_tp_size:
+            raise RuntimeError(
+                f"WORLD_SIZE ({self.world_size}) must equal train TP size "
+                f"({self.train_tp_size}). Launch with torchrun "
+                f"--nproc-per-node={self.train_tp_size}."
+            )
+        if self.train_tp_size > 1 and comm_backend == "file":
+            raise RuntimeError("Training TP > 1 requires the NCCL or HCCL backend.")
+
+        self.meta_server_addr = None
         self.inference_config = inference_config or copy.deepcopy(vllm_inference_config)
         self.inference_config["comm_backend"] = comm_backend
-        self.inference_config["meta_server_addr"] = self.meta_server_addr
         self.train_config = {
-            "meta_server_addr": self.meta_server_addr,
             "comm_backend": comm_backend,
             "enable_debug_mode": enable_debug_mode,
         }
@@ -95,16 +118,13 @@ class VLLMWeightsExchangeIT:
         self.dump_weights_list_for_validation = dump_weights_list_for_validation or []
         self.dump_weights_dir_for_validation = dump_weights_dir_for_validation
 
-        # Select devices so that:
-        #   - Megatron uses first visible GPU
-        #   - vLLM uses second (and onward for tp_size)
         self.vllm_visible_devices, self.megatron_device = self._select_devices()
 
         self.megatron_engine = None
         self.vllm_process = None
 
     def _select_devices(self):
-        tp = self.inference_config["tp_size"]
+        inference_tp = self.inference_config["tp_size"]
 
         visible_env = device_util.visible_devices_env_value().strip()
         if visible_env:
@@ -116,35 +136,93 @@ class VLLMWeightsExchangeIT:
             # Fallback: use torch to detect. (May touch CUDA, but that's OK with set_device below.)
             visible_devices = list(range(device_util.device_count()))
 
-        need = 1 + tp  # 1 for Megatron + tp for vLLM
+        need = self.train_tp_size + inference_tp
         if len(visible_devices) < need:
             raise RuntimeError(
-                f"Need at least {need} visible devices (1 for Megatron + {tp} for vLLM). "
+                f"Need at least {need} visible devices ({self.train_tp_size} for "
+                f"Megatron + {inference_tp} for vLLM). "
                 f"Found {len(visible_devices)} via visible devices env='{visible_env or '(unset)'}'."
             )
+        if not 0 <= self.local_rank < self.train_tp_size:
+            raise RuntimeError(
+                f"LOCAL_RANK ({self.local_rank}) must be in [0, {self.train_tp_size})."
+            )
 
-        # Pin Megatron to the FIRST visible GPU
-        megatron_device = visible_devices[0]
-        # Give vLLM the NEXT tp GPUs
-        vllm_devices = visible_devices[1 : 1 + tp]
+        megatron_device = visible_devices[self.local_rank]
+        vllm_devices = visible_devices[
+            self.train_tp_size : self.train_tp_size + inference_tp
+        ]
         return vllm_devices, megatron_device
 
     def initialize(self):
-        # 1) Init Megatron first on GPU-0 (main process)
+        self._start_meta_server()
+        self._init_distributed()
+        self._share_meta_server_address()
         self._init_megatron_engine()
-        # 2) Start vLLM server in a subprocess restricted to GPU-1 (or more)
-        self._start_vllm_server()
-        # 3) Awex init handshake
-        self._awex_init()
+        if self.is_driver:
+            self._start_vllm_server()
+            self._awex_init()
+        self._training_barrier()
 
     def destroy(self):
-        if self.vllm_process is not None:
+        self._training_barrier()
+        if self.is_driver and self.vllm_process is not None:
             self.vllm_process.terminate()
             try:
                 self.vllm_process.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 self.vllm_process.kill()
-        stop_meta_server()
+        if self.is_driver and self.meta_server_addr is not None:
+            stop_meta_server()
+        self._training_barrier()
+
+    def _init_distributed(self):
+        if self.world_size == 1:
+            os.environ.setdefault("RANK", "0")
+            os.environ.setdefault("LOCAL_RANK", "0")
+            os.environ.setdefault("WORLD_SIZE", "1")
+            os.environ.setdefault("MASTER_PORT", "17443")
+            os.environ.setdefault("MASTER_ADDR", "localhost")
+        os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo")
+
+        device_util.set_device(self.local_rank)
+        if not dist.is_initialized():
+            backend = "hccl" if self.device_backend == "npu" else "nccl"
+            dist.init_process_group(backend)
+
+        logger.info(
+            "Megatron rank %s/%s uses physical device id=%s (logical device %s)",
+            self.rank,
+            self.world_size,
+            self.megatron_device,
+            self.local_rank,
+        )
+        logger.info(
+            "Training-process visible devices env=%s",
+            device_util.visible_devices_env_value() or "(unset)",
+        )
+
+    def _training_barrier(self):
+        if self.world_size <= 1 or not dist.is_initialized():
+            return
+        if self.device_backend == "cuda":
+            dist.barrier(device_ids=[device_util.current_device()])
+        else:
+            dist.barrier()
+
+    def _start_meta_server(self):
+        if self.is_driver:
+            ip, port = start_meta_server()
+            self.meta_server_addr = f"{ip}:{port}"
+
+    def _share_meta_server_address(self):
+        addresses = [self.meta_server_addr]
+        if self.world_size > 1:
+            dist.broadcast_object_list(addresses, src=0)
+
+        self.meta_server_addr = addresses[0]
+        self.inference_config["meta_server_addr"] = self.meta_server_addr
+        self.train_config["meta_server_addr"] = self.meta_server_addr
 
     def _start_vllm_server(self):
         env = os.environ.copy()
@@ -152,6 +230,19 @@ class VLLMWeightsExchangeIT:
         visible_env = device_util.visible_devices_env_names()[0]
         env[visible_env] = ",".join(map(str, self.vllm_visible_devices))
         env.setdefault("AWEX_DEVICE_TYPE", device_util.get_device_type())
+        for name in (
+            "LOCAL_WORLD_SIZE",
+            "GROUP_RANK",
+            "ROLE_RANK",
+            "ROLE_WORLD_SIZE",
+            "MASTER_ADDR",
+            "MASTER_PORT",
+        ):
+            env.pop(name, None)
+        for name in list(env):
+            if name.startswith("TORCHELASTIC_"):
+                env.pop(name)
+        env.update({"RANK": "0", "LOCAL_RANK": "0", "WORLD_SIZE": "1"})
 
         cmd = [
             "python",
@@ -217,38 +308,10 @@ class VLLMWeightsExchangeIT:
             raise RuntimeError(f"Awex init failed: {resp.text}")
 
     def _init_megatron_engine(self):
-        self.train_config["tensor_model_parallel_size"] = 1
+        self.train_config["tensor_model_parallel_size"] = self.train_tp_size
         self.train_config["pipeline_model_parallel_size"] = 1
         self.train_config["expert_model_parallel_size"] = 1
 
-        # Single-process Megatron
-        os.environ["RANK"] = "0"
-        os.environ["LOCAL_RANK"] = "0"
-        os.environ["WORLD_SIZE"] = "1"
-        os.environ["MASTER_PORT"] = "17443"
-        os.environ["MASTER_ADDR"] = "localhost"
-        os.environ["GLOO_SOCKET_IFNAME"] = "lo"
-
-        # IMPORTANT:
-        # Do NOT try to isolate Megatron by changing CUDA_VISIBLE_DEVICES in this same process.
-        # Instead, explicitly pin Megatron to the first visible GPU (logical index 0).
-        #
-        # If your parent process sees multiple GPUs, logical 0 corresponds to the first one.
-        # We'll also log the mapping expectation:
-        logger.info(
-            "Megatron intended physical device id=%s (first visible)",
-            self.megatron_device,
-        )
-        logger.info(
-            "Main-process visible devices env=%s",
-            device_util.visible_devices_env_value() or "(unset)",
-        )
-
-        # Pin to logical GPU 0 for allocations + NCCL.
-        # (Even if physical ids differ, logical 0 is the first visible device in this process.)
-        device_util.set_device(0)
-
-        # Optional sanity log:
         try:
             logger.info(
                 "Megatron pinned device=%s:%s name=%s",
@@ -258,9 +321,6 @@ class VLLMWeightsExchangeIT:
             )
         except Exception:
             pass
-
-        backend = "hccl" if device_util.get_device_type() == "npu" else "nccl"
-        torch.distributed.init_process_group(backend)
 
         self.mcore_model, self.mcore_hf_config = self.setup_megatron()
         from awex.engine.mcore import MegatronEngine
@@ -283,7 +343,7 @@ class VLLMWeightsExchangeIT:
         from awex.tests.test_utils import megatron_model_from_hf
 
         mpu.initialize_model_parallel(
-            tensor_model_parallel_size=1,
+            tensor_model_parallel_size=self.train_tp_size,
             virtual_pipeline_model_parallel_size=None,
             context_parallel_size=1,
             expert_model_parallel_size=1,
@@ -324,12 +384,22 @@ class VLLMWeightsExchangeIT:
                 self.megatron_engine.write_weights(path=path)
                 self._awex_update(path=path)
             else:
-                # For NCCL, start reader first so it can receive as soon as writer sends.
-                with ThreadPoolExecutor(max_workers=1) as executor:
-                    future = executor.submit(self._awex_update, path=None)
+                executor_context = (
+                    ThreadPoolExecutor(max_workers=1)
+                    if self.is_driver
+                    else nullcontext()
+                )
+                with executor_context as executor:
+                    future = (
+                        executor.submit(self._awex_update, path=None)
+                        if executor is not None
+                        else None
+                    )
+                    self._training_barrier()
                     time.sleep(1)
                     self.megatron_engine.write_weights()
-                    future.result()
+                    if future is not None:
+                        future.result()
         logger.info("Update weights finished")
 
     def _awex_update(self, path: str | None):
@@ -348,10 +418,12 @@ def main(args):
     inference_config = copy.deepcopy(vllm_inference_config)
     if args.model_path:
         inference_config["model_path"] = args.model_path
+    inference_config["tp_size"] = args.vllm_tp_size
 
     weights_exchange_it = VLLMWeightsExchangeIT(
         inference_config=inference_config,
         comm_backend=comm_backend,
+        train_tp_size=args.train_tp_size,
         use_mbridge=args.use_mbridge,
         host=args.host,
         port=args.port,
@@ -402,6 +474,23 @@ if __name__ == "__main__":
         "--model-path",
         default=vllm_inference_config["model_path"],
         help="HF model path used by Megatron and the vLLM server.",
+    )
+    parser.add_argument(
+        "--train-tp-size",
+        type=_positive_int,
+        default=1,
+        metavar="N",
+        help=(
+            "Megatron tensor-parallel size. Values greater than 1 require "
+            "torchrun --nproc-per-node=N."
+        ),
+    )
+    parser.add_argument(
+        "--vllm-tp-size",
+        type=_positive_int,
+        default=vllm_inference_config["tp_size"],
+        metavar="N",
+        help="vLLM tensor-parallel size. Requires train TP size + N visible devices.",
     )
     parser.add_argument(
         "--device-backend",

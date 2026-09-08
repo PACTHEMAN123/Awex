@@ -17,12 +17,12 @@
 
 """Registration for dense Qwen3 (``Qwen3ForCausalLM``).
 
-Dense and MoE Qwen3 share the layout both converters target: canonical
+Dense and MoE Qwen3 share the layout both inference engines expose: canonical
 ``self_attn.{q,k,v,o}_proj`` with per-head ``self_attn.{q,k}_norm``, GQA head
 grouping in the fused Megatron ``linear_qkv``, and gate/up projections that
-sglang serves fused while the train side reports them split. The dense model
-simply has no expert parameters, so the shared converters need no change; only
-the architecture name has to be registered.
+the inference engines serve fused while the train side reports them split.
+The dense model simply has no expert parameters, so the shared converters need
+no change; only the architecture name has to be registered.
 """
 
 from awex.models.qwen3_moe import (
@@ -34,4 +34,5 @@ CONFIG = {
     "model_name": "Qwen3ForCausalLM",
     "mcore_converter": _build_mcore_converter_qwen3_moe,
     "sglang_converter": SGlangToHFWeightConverterQwen3Moe,
+    "vllm_converter": SGlangToHFWeightConverterQwen3Moe,
 }

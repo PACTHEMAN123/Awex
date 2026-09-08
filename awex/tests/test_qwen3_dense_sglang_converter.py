@@ -71,6 +71,17 @@ def test_registry_resolves_the_shared_sglang_converter():
     assert isinstance(converter, SGlangToHFWeightConverterQwen3Moe)
 
 
+def test_registry_resolves_the_shared_vllm_converter():
+    converter = get_infer_weights_converter(
+        "vllm",
+        "Qwen3ForCausalLM",
+        _model_config(),
+        _rank_info(),
+        _infer_engine_config(),
+    )
+    assert isinstance(converter, SGlangToHFWeightConverterQwen3Moe)
+
+
 def test_layer_names_match_the_train_side_contract():
     converter = _converter()
     qkv_rows = (NUM_HEADS + 2 * NUM_KV_HEADS) * HEAD_DIM
