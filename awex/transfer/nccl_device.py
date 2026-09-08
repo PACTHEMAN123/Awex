@@ -36,10 +36,18 @@ import torch
 import torch.distributed as dist
 
 from awex import logging
-from awex.transfer.transfer_plan import CommunicationOperation, TransferPlan, slice_tensor
+from awex.transfer.transfer_plan import (
+    CommunicationOperation,
+    TransferPlan,
+    build_transfer_chunks,
+    slice_tensor,
+)
 from awex.util import device as device_util
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_CHUNK_BYTES = 4 * 1024 * 1024
+_CHUNK_ALIGNMENT = 16
 
 
 class NCCLDeviceUnavailableError(RuntimeError):
@@ -205,9 +213,65 @@ def _operation_groups(
     return [(peer, list(plan.operations[peer])) for peer in peers]
 
 
+def _resolve_chunk_bytes(chunk_bytes: Optional[int]) -> int:
+    if chunk_bytes is None:
+        configured = os.environ.get("AWEX_NCCL_DEVICE_CHUNK_BYTES")
+        try:
+            chunk_bytes = (
+                _DEFAULT_CHUNK_BYTES if configured is None else int(configured)
+            )
+        except ValueError as exc:
+            raise NCCLDeviceUnavailableError(
+                "AWEX_NCCL_DEVICE_CHUNK_BYTES must be an integer"
+            ) from exc
+    chunk_bytes = int(chunk_bytes)
+    if chunk_bytes < 0:
+        raise NCCLDeviceUnavailableError(
+            "nccl_device chunk_bytes must be non-negative"
+        )
+    if chunk_bytes and chunk_bytes % _CHUNK_ALIGNMENT != 0:
+        raise NCCLDeviceUnavailableError(
+            f"nccl_device chunk_bytes must be a multiple of {_CHUNK_ALIGNMENT}"
+        )
+    return chunk_bytes
+
+
+def _split_contiguous_tensor(
+    tensor: torch.Tensor, chunk_bytes: int
+) -> List[Tuple[torch.Tensor, int, int]]:
+    """Return tensor views paired with their byte offset and length."""
+
+    element_size = int(tensor.element_size())
+    total_bytes = int(tensor.numel()) * element_size
+    flat = tensor.reshape(-1)
+    result = []
+    for chunk in build_transfer_chunks(total_bytes, chunk_bytes):
+        if chunk.byte_offset % element_size or chunk.nbytes % element_size:
+            raise NCCLDeviceUnavailableError(
+                "nccl_device chunk boundaries must align to tensor elements"
+            )
+        result.append(
+            (
+                flat.narrow(
+                    0,
+                    chunk.byte_offset // element_size,
+                    chunk.nbytes // element_size,
+                ),
+                chunk.byte_offset,
+                chunk.nbytes,
+            )
+        )
+    return result
+
+
 def _build_send_batch(
-    parameters: dict, plan: TransferPlan, rank: int, world_size: int
+    parameters: dict,
+    plan: TransferPlan,
+    rank: int,
+    world_size: int,
+    chunk_bytes: int = _DEFAULT_CHUNK_BYTES,
 ) -> _DeviceBatch:
+    chunk_bytes = _resolve_chunk_bytes(chunk_bytes)
     tensors: List[torch.Tensor] = []
     offsets: List[int] = []
     lengths: List[int] = []
@@ -219,21 +283,26 @@ def _build_send_batch(
     context = {}
     for peer, operations in _operation_groups(plan, rank, world_size):
         peer_offset = 0
-        for ordinal, op in enumerate(operations):
+        ordinal = 0
+        for op in operations:
             tensor = parameters[op.send_shard_meta.name]
             tensor = slice_tensor(tensor, op, True, slice_context=context)
             if not tensor.is_contiguous():
                 tensor = tensor.contiguous()
             _ensure_cuda_tensor(tensor, op.send_shard_meta.name)
             length = int(tensor.numel()) * int(tensor.element_size())
-            tensors.append(tensor)
-            offsets.append(peer_offset)
-            lengths.append(length)
-            peers.append(peer)
-            ordinals.append(ordinal)
-            region_indices.append(rank)
+            for chunk, chunk_offset, chunk_length in _split_contiguous_tensor(
+                tensor, chunk_bytes
+            ):
+                tensors.append(chunk)
+                offsets.append(peer_offset + chunk_offset)
+                lengths.append(chunk_length)
+                peers.append(peer)
+                ordinals.append(ordinal)
+                region_indices.append(rank)
+                ordinal += 1
             peer_offset += length
-        expected_counts[peer] = len(operations)
+        expected_counts[peer] = ordinal
         region_bytes[rank] = max(region_bytes[rank], peer_offset)
     return _DeviceBatch(
         tensors,
@@ -249,8 +318,13 @@ def _build_send_batch(
 
 
 def _build_recv_batch(
-    parameters: dict, plan: TransferPlan, rank: int, world_size: int
+    parameters: dict,
+    plan: TransferPlan,
+    rank: int,
+    world_size: int,
+    chunk_bytes: int = _DEFAULT_CHUNK_BYTES,
 ) -> _DeviceBatch:
+    chunk_bytes = _resolve_chunk_bytes(chunk_bytes)
     tensors: List[torch.Tensor] = []
     offsets: List[int] = []
     lengths: List[int] = []
@@ -262,7 +336,8 @@ def _build_recv_batch(
     copybacks: List[Tuple[torch.Tensor, torch.Tensor]] = []
     for peer, operations in _operation_groups(plan, rank, world_size):
         peer_offset = 0
-        for ordinal, op in enumerate(operations):
+        ordinal = 0
+        for op in operations:
             parameter = parameters[op.recv_shard_meta.name]
             view = parameter[op.inf_slices]
             if not isinstance(view, torch.Tensor) or not view.is_cuda:
@@ -275,14 +350,18 @@ def _build_recv_batch(
                 copybacks.append((view, target))
             _ensure_cuda_tensor(target, op.recv_shard_meta.name)
             length = int(target.numel()) * int(target.element_size())
-            tensors.append(target)
-            offsets.append(peer_offset)
-            lengths.append(length)
-            peers.append(peer)
-            ordinals.append(ordinal)
-            region_indices.append(peer)
+            for chunk, chunk_offset, chunk_length in _split_contiguous_tensor(
+                target, chunk_bytes
+            ):
+                tensors.append(chunk)
+                offsets.append(peer_offset + chunk_offset)
+                lengths.append(chunk_length)
+                peers.append(peer)
+                ordinals.append(ordinal)
+                region_indices.append(peer)
+                ordinal += 1
             peer_offset += length
-        expected_counts[peer] = len(operations)
+        expected_counts[peer] = ordinal
         region_bytes[peer] = max(region_bytes[peer], peer_offset)
     return _DeviceBatch(
         tensors,
@@ -306,6 +385,7 @@ class NCCLDeviceTransport:
         rank: int,
         world_size: int,
         timeout_ms: Optional[int] = None,
+        chunk_bytes: Optional[int] = None,
     ):
         if world_size < 2 or world_size > 256:
             raise NCCLDeviceUnavailableError(
@@ -317,10 +397,17 @@ class NCCLDeviceTransport:
         self.timeout_ms = int(
             timeout_ms or os.environ.get("AWEX_NCCL_DEVICE_TIMEOUT_MS", "120000")
         )
+        self.chunk_bytes = _resolve_chunk_bytes(chunk_bytes)
         self._extension = None
         self._handle: Optional[int] = None
         self._initialized = False
         self._region_sizes: Optional[List[int]] = None
+        self._logged_batch_shape = False
+        logger.info(
+            "Configured nccl_device transport rank=%s chunk_bytes=%s",
+            self.rank,
+            self.chunk_bytes,
+        )
 
     def _ensure_initialized(self, total_bytes: int) -> None:
         if self._initialized:
@@ -364,6 +451,18 @@ class NCCLDeviceTransport:
         )
 
     def _run(self, batch: _DeviceBatch, sender: bool, sequence: int) -> None:
+        if not self._logged_batch_shape:
+            logger.info(
+                "Lowered nccl_device plan rank=%s sender=%s tasks=%s "
+                "payload_bytes=%s chunk_bytes=%s expected_counts=%s",
+                self.rank,
+                sender,
+                len(batch.tensors),
+                sum(batch.lengths),
+                self.chunk_bytes,
+                batch.expected_counts,
+            )
+            self._logged_batch_shape = True
         device = torch.device(device_util.get_torch_device())
         if self._region_sizes is None:
             region_sizes = torch.tensor(
@@ -411,13 +510,13 @@ class NCCLDeviceTransport:
 
     def send(self, parameters: dict, plan: TransferPlan, step_id: int) -> None:
         batch = _build_send_batch(
-            parameters, plan, self.rank, self.world_size
+            parameters, plan, self.rank, self.world_size, self.chunk_bytes
         )
         self._run(batch, sender=True, sequence=int(step_id) + 1)
 
     def recv(self, parameters: dict, plan: TransferPlan, step_id: int) -> None:
         batch = _build_recv_batch(
-            parameters, plan, self.rank, self.world_size
+            parameters, plan, self.rank, self.world_size, self.chunk_bytes
         )
         self._run(batch, sender=False, sequence=int(step_id) + 1)
 

@@ -103,10 +103,15 @@ __device__ bool wait_for_value(
     volatile unsigned long long* address,
     unsigned long long expected,
     volatile unsigned int* error,
-    unsigned long long timeout_cycles) {
+    unsigned long long timeout_cycles,
+    bool monotonic = false) {
   const unsigned long long start = clock64();
-  while (atomicAdd_system(
-             const_cast<unsigned long long*>(address), 0ULL) != expected) {
+  while (true) {
+    const auto value = atomicAdd_system(
+        const_cast<unsigned long long*>(address), 0ULL);
+    if ((monotonic && value >= expected) || (!monotonic && value == expected)) {
+      return true;
+    }
     if (atomicAdd(const_cast<unsigned int*>(error), 0U) != 0U) {
       return false;
     }
@@ -115,7 +120,6 @@ __device__ bool wait_for_value(
       return false;
     }
   }
-  return true;
 }
 
 __global__ void awex_transfer_kernel(
@@ -180,7 +184,8 @@ __global__ void awex_transfer_kernel(
             &local->ready_count[task.peer],
             expected,
             &local->error,
-            timeout_cycles);
+            timeout_cycles,
+            true);
       }
       __syncthreads();
       if (!initialized) {
@@ -229,7 +234,8 @@ __global__ void awex_transfer_kernel(
               &local->done_count[peer],
               expected,
               &local->error,
-              timeout_cycles)) {
+              timeout_cycles,
+              true)) {
         return;
       }
     }

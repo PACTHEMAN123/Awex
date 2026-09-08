@@ -50,6 +50,13 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
+def _non_negative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be a non-negative integer")
+    return parsed
+
+
 vllm_inference_config = {
     "model_path": "/home/model/Qwen3-0.6B",
     "tp_size": DEFAULT_VLLM_TP_SIZE,
@@ -414,6 +421,10 @@ class VLLMWeightsExchangeIT:
 
 def main(args):
     os.environ["NCCL_DEBUG"] = "WARNING"
+    if getattr(args, "nccl_device_chunk_mb", None) is not None:
+        os.environ["AWEX_NCCL_DEVICE_CHUNK_BYTES"] = str(
+            args.nccl_device_chunk_mb * 1024 * 1024
+        )
     comm_backend = args.comm_backend
     inference_config = copy.deepcopy(vllm_inference_config)
     if args.model_path:
@@ -491,6 +502,16 @@ if __name__ == "__main__":
         default=vllm_inference_config["tp_size"],
         metavar="N",
         help="vLLM tensor-parallel size. Requires train TP size + N visible devices.",
+    )
+    parser.add_argument(
+        "--nccl-device-chunk-mb",
+        type=_non_negative_int,
+        default=None,
+        metavar="MiB",
+        help=(
+            "Fixed nccl_device task chunk size in MiB (default: 4; "
+            "0 restores one task per tensor)."
+        ),
     )
     parser.add_argument(
         "--device-backend",

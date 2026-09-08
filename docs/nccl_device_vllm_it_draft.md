@@ -13,10 +13,13 @@
 ```bash
 AWEX_NCCL_DEVICE_TIMEOUT_MS=120000 \
 python -m awex.tests.weights_exchange_vllm_it \
-  --comm_backend nccl_device
+  --comm_backend nccl_device \
+  --nccl-device-chunk-mb 4
 ```
 
 `AWEX_NCCL_INCLUDE` 和 `AWEX_NCCL_LIB` 可用于指定包含 `nccl_device.h` 的 NCCL 头文件目录和 `libnccl.so` 目录。这样可在同一个 IT case 内直接 A/B legacy NCCL 与 device path。当前实现没有 queue-depth 配置；每次 update 使用单调 sequence 和 rank-indexed counters，避免复用 slot 时覆盖仍在消费的信号。
+
+device task 在现有 `TransferPlan` 降低为 `_DeviceBatch` 时按固定字节数切分，默认 chunk 为 4 MiB。可通过 `AWEX_NCCL_DEVICE_CHUNK_BYTES` 或上述 IT 参数调整；设置为 0 会恢复一 tensor 一 task，便于 A/B。切分只改变 device task 粒度，不改变通用 `CommunicationOperation`，因此不会影响 legacy NCCL 后端。
 
 ## 2. 现有路径和替换边界
 

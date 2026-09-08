@@ -56,6 +56,37 @@ class CommunicationOperation:
     param_class: str = "dense_other"
 
 
+@dataclass(frozen=True, slots=True)
+class TransferChunk:
+    """A contiguous byte range in a lowered device transfer plan."""
+
+    byte_offset: int
+    nbytes: int
+
+
+def build_transfer_chunks(total_bytes: int, chunk_bytes: int) -> List[TransferChunk]:
+    """Split one contiguous transfer into deterministic fixed-size chunks.
+
+    A non-positive ``chunk_bytes`` value preserves the original one-task-per-
+    tensor behavior. Sender and receiver use this pure helper independently,
+    so identical operation byte lengths always produce matching task ordinals.
+    """
+
+    if total_bytes < 0:
+        raise ValueError("total_bytes must be non-negative")
+    if total_bytes == 0:
+        return []
+    if chunk_bytes <= 0:
+        return [TransferChunk(byte_offset=0, nbytes=total_bytes)]
+    return [
+        TransferChunk(
+            byte_offset=byte_offset,
+            nbytes=min(chunk_bytes, total_bytes - byte_offset),
+        )
+        for byte_offset in range(0, total_bytes, chunk_bytes)
+    ]
+
+
 @dataclass(slots=True)
 class TransferPlan:
     """Represents a transfer plan for a specific rank.
