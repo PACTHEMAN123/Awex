@@ -170,7 +170,7 @@ def _load_extension() -> Any:
         ]
         try:
             _extension = load(
-                name="awex_nccl_device_ext_v2",
+                name="awex_nccl_device_ext_v4",
                 sources=[str(source)],
                 extra_include_paths=include_paths,
                 extra_cuda_cflags=["-O3"],

@@ -44,6 +44,9 @@ namespace py = pybind11;
 namespace {
 
 constexpr int kMaxRanks = 256;
+constexpr uint64_t kVectorBytes = sizeof(uint4);
+static_assert(
+    kVectorBytes == 16, "nccl_device vector copy requires 16-byte uint4");
 
 struct alignas(64) ControlBlock {
   unsigned long long ready_count[kMaxRanks];
@@ -122,6 +125,34 @@ __device__ bool wait_for_value(
   }
 }
 
+__device__ __forceinline__ void copy_task_bytes(
+    uint8_t* __restrict__ destination,
+    const uint8_t* __restrict__ source,
+    uint64_t nbytes) {
+  const auto address_bits = reinterpret_cast<uintptr_t>(destination) |
+      reinterpret_cast<uintptr_t>(source);
+  if ((address_bits & (kVectorBytes - 1)) == 0) {
+    auto* destination_vectors = reinterpret_cast<uint4*>(destination);
+    const auto* source_vectors = reinterpret_cast<const uint4*>(source);
+    const uint64_t vector_count = nbytes / kVectorBytes;
+    for (uint64_t vector = threadIdx.x; vector < vector_count;
+         vector += blockDim.x) {
+      destination_vectors[vector] = source_vectors[vector];
+    }
+
+    const uint64_t tail_offset = vector_count * kVectorBytes;
+    for (uint64_t byte = tail_offset + threadIdx.x; byte < nbytes;
+         byte += blockDim.x) {
+      destination[byte] = source[byte];
+    }
+    return;
+  }
+
+  for (uint64_t byte = threadIdx.x; byte < nbytes; byte += blockDim.x) {
+    destination[byte] = source[byte];
+  }
+}
+
 __global__ void awex_transfer_kernel(
     const DeviceTask* tasks,
     uint32_t task_count,
@@ -194,13 +225,10 @@ __global__ void awex_transfer_kernel(
       __threadfence_system();
     }
 
-    for (uint64_t byte = threadIdx.x; byte < task.nbytes;
-         byte += blockDim.x) {
-      if (sender) {
-        remote_data[byte] = source[byte];
-      } else {
-        source[byte] = local_data[byte];
-      }
+    if (sender) {
+      copy_task_bytes(remote_data, source, task.nbytes);
+    } else {
+      copy_task_bytes(source, local_data, task.nbytes);
     }
     __syncthreads();
     if (threadIdx.x == 0) {

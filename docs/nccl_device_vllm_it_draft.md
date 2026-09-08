@@ -21,6 +21,8 @@ python -m awex.tests.weights_exchange_vllm_it \
 
 device task 在现有 `TransferPlan` 降低为 `_DeviceBatch` 时按固定字节数切分，默认 chunk 为 4 MiB。可通过 `AWEX_NCCL_DEVICE_CHUNK_BYTES` 或上述 IT 参数调整；设置为 0 会恢复一 tensor 一 task，便于 A/B。切分只改变 device task 粒度，不改变通用 `CommunicationOperation`，因此不会影响 legacy NCCL 后端。
 
+每个 task 在源、目标地址均满足 16-byte 对齐时使用 `uint4` vectorized load/store，尾部不足 16 bytes 的部分使用逐字节 copy；地址不满足要求时整个 task 自动回退逐字节 copy。该选择完全发生在 device，不增加逐 task host 判断或提交。
+
 ## 2. 现有路径和替换边界
 
 `weights_exchange_vllm_it.py` 的 reader/writer 生命周期、MetaServer、converter 和 `TransferPlan` 应保持不变。当前 NCCL 执行层大致是：
