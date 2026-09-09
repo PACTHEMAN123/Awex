@@ -29,6 +29,7 @@
 #include <ATen/cuda/CUDAContext.h>
 
 #include <algorithm>
+#include <chrono>
 #include <climits>
 #include <cstdint>
 #include <cstdlib>
@@ -66,6 +67,17 @@ struct DeviceTask {
   uint32_t ordinal;
 };
 
+struct DeviceProfile {
+  unsigned long long kernel_start_ns;
+  unsigned long long first_ready_ns;
+  unsigned long long last_ready_ns;
+  unsigned long long first_copy_ns;
+  unsigned long long last_copy_ns;
+  unsigned long long publish_start_ns;
+  unsigned long long publish_done_ns;
+  unsigned long long peer_done_ns;
+};
+
 struct DeviceState {
   ncclComm_t comm = nullptr;
   ncclDevComm_t* dev_comm = nullptr;
@@ -79,6 +91,15 @@ struct DeviceState {
   int rank = 0;
   int world_size = 0;
   int device = 0;
+  DeviceTask* device_tasks = nullptr;
+  uint32_t* device_expected_counts = nullptr;
+  unsigned long long* device_task_done = nullptr;
+  DeviceProfile* device_profile = nullptr;
+  size_t task_capacity = 0;
+  size_t expected_count_capacity = 0;
+  cudaEvent_t metadata_start = nullptr;
+  cudaEvent_t metadata_end = nullptr;
+  cudaEvent_t kernel_end = nullptr;
 };
 
 [[noreturn]] void throw_nccl(ncclResult_t result, const char* expression) {
@@ -101,6 +122,125 @@ void check_cuda(cudaError_t result, const char* expression) {
 
 #define AWEX_NCCL_CHECK(expr) check_nccl((expr), #expr)
 #define AWEX_CUDA_CHECK(expr) check_cuda((expr), #expr)
+
+void ensure_launch_resources(
+    DeviceState* state,
+    size_t task_count,
+    size_t expected_count_count,
+    bool collect_profile) {
+  if (task_count > state->task_capacity) {
+    DeviceTask* new_tasks = nullptr;
+    unsigned long long* new_task_done = nullptr;
+    try {
+      AWEX_CUDA_CHECK(cudaMalloc(
+          reinterpret_cast<void**>(&new_tasks),
+          task_count * sizeof(DeviceTask)));
+      AWEX_CUDA_CHECK(cudaMalloc(
+          reinterpret_cast<void**>(&new_task_done),
+          task_count * sizeof(unsigned long long)));
+    } catch (...) {
+      if (new_tasks != nullptr) {
+        cudaFree(new_tasks);
+      }
+      if (new_task_done != nullptr) {
+        cudaFree(new_task_done);
+      }
+      throw;
+    }
+    if (state->device_tasks != nullptr) {
+      AWEX_CUDA_CHECK(cudaFree(state->device_tasks));
+    }
+    if (state->device_task_done != nullptr) {
+      AWEX_CUDA_CHECK(cudaFree(state->device_task_done));
+    }
+    state->device_tasks = new_tasks;
+    state->device_task_done = new_task_done;
+    state->task_capacity = task_count;
+  }
+
+  if (expected_count_count > state->expected_count_capacity) {
+    uint32_t* new_expected_counts = nullptr;
+    AWEX_CUDA_CHECK(cudaMalloc(
+        reinterpret_cast<void**>(&new_expected_counts),
+        expected_count_count * sizeof(uint32_t)));
+    if (state->device_expected_counts != nullptr) {
+      AWEX_CUDA_CHECK(cudaFree(state->device_expected_counts));
+    }
+    state->device_expected_counts = new_expected_counts;
+    state->expected_count_capacity = expected_count_count;
+  }
+
+  if (collect_profile && state->device_profile == nullptr) {
+    DeviceProfile* new_profile = nullptr;
+    cudaEvent_t new_metadata_start = nullptr;
+    cudaEvent_t new_metadata_end = nullptr;
+    cudaEvent_t new_kernel_end = nullptr;
+    try {
+      AWEX_CUDA_CHECK(cudaMalloc(
+          reinterpret_cast<void**>(&new_profile), sizeof(DeviceProfile)));
+      AWEX_CUDA_CHECK(cudaEventCreate(&new_metadata_start));
+      AWEX_CUDA_CHECK(cudaEventCreate(&new_metadata_end));
+      AWEX_CUDA_CHECK(cudaEventCreate(&new_kernel_end));
+    } catch (...) {
+      if (new_profile != nullptr) {
+        cudaFree(new_profile);
+      }
+      if (new_metadata_start != nullptr) {
+        cudaEventDestroy(new_metadata_start);
+      }
+      if (new_metadata_end != nullptr) {
+        cudaEventDestroy(new_metadata_end);
+      }
+      if (new_kernel_end != nullptr) {
+        cudaEventDestroy(new_kernel_end);
+      }
+      throw;
+    }
+    state->device_profile = new_profile;
+    state->metadata_start = new_metadata_start;
+    state->metadata_end = new_metadata_end;
+    state->kernel_end = new_kernel_end;
+  }
+}
+
+void release_launch_resources(DeviceState* state) {
+  if (state->device_tasks != nullptr) {
+    AWEX_CUDA_CHECK(cudaFree(state->device_tasks));
+    state->device_tasks = nullptr;
+  }
+  if (state->device_expected_counts != nullptr) {
+    AWEX_CUDA_CHECK(cudaFree(state->device_expected_counts));
+    state->device_expected_counts = nullptr;
+  }
+  if (state->device_task_done != nullptr) {
+    AWEX_CUDA_CHECK(cudaFree(state->device_task_done));
+    state->device_task_done = nullptr;
+  }
+  if (state->device_profile != nullptr) {
+    AWEX_CUDA_CHECK(cudaFree(state->device_profile));
+    state->device_profile = nullptr;
+  }
+  if (state->metadata_start != nullptr) {
+    AWEX_CUDA_CHECK(cudaEventDestroy(state->metadata_start));
+    state->metadata_start = nullptr;
+  }
+  if (state->metadata_end != nullptr) {
+    AWEX_CUDA_CHECK(cudaEventDestroy(state->metadata_end));
+    state->metadata_end = nullptr;
+  }
+  if (state->kernel_end != nullptr) {
+    AWEX_CUDA_CHECK(cudaEventDestroy(state->kernel_end));
+    state->kernel_end = nullptr;
+  }
+  state->task_capacity = 0;
+  state->expected_count_capacity = 0;
+}
+
+__device__ __forceinline__ unsigned long long global_timer_ns() {
+  unsigned long long value;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(value));
+  return value;
+}
 
 __device__ bool wait_for_value(
     volatile unsigned long long* address,
@@ -163,12 +303,16 @@ __global__ void awex_transfer_kernel(
     int world_size,
     const uint32_t* expected_counts,
     unsigned long long* task_done,
+    DeviceProfile* profile,
     unsigned long long timeout_cycles) {
   auto* local = reinterpret_cast<ControlBlock*>(local_base);
 
   // Capture the current counter values once per update.  Counters are never
   // reset, so a new update can safely signal over a previous update's window.
   if (blockIdx.x == 0 && threadIdx.x == 0) {
+    if (profile != nullptr) {
+      profile->kernel_start_ns = global_timer_ns();
+    }
     for (int peer = 0; peer < world_size; ++peer) {
       local->ready_base[peer] =
           atomicAdd_system(&local->ready_count[peer], 0ULL);
@@ -222,9 +366,18 @@ __global__ void awex_transfer_kernel(
       if (!initialized) {
         return;
       }
+      if (profile != nullptr) {
+        const auto ready_ns = global_timer_ns();
+        atomicMin(&profile->first_ready_ns, ready_ns);
+        atomicMax(&profile->last_ready_ns, ready_ns);
+      }
       __threadfence_system();
     }
 
+    if (threadIdx.x == 0 && profile != nullptr) {
+      atomicMin(&profile->first_copy_ns, global_timer_ns());
+    }
+    __syncthreads();
     if (sender) {
       copy_task_bytes(remote_data, source, task.nbytes);
     } else {
@@ -232,6 +385,9 @@ __global__ void awex_transfer_kernel(
     }
     __syncthreads();
     if (threadIdx.x == 0) {
+      if (profile != nullptr) {
+        atomicMax(&profile->last_copy_ns, global_timer_ns());
+      }
       if (sender) {
         __threadfence_system();
         atomicExch(&task_done[index], 1ULL);
@@ -247,6 +403,9 @@ __global__ void awex_transfer_kernel(
   if (sender && blockIdx.x == 0 && threadIdx.x == 0) {
     // Blocks may finish copies out of order.  Publish ready counters in task
     // ordinal order so the receiver's counter wait identifies the right task.
+    if (profile != nullptr) {
+      profile->publish_start_ns = global_timer_ns();
+    }
     for (uint32_t index = 0; index < task_count; ++index) {
       if (!wait_for_value(
               &task_done[index], 1ULL, &local->error, timeout_cycles)) {
@@ -255,6 +414,9 @@ __global__ void awex_transfer_kernel(
       auto* remote = reinterpret_cast<ControlBlock*>(tasks[index].remote_base);
       __threadfence_system();
       atomicAdd_system(&remote->ready_count[local_rank], 1ULL);
+    }
+    if (profile != nullptr) {
+      profile->publish_done_ns = global_timer_ns();
     }
     for (int peer = 0; peer < world_size; ++peer) {
       const auto expected = local->done_base[peer] + expected_counts[peer];
@@ -266,6 +428,9 @@ __global__ void awex_transfer_kernel(
               true)) {
         return;
       }
+    }
+    if (profile != nullptr) {
+      profile->peer_done_ns = global_timer_ns();
     }
     __threadfence_system();
   }
@@ -379,6 +544,7 @@ void destroy_state(DeviceState* state) {
     return;
   }
   AWEX_CUDA_CHECK(cudaSetDevice(state->device));
+  release_launch_resources(state);
   if (state->window != nullptr) {
     AWEX_NCCL_CHECK(ncclCommWindowDeregister(state->comm, state->window));
     state->window = nullptr;
@@ -398,7 +564,7 @@ void destroy_state(DeviceState* state) {
   }
 }
 
-void launch(
+py::dict launch(
     int64_t handle,
     const py::list& tensors,
     const std::vector<int64_t>& offsets,
@@ -408,6 +574,14 @@ void launch(
     const std::vector<int64_t>& expected_counts,
     bool sender,
     int64_t sequence) {
+  using Clock = std::chrono::steady_clock;
+  const auto launch_start = Clock::now();
+  const char* profile_env = std::getenv("AWEX_PROFILE");
+  const bool collect_profile = profile_env != nullptr &&
+      (std::strcmp(profile_env, "1") == 0 ||
+       std::strcmp(profile_env, "true") == 0 ||
+       std::strcmp(profile_env, "True") == 0);
+  py::dict metrics;
   auto* state = reinterpret_cast<DeviceState*>(handle);
   if (state == nullptr) {
     throw std::runtime_error("Invalid nccl_device state handle");
@@ -478,20 +652,42 @@ void launch(
     throw std::runtime_error(
         "nccl_device task count does not match expected peer counts");
   }
+  metrics["host_descriptor_time_ms"] =
+      std::chrono::duration<double, std::milli>(Clock::now() - launch_start)
+          .count();
 
   AWEX_CUDA_CHECK(cudaSetDevice(state->device));
   auto stream = at::cuda::getCurrentCUDAStream(state->device).stream();
   auto* local_control = reinterpret_cast<ControlBlock*>(state->local_base);
+
+  const auto allocation_start = Clock::now();
+  ensure_launch_resources(
+      state,
+      host_tasks.size(),
+      host_expected_counts.size(),
+      collect_profile);
+  metrics["buffer_allocation_time_ms"] =
+      std::chrono::duration<double, std::milli>(Clock::now() - allocation_start)
+          .count();
+
+  auto* device_tasks = state->device_tasks;
+  auto* device_expected_counts = state->device_expected_counts;
+  auto* device_task_done = state->device_task_done;
+  auto* device_profile = collect_profile ? state->device_profile : nullptr;
+  const auto metadata_start =
+      collect_profile ? state->metadata_start : nullptr;
+  const auto metadata_end = collect_profile ? state->metadata_end : nullptr;
+  const auto kernel_end = collect_profile ? state->kernel_end : nullptr;
+
+  DeviceProfile initial_profile{};
+  initial_profile.first_ready_ns = ULLONG_MAX;
+  initial_profile.first_copy_ns = ULLONG_MAX;
+  if (collect_profile) {
+    AWEX_CUDA_CHECK(cudaEventRecord(metadata_start, stream));
+  }
   AWEX_CUDA_CHECK(cudaMemsetAsync(
       &local_control->error, 0, sizeof(local_control->error), stream));
-
-  DeviceTask* device_tasks = nullptr;
-  uint32_t* device_expected_counts = nullptr;
-  unsigned long long* device_task_done = nullptr;
   if (!host_tasks.empty()) {
-    AWEX_CUDA_CHECK(cudaMalloc(
-        reinterpret_cast<void**>(&device_tasks),
-        host_tasks.size() * sizeof(DeviceTask)));
     AWEX_CUDA_CHECK(cudaMemcpyAsync(
         device_tasks,
         host_tasks.data(),
@@ -499,9 +695,6 @@ void launch(
         cudaMemcpyHostToDevice,
         stream));
   }
-  AWEX_CUDA_CHECK(cudaMalloc(
-      reinterpret_cast<void**>(&device_expected_counts),
-      host_expected_counts.size() * sizeof(uint32_t)));
   AWEX_CUDA_CHECK(cudaMemcpyAsync(
       device_expected_counts,
       host_expected_counts.data(),
@@ -509,14 +702,22 @@ void launch(
       cudaMemcpyHostToDevice,
       stream));
   if (!host_tasks.empty()) {
-    AWEX_CUDA_CHECK(cudaMalloc(
-        reinterpret_cast<void**>(&device_task_done),
-        host_tasks.size() * sizeof(unsigned long long)));
     AWEX_CUDA_CHECK(cudaMemsetAsync(
         device_task_done,
         0,
         host_tasks.size() * sizeof(unsigned long long),
         stream));
+  }
+  if (device_profile != nullptr) {
+    AWEX_CUDA_CHECK(cudaMemcpyAsync(
+        device_profile,
+        &initial_profile,
+        sizeof(DeviceProfile),
+        cudaMemcpyHostToDevice,
+        stream));
+  }
+  if (collect_profile) {
+    AWEX_CUDA_CHECK(cudaEventRecord(metadata_end, stream));
   }
 
   const unsigned int blocks = static_cast<unsigned int>(
@@ -531,27 +732,79 @@ void launch(
       state->world_size,
       device_expected_counts,
       device_task_done,
+      device_profile,
       state->timeout_cycles);
   AWEX_CUDA_CHECK(cudaGetLastError());
-  AWEX_CUDA_CHECK(cudaStreamSynchronize(stream));
-  if (device_tasks != nullptr) {
-    AWEX_CUDA_CHECK(cudaFree(device_tasks));
+  if (collect_profile) {
+    AWEX_CUDA_CHECK(cudaEventRecord(kernel_end, stream));
   }
-  AWEX_CUDA_CHECK(cudaFree(device_expected_counts));
-  if (device_task_done != nullptr) {
-    AWEX_CUDA_CHECK(cudaFree(device_task_done));
+  AWEX_CUDA_CHECK(cudaStreamSynchronize(stream));
+
+  DeviceProfile host_profile{};
+  if (collect_profile) {
+    float metadata_upload_time_ms = 0.0F;
+    float kernel_transfer_time_ms = 0.0F;
+    AWEX_CUDA_CHECK(cudaEventElapsedTime(
+        &metadata_upload_time_ms, metadata_start, metadata_end));
+    AWEX_CUDA_CHECK(cudaEventElapsedTime(
+        &kernel_transfer_time_ms, metadata_end, kernel_end));
+    metrics["metadata_upload_time_ms"] = metadata_upload_time_ms;
+    metrics["kernel_transfer_time_ms"] = kernel_transfer_time_ms;
+    AWEX_CUDA_CHECK(cudaMemcpy(
+        &host_profile,
+        device_profile,
+        sizeof(DeviceProfile),
+        cudaMemcpyDeviceToHost));
   }
 
   ControlBlock host_control;
+  const auto control_download_start = Clock::now();
   AWEX_CUDA_CHECK(cudaMemcpy(
       &host_control,
       local_control,
       sizeof(host_control),
       cudaMemcpyDeviceToHost));
+  metrics["control_download_time_ms"] =
+      std::chrono::duration<double, std::milli>(
+          Clock::now() - control_download_start)
+          .count();
+
+  metrics["buffer_cleanup_time_ms"] = 0.0;
+
+  auto device_delta_ms = [](unsigned long long start,
+                            unsigned long long end) -> double {
+    if (start == 0 || start == ULLONG_MAX || end < start) {
+      return 0.0;
+    }
+    return static_cast<double>(end - start) / 1.0e6;
+  };
+  if (collect_profile) {
+    metrics["device_copy_span_time_ms"] = device_delta_ms(
+        host_profile.first_copy_ns, host_profile.last_copy_ns);
+    if (sender) {
+      metrics["sender_publish_time_ms"] = device_delta_ms(
+          host_profile.publish_start_ns, host_profile.publish_done_ns);
+      metrics["sender_reader_ack_wait_time_ms"] = device_delta_ms(
+          host_profile.publish_done_ns, host_profile.peer_done_ns);
+    } else {
+      metrics["reader_first_ready_time_ms"] = device_delta_ms(
+          host_profile.kernel_start_ns, host_profile.first_ready_ns);
+      metrics["reader_wait_time_ms"] = device_delta_ms(
+          host_profile.kernel_start_ns, host_profile.last_ready_ns);
+      metrics["reader_copyback_time_ms"] = device_delta_ms(
+          host_profile.first_copy_ns, host_profile.last_copy_ns);
+      metrics["reader_copyback_tail_time_ms"] = device_delta_ms(
+          host_profile.last_ready_ns, host_profile.last_copy_ns);
+    }
+  }
+  metrics["extension_total_time_ms"] =
+      std::chrono::duration<double, std::milli>(Clock::now() - launch_start)
+          .count();
   if (host_control.error != 0) {
     throw std::runtime_error(
         "nccl_device kernel aborted while waiting for the peer");
   }
+  return metrics;
 }
 
 }  // namespace

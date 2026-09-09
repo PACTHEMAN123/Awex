@@ -34,6 +34,7 @@ from awex.util import device as device_util
 from awex.util.common import compute_statistics, get_ip_address
 from awex.util.gpu import print_current_gpu_status
 from awex.util.process_group import init_weights_update_group, setup_batch_isend_irecv
+from awex.util.profile import emit_profile, profile_phase
 from awex.util.system_util import count_open_fds
 from awex.util.tensor_util import (
     cuda_ipc_serialize,
@@ -254,11 +255,28 @@ class NCCLWeightsWriter(WeightsExchangeShardingWriter):
             f"with {self.num_to_sends} sends"
         )
         self._init_weights_exchange_process_group()
-        start_time = time.time()
+        sync_start_barrier_time_ms = 0.0
+        if os.environ.get("AWEX_PROFILE_SYNC_START", "0") == "1":
+            sync_start = time.perf_counter()
+            dist.barrier(
+                group=self.weights_update_group,
+                device_ids=[device_util.current_device()],
+            )
+            sync_start_barrier_time_ms = (
+                time.perf_counter() - sync_start
+            ) * 1000.0
+        start_time = time.perf_counter()
         parameters = None
         parameters_are_static = False
         p2p_op_list = None
         using_device_transport = self.device_transport is not None
+        profile_metrics = {
+            "build_batch_time_ms": 0.0,
+            "metadata_upload_time_ms": 0.0,
+            "kernel_transfer_time_ms": 0.0,
+            "payload_bytes": 0.0,
+        }
+        convert_time_ms = 0.0
         try:
             if using_device_transport and self.device_parameters is not None:
                 parameters = self.device_parameters
@@ -272,9 +290,13 @@ class NCCLWeightsWriter(WeightsExchangeShardingWriter):
                     print_current_gpu_status(
                         f"writer-{self.transfer_rank} before convert"
                     )
+                convert_start = time.perf_counter()
                 parameters = self.convert_parameters(
                     required_names=self.required_param_names
                 )
+                convert_time_ms = (
+                    time.perf_counter() - convert_start
+                ) * 1000.0
                 logger.info("Writer: Converting parameters completed")
                 if self.enable_mem_debug:
                     print_current_gpu_status(
@@ -282,15 +304,29 @@ class NCCLWeightsWriter(WeightsExchangeShardingWriter):
                     )
             if using_device_transport:
                 logger.info("Writer: submitting device task batch")
-                self.device_transport.send(parameters, self.transfer_plan, step_id)
+                profile_metrics.update(
+                    self.device_transport.send(
+                        parameters, self.transfer_plan, step_id
+                    )
+                )
             else:
                 logger.info("Writer: building legacy NCCL send ops")
+                build_start = time.perf_counter()
                 p2p_op_list, _, send_traj_list = nccl_build_send_ops(
                     parameters,
                     self.transfer_plan,
                     self.weights_update_group,
                     -1,
                     self.use_batch_send_recv,
+                )
+                profile_metrics["build_batch_time_ms"] = (
+                    time.perf_counter() - build_start
+                ) * 1000.0
+                profile_metrics["payload_bytes"] = float(
+                    sum(
+                        int(op.tensor.numel()) * int(op.tensor.element_size())
+                        for op in p2p_op_list
+                    )
                 )
                 logger.info(
                     f"Writer: Built {len(p2p_op_list)} send operations to "
@@ -313,6 +349,7 @@ class NCCLWeightsWriter(WeightsExchangeShardingWriter):
                 logger.info(
                     f"Writer: Executing {len(p2p_op_list)} send ops via batch_send_recv"
                 )
+                transfer_start = time.perf_counter()
                 if self.use_batch_send_recv:
                     batch_send_recv(
                         send_ops=p2p_op_list,
@@ -323,9 +360,12 @@ class NCCLWeightsWriter(WeightsExchangeShardingWriter):
                 else:
                     self._send_recv_one_by_one(p2p_op_list, send_traj_list)
                 device_util.synchronize(device_id=device_util.current_device())
+                profile_metrics["kernel_transfer_time_ms"] = (
+                    time.perf_counter() - transfer_start
+                ) * 1000.0
             if self.enable_mem_debug:
                 print_current_gpu_status(f"writer-{self.transfer_rank} after send")
-            duration = time.time() - start_time
+            duration = time.perf_counter() - start_time
             logger.info(
                 f"Finished sending weights for step {step_id} using NCCL to {len(self.transfer_plan.operations)} ranks({self.recv_ranks_sample}) "
                 f"from rank {rank_coordinate} with {self.num_to_sends} sends, took {duration:.4f} seconds"
@@ -336,12 +376,39 @@ class NCCLWeightsWriter(WeightsExchangeShardingWriter):
                 duration,
                 "Send weights using NCCL",
             )
+            completion_barrier_start = time.perf_counter()
             dist.barrier(
                 group=self.weights_update_group,
                 device_ids=[device_util.current_device()],
             )
+            completion_barrier_time_ms = (
+                time.perf_counter() - completion_barrier_start
+            ) * 1000.0
             logger.info(
                 f"Barrier passed for writer step {step_id} with rank {self.transfer_rank}"
+            )
+            kernel_transfer_time_ms = profile_metrics.get(
+                "kernel_transfer_time_ms", 0.0
+            )
+            effective_gbps = 0.0
+            if kernel_transfer_time_ms > 0:
+                effective_gbps = profile_metrics.get("payload_bytes", 0.0) / (
+                    kernel_transfer_time_ms * 1_000_000.0
+                )
+            emit_profile(
+                logger,
+                event="weight_transfer",
+                role="writer",
+                backend=self.comm_backend,
+                phase=profile_phase(step_id),
+                step_id=int(step_id),
+                rank=int(self.transfer_rank),
+                convert_time_ms=convert_time_ms,
+                sync_start_barrier_time_ms=sync_start_barrier_time_ms,
+                completion_barrier_time_ms=completion_barrier_time_ms,
+                total_transfer_time_ms=duration * 1000.0,
+                effective_gbps=effective_gbps,
+                **profile_metrics,
             )
         finally:
             # Explicitly release temporary converted tensors after each step

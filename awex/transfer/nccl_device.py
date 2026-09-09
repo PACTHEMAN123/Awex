@@ -28,9 +28,10 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -266,6 +267,15 @@ def _split_contiguous_tensor(
     return result
 
 
+def _sequence_from_step(step_id: int) -> int:
+    sequence = int(step_id) + 2
+    if sequence <= 0:
+        raise NCCLDeviceUnavailableError(
+            f"nccl_device step_id must be at least -1, got {step_id}."
+        )
+    return sequence
+
+
 def _build_send_batch(
     parameters: dict,
     plan: TransferPlan,
@@ -469,9 +479,10 @@ class NCCLDeviceTransport:
             self.chunk_bytes,
         )
 
-    def _ensure_initialized(self, total_bytes: int) -> None:
+    def _ensure_initialized(self, total_bytes: int) -> float:
         if self._initialized:
-            return
+            return 0.0
+        start_time = time.perf_counter()
         self._extension = _load_extension()
         device = torch.device(device_util.get_torch_device())
         max_bytes = int(total_bytes)
@@ -507,8 +518,12 @@ class NCCLDeviceTransport:
             self.world_size,
             max_bytes,
         )
+        return (time.perf_counter() - start_time) * 1000.0
 
-    def _run(self, batch: _DeviceBatch, sender: bool, sequence: int) -> None:
+    def _run(
+        self, batch: _DeviceBatch, sender: bool, sequence: int
+    ) -> Dict[str, float]:
+        run_start = time.perf_counter()
         if not self._logged_batch_shape:
             logger.info(
                 "Lowered nccl_device plan rank=%s sender=%s tasks=%s "
@@ -522,6 +537,7 @@ class NCCLDeviceTransport:
             )
             self._logged_batch_shape = True
         device = torch.device(device_util.get_torch_device())
+        region_metadata_start = time.perf_counter()
         if self._region_sizes is None:
             region_sizes = torch.tensor(
                 batch.region_bytes, dtype=torch.int64, device=device
@@ -545,44 +561,88 @@ class NCCLDeviceTransport:
             region_offsets[region] + offset
             for region, offset in zip(batch.region_indices, batch.offsets)
         ]
-        self._ensure_initialized(total_bytes)
+        region_metadata_time_ms = (
+            time.perf_counter() - region_metadata_start
+        ) * 1000.0
+        transport_init_time_ms = self._ensure_initialized(total_bytes)
         assert self._extension is not None and self._handle is not None
-        self._extension.launch(
-            self._handle,
-            batch.tensors,
-            absolute_offsets,
-            batch.lengths,
-            batch.peers,
-            batch.ordinals,
-            batch.expected_counts,
-            bool(sender),
-            int(sequence),
+        extension_metrics = dict(
+            self._extension.launch(
+                self._handle,
+                batch.tensors,
+                absolute_offsets,
+                batch.lengths,
+                batch.peers,
+                batch.ordinals,
+                batch.expected_counts,
+                bool(sender),
+                int(sequence),
+            )
         )
+        python_copyback_start = time.perf_counter()
         if batch.copybacks:
             with torch.no_grad():
                 for destination, staging in batch.copybacks:
                     destination.copy_(staging)
             torch.cuda.current_stream().synchronize()
+        python_copyback_time_ms = (
+            time.perf_counter() - python_copyback_start
+        ) * 1000.0
+        extension_metrics.update(
+            {
+                "payload_bytes": float(sum(batch.lengths)),
+                "region_metadata_time_ms": region_metadata_time_ms,
+                "transport_init_time_ms": transport_init_time_ms,
+                "python_copyback_time_ms": python_copyback_time_ms,
+                "transport_total_time_ms": (
+                    time.perf_counter() - run_start
+                )
+                * 1000.0,
+            }
+        )
+        extension_metrics["reader_copyback_total_time_ms"] = (
+            extension_metrics.get("reader_copyback_time_ms", 0.0)
+            + python_copyback_time_ms
+        )
+        return extension_metrics
 
-    def send(self, parameters: dict, plan: TransferPlan, step_id: int) -> None:
+    def send(
+        self, parameters: dict, plan: TransferPlan, step_id: int
+    ) -> Dict[str, float]:
+        build_batch_time_ms = 0.0
         prepared = self._prepared_send
         if prepared is not None and prepared[0] is parameters and prepared[1] is plan:
             batch = prepared[2]
         else:
+            build_start = time.perf_counter()
             batch = _build_send_batch(
                 parameters, plan, self.rank, self.world_size, self.chunk_bytes
             )
-        self._run(batch, sender=True, sequence=int(step_id) + 1)
+            build_batch_time_ms = (time.perf_counter() - build_start) * 1000.0
+        metrics = self._run(
+            batch, sender=True, sequence=_sequence_from_step(step_id)
+        )
+        metrics["build_batch_time_ms"] = build_batch_time_ms
+        return metrics
 
-    def recv(self, parameters: dict, plan: TransferPlan, step_id: int) -> None:
+    def recv(
+        self, parameters: dict, plan: TransferPlan, step_id: int
+    ) -> Dict[str, float]:
+        build_batch_time_ms = 0.0
         prepared = self._prepared_recv
         if prepared is not None and prepared[0] is parameters and prepared[1] is plan:
             batch = prepared[2]
         else:
+            build_start = time.perf_counter()
             batch = _build_recv_batch(
                 parameters, plan, self.rank, self.world_size, self.chunk_bytes
             )
-        self._run(batch, sender=False, sequence=int(step_id) + 1)
+            build_batch_time_ms = (time.perf_counter() - build_start) * 1000.0
+        metrics = self._run(
+            batch, sender=False, sequence=_sequence_from_step(step_id)
+        )
+        metrics["build_batch_time_ms"] = build_batch_time_ms
+        return metrics
 
     def prepare_send(
         self,
@@ -609,7 +669,6 @@ class NCCLDeviceTransport:
         allow_staging: bool = True,
     ) -> None:
         """Bind stable destination tensors to device tasks once during initialization."""
-
         batch = _build_recv_batch(
             parameters,
             plan,

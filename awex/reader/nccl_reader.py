@@ -40,6 +40,7 @@ from awex.util.common import (
 from awex.util.gpu import get_gpu_status, print_current_gpu_status
 from awex.util.system_util import count_open_fds
 from awex.util.tensor_util import reconstruct_ipc_weights
+from awex.util.profile import emit_profile, profile_phase
 
 logger = logging.getLogger(__name__)
 
@@ -374,21 +375,53 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
             f"for rank {self.rank_coordinate}."
         )
         self._init_weights_exchange_process_group()
-        start_time = time.time()
+        sync_start_barrier_time_ms = 0.0
+        if os.environ.get("AWEX_PROFILE_SYNC_START", "0") == "1":
+            sync_start = time.perf_counter()
+            dist.barrier(
+                group=self.weights_update_group,
+                device_ids=[device_util.current_device()],
+            )
+            sync_start_barrier_time_ms = (
+                time.perf_counter() - sync_start
+            ) * 1000.0
+        start_time = time.perf_counter()
 
         p2p_op_list = None
+        profile_metrics = {
+            "build_batch_time_ms": 0.0,
+            "metadata_upload_time_ms": 0.0,
+            "kernel_transfer_time_ms": 0.0,
+            "reader_wait_time_ms": 0.0,
+            "reader_copyback_time_ms": 0.0,
+            "payload_bytes": 0.0,
+        }
         if self.device_transport is not None:
             logger.info("Reader: submitting device task batch")
-            self.device_transport.recv(self.parameters, self.transfer_plan, step_id)
+            profile_metrics.update(
+                self.device_transport.recv(
+                    self.parameters, self.transfer_plan, step_id
+                )
+            )
         else:
             # Build receive ops once for logging, then execute them via
             # batch_send_recv to keep scheduling consistent with the writer.
+            build_start = time.perf_counter()
             p2p_op_list, non_contiguous_tensor_pairs, recv_traj_list = (
                 nccl_build_recv_ops(
                     self.parameters,
                     self.transfer_plan,
                     self.weights_update_group,
                     self.use_batch_send_recv,
+                )
+            )
+            profile_metrics["build_batch_time_ms"] = (
+                time.perf_counter() - build_start
+            ) * 1000.0
+            profile_metrics["payload_bytes"] = float(
+                sum(
+                    int(op.tensor.numel()) * int(op.tensor.element_size())
+                    for op in p2p_op_list
                 )
             )
             logger.info(
@@ -399,6 +432,7 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
             logger.info(
                 f"Reader: Executing {len(p2p_op_list)} recv ops via batch_send_recv"
             )
+            transfer_start = time.perf_counter()
             if self.use_batch_send_recv:
                 batch_send_recv(
                     send_ops=[], recv_ops=p2p_op_list, blocking=True, use_group=True
@@ -406,9 +440,16 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
             else:
                 self._send_recv_one_by_one(p2p_op_list, recv_traj_list)
 
+            profile_metrics["kernel_transfer_time_ms"] = (
+                time.perf_counter() - transfer_start
+            ) * 1000.0
+            copyback_start = time.perf_counter()
             self._sync_non_contiguous_tensor_pairs(non_contiguous_tensor_pairs)
             device_util.synchronize(device_id=device_util.current_device())
-        duration = time.time() - start_time
+            profile_metrics["reader_copyback_time_ms"] = (
+                time.perf_counter() - copyback_start
+            ) * 1000.0
+        duration = time.perf_counter() - start_time
         logger.info(
             f"Finished receiving weights for step {step_id} using NCCL "
             f"from {len(self.transfer_plan.operations)} ranks({self.send_ranks_sample}) "
@@ -420,11 +461,35 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
             duration,
             "Receive weights using NCCL",
         )
+        completion_barrier_start = time.perf_counter()
         dist.barrier(
             group=self.weights_update_group, device_ids=[device_util.current_device()]
         )
+        completion_barrier_time_ms = (
+            time.perf_counter() - completion_barrier_start
+        ) * 1000.0
         logger.info(
             f"Barrier passed for reader step {step_id} with rank {self.transfer_rank}"
+        )
+        kernel_transfer_time_ms = profile_metrics.get("kernel_transfer_time_ms", 0.0)
+        effective_gbps = 0.0
+        if kernel_transfer_time_ms > 0:
+            effective_gbps = profile_metrics.get("payload_bytes", 0.0) / (
+                kernel_transfer_time_ms * 1_000_000.0
+            )
+        emit_profile(
+            logger,
+            event="weight_transfer",
+            role="reader",
+            backend=self.comm_backend,
+            phase=profile_phase(step_id),
+            step_id=int(step_id),
+            rank=int(self.transfer_rank),
+            sync_start_barrier_time_ms=sync_start_barrier_time_ms,
+            completion_barrier_time_ms=completion_barrier_time_ms,
+            total_transfer_time_ms=duration * 1000.0,
+            effective_gbps=effective_gbps,
+            **profile_metrics,
         )
         if p2p_op_list is not None:
             p2p_op_list.clear()

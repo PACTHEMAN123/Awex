@@ -32,6 +32,7 @@ import torch.distributed as dist
 from awex import logging
 from awex.meta.meta_server import start_meta_server, stop_meta_server
 from awex.util import device as device_util
+from awex.util.profile import emit_profile, profile_phase
 
 logger = logging.getLogger(__name__)
 
@@ -386,6 +387,7 @@ class VLLMWeightsExchangeIT:
             temp_ctx = nullcontext()
             path = None
 
+        end_to_end_start = time.perf_counter()
         with temp_ctx:
             if self.comm_backend == "file":
                 self.megatron_engine.write_weights(path=path)
@@ -403,11 +405,25 @@ class VLLMWeightsExchangeIT:
                         else None
                     )
                     self._training_barrier()
-                    time.sleep(1)
                     self.megatron_engine.write_weights()
                     if future is not None:
                         future.result()
         logger.info("Update weights finished")
+        if self.is_driver:
+            step_id = int(self.megatron_engine.global_step)
+            emit_profile(
+                logger,
+                event="end_to_end_update",
+                role="driver",
+                backend=self.comm_backend,
+                phase=profile_phase(step_id),
+                step_id=step_id,
+                rank=int(self.rank),
+                end_to_end_update_time_ms=(
+                    time.perf_counter() - end_to_end_start
+                )
+                * 1000.0,
+            )
 
     def _awex_update(self, path: str | None):
         url = f"http://{self.host}:{self.port}/areal_awex_update"
@@ -425,6 +441,11 @@ def main(args):
         os.environ["AWEX_NCCL_DEVICE_CHUNK_BYTES"] = str(
             args.nccl_device_chunk_mb * 1024 * 1024
         )
+    if args.profile:
+        os.environ["AWEX_PROFILE"] = "1"
+        os.environ["AWEX_PROFILE_WARMUP_UPDATES"] = str(args.warmup_updates)
+    if args.sync_transfer_start:
+        os.environ["AWEX_PROFILE_SYNC_START"] = "1"
     comm_backend = args.comm_backend
     inference_config = copy.deepcopy(vllm_inference_config)
     if args.model_path:
@@ -445,8 +466,16 @@ def main(args):
 
     try:
         weights_exchange_it.initialize()
-        logger.info("========== Test weights exchange ==========")
-        weights_exchange_it.exchange_weights()
+        for update_index in range(args.num_updates):
+            step_id = update_index - 1
+            weights_exchange_it.megatron_engine.set_global_step(step_id)
+            logger.info(
+                "========== Test weights exchange step %s (%s/%s) ==========",
+                step_id,
+                update_index + 1,
+                args.num_updates,
+            )
+            weights_exchange_it.exchange_weights()
     finally:
         weights_exchange_it.destroy()
         _destroy_process_group(timeout=5)
@@ -514,6 +543,30 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--num-updates",
+        type=_positive_int,
+        default=1,
+        metavar="N",
+        help="Number of consecutive weight updates to execute.",
+    )
+    parser.add_argument(
+        "--warmup-updates",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Number of initial updates marked as warmup in profile output.",
+    )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Emit structured AWEX_PROFILE timing records.",
+    )
+    parser.add_argument(
+        "--sync-transfer-start",
+        action="store_true",
+        help="Synchronize all reader and writer ranks immediately before transfer.",
+    )
+    parser.add_argument(
         "--device-backend",
         choices=["auto", "cuda", "npu", "cpu"],
         default="auto",
@@ -542,6 +595,8 @@ if __name__ == "__main__":
         help="Directory to dump validation tensors.",
     )
     args = parser.parse_args()
+    if args.warmup_updates < 0 or args.warmup_updates >= args.num_updates:
+        parser.error("--warmup-updates must be in [0, --num-updates)")
     if args.device_backend and args.device_backend != "auto":
         os.environ["AWEX_DEVICE_TYPE"] = args.device_backend
     if device_util.get_device_type() == "npu" and args.comm_backend == "nccl":

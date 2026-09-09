@@ -41,6 +41,7 @@ from awex.util.common import (
     simple_hf_config,
     stripped_env_vars,
 )
+from awex.util.profile import emit_profile, profile_phase
 from awex.util.tensor_util import (
     check_and_log_nan_values,
     compare_and_log_tensor_differences,
@@ -759,15 +760,30 @@ class WorkerWeightsReader:
         logger.info(
             f"Start to flush cache for step {step_id} for rank {self.transfer_rank}"
         )
+        flush_cache_start = time.perf_counter()
         flash_cache_success = self.scheduler.flush_cache()
         assert flash_cache_success, "Cache flush failed after updating weights"
         logger.info(
             f"Finished flushing cache for step {step_id} for rank {self.transfer_rank}"
         )
         device_util.synchronize()
+        flush_cache_time_ms = (
+            time.perf_counter() - flush_cache_start
+        ) * 1000.0
         duration = time.time() - start_time
         compute_statistics(
             self._history_update_weights_time, step_id, duration, "Update weights"
+        )
+        emit_profile(
+            logger,
+            event="reader_worker_update",
+            role="reader_worker",
+            backend=self.comm_backend,
+            phase=profile_phase(step_id),
+            step_id=int(step_id),
+            rank=int(self.transfer_rank),
+            flush_cache_time_ms=flush_cache_time_ms,
+            worker_update_time_ms=duration * 1000.0,
         )
 
     def _update_weights(self, step_id, **kwargs):
