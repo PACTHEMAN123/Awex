@@ -375,16 +375,6 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
             f"for rank {self.rank_coordinate}."
         )
         self._init_weights_exchange_process_group()
-        sync_start_barrier_time_ms = 0.0
-        if os.environ.get("AWEX_PROFILE_SYNC_START", "0") == "1":
-            sync_start = time.perf_counter()
-            dist.barrier(
-                group=self.weights_update_group,
-                device_ids=[device_util.current_device()],
-            )
-            sync_start_barrier_time_ms = (
-                time.perf_counter() - sync_start
-            ) * 1000.0
         start_time = time.perf_counter()
 
         p2p_op_list = None
@@ -398,11 +388,6 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
         }
         if self.device_transport is not None:
             logger.info("Reader: submitting device task batch")
-            profile_metrics.update(
-                self.device_transport.recv(
-                    self.parameters, self.transfer_plan, step_id
-                )
-            )
         else:
             # Build receive ops once for logging, then execute them via
             # batch_send_recv to keep scheduling consistent with the writer.
@@ -432,6 +417,24 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
             logger.info(
                 f"Reader: Executing {len(p2p_op_list)} recv ops via batch_send_recv"
             )
+        sync_start_barrier_time_ms = 0.0
+        if os.environ.get("AWEX_PROFILE_SYNC_START", "0") == "1":
+            sync_start = time.perf_counter()
+            dist.barrier(
+                group=self.weights_update_group,
+                device_ids=[device_util.current_device()],
+            )
+            sync_start_barrier_time_ms = (
+                time.perf_counter() - sync_start
+            ) * 1000.0
+        backend_execute_start = time.perf_counter()
+        if self.device_transport is not None:
+            profile_metrics.update(
+                self.device_transport.recv(
+                    self.parameters, self.transfer_plan, step_id
+                )
+            )
+        else:
             transfer_start = time.perf_counter()
             if self.use_batch_send_recv:
                 batch_send_recv(
@@ -449,6 +452,10 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
             profile_metrics["reader_copyback_time_ms"] = (
                 time.perf_counter() - copyback_start
             ) * 1000.0
+        device_util.synchronize(device_id=device_util.current_device())
+        profile_metrics["backend_execute_time_ms"] = (
+            time.perf_counter() - backend_execute_start
+        ) * 1000.0
         duration = time.perf_counter() - start_time
         logger.info(
             f"Finished receiving weights for step {step_id} using NCCL "
@@ -477,6 +484,14 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
             effective_gbps = profile_metrics.get("payload_bytes", 0.0) / (
                 kernel_transfer_time_ms * 1_000_000.0
             )
+        backend_execute_time_ms = profile_metrics.get(
+            "backend_execute_time_ms", 0.0
+        )
+        backend_effective_gbps = 0.0
+        if backend_execute_time_ms > 0:
+            backend_effective_gbps = profile_metrics.get(
+                "payload_bytes", 0.0
+            ) / (backend_execute_time_ms * 1_000_000.0)
         emit_profile(
             logger,
             event="weight_transfer",
@@ -489,6 +504,7 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
             completion_barrier_time_ms=completion_barrier_time_ms,
             total_transfer_time_ms=duration * 1000.0,
             effective_gbps=effective_gbps,
+            backend_effective_gbps=backend_effective_gbps,
             **profile_metrics,
         )
         should_collect_garbage = p2p_op_list is not None

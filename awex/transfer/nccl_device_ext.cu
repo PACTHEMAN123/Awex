@@ -576,7 +576,13 @@ py::dict launch(
     int64_t sequence) {
   using Clock = std::chrono::steady_clock;
   const auto launch_start = Clock::now();
-  const char* profile_env = std::getenv("AWEX_PROFILE");
+  // Fair backend benchmarks use the common host-side timer without adding
+  // device-only events and profile-buffer copies. Preserve the historical
+  // AWEX_PROFILE behavior unless an explicit detail override is provided.
+  const char* profile_env = std::getenv("AWEX_PROFILE_DEVICE_DETAILS");
+  if (profile_env == nullptr) {
+    profile_env = std::getenv("AWEX_PROFILE");
+  }
   const bool collect_profile = profile_env != nullptr &&
       (std::strcmp(profile_env, "1") == 0 ||
        std::strcmp(profile_env, "true") == 0 ||

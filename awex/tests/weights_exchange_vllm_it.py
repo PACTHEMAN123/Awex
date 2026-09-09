@@ -564,7 +564,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--sync-transfer-start",
         action="store_true",
-        help="Synchronize all reader and writer ranks immediately before transfer.",
+        help=(
+            "Synchronize all reader and writer ranks after transfer preparation "
+            "and immediately before timed backend execution."
+        ),
     )
     parser.add_argument(
         "--device-backend",

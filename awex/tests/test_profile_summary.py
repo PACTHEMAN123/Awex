@@ -59,6 +59,34 @@ def test_summarize_uses_per_step_critical_rank():
     assert result["effective_gbps"]["p50"] == 35.0
 
 
+def test_summarize_reports_cross_role_backend_critical_path():
+    records = [
+        {
+            "role": "writer",
+            "step_id": 0,
+            "backend_execute_time_ms": 8.0,
+            "backend_effective_gbps": 90.0,
+        },
+        {
+            "role": "reader",
+            "step_id": 0,
+            "backend_execute_time_ms": 10.0,
+            "backend_effective_gbps": 75.0,
+        },
+    ]
+
+    result = {
+        (item["role"], item["metric"]): item for item in summarize(records)
+    }
+
+    assert result[("transfer_critical_path", "backend_execute_time_ms")][
+        "p50"
+    ] == 10.0
+    assert result[("transfer_critical_path", "backend_effective_gbps")][
+        "p50"
+    ] == 75.0
+
+
 def test_load_records_recovers_multiple_process_records_on_one_line(tmp_path):
     records = [
         {"role": "writer", "phase": "measure", "step_id": 1},

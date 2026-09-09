@@ -32,6 +32,7 @@ METRICS = (
     ("writer", "buffer_allocation_time_ms", "ms", "max"),
     ("writer", "metadata_upload_time_ms", "ms", "max"),
     ("writer", "kernel_transfer_time_ms", "ms", "max"),
+    ("writer", "backend_execute_time_ms", "ms", "max"),
     ("writer", "device_copy_span_time_ms", "ms", "max"),
     ("writer", "sender_publish_time_ms", "ms", "max"),
     ("writer", "sender_reader_ack_wait_time_ms", "ms", "max"),
@@ -46,6 +47,7 @@ METRICS = (
     ("reader", "build_batch_time_ms", "ms", "max"),
     ("reader", "metadata_upload_time_ms", "ms", "max"),
     ("reader", "kernel_transfer_time_ms", "ms", "max"),
+    ("reader", "backend_execute_time_ms", "ms", "max"),
     ("reader", "reader_first_ready_time_ms", "ms", "max"),
     ("reader", "reader_wait_time_ms", "ms", "max"),
     ("reader", "reader_copyback_time_ms", "ms", "max"),
@@ -67,6 +69,13 @@ METRICS = (
     ("driver", "end_to_end_update_time_ms", "ms", "max"),
     ("writer", "effective_gbps", "GB/s", "min"),
     ("reader", "effective_gbps", "GB/s", "min"),
+    ("writer", "backend_effective_gbps", "GB/s", "min"),
+    ("reader", "backend_effective_gbps", "GB/s", "min"),
+)
+
+CRITICAL_PATH_METRICS = (
+    ("backend_execute_time_ms", "ms", "max"),
+    ("backend_effective_gbps", "GB/s", "min"),
 )
 
 
@@ -123,6 +132,29 @@ def summarize(records: list[dict]) -> list[dict]:
             result.append(
                 {
                     "role": role,
+                    "metric": metric,
+                    "unit": unit,
+                    "samples": len(values),
+                    "p50": percentile(values, 0.50),
+                    "p95": percentile(values, 0.95),
+                    "min": min(values),
+                    "max": max(values),
+                }
+            )
+    for metric, unit, reduction in CRITICAL_PATH_METRICS:
+        by_step = defaultdict(list)
+        for record in records:
+            if record.get("role") not in {"writer", "reader"} or metric not in record:
+                continue
+            by_step[int(record["step_id"])].append(float(record[metric]))
+        values = [
+            min(step_values) if reduction == "min" else max(step_values)
+            for step_values in by_step.values()
+        ]
+        if values:
+            result.append(
+                {
+                    "role": "transfer_critical_path",
                     "metric": metric,
                     "unit": unit,
                     "samples": len(values),
