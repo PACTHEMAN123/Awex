@@ -751,26 +751,40 @@ class WorkerWeightsReader:
         pass
 
     def update_weights(self, step_id, **kwargs):
-        start_time = time.time()
+        start_time = time.perf_counter()
+        pre_update_sync_start = time.perf_counter()
         device_util.synchronize()
+        pre_update_device_sync_time_ms = (
+            time.perf_counter() - pre_update_sync_start
+        ) * 1000.0
+        update_body_start = time.perf_counter()
         if self.enable_colocate_mode:
             self._update_weights_in_colocate_mode(step_id, **kwargs)
         else:
             self._update_weights(step_id, **kwargs)
+        update_body_time_ms = (time.perf_counter() - update_body_start) * 1000.0
         logger.info(
             f"Start to flush cache for step {step_id} for rank {self.transfer_rank}"
         )
         flush_cache_start = time.perf_counter()
+        flush_cache_call_start = time.perf_counter()
         flash_cache_success = self.scheduler.flush_cache()
+        flush_cache_call_time_ms = (
+            time.perf_counter() - flush_cache_call_start
+        ) * 1000.0
         assert flash_cache_success, "Cache flush failed after updating weights"
         logger.info(
             f"Finished flushing cache for step {step_id} for rank {self.transfer_rank}"
         )
+        post_flush_sync_start = time.perf_counter()
         device_util.synchronize()
+        post_flush_device_sync_time_ms = (
+            time.perf_counter() - post_flush_sync_start
+        ) * 1000.0
         flush_cache_time_ms = (
             time.perf_counter() - flush_cache_start
         ) * 1000.0
-        duration = time.time() - start_time
+        duration = time.perf_counter() - start_time
         compute_statistics(
             self._history_update_weights_time, step_id, duration, "Update weights"
         )
@@ -782,6 +796,10 @@ class WorkerWeightsReader:
             phase=profile_phase(step_id),
             step_id=int(step_id),
             rank=int(self.transfer_rank),
+            pre_update_device_sync_time_ms=pre_update_device_sync_time_ms,
+            update_body_time_ms=update_body_time_ms,
+            flush_cache_call_time_ms=flush_cache_call_time_ms,
+            post_flush_device_sync_time_ms=post_flush_device_sync_time_ms,
             flush_cache_time_ms=flush_cache_time_ms,
             worker_update_time_ms=duration * 1000.0,
         )

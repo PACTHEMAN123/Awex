@@ -491,11 +491,37 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
             effective_gbps=effective_gbps,
             **profile_metrics,
         )
+        should_collect_garbage = p2p_op_list is not None
+        resource_cleanup_start = time.perf_counter()
         if p2p_op_list is not None:
             p2p_op_list.clear()
             del p2p_op_list
         self._destroy_weights_exchange_process_group()
-        gc.collect()
+        resource_cleanup_time_ms = (
+            time.perf_counter() - resource_cleanup_start
+        ) * 1000.0
+        # Prepared device batches and model parameters are state-owned. The
+        # per-step locals are acyclic, so reference counting is sufficient and
+        # a full-heap collection only adds latency to the update critical path.
+        gc_collect_time_ms = 0.0
+        if should_collect_garbage:
+            gc_collect_start = time.perf_counter()
+            gc.collect()
+            gc_collect_time_ms = (
+                time.perf_counter() - gc_collect_start
+            ) * 1000.0
+        emit_profile(
+            logger,
+            event="weight_transfer_cleanup",
+            role="reader",
+            backend=self.comm_backend,
+            phase=profile_phase(step_id),
+            step_id=int(step_id),
+            rank=int(self.transfer_rank),
+            resource_cleanup_time_ms=resource_cleanup_time_ms,
+            gc_collect_time_ms=gc_collect_time_ms,
+            gc_collect_skipped=not should_collect_garbage,
+        )
 
     def _send_recv_one_by_one(self, p2p_op_list, recv_traj_list):
         # it's useful for debug or insufficient memory if infer with closed sleep mode

@@ -413,12 +413,41 @@ class NCCLWeightsWriter(WeightsExchangeShardingWriter):
         finally:
             # Explicitly release temporary converted tensors after each step
             # to avoid carrying peak memory into the next training iteration.
+            resource_cleanup_start = time.perf_counter()
             if p2p_op_list is not None:
                 p2p_op_list.clear()
             if parameters is not None and not parameters_are_static:
                 parameters.clear()
             self._destroy_weights_exchange_process_group()
-            gc.collect()
+            resource_cleanup_time_ms = (
+                time.perf_counter() - resource_cleanup_start
+            ) * 1000.0
+            # Compiled device parameters and prepared batches live on the
+            # writer state. There is no per-step tensor graph to cycle-collect
+            # on that path; legacy and dynamic conversion paths keep the
+            # existing full collection after releasing temporary objects.
+            should_collect_garbage = p2p_op_list is not None or (
+                parameters is not None and not parameters_are_static
+            )
+            gc_collect_time_ms = 0.0
+            if should_collect_garbage:
+                gc_collect_start = time.perf_counter()
+                gc.collect()
+                gc_collect_time_ms = (
+                    time.perf_counter() - gc_collect_start
+                ) * 1000.0
+            emit_profile(
+                logger,
+                event="weight_transfer_cleanup",
+                role="writer",
+                backend=self.comm_backend,
+                phase=profile_phase(step_id),
+                step_id=int(step_id),
+                rank=int(self.transfer_rank),
+                resource_cleanup_time_ms=resource_cleanup_time_ms,
+                gc_collect_time_ms=gc_collect_time_ms,
+                gc_collect_skipped=not should_collect_garbage,
+            )
             if self.enable_mem_debug:
                 if device_util.get_device_type() == "cuda":
                     torch.cuda.empty_cache()
