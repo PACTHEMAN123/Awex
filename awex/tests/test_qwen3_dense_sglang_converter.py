@@ -21,9 +21,14 @@ from types import SimpleNamespace
 
 import torch
 
-from awex.models.qwen3 import CONFIG
+from awex.models.qwen3 import (
+    CONFIG,
+    annotate_qwen3_dense_transfer_plan,
+    build_qwen3_dense_qkv_layouts,
+)
 from awex.models.qwen3_moe import SGlangToHFWeightConverterQwen3Moe
 from awex.models.registry import get_infer_weights_converter
+from awex.transfer.transfer_plan import CommunicationOperation, TransferPlan
 
 NUM_HEADS = 8
 NUM_KV_HEADS = 2
@@ -137,4 +142,53 @@ def test_qkv_split_is_gqa_aware():
     )
     assert (
         shapes["model.layers.0.self_attn.v_proj.weight"][0] == NUM_KV_HEADS * HEAD_DIM
+    )
+
+
+def test_qkv_device_layout_matches_materialized_conversion_without_copying():
+    group_rows = (NUM_HEADS // NUM_KV_HEADS + 2) * HEAD_DIM
+    fused = torch.arange(
+        NUM_KV_HEADS * group_rows * HIDDEN, dtype=torch.float32
+    ).reshape(NUM_KV_HEADS * group_rows, HIDDEN)
+
+    layouts = build_qwen3_dense_qkv_layouts(fused, _model_config())
+
+    q_rows = NUM_HEADS // NUM_KV_HEADS * HEAD_DIM
+    blocks = fused.reshape(NUM_KV_HEADS, group_rows, HIDDEN)
+    expected = {
+        "q": blocks[:, :q_rows].reshape(-1, HIDDEN),
+        "k": blocks[:, q_rows : q_rows + HEAD_DIM].reshape(-1, HIDDEN),
+        "v": blocks[:, q_rows + HEAD_DIM :].reshape(-1, HIDDEN),
+    }
+    source_storage = fused.untyped_storage().data_ptr()
+    for projection, layout in layouts.items():
+        assert all(
+            span.untyped_storage().data_ptr() == source_storage for span in layout.spans
+        )
+        actual = torch.cat(layout.slice(tuple(slice(None) for _ in layout.shape)))
+        assert torch.equal(actual.reshape(layout.shape), expected[projection])
+
+
+def test_qwen3_dense_plan_annotation_uses_gqa_group_boundaries():
+    shard = SimpleNamespace(
+        name="model.layers.0.self_attn.q_proj.weight",
+        shape=(NUM_HEADS * HEAD_DIM, HIDDEN),
+    )
+    operation = CommunicationOperation(
+        send_rank=1,
+        send_shard_meta=shard,
+        send_offset=(0, 0),
+        recv_rank=0,
+        recv_shard_meta=shard,
+        recv_offset=(0, 0),
+        overlap_shape=shard.shape,
+        train_slices=(slice(None), slice(None)),
+        inf_slices=(slice(None), slice(None)),
+    )
+    plan = TransferPlan(operations={0: [operation]})
+
+    assert annotate_qwen3_dense_transfer_plan(plan, _model_config()) == 1
+    assert (
+        operation.send_tensor_span_numels
+        == ((NUM_HEADS // NUM_KV_HEADS) * HEAD_DIM * HIDDEN,) * NUM_KV_HEADS
     )

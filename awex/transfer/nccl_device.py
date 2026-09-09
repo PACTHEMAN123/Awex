@@ -36,6 +36,10 @@ import torch
 import torch.distributed as dist
 
 from awex import logging
+from awex.transfer.tensor_layout import (
+    StaticTensorLayout,
+    slice_layout_fragments,
+)
 from awex.transfer.transfer_plan import (
     CommunicationOperation,
     TransferPlan,
@@ -226,9 +230,7 @@ def _resolve_chunk_bytes(chunk_bytes: Optional[int]) -> int:
             ) from exc
     chunk_bytes = int(chunk_bytes)
     if chunk_bytes < 0:
-        raise NCCLDeviceUnavailableError(
-            "nccl_device chunk_bytes must be non-negative"
-        )
+        raise NCCLDeviceUnavailableError("nccl_device chunk_bytes must be non-negative")
     if chunk_bytes and chunk_bytes % _CHUNK_ALIGNMENT != 0:
         raise NCCLDeviceUnavailableError(
             f"nccl_device chunk_bytes must be a multiple of {_CHUNK_ALIGNMENT}"
@@ -270,6 +272,7 @@ def _build_send_batch(
     rank: int,
     world_size: int,
     chunk_bytes: int = _DEFAULT_CHUNK_BYTES,
+    allow_staging: bool = True,
 ) -> _DeviceBatch:
     chunk_bytes = _resolve_chunk_bytes(chunk_bytes)
     tensors: List[torch.Tensor] = []
@@ -285,23 +288,50 @@ def _build_send_batch(
         peer_offset = 0
         ordinal = 0
         for op in operations:
-            tensor = parameters[op.send_shard_meta.name]
-            tensor = slice_tensor(tensor, op, True, slice_context=context)
-            if not tensor.is_contiguous():
-                tensor = tensor.contiguous()
-            _ensure_cuda_tensor(tensor, op.send_shard_meta.name)
-            length = int(tensor.numel()) * int(tensor.element_size())
-            for chunk, chunk_offset, chunk_length in _split_contiguous_tensor(
-                tensor, chunk_bytes
-            ):
-                tensors.append(chunk)
-                offsets.append(peer_offset + chunk_offset)
-                lengths.append(chunk_length)
-                peers.append(peer)
-                ordinals.append(ordinal)
-                region_indices.append(rank)
-                ordinal += 1
-            peer_offset += length
+            parameter = parameters[op.send_shard_meta.name]
+            if isinstance(parameter, StaticTensorLayout):
+                if (
+                    op.send_tensor_span_numels
+                    and parameter.span_numels != op.send_tensor_span_numels
+                ):
+                    raise NCCLDeviceUnavailableError(
+                        "Compiled source layout does not match transfer plan for "
+                        f"{op.send_shard_meta.name}: layout={parameter.span_numels} "
+                        f"plan={op.send_tensor_span_numels}"
+                    )
+                fragments = parameter.slice(op.train_slices)
+            else:
+                if allow_staging:
+                    tensor = slice_tensor(parameter, op, True, slice_context=context)
+                else:
+                    tensor = parameter[op.train_slices]
+                    if not tensor.is_contiguous():
+                        raise NCCLDeviceUnavailableError(
+                            "Compiled nccl_device plan would require a sender "
+                            "staging copy: "
+                            f"parameter={op.send_shard_meta.name}, "
+                            f"shape={tuple(parameter.shape)}, "
+                            f"slices={op.train_slices}. Adjust train/inference "
+                            "sharding alignment or lower this slice to direct spans."
+                        )
+                if not tensor.is_contiguous():
+                    tensor = tensor.contiguous()
+                fragments = [tensor]
+
+            for fragment in fragments:
+                _ensure_cuda_tensor(fragment, op.send_shard_meta.name)
+                length = int(fragment.numel()) * int(fragment.element_size())
+                for chunk, chunk_offset, chunk_length in _split_contiguous_tensor(
+                    fragment, chunk_bytes
+                ):
+                    tensors.append(chunk)
+                    offsets.append(peer_offset + chunk_offset)
+                    lengths.append(chunk_length)
+                    peers.append(peer)
+                    ordinals.append(ordinal)
+                    region_indices.append(rank)
+                    ordinal += 1
+                peer_offset += length
         expected_counts[peer] = ordinal
         region_bytes[rank] = max(region_bytes[rank], peer_offset)
     return _DeviceBatch(
@@ -323,6 +353,7 @@ def _build_recv_batch(
     rank: int,
     world_size: int,
     chunk_bytes: int = _DEFAULT_CHUNK_BYTES,
+    allow_staging: bool = True,
 ) -> _DeviceBatch:
     chunk_bytes = _resolve_chunk_bytes(chunk_bytes)
     tensors: List[torch.Tensor] = []
@@ -340,27 +371,54 @@ def _build_recv_batch(
         for op in operations:
             parameter = parameters[op.recv_shard_meta.name]
             view = parameter[op.inf_slices]
-            if not isinstance(view, torch.Tensor) or not view.is_cuda:
-                raise NCCLDeviceUnavailableError(
-                    f"nccl_device only supports CUDA tensors ({op.recv_shard_meta.name})."
-                )
             target = view
             if not view.is_contiguous():
+                if not allow_staging:
+                    raise NCCLDeviceUnavailableError(
+                        "Compiled nccl_device plan would require a receiver staging "
+                        "copy: "
+                        f"parameter={op.recv_shard_meta.name}, "
+                        f"shape={tuple(parameter.shape)}, "
+                        f"slices={op.inf_slices}. Adjust train/inference sharding "
+                        "alignment or lower this slice to direct spans."
+                    )
                 target = torch.empty_like(view, memory_format=torch.contiguous_format)
                 copybacks.append((view, target))
             _ensure_cuda_tensor(target, op.recv_shard_meta.name)
-            length = int(target.numel()) * int(target.element_size())
-            for chunk, chunk_offset, chunk_length in _split_contiguous_tensor(
-                target, chunk_bytes
-            ):
-                tensors.append(chunk)
-                offsets.append(peer_offset + chunk_offset)
-                lengths.append(chunk_length)
-                peers.append(peer)
-                ordinals.append(ordinal)
-                region_indices.append(peer)
-                ordinal += 1
-            peer_offset += length
+            targets = [target]
+            if op.send_tensor_span_numels:
+                layout_fragments = slice_layout_fragments(
+                    op.send_shard_meta.shape,
+                    op.train_slices,
+                    op.send_tensor_span_numels,
+                )
+                fragment_numels = [fragment[2] for fragment in layout_fragments]
+                if sum(fragment_numels) != target.numel():
+                    raise NCCLDeviceUnavailableError(
+                        "Source layout slice does not match receive tensor for "
+                        f"{op.recv_shard_meta.name}: source={sum(fragment_numels)} "
+                        f"target={target.numel()}"
+                    )
+                flat_target = target.reshape(-1)
+                target_offset = 0
+                targets = []
+                for fragment_numel in fragment_numels:
+                    targets.append(flat_target.narrow(0, target_offset, fragment_numel))
+                    target_offset += fragment_numel
+
+            for fragment in targets:
+                length = int(fragment.numel()) * int(fragment.element_size())
+                for chunk, chunk_offset, chunk_length in _split_contiguous_tensor(
+                    fragment, chunk_bytes
+                ):
+                    tensors.append(chunk)
+                    offsets.append(peer_offset + chunk_offset)
+                    lengths.append(chunk_length)
+                    peers.append(peer)
+                    ordinals.append(ordinal)
+                    region_indices.append(peer)
+                    ordinal += 1
+                peer_offset += length
         expected_counts[peer] = ordinal
         region_bytes[peer] = max(region_bytes[peer], peer_offset)
     return _DeviceBatch(
@@ -403,6 +461,8 @@ class NCCLDeviceTransport:
         self._initialized = False
         self._region_sizes: Optional[List[int]] = None
         self._logged_batch_shape = False
+        self._prepared_send = None
+        self._prepared_recv = None
         logger.info(
             "Configured nccl_device transport rank=%s chunk_bytes=%s",
             self.rank,
@@ -417,9 +477,7 @@ class NCCLDeviceTransport:
         max_bytes = int(total_bytes)
 
         unique_id_size = int(self._extension.unique_id_size())
-        unique_id_tensor = torch.empty(
-            unique_id_size, dtype=torch.uint8, device=device
-        )
+        unique_id_tensor = torch.empty(unique_id_size, dtype=torch.uint8, device=device)
         if self.rank == 0:
             unique_id = self._extension.get_unique_id()
             if len(unique_id) != unique_id_size:
@@ -469,9 +527,7 @@ class NCCLDeviceTransport:
                 batch.region_bytes, dtype=torch.int64, device=device
             )
             dist.all_reduce(region_sizes, op=dist.ReduceOp.MAX, group=self.group)
-            self._region_sizes = [
-                int(value) for value in region_sizes.cpu().tolist()
-            ]
+            self._region_sizes = [int(value) for value in region_sizes.cpu().tolist()]
         elif any(
             requested > allocated
             for requested, allocated in zip(batch.region_bytes, self._region_sizes)
@@ -509,25 +565,71 @@ class NCCLDeviceTransport:
             torch.cuda.current_stream().synchronize()
 
     def send(self, parameters: dict, plan: TransferPlan, step_id: int) -> None:
-        batch = _build_send_batch(
-            parameters, plan, self.rank, self.world_size, self.chunk_bytes
-        )
+        prepared = self._prepared_send
+        if prepared is not None and prepared[0] is parameters and prepared[1] is plan:
+            batch = prepared[2]
+        else:
+            batch = _build_send_batch(
+                parameters, plan, self.rank, self.world_size, self.chunk_bytes
+            )
         self._run(batch, sender=True, sequence=int(step_id) + 1)
 
     def recv(self, parameters: dict, plan: TransferPlan, step_id: int) -> None:
-        batch = _build_recv_batch(
-            parameters, plan, self.rank, self.world_size, self.chunk_bytes
-        )
+        prepared = self._prepared_recv
+        if prepared is not None and prepared[0] is parameters and prepared[1] is plan:
+            batch = prepared[2]
+        else:
+            batch = _build_recv_batch(
+                parameters, plan, self.rank, self.world_size, self.chunk_bytes
+            )
         self._run(batch, sender=False, sequence=int(step_id) + 1)
 
+    def prepare_send(
+        self,
+        parameters: dict,
+        plan: TransferPlan,
+        allow_staging: bool = True,
+    ) -> None:
+        """Bind stable source tensors to device tasks once during initialization."""
+
+        batch = _build_send_batch(
+            parameters,
+            plan,
+            self.rank,
+            self.world_size,
+            self.chunk_bytes,
+            allow_staging=allow_staging,
+        )
+        self._prepared_send = (parameters, plan, batch)
+
+    def prepare_recv(
+        self,
+        parameters: dict,
+        plan: TransferPlan,
+        allow_staging: bool = True,
+    ) -> None:
+        """Bind stable destination tensors to device tasks once during initialization."""
+
+        batch = _build_recv_batch(
+            parameters,
+            plan,
+            self.rank,
+            self.world_size,
+            self.chunk_bytes,
+            allow_staging=allow_staging,
+        )
+        self._prepared_recv = (parameters, plan, batch)
+
     def close(self) -> None:
-        if self._handle is not None and self._extension is not None:
-            try:
+        try:
+            if self._handle is not None and self._extension is not None:
                 self._extension.destroy(self._handle)
-            finally:
-                self._handle = None
-                self._initialized = False
-                self._region_sizes = None
+        finally:
+            self._handle = None
+            self._initialized = False
+            self._region_sizes = None
+            self._prepared_send = None
+            self._prepared_recv = None
 
     def __del__(self):
         try:

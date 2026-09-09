@@ -54,6 +54,9 @@ class CommunicationOperation:
     placement_version: int = -1
     # Optional parameter class tag (attention/expert/dense_other).
     param_class: str = "dense_other"
+    # Logical source span sizes for a copy-only, materialization-free layout.
+    # Empty means the canonical source tensor is one contiguous span.
+    send_tensor_span_numels: Tuple[int, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -785,6 +788,7 @@ def compute_transfer_plan_hash(
                     op.pp_rank,
                     op.placement_version,
                     op.param_class,
+                    tuple(op.send_tensor_span_numels),
                 )
             )
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))

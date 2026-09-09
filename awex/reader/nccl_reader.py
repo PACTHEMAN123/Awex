@@ -68,6 +68,20 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
             self.training_params_meta,
             self.transfer_rank,
         )
+        if (
+            self.comm_backend == "nccl_device"
+            and self.model_arch_name == "Qwen3ForCausalLM"
+        ):
+            from awex.models.qwen3 import annotate_qwen3_dense_transfer_plan
+
+            annotated = annotate_qwen3_dense_transfer_plan(
+                self.transfer_plan, self.hf_config
+            )
+            logger.info(
+                "Reader rank %s annotated %s Qwen3 dense device operations",
+                self.transfer_rank,
+                annotated,
+            )
         inter_hash = compute_transfer_plan_hash(self.transfer_plan)
         logger.info(
             "Reader rank %s inter plan hash: %s",
@@ -116,6 +130,12 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
                 self.transfer_rank,
                 self.world_size,
             )
+            if self.model_arch_name == "Qwen3ForCausalLM":
+                self.device_transport.prepare_recv(
+                    self.parameters,
+                    self.transfer_plan,
+                    allow_staging=False,
+                )
 
         self.send_ranks = list(self.transfer_plan.operations.keys())
         self.send_ranks_sample = (
@@ -213,9 +233,7 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
             rank=self.transfer_rank,
             world_size=self.world_size,
             group_name="weights_exchange",
-            backend=(
-                "nccl" if self.comm_backend == "nccl_device" else self.backend
-            ),
+            backend=("nccl" if self.comm_backend == "nccl_device" else self.backend),
             role="inference",
         )
         logger.info(
@@ -361,9 +379,7 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
         p2p_op_list = None
         if self.device_transport is not None:
             logger.info("Reader: submitting device task batch")
-            self.device_transport.recv(
-                self.parameters, self.transfer_plan, step_id
-            )
+            self.device_transport.recv(self.parameters, self.transfer_plan, step_id)
         else:
             # Build receive ops once for logging, then execute them via
             # batch_send_recv to keep scheduling consistent with the writer.

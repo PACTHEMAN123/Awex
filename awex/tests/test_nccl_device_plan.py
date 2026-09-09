@@ -23,10 +23,12 @@ import torch
 from awex.transfer import nccl_device
 from awex.transfer.nccl_device import (
     NCCLDeviceUnavailableError,
+    _build_recv_batch,
     _build_send_batch,
     _resolve_chunk_bytes,
     _split_contiguous_tensor,
 )
+from awex.transfer.tensor_layout import StaticTensorLayout, slice_layout_fragments
 from awex.transfer.transfer_plan import (
     CommunicationOperation,
     TransferChunk,
@@ -99,3 +101,214 @@ def test_send_plan_lowers_tensor_to_chunk_tasks(monkeypatch):
     assert batch.expected_counts == [3, 0]
     assert batch.region_bytes == [0, 40]
     assert torch.equal(torch.cat(batch.tensors), tensor)
+
+
+def test_static_layout_slices_logical_order_without_materializing():
+    source = torch.arange(24, dtype=torch.int32).reshape(6, 4)
+    layout = StaticTensorLayout(
+        shape=(4, 4),
+        spans=(source.narrow(0, 0, 2), source.narrow(0, 4, 2)),
+    )
+
+    fragments = layout.slice((slice(1, 3), slice(None)))
+
+    assert [fragment.data_ptr() for fragment in fragments] == [
+        source[1].data_ptr(),
+        source[4].data_ptr(),
+    ]
+    assert torch.equal(
+        torch.cat(fragments).reshape(2, 4),
+        torch.stack((source[1], source[4])),
+    )
+
+
+def test_static_layout_fragment_schedule_handles_partial_columns():
+    fragments = slice_layout_fragments(
+        shape=(4, 4),
+        slices=(slice(1, 4), slice(1, 3)),
+        span_numels=(8, 8),
+    )
+
+    assert fragments == [
+        (0, 5, 2),
+        (1, 1, 2),
+        (1, 5, 2),
+    ]
+
+
+def test_send_plan_lowers_static_layout_to_matching_contiguous_tasks(monkeypatch):
+    source = torch.arange(24, dtype=torch.int32).reshape(6, 4)
+    layout = StaticTensorLayout(
+        shape=(4, 4),
+        spans=(source.narrow(0, 0, 2), source.narrow(0, 4, 2)),
+    )
+    shard = SimpleNamespace(name="weight", shape=(4, 4))
+    operation = CommunicationOperation(
+        send_rank=1,
+        send_shard_meta=shard,
+        send_offset=(0, 0),
+        recv_rank=0,
+        recv_shard_meta=shard,
+        recv_offset=(0, 0),
+        overlap_shape=(4, 4),
+        train_slices=(slice(None), slice(None)),
+        inf_slices=(slice(None), slice(None)),
+        send_tensor_span_numels=(8, 8),
+    )
+    plan = TransferPlan(operations={0: [operation]})
+    monkeypatch.setattr(nccl_device, "_ensure_cuda_tensor", lambda *_: None)
+
+    batch = _build_send_batch(
+        {"weight": layout}, plan, rank=1, world_size=2, chunk_bytes=16
+    )
+
+    assert batch.offsets == [0, 16, 32, 48]
+    assert batch.lengths == [16, 16, 16, 16]
+    assert batch.ordinals == [0, 1, 2, 3]
+    assert batch.expected_counts == [4, 0]
+    assert torch.equal(
+        torch.cat(batch.tensors).reshape(4, 4),
+        torch.cat((source[:2], source[4:])),
+    )
+
+
+def test_static_layout_sender_and_receiver_batches_are_symmetric(monkeypatch):
+    source = torch.arange(24, dtype=torch.int32).reshape(6, 4)
+    layout = StaticTensorLayout(
+        shape=(4, 4),
+        spans=(source.narrow(0, 0, 2), source.narrow(0, 4, 2)),
+    )
+    destination = torch.empty((4, 4), dtype=torch.int32)
+    shard = SimpleNamespace(name="weight", shape=(4, 4))
+    operation = CommunicationOperation(
+        send_rank=1,
+        send_shard_meta=shard,
+        send_offset=(0, 0),
+        recv_rank=0,
+        recv_shard_meta=shard,
+        recv_offset=(0, 0),
+        overlap_shape=(4, 4),
+        train_slices=(slice(None), slice(None)),
+        inf_slices=(slice(None), slice(None)),
+        send_tensor_span_numels=(8, 8),
+    )
+    monkeypatch.setattr(nccl_device, "_ensure_cuda_tensor", lambda *_: None)
+
+    send_batch = _build_send_batch(
+        {"weight": layout},
+        TransferPlan(operations={0: [operation]}),
+        rank=1,
+        world_size=2,
+        chunk_bytes=16,
+    )
+    recv_batch = _build_recv_batch(
+        {"weight": destination},
+        TransferPlan(operations={1: [operation]}),
+        rank=0,
+        world_size=2,
+        chunk_bytes=16,
+    )
+
+    assert send_batch.offsets == recv_batch.offsets
+    assert send_batch.lengths == recv_batch.lengths
+    assert send_batch.ordinals == recv_batch.ordinals
+    for source_chunk, destination_chunk in zip(send_batch.tensors, recv_batch.tensors):
+        destination_chunk.copy_(source_chunk)
+    assert torch.equal(destination, torch.cat((source[:2], source[4:])))
+
+
+def test_strict_plan_lowers_static_partial_columns_without_staging(monkeypatch):
+    source = torch.arange(24, dtype=torch.int32).reshape(6, 4)
+    layout = StaticTensorLayout(
+        shape=(4, 4),
+        spans=(source.narrow(0, 0, 2), source.narrow(0, 4, 2)),
+    )
+    destination = torch.empty((4, 2), dtype=torch.int32)
+    send_shard = SimpleNamespace(name="weight", shape=(4, 4))
+    recv_shard = SimpleNamespace(name="weight", shape=(4, 2))
+    operation = CommunicationOperation(
+        send_rank=1,
+        send_shard_meta=send_shard,
+        send_offset=(0, 1),
+        recv_rank=0,
+        recv_shard_meta=recv_shard,
+        recv_offset=(0, 0),
+        overlap_shape=(4, 2),
+        train_slices=(slice(None), slice(1, 3)),
+        inf_slices=(slice(None), slice(None)),
+        send_tensor_span_numels=(8, 8),
+    )
+    monkeypatch.setattr(nccl_device, "_ensure_cuda_tensor", lambda *_: None)
+
+    send_batch = _build_send_batch(
+        {"weight": layout},
+        TransferPlan(operations={0: [operation]}),
+        rank=1,
+        world_size=2,
+        allow_staging=False,
+    )
+    recv_batch = _build_recv_batch(
+        {"weight": destination},
+        TransferPlan(operations={1: [operation]}),
+        rank=0,
+        world_size=2,
+        allow_staging=False,
+    )
+
+    assert send_batch.copybacks == []
+    assert recv_batch.copybacks == []
+    assert send_batch.lengths == recv_batch.lengths
+    for source_chunk, destination_chunk in zip(send_batch.tensors, recv_batch.tensors):
+        destination_chunk.copy_(source_chunk)
+    expected = torch.cat((source[:2], source[4:]))[:, 1:3]
+    assert torch.equal(destination, expected)
+
+
+def test_strict_send_plan_rejects_staging_copy():
+    tensor = torch.arange(16, dtype=torch.int32).reshape(4, 4)
+    shard = SimpleNamespace(name="weight", shape=(4, 4))
+    operation = CommunicationOperation(
+        send_rank=1,
+        send_shard_meta=shard,
+        send_offset=(0, 1),
+        recv_rank=0,
+        recv_shard_meta=shard,
+        recv_offset=(0, 0),
+        overlap_shape=(4, 2),
+        train_slices=(slice(None), slice(1, 3)),
+        inf_slices=(slice(None), slice(0, 2)),
+    )
+
+    with pytest.raises(NCCLDeviceUnavailableError, match="sender staging copy"):
+        _build_send_batch(
+            {"weight": tensor},
+            TransferPlan(operations={0: [operation]}),
+            rank=1,
+            world_size=2,
+            allow_staging=False,
+        )
+
+
+def test_strict_recv_plan_rejects_staging_copy():
+    tensor = torch.empty((4, 4), dtype=torch.int32)
+    shard = SimpleNamespace(name="weight", shape=(4, 4))
+    operation = CommunicationOperation(
+        send_rank=1,
+        send_shard_meta=shard,
+        send_offset=(0, 0),
+        recv_rank=0,
+        recv_shard_meta=shard,
+        recv_offset=(0, 1),
+        overlap_shape=(4, 2),
+        train_slices=(slice(None), slice(0, 2)),
+        inf_slices=(slice(None), slice(1, 3)),
+    )
+
+    with pytest.raises(NCCLDeviceUnavailableError, match="receiver staging copy"):
+        _build_recv_batch(
+            {"weight": tensor},
+            TransferPlan(operations={1: [operation]}),
+            rank=0,
+            world_size=2,
+            allow_staging=False,
+        )

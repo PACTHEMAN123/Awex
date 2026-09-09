@@ -67,6 +67,20 @@ class NCCLWeightsWriter(WeightsExchangeShardingWriter):
             self.parameters_meta,
             self.transfer_rank,
         )
+        if (
+            self.comm_backend == "nccl_device"
+            and self.model_arch_name == "Qwen3ForCausalLM"
+        ):
+            from awex.models.qwen3 import annotate_qwen3_dense_transfer_plan
+
+            annotated = annotate_qwen3_dense_transfer_plan(
+                self.transfer_plan, self.hf_config
+            )
+            logger.info(
+                "Writer rank %s annotated %s Qwen3 dense device operations",
+                self.transfer_rank,
+                annotated,
+            )
         inter_hash = compute_transfer_plan_hash(self.transfer_plan)
         logger.info(
             "Writer rank %s inter plan hash: %s",
@@ -84,6 +98,14 @@ class NCCLWeightsWriter(WeightsExchangeShardingWriter):
             for ops in self.transfer_plan.operations.values()
             for op in ops
         }
+        self.device_parameters = None
+        if (
+            self.comm_backend == "nccl_device"
+            and self.model_arch_name == "Qwen3ForCausalLM"
+        ):
+            self.device_parameters = self.compile_device_parameters(
+                self.required_param_names
+            )
         logger.info(
             f"Writer rank {self.transfer_rank}: Built transfer plan to send to ranks: {self.recv_ranks}"
         )
@@ -124,6 +146,12 @@ class NCCLWeightsWriter(WeightsExchangeShardingWriter):
                 self.transfer_rank,
                 self.transfer_world_size,
             )
+            if self.device_parameters is not None:
+                self.device_transport.prepare_send(
+                    self.device_parameters,
+                    self.transfer_plan,
+                    allow_staging=False,
+                )
 
         logger.info(
             f"Finished initializing NCCL weights writer for rank {self.transfer_rank}"
@@ -228,22 +256,33 @@ class NCCLWeightsWriter(WeightsExchangeShardingWriter):
         self._init_weights_exchange_process_group()
         start_time = time.time()
         parameters = None
+        parameters_are_static = False
         p2p_op_list = None
         using_device_transport = self.device_transport is not None
         try:
-            if self.enable_mem_debug:
-                print_current_gpu_status(f"writer-{self.transfer_rank} before convert")
-            parameters = self.convert_parameters(
-                required_names=self.required_param_names
-            )
-            logger.info("Writer: Converting parameters completed")
-            if self.enable_mem_debug:
-                print_current_gpu_status(f"writer-{self.transfer_rank} after convert")
+            if using_device_transport and self.device_parameters is not None:
+                parameters = self.device_parameters
+                parameters_are_static = True
+                logger.info(
+                    "Writer: using compiled Qwen3 dense device parameters; "
+                    "skipping format conversion"
+                )
+            else:
+                if self.enable_mem_debug:
+                    print_current_gpu_status(
+                        f"writer-{self.transfer_rank} before convert"
+                    )
+                parameters = self.convert_parameters(
+                    required_names=self.required_param_names
+                )
+                logger.info("Writer: Converting parameters completed")
+                if self.enable_mem_debug:
+                    print_current_gpu_status(
+                        f"writer-{self.transfer_rank} after convert"
+                    )
             if using_device_transport:
                 logger.info("Writer: submitting device task batch")
-                self.device_transport.send(
-                    parameters, self.transfer_plan, step_id
-                )
+                self.device_transport.send(parameters, self.transfer_plan, step_id)
             else:
                 logger.info("Writer: building legacy NCCL send ops")
                 p2p_op_list, _, send_traj_list = nccl_build_send_ops(
@@ -309,7 +348,7 @@ class NCCLWeightsWriter(WeightsExchangeShardingWriter):
             # to avoid carrying peak memory into the next training iteration.
             if p2p_op_list is not None:
                 p2p_op_list.clear()
-            if parameters is not None:
+            if parameters is not None and not parameters_are_static:
                 parameters.clear()
             self._destroy_weights_exchange_process_group()
             gc.collect()

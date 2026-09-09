@@ -36,6 +36,7 @@ from awex.models.registry import get_train_weights_converter
 from awex.sharding.param_sharding import (
     get_rank_info_extractor,
 )
+from awex.transfer.tensor_layout import StaticTensorLayout
 from awex.util import device as device_util
 from awex.util.common import (
     check_train_infer_params_meta,
@@ -272,6 +273,78 @@ class WeightsExchangeShardingWriter(WeightExchangeWriter):
         if self.enable_mem_debug:
             self._log_converted_tensor_stats(converted, required)
         return converted
+
+    @torch.no_grad()
+    def compile_device_parameters(self, required_names):
+        """Bind canonical names to stable source views for a device-only plan."""
+
+        convert_to_layout = getattr(
+            self.weight_converter, "convert_param_to_device_layout", None
+        )
+        if convert_to_layout is None:
+            return None
+
+        required = set(required_names)
+        compiled = {}
+        for vp_stage, model in enumerate(self.model):
+            for source_name, source_parameter in get_mcore_model_parameters(
+                model
+            ).items():
+                source_parameter = source_parameter.detach()
+                converted = convert_to_layout(
+                    source_name, source_parameter, vp_stage=vp_stage
+                )
+                for target_name, target in converted:
+                    if target_name not in required:
+                        continue
+                    if target_name in compiled:
+                        raise ValueError(
+                            f"Duplicate compiled device parameter: {target_name}"
+                        )
+                    tensors = (
+                        target.spans
+                        if isinstance(target, StaticTensorLayout)
+                        else (target,)
+                    )
+                    source_storage = source_parameter.untyped_storage().data_ptr()
+                    if any(
+                        tensor.untyped_storage().data_ptr() != source_storage
+                        for tensor in tensors
+                    ):
+                        raise ValueError(
+                            "Qwen3 dense device plan only supports copy-only "
+                            f"conversions, but {source_name} -> {target_name} "
+                            "materialized new storage"
+                        )
+                    if any(not tensor.is_contiguous() for tensor in tensors):
+                        raise ValueError(
+                            "Qwen3 dense device plan requires contiguous source "
+                            f"spans: {source_name} -> {target_name}"
+                        )
+                    compiled[target_name] = target
+
+        if (
+            getattr(self.hf_config, "tie_word_embeddings", False)
+            and self.rank_info.pp_rank == self.rank_info.pp_size - 1
+            and "lm_head.weight" in required
+            and "lm_head.weight" not in compiled
+            and "model.embed_tokens.weight" in compiled
+        ):
+            compiled["lm_head.weight"] = compiled["model.embed_tokens.weight"]
+
+        missing = required - set(compiled)
+        if missing:
+            raise ValueError(
+                "Compiled device plan is missing required parameters: "
+                f"{sorted(missing)}"
+            )
+        logger.info(
+            "[Writer %s] Compiled %s stable device parameters; per-step "
+            "format conversion is disabled",
+            self.transfer_rank,
+            len(compiled),
+        )
+        return compiled
 
     def _log_converted_tensor_stats(self, converted, required):
         if not converted:

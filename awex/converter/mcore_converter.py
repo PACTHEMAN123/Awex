@@ -689,12 +689,9 @@ class McoreToHFWeightConverter:
         name = name.replace("query_key_value_proj_proj", "query_key_value_proj")
         return name
 
-    @torch.no_grad()
-    def convert_param(
-        self, name: str, parameter: torch.Tensor, vp_stage: int = None
-    ) -> List[Tuple[str, torch.Tensor]]:
+    def _canonicalize_source_name(self, name: str, vp_stage: int = None) -> str:
         name = name.replace("module.", "")
-        name = _process_mcore_pp_name(
+        return _process_mcore_pp_name(
             name,
             self.rank_info,
             self.hf_config,
@@ -702,6 +699,12 @@ class McoreToHFWeightConverter:
             vp_stage=vp_stage,
             pp_stage_layer_id_map=self._pp_stage_layer_id_map,
         )
+
+    @torch.no_grad()
+    def convert_param(
+        self, name: str, parameter: torch.Tensor, vp_stage: int = None
+    ) -> List[Tuple[str, torch.Tensor]]:
+        name = self._canonicalize_source_name(name, vp_stage)
         direct_name_mapping = {
             "embedding.word_embeddings.weight": "model.embed_tokens.weight",
             "decoder.final_layernorm.weight": "model.norm.weight",
