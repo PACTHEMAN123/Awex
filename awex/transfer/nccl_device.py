@@ -513,7 +513,8 @@ class NCCLDeviceTransport:
         )
         self._initialized = True
         logger.info(
-            "Initialized nccl_device transport rank=%s world_size=%s window_bytes=%s",
+            "Initialized nccl_device transport rank=%s world_size=%s "
+            "logical_data_bytes=%s",
             self.rank,
             self.world_size,
             max_bytes,
