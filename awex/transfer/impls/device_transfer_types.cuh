@@ -51,7 +51,14 @@ struct DeviceTask {
   std::uint32_t peer;
   // Dense per-peer segment index.  It selects a ring lane and forms the ticket.
   std::uint32_t ordinal;
+  // Multicast tasks carry the LSA bases of every intended consumer in a
+  // flattened launch array. Unicast tasks have one target.
+  std::uint32_t target_begin;
+  std::uint32_t target_count;
+  std::uint32_t flags;
 };
+
+constexpr std::uint32_t kTaskMulticast = 1U;
 
 struct alignas(16) RingSlotState {
   // The slot is reusable exactly when both tickets are equal.
@@ -85,6 +92,7 @@ struct DeviceTransferArgs {
   const std::uint32_t* expected_counts;
   const std::uint32_t* peer_offsets;
   const std::uint32_t* active_peers;
+  const std::uintptr_t* target_bases;
   std::uint32_t active_peer_count;
   std::uint32_t slots_per_peer;
   std::size_t slot_bytes;

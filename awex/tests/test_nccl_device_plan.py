@@ -103,6 +103,114 @@ def test_send_plan_lowers_tensor_to_chunk_tasks(monkeypatch):
     assert torch.equal(torch.cat(batch.tensors), tensor)
 
 
+def test_send_plan_marks_identical_engine_replicas_for_multicast(monkeypatch):
+    tensor = torch.arange(16, dtype=torch.int32)
+    shard = SimpleNamespace(name="weight")
+
+    def operation(recv_rank):
+        return CommunicationOperation(
+            send_rank=4,
+            send_shard_meta=shard,
+            send_offset=(0,),
+            recv_rank=recv_rank,
+            recv_shard_meta=shard,
+            recv_offset=(0,),
+            overlap_shape=(16,),
+            train_slices=(slice(None),),
+            inf_slices=(slice(None),),
+        )
+
+    monkeypatch.setattr(nccl_device, "_ensure_cuda_tensor", lambda *_: None)
+    batch = _build_send_batch(
+        {"weight": tensor},
+        TransferPlan(operations={0: [operation(0)], 2: [operation(2)]}),
+        rank=4,
+        world_size=5,
+        chunk_bytes=16,
+        allow_staging=False,
+        infer_instance_world_size=2,
+        num_infer_engines=2,
+    )
+
+    assert batch.expected_counts == [4, 0, 4, 0, 0]
+    assert batch.multicast_groups == [[0, 2], [], [], [], []]
+
+
+def test_send_plan_does_not_multicast_multiple_logical_streams(monkeypatch):
+    tensor = torch.arange(16, dtype=torch.int32)
+    shard = SimpleNamespace(name="weight")
+
+    def operation(recv_rank):
+        return CommunicationOperation(
+            send_rank=4,
+            send_shard_meta=shard,
+            send_offset=(0,),
+            recv_rank=recv_rank,
+            recv_shard_meta=shard,
+            recv_offset=(0,),
+            overlap_shape=(16,),
+            train_slices=(slice(None),),
+            inf_slices=(slice(None),),
+        )
+
+    monkeypatch.setattr(nccl_device, "_ensure_cuda_tensor", lambda *_: None)
+    batch = _build_send_batch(
+        {"weight": tensor},
+        TransferPlan(
+            operations={peer: [operation(peer)] for peer in range(4)}
+        ),
+        rank=4,
+        world_size=5,
+        chunk_bytes=16,
+        allow_staging=False,
+        infer_instance_world_size=2,
+        num_infer_engines=2,
+    )
+
+    assert batch.multicast_groups == [[], [], [], [], []]
+
+
+def test_send_plan_does_not_multicast_different_source_slices(monkeypatch):
+    tensor = torch.arange(16, dtype=torch.int32)
+    shard = SimpleNamespace(name="weight")
+    first = CommunicationOperation(
+        send_rank=4,
+        send_shard_meta=shard,
+        send_offset=(0,),
+        recv_rank=0,
+        recv_shard_meta=shard,
+        recv_offset=(0,),
+        overlap_shape=(8,),
+        train_slices=(slice(0, 8),),
+        inf_slices=(slice(0, 8),),
+    )
+    second = CommunicationOperation(
+        send_rank=4,
+        send_shard_meta=shard,
+        send_offset=(8,),
+        recv_rank=2,
+        recv_shard_meta=shard,
+        recv_offset=(0,),
+        overlap_shape=(8,),
+        train_slices=(slice(8, 16),),
+        inf_slices=(slice(0, 8),),
+    )
+
+    monkeypatch.setattr(nccl_device, "_ensure_cuda_tensor", lambda *_: None)
+    batch = _build_send_batch(
+        {"weight": tensor},
+        TransferPlan(operations={0: [first], 2: [second]}),
+        rank=4,
+        world_size=5,
+        chunk_bytes=16,
+        allow_staging=False,
+        infer_instance_world_size=2,
+        num_infer_engines=2,
+    )
+
+    assert batch.multicast_groups == [[], [], [], [], []]
+
+
 def test_static_layout_slices_logical_order_without_materializing():
     source = torch.arange(24, dtype=torch.int32).reshape(6, 4)
     layout = StaticTensorLayout(

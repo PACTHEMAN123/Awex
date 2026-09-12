@@ -29,7 +29,7 @@ from __future__ import annotations
 import os
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -70,6 +70,10 @@ class _DeviceBatch:
     region_bytes: List[int]
     expected_counts: List[int]
     copybacks: List[Tuple[torch.Tensor, torch.Tensor]]
+    # Indexed by canonical peer. A non-empty entry names the inference ranks
+    # that consume an identical task stream and can therefore share one
+    # multimem write. The full per-peer task list is retained for LSA fallback.
+    multicast_groups: List[List[int]] = field(default_factory=list)
 
 
 _extension_lock = threading.Lock()
@@ -175,7 +179,7 @@ def _load_extension() -> Any:
         ]
         try:
             _extension = load(
-                name="awex_nccl_device_ext_v4",
+                name="awex_nccl_device_ext_v5",
                 sources=[str(source)],
                 extra_include_paths=include_paths,
                 extra_cuda_cflags=["-O3"],
@@ -283,6 +287,8 @@ def _build_send_batch(
     world_size: int,
     chunk_bytes: int = _DEFAULT_CHUNK_BYTES,
     allow_staging: bool = True,
+    infer_instance_world_size: int = 0,
+    num_infer_engines: int = 1,
 ) -> _DeviceBatch:
     chunk_bytes = _resolve_chunk_bytes(chunk_bytes)
     tensors: List[torch.Tensor] = []
@@ -344,7 +350,7 @@ def _build_send_batch(
                 peer_offset += length
         expected_counts[peer] = ordinal
         region_bytes[rank] = max(region_bytes[rank], peer_offset)
-    return _DeviceBatch(
+    batch = _DeviceBatch(
         tensors,
         offsets,
         lengths,
@@ -355,6 +361,83 @@ def _build_send_batch(
         expected_counts,
         [],
     )
+    batch.multicast_groups = _find_multicast_groups(
+        batch,
+        infer_instance_world_size=infer_instance_world_size,
+        num_infer_engines=num_infer_engines,
+    )
+    return batch
+
+
+def _find_multicast_groups(
+    batch: _DeviceBatch,
+    infer_instance_world_size: int,
+    num_infer_engines: int,
+) -> List[List[int]]:
+    """Find one engine-replicated sender stream that is safe to broadcast.
+
+    The first implementation deliberately accepts only one logical inference
+    peer per sender. A world-wide NCCL multimem mapping also updates ranks that
+    do not consume the stream; allowing a second logical stream on the same
+    sender channel would let those ranks observe the wrong ring ticket.
+    """
+
+    world_size = len(batch.expected_counts)
+    groups: List[List[int]] = [[] for _ in range(world_size)]
+    instance_world_size = int(infer_instance_world_size)
+    engine_count = int(num_infer_engines)
+    if engine_count < 2 or instance_world_size <= 0:
+        return groups
+
+    infer_world_size = engine_count * instance_world_size
+    if infer_world_size > world_size:
+        raise NCCLDeviceUnavailableError(
+            "nccl_device inference topology exceeds transfer world size"
+        )
+
+    active_peers = [
+        peer for peer, count in enumerate(batch.expected_counts) if count > 0
+    ]
+    if not active_peers or any(peer >= infer_world_size for peer in active_peers):
+        return groups
+
+    logical_peers = {peer % instance_world_size for peer in active_peers}
+    if len(logical_peers) != 1:
+        return groups
+
+    logical_peer = next(iter(logical_peers))
+    target_peers = [
+        engine_rank * instance_world_size + logical_peer
+        for engine_rank in range(engine_count)
+    ]
+    if active_peers != target_peers:
+        return groups
+
+    task_indices = {peer: [] for peer in target_peers}
+    for index, peer in enumerate(batch.peers):
+        if peer in task_indices:
+            task_indices[peer].append(index)
+
+    def task_signature(index: int) -> tuple:
+        tensor = batch.tensors[index]
+        return (
+            int(tensor.data_ptr()),
+            int(batch.offsets[index]),
+            int(batch.lengths[index]),
+            int(batch.ordinals[index]),
+            int(batch.region_indices[index]),
+        )
+
+    canonical_peer = target_peers[0]
+    canonical = [task_signature(index) for index in task_indices[canonical_peer]]
+    if not canonical:
+        return groups
+    for peer in target_peers[1:]:
+        if [task_signature(index) for index in task_indices[peer]] != canonical:
+            return groups
+
+    groups[canonical_peer] = target_peers
+    return groups
 
 
 def _build_recv_batch(
@@ -454,6 +537,8 @@ class NCCLDeviceTransport:
         world_size: int,
         timeout_ms: Optional[int] = None,
         chunk_bytes: Optional[int] = None,
+        infer_instance_world_size: int = 0,
+        num_infer_engines: int = 1,
     ):
         if world_size < 2 or world_size > 256:
             raise NCCLDeviceUnavailableError(
@@ -466,6 +551,8 @@ class NCCLDeviceTransport:
             timeout_ms or os.environ.get("AWEX_NCCL_DEVICE_TIMEOUT_MS", "120000")
         )
         self.chunk_bytes = _resolve_chunk_bytes(chunk_bytes)
+        self.infer_instance_world_size = int(infer_instance_world_size)
+        self.num_infer_engines = int(num_infer_engines)
         self._extension = None
         self._handle: Optional[int] = None
         self._initialized = False
@@ -536,6 +623,13 @@ class NCCLDeviceTransport:
                 self.chunk_bytes,
                 batch.expected_counts,
             )
+            multicast_groups = [group for group in batch.multicast_groups if group]
+            if multicast_groups:
+                logger.info(
+                    "Lowered nccl_device multicast candidates rank=%s groups=%s",
+                    self.rank,
+                    multicast_groups,
+                )
             self._logged_batch_shape = True
         device = torch.device(device_util.get_torch_device())
         region_metadata_start = time.perf_counter()
@@ -576,6 +670,7 @@ class NCCLDeviceTransport:
                 batch.peers,
                 batch.ordinals,
                 batch.expected_counts,
+                batch.multicast_groups,
                 bool(sender),
                 int(sequence),
             )
@@ -617,7 +712,13 @@ class NCCLDeviceTransport:
         else:
             build_start = time.perf_counter()
             batch = _build_send_batch(
-                parameters, plan, self.rank, self.world_size, self.chunk_bytes
+                parameters,
+                plan,
+                self.rank,
+                self.world_size,
+                self.chunk_bytes,
+                infer_instance_world_size=self.infer_instance_world_size,
+                num_infer_engines=self.num_infer_engines,
             )
             build_batch_time_ms = (time.perf_counter() - build_start) * 1000.0
         metrics = self._run(
@@ -660,6 +761,8 @@ class NCCLDeviceTransport:
             self.world_size,
             self.chunk_bytes,
             allow_staging=allow_staging,
+            infer_instance_world_size=self.infer_instance_world_size,
+            num_infer_engines=self.num_infer_engines,
         )
         self._prepared_send = (parameters, plan, batch)
 

@@ -55,6 +55,7 @@ struct DeviceState {
   ncclDevComm_t* dev_comm = nullptr;
   ncclWindow_t window = nullptr;
   void* local_base = nullptr;
+  void* multimem_base = nullptr;
   // Cached NCCL LSA device pointers; the transfer kernel uses direct
   // load/store operations instead of issuing a host-side NCCL P2P operation.
   std::vector<void*> remote_bases;
@@ -72,9 +73,11 @@ struct DeviceState {
   uint32_t* device_expected_counts = nullptr;
   uint32_t* device_peer_offsets = nullptr;
   uint32_t* device_active_peers = nullptr;
+  uintptr_t* device_target_bases = nullptr;
   dt::DeviceProfile* device_profile = nullptr;
   size_t task_capacity = 0;
   size_t expected_count_capacity = 0;
+  size_t target_base_capacity = 0;
   cudaEvent_t metadata_start = nullptr;
   cudaEvent_t metadata_end = nullptr;
   cudaEvent_t kernel_end = nullptr;
@@ -162,6 +165,7 @@ void ensure_launch_resources(
     DeviceState* state,
     size_t task_count,
     size_t expected_count_count,
+    size_t target_base_count,
     bool collect_profile) {
   if (task_count > state->task_capacity) {
     dt::DeviceTask* new_tasks = nullptr;
@@ -173,6 +177,18 @@ void ensure_launch_resources(
     }
     state->device_tasks = new_tasks;
     state->task_capacity = task_count;
+  }
+
+  if (target_base_count > state->target_base_capacity) {
+    uintptr_t* new_target_bases = nullptr;
+    AWEX_CUDA_CHECK(cudaMalloc(
+        reinterpret_cast<void**>(&new_target_bases),
+        target_base_count * sizeof(uintptr_t)));
+    if (state->device_target_bases != nullptr) {
+      AWEX_CUDA_CHECK(cudaFree(state->device_target_bases));
+    }
+    state->device_target_bases = new_target_bases;
+    state->target_base_capacity = target_base_count;
   }
 
   if (expected_count_count > state->expected_count_capacity) {
@@ -266,6 +282,10 @@ void release_launch_resources(DeviceState* state) {
     AWEX_CUDA_CHECK(cudaFree(state->device_active_peers));
     state->device_active_peers = nullptr;
   }
+  if (state->device_target_bases != nullptr) {
+    AWEX_CUDA_CHECK(cudaFree(state->device_target_bases));
+    state->device_target_bases = nullptr;
+  }
   if (state->device_profile != nullptr) {
     AWEX_CUDA_CHECK(cudaFree(state->device_profile));
     state->device_profile = nullptr;
@@ -284,6 +304,7 @@ void release_launch_resources(DeviceState* state) {
   }
   state->task_capacity = 0;
   state->expected_count_capacity = 0;
+  state->target_base_capacity = 0;
 }
 
 std::unique_ptr<DeviceState> make_state(
@@ -335,6 +356,12 @@ std::unique_ptr<DeviceState> make_state(
     }
 
     ncclDevCommRequirements_t requirements = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
+    const char* multicast_env = std::getenv("AWEX_NCCL_DEVICE_MULTICAST");
+    const bool multicast_requested = multicast_env == nullptr ||
+        (std::strcmp(multicast_env, "0") != 0 &&
+         std::strcmp(multicast_env, "false") != 0 &&
+         std::strcmp(multicast_env, "False") != 0);
+    requirements.lsaMultimem = multicast_requested && properties.multimemSupport;
     size_t dev_comm_bytes = 0;
 #if defined(NCCL_VERSION_CODE) && NCCL_VERSION_CODE >= NCCL_VERSION(2, 31, 0)
     requirements.useRuntimeVersion = true;
@@ -362,6 +389,10 @@ std::unique_ptr<DeviceState> make_state(
         state->window_bytes,
         &state->window,
         NCCL_WIN_COLL_SYMMETRIC));
+    if (requirements.lsaMultimem) {
+      AWEX_NCCL_CHECK(ncclGetLsaMultimemDevicePointer(
+          state->window, 0, &state->multimem_base));
+    }
     AWEX_CUDA_CHECK(cudaMemset(
         state->local_base, 0, state->ring_data_offset));
 
@@ -423,6 +454,10 @@ struct RingLaunchDescriptor {
   std::vector<uint32_t> expected_counts;
   std::vector<uint32_t> peer_offsets;
   std::vector<uint32_t> active_peers;
+  std::vector<uintptr_t> target_bases;
+  uint64_t injected_payload_bytes = 0;
+  uint32_t multicast_group_count = 0;
+  uint32_t multicast_segment_count = 0;
 };
 
 RingLaunchDescriptor build_ring_launch_descriptor(
@@ -432,13 +467,19 @@ RingLaunchDescriptor build_ring_launch_descriptor(
     const std::vector<int64_t>& lengths,
     const std::vector<int64_t>& peers,
     const std::vector<int64_t>& ordinals,
-    const std::vector<int64_t>& expected_counts) {
+    const std::vector<int64_t>& expected_counts,
+    const std::vector<std::vector<int64_t>>& multicast_groups,
+    bool sender) {
   if (tensors.size() != offsets.size() || tensors.size() != lengths.size() ||
       tensors.size() != peers.size() || tensors.size() != ordinals.size()) {
     throw std::runtime_error("Tensor/task descriptor lengths do not match");
   }
   if (expected_counts.size() != static_cast<size_t>(state.world_size)) {
     throw std::runtime_error("Expected-count vector does not match world_size");
+  }
+  if (!multicast_groups.empty() &&
+      multicast_groups.size() != static_cast<size_t>(state.world_size)) {
+    throw std::runtime_error("Multicast-group vector does not match world_size");
   }
 
   std::vector<uint32_t> original_expected_counts;
@@ -516,9 +557,81 @@ RingLaunchDescriptor build_ring_launch_descriptor(
   RingLaunchDescriptor descriptor;
   descriptor.expected_counts.resize(state.world_size, 0);
   descriptor.peer_offsets.resize(state.world_size + 1, 0);
+  std::vector<bool> suppressed_peer(state.world_size, false);
+  const bool use_multicast =
+      sender && state.multimem_base != nullptr && !multicast_groups.empty();
+
+  if (use_multicast) {
+    for (int canonical_peer = 0; canonical_peer < state.world_size;
+         ++canonical_peer) {
+      const auto& targets = multicast_groups[canonical_peer];
+      if (targets.empty()) {
+        continue;
+      }
+      if (targets.size() < 2 || targets.front() != canonical_peer) {
+        throw std::runtime_error(
+            "nccl_device multicast group must start with its canonical peer");
+      }
+      const auto& canonical_tasks = ordered_tasks[canonical_peer];
+      if (canonical_tasks.empty()) {
+        throw std::runtime_error(
+            "nccl_device multicast group has no canonical tasks");
+      }
+      int64_t previous_target = -1;
+      for (const int64_t target : targets) {
+        if (target < 0 || target >= state.world_size || target == state.rank ||
+            target <= previous_target) {
+          throw std::runtime_error(
+              "nccl_device multicast targets must be sorted, unique peers");
+        }
+        previous_target = target;
+        const auto& target_tasks = ordered_tasks[target];
+        if (target_tasks.size() != canonical_tasks.size()) {
+          throw std::runtime_error(
+              "nccl_device multicast target task count differs from canonical");
+        }
+        for (size_t task = 0; task < canonical_tasks.size(); ++task) {
+          if (target_tasks[task].tensor_ptr != canonical_tasks[task].tensor_ptr ||
+              target_tasks[task].nbytes != canonical_tasks[task].nbytes) {
+            throw std::runtime_error(
+                "nccl_device multicast target task stream is not identical");
+          }
+        }
+        if (target != canonical_peer) {
+          if (suppressed_peer[target]) {
+            throw std::runtime_error(
+                "nccl_device peer belongs to multiple multicast groups");
+          }
+          suppressed_peer[target] = true;
+        }
+      }
+      ++descriptor.multicast_group_count;
+    }
+  }
+
   for (int peer = 0; peer < state.world_size; ++peer) {
     descriptor.peer_offsets[peer] =
         static_cast<uint32_t>(descriptor.tasks.size());
+    if (suppressed_peer[peer]) {
+      descriptor.peer_offsets[peer + 1] =
+          static_cast<uint32_t>(descriptor.tasks.size());
+      continue;
+    }
+
+    const bool peer_multicast =
+        use_multicast && !multicast_groups[peer].empty();
+    const auto target_begin = static_cast<uint32_t>(descriptor.target_bases.size());
+    if (peer_multicast) {
+      for (const int64_t target : multicast_groups[peer]) {
+        descriptor.target_bases.push_back(
+            reinterpret_cast<uintptr_t>(state.remote_bases[target]));
+      }
+    } else if (!ordered_tasks[peer].empty()) {
+      descriptor.target_bases.push_back(
+          reinterpret_cast<uintptr_t>(state.remote_bases[peer]));
+    }
+    const auto target_count = static_cast<uint32_t>(
+        descriptor.target_bases.size() - target_begin);
     uint64_t segment_ordinal = 0;
     for (const auto& task : ordered_tasks[peer]) {
       for (uint64_t offset = 0; offset < task.nbytes;
@@ -531,11 +644,19 @@ RingLaunchDescriptor build_ring_launch_descriptor(
             state.ring_slot_bytes, task.nbytes - offset);
         descriptor.tasks.push_back(dt::DeviceTask{
             task.tensor_ptr + static_cast<uintptr_t>(offset),
-            reinterpret_cast<uintptr_t>(state.remote_bases[peer]),
+            reinterpret_cast<uintptr_t>(
+                peer_multicast ? state.multimem_base : state.remote_bases[peer]),
             segment_bytes,
             static_cast<uint32_t>(peer),
             static_cast<uint32_t>(segment_ordinal),
+            target_begin,
+            target_count,
+            peer_multicast ? dt::kTaskMulticast : 0U,
         });
+        descriptor.injected_payload_bytes += segment_bytes;
+        if (peer_multicast) {
+          ++descriptor.multicast_segment_count;
+        }
         ++segment_ordinal;
       }
     }
@@ -562,6 +683,7 @@ py::dict launch(
     const std::vector<int64_t>& peers,
     const std::vector<int64_t>& ordinals,
     const std::vector<int64_t>& expected_counts,
+    const std::vector<std::vector<int64_t>>& multicast_groups,
     bool sender,
     int64_t sequence) {
   using Clock = std::chrono::steady_clock;
@@ -591,11 +713,26 @@ py::dict launch(
         "nccl_device sequence must increase between ring launches");
   }
   const auto descriptor = build_ring_launch_descriptor(
-      *state, tensors, offsets, lengths, peers, ordinals, expected_counts);
+      *state,
+      tensors,
+      offsets,
+      lengths,
+      peers,
+      ordinals,
+      expected_counts,
+      multicast_groups,
+      sender);
   metrics["ring_segment_count"] = py::int_(descriptor.tasks.size());
   metrics["ring_slot_bytes"] = py::int_(state->ring_slot_bytes);
   metrics["ring_slots_per_peer"] = py::int_(state->ring_slots_per_peer);
   metrics["registered_window_bytes"] = py::int_(state->window_bytes);
+  metrics["multimem_available"] = py::bool_(state->multimem_base != nullptr);
+  metrics["multicast_group_count"] = py::int_(
+      descriptor.multicast_group_count);
+  metrics["multicast_segment_count"] = py::int_(
+      descriptor.multicast_segment_count);
+  metrics["injected_payload_bytes"] = py::int_(
+      descriptor.injected_payload_bytes);
   metrics["host_descriptor_time_ms"] =
       std::chrono::duration<double, std::milli>(Clock::now() - launch_start)
           .count();
@@ -610,6 +747,7 @@ py::dict launch(
       state,
       descriptor.tasks.size(),
       descriptor.expected_counts.size(),
+      descriptor.target_bases.size(),
       collect_profile);
   metrics["buffer_allocation_time_ms"] =
       std::chrono::duration<double, std::milli>(Clock::now() - allocation_start)
@@ -619,6 +757,7 @@ py::dict launch(
   auto* device_expected_counts = state->device_expected_counts;
   auto* device_peer_offsets = state->device_peer_offsets;
   auto* device_active_peers = state->device_active_peers;
+  auto* device_target_bases = state->device_target_bases;
   auto* device_profile = collect_profile ? state->device_profile : nullptr;
   const auto metadata_start =
       collect_profile ? state->metadata_start : nullptr;
@@ -662,6 +801,14 @@ py::dict launch(
         cudaMemcpyHostToDevice,
         stream));
   }
+  if (!descriptor.target_bases.empty()) {
+    AWEX_CUDA_CHECK(cudaMemcpyAsync(
+        device_target_bases,
+        descriptor.target_bases.data(),
+        descriptor.target_bases.size() * sizeof(uintptr_t),
+        cudaMemcpyHostToDevice,
+        stream));
+  }
   if (device_profile != nullptr) {
     AWEX_CUDA_CHECK(cudaMemcpyAsync(
         device_profile,
@@ -687,6 +834,7 @@ py::dict launch(
       device_expected_counts,
       device_peer_offsets,
       device_active_peers,
+      device_target_bases,
       static_cast<uint32_t>(descriptor.active_peers.size()),
       state->ring_slots_per_peer,
       state->ring_slot_bytes,

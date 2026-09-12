@@ -146,6 +146,8 @@ class NCCLWeightsWriter(WeightsExchangeShardingWriter):
                 self.weights_update_group,
                 self.transfer_rank,
                 self.transfer_world_size,
+                infer_instance_world_size=self.infer_instance_world_size,
+                num_infer_engines=self.num_infer_engines,
             )
             if self.device_parameters is not None:
                 self.device_transport.prepare_send(

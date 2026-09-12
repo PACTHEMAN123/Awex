@@ -130,6 +130,8 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
                 self.weights_update_group,
                 self.transfer_rank,
                 self.world_size,
+                infer_instance_world_size=self.infer_instance_world_size,
+                num_infer_engines=self.num_engines,
             )
             if self.model_arch_name == "Qwen3ForCausalLM":
                 self.device_transport.prepare_recv(

@@ -55,8 +55,8 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 1) transfer_impl(
     return;
   }
 
-  auto* remote_base = reinterpret_cast<std::uint8_t*>(
-      args.tasks[peer_task_begin].remote_base);
+  const DeviceTask first_task = args.tasks[peer_task_begin];
+  auto* remote_base = reinterpret_cast<std::uint8_t*>(first_task.remote_base);
   auto* remote_control = reinterpret_cast<ControlBlock*>(remote_base);
 
   __shared__ int ready;
@@ -66,7 +66,20 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 1) transfer_impl(
         args.sequence,
         &local_control->error,
         args.timeout_cycles);
-    if (ready) {
+    if (ready && sender && (first_task.flags & kTaskMulticast) != 0) {
+      for (std::uint32_t target = 0;
+           target < first_task.target_count && ready;
+           ++target) {
+        auto* target_base = reinterpret_cast<std::uint8_t*>(
+            args.target_bases[first_task.target_begin + target]);
+        auto* target_control = reinterpret_cast<ControlBlock*>(target_base);
+        ready = wait_for_ticket(
+            &target_control->epoch,
+            args.sequence,
+            &local_control->error,
+            args.timeout_cycles);
+      }
+    } else if (ready) {
       ready = wait_for_ticket(
           &remote_control->epoch,
           args.sequence,
@@ -93,7 +106,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 1) transfer_impl(
 
     const DeviceTask task = args.tasks[task_index];
     if (task.peer != peer || task.ordinal != ordinal ||
-        task.nbytes > args.slot_bytes) {
+        task.nbytes > args.slot_bytes || task.target_count == 0) {
       if (threadIdx.x == 0) {
         atomicExch_system(&local_control->error, 1U);
       }
@@ -102,6 +115,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 1) transfer_impl(
 
     const std::uint32_t channel =
         sender ? static_cast<std::uint32_t>(args.local_rank) : peer;
+    const bool multicast = sender && (task.flags & kTaskMulticast) != 0;
     RingSlot slot = ring_slot(
         sender ? remote_base : args.local_base,
         args.ring_data_offset,
@@ -114,8 +128,23 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 1) transfer_impl(
 
     if (threadIdx.x == 0) {
       if (sender) {
-        ready = wait_until_free(
-            slot.state, &local_control->error, args.timeout_cycles);
+        ready = 1;
+        for (std::uint32_t target = 0; target < task.target_count && ready;
+             ++target) {
+          auto* target_base = reinterpret_cast<std::uint8_t*>(
+              args.target_bases[task.target_begin + target]);
+          RingSlot target_slot = ring_slot(
+              target_base,
+              args.ring_data_offset,
+              args.slot_bytes,
+              static_cast<std::uint32_t>(args.local_rank),
+              lane,
+              args.slots_per_peer);
+          ready = wait_until_free(
+              target_slot.state,
+              &local_control->error,
+              args.timeout_cycles);
+        }
       } else {
         ready = wait_for_ticket(
             &slot.state->ready_ticket,
@@ -135,6 +164,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 1) transfer_impl(
     }
     if (!sender) {
       __threadfence_system();
+      fence_proxy_alias();
     }
 
     if (threadIdx.x == 0 && args.profile != nullptr) {
@@ -142,7 +172,11 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 1) transfer_impl(
     }
     __syncthreads();
     if (sender) {
-      copy_contiguous_1d(slot.data, tensor_data, task.nbytes);
+      if (multicast) {
+        copy_contiguous_1d_multicast(slot.data, tensor_data, task.nbytes);
+      } else {
+        copy_contiguous_1d(slot.data, tensor_data, task.nbytes);
+      }
     } else {
       copy_contiguous_1d(tensor_data, slot.data, task.nbytes);
     }
@@ -156,7 +190,12 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 1) transfer_impl(
         if (args.profile != nullptr) {
           atomicMin(&args.profile->publish_start_ns, global_timer_ns());
         }
-        mark_ready(slot.state, ticket);
+        if (multicast) {
+          multimem_store_release_u64(&slot.state->ready_ticket, ticket);
+          fence_proxy_alias();
+        } else {
+          mark_ready(slot.state, ticket);
+        }
         if (args.profile != nullptr) {
           atomicMax(&args.profile->publish_done_ns, global_timer_ns());
         }
@@ -173,11 +212,29 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 1) transfer_impl(
   // Reuse already acknowledges every earlier generation.  Waiting for the
   // lane's final ticket makes tensor lifetime safe when the kernel returns.
   if (sender && last_slot_state != nullptr && threadIdx.x == 0) {
-    ready = wait_for_ticket(
-        &last_slot_state->consumed_ticket,
-        last_ticket,
-        &local_control->error,
-        args.timeout_cycles);
+    const DeviceTask last_task = args.tasks[
+        peer_task_begin + lane +
+        ((peer_task_count - 1 - lane) / args.slots_per_peer) *
+            args.slots_per_peer];
+    ready = 1;
+    for (std::uint32_t target = 0;
+         target < last_task.target_count && ready;
+         ++target) {
+      auto* target_base = reinterpret_cast<std::uint8_t*>(
+          args.target_bases[last_task.target_begin + target]);
+      RingSlot target_slot = ring_slot(
+          target_base,
+          args.ring_data_offset,
+          args.slot_bytes,
+          static_cast<std::uint32_t>(args.local_rank),
+          lane,
+          args.slots_per_peer);
+      ready = wait_for_ticket(
+          &target_slot.state->consumed_ticket,
+          last_ticket,
+          &local_control->error,
+          args.timeout_cycles);
+    }
     if (ready && args.profile != nullptr) {
       atomicMax(&args.profile->peer_done_ns, global_timer_ns());
     }
