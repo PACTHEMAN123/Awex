@@ -512,6 +512,7 @@ def _load_extension() -> Any:
                 f"Missing CUDA source: {kernel_source}"
             )
 
+        library_paths = _candidate_library_paths()
         try:
             _extension = load(
                 name="awex_nccl_device_ext_v2",
@@ -519,7 +520,8 @@ def _load_extension() -> Any:
                 extra_include_paths=include_paths,
                 extra_cuda_cflags=["-O3"],
                 extra_ldflags=[
-                    *(f"-L{path}" for path in _candidate_library_paths()),
+                    *(f"-L{path}" for path in library_paths),
+                    *(f"-Wl,-rpath,{path}" for path in library_paths),
                     "-lnccl",
                 ],
                 with_cuda=True,
