@@ -96,7 +96,11 @@ _AWEX_WORKER_SIGNATURES = {
             "enable_colocate_mode",
             "ipc_backend",
         ],
-        "optional": ["enable_debug_mode", "weights_comm_nccl_group_size"],
+        "optional": [
+            "enable_debug_mode",
+            "weights_comm_nccl_group_size",
+            "infer_engine_config",
+        ],
     },
     "_update_parameters_in_tp_worker": {"required": ["step_id"], "optional": []},
     "_pre_update_weights_in_tp_worker": {"required": ["step_id"], "optional": []},

@@ -225,6 +225,7 @@ class WeightsReader(WeightExchangeReader):
         infer_conf_bytes = pickle.dumps(self.infer_conf)
         self.inference_engine.execute_task_in_model_worker(
             self._init_in_tp_worker,
+            infer_engine_config=config,
             infer_conf_bytes=infer_conf_bytes,
             parameters_meta_bytes=infer_parameters_meta_bytes,
             training_params_meta_bytes=train_parameters_meta_bytes,
