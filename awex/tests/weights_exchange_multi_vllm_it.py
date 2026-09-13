@@ -330,6 +330,9 @@ class MultiVLLMWeightsExchangeIT:
             "engine_rank": engine_rank,
             "num_engines": self.inference_config["num_engines"],
             "comm_backend": self.inference_config["comm_backend"],
+            "transfer_plan_replica_policy": self.inference_config.get(
+                "transfer_plan_replica_policy", "balanced"
+            ),
             "enable_debug_mode": enable_debug_mode,
             "nnodes": 1,
             "node_rank": 0,
@@ -504,6 +507,8 @@ def main(args):
         inference_config["model_path"] = args.model_path
     inference_config["tp_size"] = args.vllm_tp_size
     inference_config["num_engines"] = args.num_engines
+    if args.fixed_transfer_plan:
+        inference_config["transfer_plan_replica_policy"] = "fixed"
 
     weights_exchange_it = MultiVLLMWeightsExchangeIT(
         inference_config=inference_config,
@@ -591,6 +596,14 @@ if __name__ == "__main__":
         default=2,
         metavar="N",
         help="Number of independent vLLM engines to update.",
+    )
+    parser.add_argument(
+        "--fixed-transfer-plan",
+        action="store_true",
+        help=(
+            "Use the same replicated-weight sender assignment for every "
+            "inference engine so nccl_device can use multicast."
+        ),
     )
     parser.add_argument(
         "--nccl-device-chunk-mb",

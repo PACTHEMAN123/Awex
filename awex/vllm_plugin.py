@@ -122,6 +122,7 @@ class AwexInitRequest(OpenAIBaseModel):
     enable_colocate_mode: bool = False
     weights_exchange_ipc_backend: str = "cuda"
     weights_comm_nccl_group_size: int = 1
+    transfer_plan_replica_policy: str = "balanced"
     nnodes: int | None = None
     node_rank: int | None = None
     weights_validation_steps: int = 0
@@ -473,6 +474,7 @@ def register_awex_plugin() -> None:
                 enable_colocate_mode=request.enable_colocate_mode,
                 weights_exchange_ipc_backend=request.weights_exchange_ipc_backend,
                 weights_comm_nccl_group_size=request.weights_comm_nccl_group_size,
+                transfer_plan_replica_policy=request.transfer_plan_replica_policy,
                 nnodes=request.nnodes,
                 node_rank=request.node_rank,
                 weights_validation_steps=request.weights_validation_steps,

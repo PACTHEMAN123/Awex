@@ -229,6 +229,50 @@ class TestTransferPlanBuilder:
         assert ops
         assert all(op.send_rank == builder.infer_world_size + 1 for op in ops)
 
+    def test_fixed_replica_assignment_repeats_across_inference_engines(self):
+        builder = TransferPlanBuilder(
+            infer_world_size=4,
+            train_world_size=4,
+            num_infer_engines=2,
+            replica_assignment_policy="fixed",
+        )
+        inference_shards = [
+            self._create_test_shard_meta(global_rank=rank)
+            for rank in range(2)
+        ]
+        training_shards = [
+            self._create_test_shard_meta(global_rank=rank)
+            for rank in range(4)
+        ]
+        inference_meta = ParameterMeta(
+            name="param1",
+            global_numel=4,
+            global_shape=(2, 2),
+            dtype=torch.float32,
+            shards=inference_shards,
+            replicas=[
+                ParameterReplicaMeta(shards=[shard])
+                for shard in inference_shards
+            ],
+        )
+        training_meta = ParameterMeta(
+            name="param1",
+            global_numel=4,
+            global_shape=(2, 2),
+            dtype=torch.float32,
+            shards=training_shards,
+            replicas=[
+                ParameterReplicaMeta(shards=[shard]) for shard in training_shards
+            ],
+        )
+
+        ops = builder._build_parameter_communication_plan(
+            "param1", inference_meta, training_meta
+        )
+
+        assignments = {(op.recv_rank, op.send_rank) for op in ops}
+        assert assignments == {(0, 4), (1, 6), (2, 4), (3, 6)}
+
     def test_build_parameter_plan_handles_lm_head_cp_replicas_without_special_checks(
         self,
     ):

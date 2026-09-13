@@ -197,9 +197,14 @@ class TransferPlanBuilder:
         num_infer_engines: int = 1,
         enable_debug_mode: bool = False,
         strict_param_key_match: bool = False,
+        replica_assignment_policy: str = "balanced",
     ):
         if num_infer_engines <= 0:
             raise ValueError("num_infer_engines must be positive")
+        if replica_assignment_policy not in {"balanced", "fixed"}:
+            raise ValueError(
+                "replica_assignment_policy must be 'balanced' or 'fixed'"
+            )
 
         self.train_world_size = train_world_size
         self.infer_world_size = infer_world_size
@@ -208,10 +213,31 @@ class TransferPlanBuilder:
         self.num_infer_engines = num_infer_engines
         self.enable_debug_mode = enable_debug_mode
         self.strict_param_key_match = strict_param_key_match
+        self.replica_assignment_policy = replica_assignment_policy
         logger.info(
             f"TransferPlanBuilder: infer_world_size: {infer_world_size}, train_world_size: {train_world_size}, world_size: {self.world_size}, "
             f"infer_instance_world_size: {self.infer_instance_world_size}, num_infer_engines: {num_infer_engines}, "
-            f"enable_debug_mode: {enable_debug_mode}, strict_param_key_match: {strict_param_key_match}"
+            f"enable_debug_mode: {enable_debug_mode}, strict_param_key_match: {strict_param_key_match}, "
+            f"replica_assignment_policy: {replica_assignment_policy}"
+        )
+
+    def _assign_training_replica(
+        self,
+        inference_replica_index: int,
+        inference_replicas_per_engine: int,
+        training_replica_count: int,
+    ) -> int:
+        if self.replica_assignment_policy == "balanced":
+            return inference_replica_index % training_replica_count
+
+        local_replica_index = (
+            inference_replica_index % inference_replicas_per_engine
+        )
+        return min(
+            training_replica_count - 1,
+            local_replica_index
+            * training_replica_count
+            // inference_replicas_per_engine,
         )
 
     def build_weights_mapping_operations(
@@ -317,7 +343,7 @@ class TransferPlanBuilder:
 
         This method handles multiple replicas by:
         1. Getting all replicas from both inference and training ParameterMeta
-        2. Assigning training replicas to inference replicas evenly using round-robin
+        2. Assigning training replicas according to the configured policy
         3. For each replica pair, finding overlapping regions and building communication operations
         4. Each inference replica receives tensors from one assigned training replica
 
@@ -344,16 +370,21 @@ class TransferPlanBuilder:
 
         # Assign training replicas to inference replicas using proper distribution
         num_inference_replicas = len(inference_replicas)
+        num_inference_replicas_per_engine = len(inference_meta.replicas)
         num_training_replicas = len(training_replicas)
 
         # Ensure each inference replica is assigned to exactly one training replica
         # and each training replica gets an equal number of inference replicas
         replica_assignments = []
 
-        # Use round-robin assignment to distribute inference replicas evenly
+        # The fixed policy repeats one proportional assignment per engine so
+        # corresponding engine-local peers build byte-identical send streams.
         for inf_replica_idx in range(num_inference_replicas):
-            # Assign each inference replica to a training replica using modulo
-            train_replica_idx = inf_replica_idx % num_training_replicas
+            train_replica_idx = self._assign_training_replica(
+                inf_replica_idx,
+                num_inference_replicas_per_engine,
+                num_training_replicas,
+            )
             replica_assignments.append((inf_replica_idx, train_replica_idx))
 
         logger.debug(

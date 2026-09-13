@@ -63,6 +63,11 @@ class NCCLWeightsWriter(WeightsExchangeShardingWriter):
             self.training_world_size,
             self.num_infer_engines,
             self.enable_debug_mode,
+            replica_assignment_policy=getattr(
+                self.infer_engine_config,
+                "transfer_plan_replica_policy",
+                "balanced",
+            ),
         ).build_local_transfer_plan(
             self.infer_params_meta,
             self.parameters_meta,

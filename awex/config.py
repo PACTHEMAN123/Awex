@@ -29,6 +29,9 @@ _VALID_COMM_BACKENDS: frozenset = frozenset(
     {"file", "nccl", "nccl_device", "hccl", "astate"}
 )
 _VALID_IPC_BACKENDS: frozenset = frozenset({"cpu", "cuda"})
+_VALID_TRANSFER_PLAN_REPLICA_POLICIES: frozenset = frozenset(
+    {"balanced", "fixed"}
+)
 
 
 @dataclass
@@ -89,6 +92,10 @@ class InferenceConfig:
     # the ipc backend of weights exchange, can be "cpu" or "cuda"
     weights_exchange_ipc_backend: str = "cuda"
     weights_comm_nccl_group_size: int = 1
+    # How replicated inference weights choose an equivalent training replica.
+    # "fixed" repeats the same assignment for every inference engine, which
+    # makes their transfer streams eligible for nccl_device multicast.
+    transfer_plan_replica_policy: Literal["balanced", "fixed"] = "balanced"
 
     def validate(self) -> None:
         """Validate configuration fields for consistency and correctness.
@@ -114,6 +121,16 @@ class InferenceConfig:
             errors.append(
                 f"weights_exchange_ipc_backend must be one of {sorted(_VALID_IPC_BACKENDS)}, "
                 f"got {self.weights_exchange_ipc_backend!r}"
+            )
+
+        if (
+            self.transfer_plan_replica_policy
+            not in _VALID_TRANSFER_PLAN_REPLICA_POLICIES
+        ):
+            errors.append(
+                "transfer_plan_replica_policy must be one of "
+                f"{sorted(_VALID_TRANSFER_PLAN_REPLICA_POLICIES)}, "
+                f"got {self.transfer_plan_replica_policy!r}"
             )
 
         # engine_rank must be in [0, num_engines)

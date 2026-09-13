@@ -63,6 +63,11 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
             self.training_world_size,
             self.num_engines,
             self.enable_debug_mode,
+            replica_assignment_policy=getattr(
+                self.infer_engine_config,
+                "transfer_plan_replica_policy",
+                "balanced",
+            ),
         )
         self.transfer_plan = plan_builder.build_local_transfer_plan(
             self.parameters_meta,
