@@ -29,8 +29,36 @@ from __future__ import annotations
 import os
 import threading
 import time
+import ctypes
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
+
+class NCCLDeviceV2UnavailableError(RuntimeError):
+    """Raised when the isolated NCCL Device v2 path cannot be initialized."""
+
+
+def _preload_configured_nccl() -> None:
+    """Load the configured NCCL before torch can load another SONAME match."""
+
+    library_dir = os.environ.get("AWEX_NCCL_LIB", "")
+    if not library_dir:
+        return
+    candidates = (
+        os.path.join(library_dir, "libnccl.so.2"),
+        os.path.join(library_dir, "libnccl.so"),
+    )
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            try:
+                ctypes.CDLL(candidate, mode=ctypes.RTLD_GLOBAL)
+            except OSError as exc:
+                raise NCCLDeviceV2UnavailableError(
+                    f"Failed to preload NCCL from {candidate}: {exc}"
+                ) from exc
+            return
+
+
+_preload_configured_nccl()
 
 import torch
 import torch.distributed as dist
@@ -52,10 +80,6 @@ logger = logging.getLogger(__name__)
 
 _extension_lock = threading.Lock()
 _extension: Optional[Any] = None
-
-
-class NCCLDeviceV2UnavailableError(RuntimeError):
-    """Raised when the isolated NCCL Device v2 path cannot be initialized."""
 
 
 @dataclass
