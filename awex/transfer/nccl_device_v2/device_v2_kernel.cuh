@@ -216,6 +216,10 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 1) device_v2_kernel(V2Kernel
             args.epoch,
             &local_header->error,
             args.timeout_cycles);
+        if (!peer_ready) {
+          // Distinguish the generation handshake from a FIFO ready timeout.
+          atomicExch_system(&local_header->error, 4U);
+        }
       }
     }
   }
