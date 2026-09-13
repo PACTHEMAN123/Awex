@@ -521,7 +521,10 @@ def _load_extension() -> Any:
                 extra_cuda_cflags=["-O3"],
                 extra_ldflags=[
                     *(f"-L{path}" for path in library_paths),
-                    *(f"-Wl,-rpath,{path}" for path in library_paths),
+                    *(
+                        f"-Wl,--disable-new-dtags,-rpath,{path}"
+                        for path in library_paths
+                    ),
                     "-lnccl",
                 ],
                 with_cuda=True,
