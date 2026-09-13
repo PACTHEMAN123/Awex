@@ -203,11 +203,6 @@ def _ensure_cuda_tensor(tensor: torch.Tensor, description: str) -> None:
         raise NCCLDeviceUnavailableError(
             f"nccl_device only supports CUDA tensors ({description})."
         )
-    if not tensor.is_contiguous():
-        raise NCCLDeviceUnavailableError(
-            f"nccl_device received a non-contiguous tensor ({description}); "
-            "the operation must be staged before submission."
-        )
 
 
 def _operation_groups(
