@@ -48,7 +48,10 @@ __device__ __forceinline__ bool v2WaitReady(volatile unsigned long long* ready, 
 __device__ __forceinline__ bool v2WaitFree(volatile V2FifoSlot* slot, unsigned long long step, std::uint32_t fifo_depth,
                                            volatile unsigned int* error, unsigned long long timeout_cycles) {
   const unsigned long long start = clock64();
-  while (v2LoadSystem(&slot->consumed_step) + fifo_depth <= step) {
+  // A zeroed slot is free for its first generation. The slot is blocked only
+  // once the producer is more than fifo_depth steps ahead of the last
+  // consumer acknowledgement; equality is still the initial use of a slot.
+  while (v2LoadSystem(&slot->consumed_step) + fifo_depth < step) {
     if (v2LoadError(error) != 0) {
       return false;
     }
