@@ -199,6 +199,30 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 1) device_v2_kernel(V2Kernel
     return;
   }
   const V2ChannelQueue queue = args.channels[blockIdx.x];
+  __shared__ int peer_ready;
+  if (threadIdx.x == 0) {
+    peer_ready = 1;
+    if (queue.batch_count == 0) {
+      peer_ready = 0;
+    } else {
+      const V2WorkBatch first_batch = args.batches[queue.first_batch];
+      if (first_batch.work_count == 0) {
+        peer_ready = 0;
+      } else {
+        const V2Work& first_work = args.works[first_batch.work_begin];
+        auto* remote_header = reinterpret_cast<V2WindowHeader*>(args.peer_windows[first_work.peer]);
+        peer_ready = v2WaitReady(
+            &remote_header->epoch,
+            args.epoch,
+            &local_header->error,
+            args.timeout_cycles);
+      }
+    }
+  }
+  __syncthreads();
+  if (!peer_ready) {
+    return;
+  }
   for (std::uint32_t index = 0; index < queue.batch_count; ++index) {
     v2RunBatch(args, args.batches[queue.first_batch + index], blockIdx.x);
   }

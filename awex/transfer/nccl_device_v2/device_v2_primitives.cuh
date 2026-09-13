@@ -38,7 +38,7 @@ __device__ __forceinline__ bool v2WaitReady(volatile unsigned long long* ready, 
       return false;
     }
     if (clock64() - start > timeout_cycles) {
-      atomicExch_system(const_cast<unsigned int*>(error), 1U);
+      atomicExch_system(const_cast<unsigned int*>(error), 2U);
       return false;
     }
   }
@@ -53,7 +53,7 @@ __device__ __forceinline__ bool v2WaitFree(volatile V2FifoSlot* slot, unsigned l
       return false;
     }
     if (clock64() - start > timeout_cycles) {
-      atomicExch_system(const_cast<unsigned int*>(error), 1U);
+      atomicExch_system(const_cast<unsigned int*>(error), 3U);
       return false;
     }
   }

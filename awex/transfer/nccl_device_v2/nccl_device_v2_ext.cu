@@ -509,7 +509,9 @@ py::dict launch(
         sizeof(header),
         cudaMemcpyDeviceToHost));
     if (header.error != 0) {
-      throw std::runtime_error("nccl_device_v2 kernel aborted while waiting for the peer");
+      throw std::runtime_error(
+          "nccl_device_v2 kernel aborted while waiting for the peer (error=" +
+          std::to_string(header.error) + ")");
     }
     state->next_step = schedule.next_step;
     state->last_sequence = static_cast<std::uint64_t>(sequence);
