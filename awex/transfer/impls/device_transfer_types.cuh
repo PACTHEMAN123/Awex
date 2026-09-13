@@ -43,11 +43,14 @@ struct alignas(64) ControlBlock {
 };
 
 struct DeviceTask {
-  // Tasks are contiguous 1D segments today.  Stride/transform metadata belongs
-  // here when the copy primitive grows a TMA or fused-transform backend.
+  // nbytes is the logical payload size. tensor_offset addresses that payload
+  // through fixed-width rows, allowing direct copies into pitched tensor views.
   std::uintptr_t tensor_ptr;
   std::uintptr_t remote_base;
   std::uint64_t nbytes;
+  std::uint64_t tensor_offset;
+  std::uint64_t tensor_row_bytes;
+  std::uint64_t tensor_row_stride;
   std::uint32_t peer;
   // Dense per-peer segment index.  It selects a ring lane and forms the ticket.
   std::uint32_t ordinal;

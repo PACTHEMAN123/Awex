@@ -465,12 +465,18 @@ RingLaunchDescriptor build_ring_launch_descriptor(
     const py::list& tensors,
     const std::vector<int64_t>& offsets,
     const std::vector<int64_t>& lengths,
+    const std::vector<int64_t>& tensor_offsets,
+    const std::vector<int64_t>& tensor_row_bytes,
+    const std::vector<int64_t>& tensor_row_strides,
     const std::vector<int64_t>& peers,
     const std::vector<int64_t>& ordinals,
     const std::vector<int64_t>& expected_counts,
     const std::vector<std::vector<int64_t>>& multicast_groups,
     bool sender) {
   if (tensors.size() != offsets.size() || tensors.size() != lengths.size() ||
+      tensors.size() != tensor_offsets.size() ||
+      tensors.size() != tensor_row_bytes.size() ||
+      tensors.size() != tensor_row_strides.size() ||
       tensors.size() != peers.size() || tensors.size() != ordinals.size()) {
     throw std::runtime_error("Tensor/task descriptor lengths do not match");
   }
@@ -494,6 +500,9 @@ RingLaunchDescriptor build_ring_launch_descriptor(
   struct HostTensorTask {
     uintptr_t tensor_ptr = 0;
     uint64_t nbytes = 0;
+    uint64_t tensor_offset = 0;
+    uint64_t tensor_row_bytes = 0;
+    uint64_t tensor_row_stride = 0;
     bool present = false;
   };
 
@@ -505,9 +514,8 @@ RingLaunchDescriptor build_ring_launch_descriptor(
 
   for (size_t index = 0; index < tensors.size(); ++index) {
     const auto tensor = tensors[index].cast<torch::Tensor>();
-    if (!tensor.is_cuda() || !tensor.is_contiguous()) {
-      throw std::runtime_error(
-          "nccl_device kernel inputs must be contiguous CUDA tensors");
+    if (!tensor.is_cuda()) {
+      throw std::runtime_error("nccl_device kernel inputs must be CUDA tensors");
     }
     if (tensor.get_device() != state.device) {
       throw std::runtime_error(
@@ -523,12 +531,16 @@ RingLaunchDescriptor build_ring_launch_descriptor(
         static_cast<uint64_t>(ordinal) >= original_expected_counts[peer]) {
       throw std::runtime_error("nccl_device task ordinal is invalid");
     }
-    if (offsets[index] < 0 || lengths[index] < 0) {
+    if (offsets[index] < 0 || lengths[index] < 0 ||
+        tensor_offsets[index] < 0 || tensor_row_bytes[index] <= 0 ||
+        tensor_row_strides[index] < tensor_row_bytes[index]) {
       throw std::runtime_error("nccl_device task byte range is invalid");
     }
 
     const auto logical_offset = static_cast<uint64_t>(offsets[index]);
     const auto task_bytes = static_cast<uint64_t>(lengths[index]);
+    const auto task_tensor_offset =
+        static_cast<uint64_t>(tensor_offsets[index]);
     if (logical_offset > state.logical_data_bytes ||
         task_bytes > state.logical_data_bytes - logical_offset) {
       throw std::runtime_error(
@@ -536,7 +548,8 @@ RingLaunchDescriptor build_ring_launch_descriptor(
     }
     const auto tensor_bytes = static_cast<uint64_t>(tensor.numel()) *
         static_cast<uint64_t>(tensor.element_size());
-    if (task_bytes > tensor_bytes) {
+    if (task_tensor_offset > tensor_bytes ||
+        task_bytes > tensor_bytes - task_tensor_offset) {
       throw std::runtime_error(
           "nccl_device task length exceeds its tensor storage");
     }
@@ -546,7 +559,12 @@ RingLaunchDescriptor build_ring_launch_descriptor(
       throw std::runtime_error("nccl_device task ordinals must be unique");
     }
     ordered_task = HostTensorTask{
-        reinterpret_cast<uintptr_t>(tensor.data_ptr()), task_bytes, true};
+        reinterpret_cast<uintptr_t>(tensor.data_ptr()),
+        task_bytes,
+        task_tensor_offset,
+        static_cast<uint64_t>(tensor_row_bytes[index]),
+        static_cast<uint64_t>(tensor_row_strides[index]),
+        true};
     ++actual_counts[peer];
   }
   if (actual_counts != original_expected_counts) {
@@ -592,7 +610,13 @@ RingLaunchDescriptor build_ring_launch_descriptor(
         }
         for (size_t task = 0; task < canonical_tasks.size(); ++task) {
           if (target_tasks[task].tensor_ptr != canonical_tasks[task].tensor_ptr ||
-              target_tasks[task].nbytes != canonical_tasks[task].nbytes) {
+              target_tasks[task].nbytes != canonical_tasks[task].nbytes ||
+              target_tasks[task].tensor_offset !=
+                  canonical_tasks[task].tensor_offset ||
+              target_tasks[task].tensor_row_bytes !=
+                  canonical_tasks[task].tensor_row_bytes ||
+              target_tasks[task].tensor_row_stride !=
+                  canonical_tasks[task].tensor_row_stride) {
             throw std::runtime_error(
                 "nccl_device multicast target task stream is not identical");
           }
@@ -643,10 +667,13 @@ RingLaunchDescriptor build_ring_launch_descriptor(
         const auto segment_bytes = std::min<uint64_t>(
             state.ring_slot_bytes, task.nbytes - offset);
         descriptor.tasks.push_back(dt::DeviceTask{
-            task.tensor_ptr + static_cast<uintptr_t>(offset),
+            task.tensor_ptr,
             reinterpret_cast<uintptr_t>(
                 peer_multicast ? state.multimem_base : state.remote_bases[peer]),
             segment_bytes,
+            task.tensor_offset + offset,
+            task.tensor_row_bytes,
+            task.tensor_row_stride,
             static_cast<uint32_t>(peer),
             static_cast<uint32_t>(segment_ordinal),
             target_begin,
@@ -680,6 +707,9 @@ py::dict launch(
     const py::list& tensors,
     const std::vector<int64_t>& offsets,
     const std::vector<int64_t>& lengths,
+    const std::vector<int64_t>& tensor_offsets,
+    const std::vector<int64_t>& tensor_row_bytes,
+    const std::vector<int64_t>& tensor_row_strides,
     const std::vector<int64_t>& peers,
     const std::vector<int64_t>& ordinals,
     const std::vector<int64_t>& expected_counts,
@@ -717,6 +747,9 @@ py::dict launch(
       tensors,
       offsets,
       lengths,
+      tensor_offsets,
+      tensor_row_bytes,
+      tensor_row_strides,
       peers,
       ordinals,
       expected_counts,

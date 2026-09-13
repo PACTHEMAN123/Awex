@@ -64,6 +64,9 @@ class _DeviceBatch:
     tensors: List[torch.Tensor]
     offsets: List[int]
     lengths: List[int]
+    tensor_offsets: List[int]
+    tensor_row_bytes: List[int]
+    tensor_row_strides: List[int]
     peers: List[int]
     ordinals: List[int]
     region_indices: List[int]
@@ -179,7 +182,7 @@ def _load_extension() -> Any:
         ]
         try:
             _extension = load(
-                name="awex_nccl_device_ext_v5",
+                name="awex_nccl_device_ext_v6",
                 sources=[str(source)],
                 extra_include_paths=include_paths,
                 extra_cuda_cflags=["-O3"],
@@ -271,6 +274,96 @@ def _split_contiguous_tensor(
     return result
 
 
+def _tensor_copy_layout(tensor: torch.Tensor, name: str) -> Tuple[int, int]:
+    """Describe a dense tensor view as rows with a fixed byte pitch."""
+
+    element_size = int(tensor.element_size())
+    total_bytes = int(tensor.numel()) * element_size
+    if tensor.is_contiguous() or tensor.dim() < 2:
+        return total_bytes, total_bytes
+    if int(tensor.stride(-1)) != 1:
+        raise NCCLDeviceUnavailableError(
+            "nccl_device only supports tensor views contiguous in their "
+            f"innermost dimension: parameter={name}, shape={tuple(tensor.shape)}, "
+            f"stride={tuple(tensor.stride())}"
+        )
+    for dimension in range(tensor.dim() - 2):
+        expected = int(tensor.shape[dimension + 1]) * int(
+            tensor.stride(dimension + 1)
+        )
+        if int(tensor.stride(dimension)) != expected:
+            raise NCCLDeviceUnavailableError(
+                "nccl_device tensor view cannot be represented by one row stride: "
+                f"parameter={name}, shape={tuple(tensor.shape)}, "
+                f"stride={tuple(tensor.stride())}"
+            )
+    row_bytes = int(tensor.shape[-1]) * element_size
+    row_stride = int(tensor.stride(-2)) * element_size
+    if row_bytes <= 0 or row_stride < row_bytes:
+        raise NCCLDeviceUnavailableError(
+            "nccl_device tensor row stride is invalid: "
+            f"parameter={name}, row_bytes={row_bytes}, row_stride={row_stride}"
+        )
+    return row_bytes, row_stride
+
+
+def _append_tensor_range(
+    *,
+    tensors: List[torch.Tensor],
+    tensor_offsets: List[int],
+    tensor_row_bytes: List[int],
+    tensor_row_strides: List[int],
+    offsets: List[int],
+    lengths: List[int],
+    peers: List[int],
+    ordinals: List[int],
+    region_indices: List[int],
+    tensor: torch.Tensor,
+    tensor_offset: int,
+    nbytes: int,
+    row_bytes: int,
+    row_stride: int,
+    peer: int,
+    peer_offset: int,
+    ordinal: int,
+    region_index: int,
+    chunk_bytes: int,
+) -> int:
+    """Append logical chunks without materializing a strided tensor view."""
+
+    element_size = int(tensor.element_size())
+    for chunk in build_transfer_chunks(nbytes, chunk_bytes):
+        logical_offset = tensor_offset + chunk.byte_offset
+        task_tensor = tensor
+        task_tensor_offset = logical_offset
+        task_row_bytes = row_bytes
+        task_row_stride = row_stride
+        if tensor.is_contiguous():
+            if logical_offset % element_size or chunk.nbytes % element_size:
+                raise NCCLDeviceUnavailableError(
+                    "nccl_device chunk boundaries must align to tensor elements"
+                )
+            task_tensor = tensor.reshape(-1).narrow(
+                0,
+                logical_offset // element_size,
+                chunk.nbytes // element_size,
+            )
+            task_tensor_offset = 0
+            task_row_bytes = chunk.nbytes
+            task_row_stride = chunk.nbytes
+        tensors.append(task_tensor)
+        tensor_offsets.append(task_tensor_offset)
+        tensor_row_bytes.append(task_row_bytes)
+        tensor_row_strides.append(task_row_stride)
+        offsets.append(peer_offset + chunk.byte_offset)
+        lengths.append(chunk.nbytes)
+        peers.append(peer)
+        ordinals.append(ordinal)
+        region_indices.append(region_index)
+        ordinal += 1
+    return ordinal
+
+
 def _sequence_from_step(step_id: int) -> int:
     sequence = int(step_id) + 2
     if sequence <= 0:
@@ -294,6 +387,9 @@ def _build_send_batch(
     tensors: List[torch.Tensor] = []
     offsets: List[int] = []
     lengths: List[int] = []
+    tensor_offsets: List[int] = []
+    tensor_row_bytes: List[int] = []
+    tensor_row_strides: List[int] = []
     peers: List[int] = []
     ordinals: List[int] = []
     region_indices: List[int] = []
@@ -321,45 +417,53 @@ def _build_send_batch(
                     tensor = slice_tensor(parameter, op, True, slice_context=context)
                 else:
                     tensor = parameter[op.train_slices]
-                    if not tensor.is_contiguous():
-                        raise NCCLDeviceUnavailableError(
-                            "Compiled nccl_device plan would require a sender "
-                            "staging copy: "
-                            f"parameter={op.send_shard_meta.name}, "
-                            f"shape={tuple(parameter.shape)}, "
-                            f"slices={op.train_slices}. Adjust train/inference "
-                            "sharding alignment or lower this slice to direct spans."
-                        )
-                if not tensor.is_contiguous():
+                if allow_staging and not tensor.is_contiguous():
                     tensor = tensor.contiguous()
                 fragments = [tensor]
 
             for fragment in fragments:
                 _ensure_cuda_tensor(fragment, op.send_shard_meta.name)
                 length = int(fragment.numel()) * int(fragment.element_size())
-                for chunk, chunk_offset, chunk_length in _split_contiguous_tensor(
-                    fragment, chunk_bytes
-                ):
-                    tensors.append(chunk)
-                    offsets.append(peer_offset + chunk_offset)
-                    lengths.append(chunk_length)
-                    peers.append(peer)
-                    ordinals.append(ordinal)
-                    region_indices.append(rank)
-                    ordinal += 1
+                row_bytes, row_stride = _tensor_copy_layout(
+                    fragment, op.send_shard_meta.name
+                )
+                ordinal = _append_tensor_range(
+                    tensors=tensors,
+                    tensor_offsets=tensor_offsets,
+                    tensor_row_bytes=tensor_row_bytes,
+                    tensor_row_strides=tensor_row_strides,
+                    offsets=offsets,
+                    lengths=lengths,
+                    peers=peers,
+                    ordinals=ordinals,
+                    region_indices=region_indices,
+                    tensor=fragment,
+                    tensor_offset=0,
+                    nbytes=length,
+                    row_bytes=row_bytes,
+                    row_stride=row_stride,
+                    peer=peer,
+                    peer_offset=peer_offset,
+                    ordinal=ordinal,
+                    region_index=rank,
+                    chunk_bytes=chunk_bytes,
+                )
                 peer_offset += length
         expected_counts[peer] = ordinal
         region_bytes[rank] = max(region_bytes[rank], peer_offset)
     batch = _DeviceBatch(
-        tensors,
-        offsets,
-        lengths,
-        peers,
-        ordinals,
-        region_indices,
-        region_bytes,
-        expected_counts,
-        [],
+        tensors=tensors,
+        offsets=offsets,
+        lengths=lengths,
+        tensor_offsets=tensor_offsets,
+        tensor_row_bytes=tensor_row_bytes,
+        tensor_row_strides=tensor_row_strides,
+        peers=peers,
+        ordinals=ordinals,
+        region_indices=region_indices,
+        region_bytes=region_bytes,
+        expected_counts=expected_counts,
+        copybacks=[],
     )
     batch.multicast_groups = _find_multicast_groups(
         batch,
@@ -424,6 +528,9 @@ def _find_multicast_groups(
             int(tensor.data_ptr()),
             int(batch.offsets[index]),
             int(batch.lengths[index]),
+            int(batch.tensor_offsets[index]),
+            int(batch.tensor_row_bytes[index]),
+            int(batch.tensor_row_strides[index]),
             int(batch.ordinals[index]),
             int(batch.region_indices[index]),
         )
@@ -452,6 +559,9 @@ def _build_recv_batch(
     tensors: List[torch.Tensor] = []
     offsets: List[int] = []
     lengths: List[int] = []
+    tensor_offsets: List[int] = []
+    tensor_row_bytes: List[int] = []
+    tensor_row_strides: List[int] = []
     peers: List[int] = []
     ordinals: List[int] = []
     region_indices: List[int] = []
@@ -465,20 +575,20 @@ def _build_recv_batch(
             parameter = parameters[op.recv_shard_meta.name]
             view = parameter[op.inf_slices]
             target = view
-            if not view.is_contiguous():
+            try:
+                row_bytes, row_stride = _tensor_copy_layout(
+                    target, op.recv_shard_meta.name
+                )
+            except NCCLDeviceUnavailableError:
                 if not allow_staging:
-                    raise NCCLDeviceUnavailableError(
-                        "Compiled nccl_device plan would require a receiver staging "
-                        "copy: "
-                        f"parameter={op.recv_shard_meta.name}, "
-                        f"shape={tuple(parameter.shape)}, "
-                        f"slices={op.inf_slices}. Adjust train/inference sharding "
-                        "alignment or lower this slice to direct spans."
-                    )
+                    raise
                 target = torch.empty_like(view, memory_format=torch.contiguous_format)
                 copybacks.append((view, target))
+                row_bytes, row_stride = _tensor_copy_layout(
+                    target, op.recv_shard_meta.name
+                )
             _ensure_cuda_tensor(target, op.recv_shard_meta.name)
-            targets = [target]
+            fragment_numels = [int(target.numel())]
             if op.send_tensor_span_numels:
                 layout_fragments = slice_layout_fragments(
                     op.send_shard_meta.shape,
@@ -492,38 +602,48 @@ def _build_recv_batch(
                         f"{op.recv_shard_meta.name}: source={sum(fragment_numels)} "
                         f"target={target.numel()}"
                     )
-                flat_target = target.reshape(-1)
-                target_offset = 0
-                targets = []
-                for fragment_numel in fragment_numels:
-                    targets.append(flat_target.narrow(0, target_offset, fragment_numel))
-                    target_offset += fragment_numel
-
-            for fragment in targets:
-                length = int(fragment.numel()) * int(fragment.element_size())
-                for chunk, chunk_offset, chunk_length in _split_contiguous_tensor(
-                    fragment, chunk_bytes
-                ):
-                    tensors.append(chunk)
-                    offsets.append(peer_offset + chunk_offset)
-                    lengths.append(chunk_length)
-                    peers.append(peer)
-                    ordinals.append(ordinal)
-                    region_indices.append(peer)
-                    ordinal += 1
+            target_offset = 0
+            element_size = int(target.element_size())
+            for fragment_numel in fragment_numels:
+                length = int(fragment_numel) * element_size
+                ordinal = _append_tensor_range(
+                    tensors=tensors,
+                    tensor_offsets=tensor_offsets,
+                    tensor_row_bytes=tensor_row_bytes,
+                    tensor_row_strides=tensor_row_strides,
+                    offsets=offsets,
+                    lengths=lengths,
+                    peers=peers,
+                    ordinals=ordinals,
+                    region_indices=region_indices,
+                    tensor=target,
+                    tensor_offset=target_offset,
+                    nbytes=length,
+                    row_bytes=row_bytes,
+                    row_stride=row_stride,
+                    peer=peer,
+                    peer_offset=peer_offset,
+                    ordinal=ordinal,
+                    region_index=peer,
+                    chunk_bytes=chunk_bytes,
+                )
+                target_offset += length
                 peer_offset += length
         expected_counts[peer] = ordinal
         region_bytes[peer] = max(region_bytes[peer], peer_offset)
     return _DeviceBatch(
-        tensors,
-        offsets,
-        lengths,
-        peers,
-        ordinals,
-        region_indices,
-        region_bytes,
-        expected_counts,
-        copybacks,
+        tensors=tensors,
+        offsets=offsets,
+        lengths=lengths,
+        tensor_offsets=tensor_offsets,
+        tensor_row_bytes=tensor_row_bytes,
+        tensor_row_strides=tensor_row_strides,
+        peers=peers,
+        ordinals=ordinals,
+        region_indices=region_indices,
+        region_bytes=region_bytes,
+        expected_counts=expected_counts,
+        copybacks=copybacks,
     )
 
 
@@ -667,6 +787,9 @@ class NCCLDeviceTransport:
                 batch.tensors,
                 absolute_offsets,
                 batch.lengths,
+                batch.tensor_offsets,
+                batch.tensor_row_bytes,
+                batch.tensor_row_strides,
                 batch.peers,
                 batch.ordinals,
                 batch.expected_counts,

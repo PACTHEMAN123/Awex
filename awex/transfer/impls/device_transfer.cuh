@@ -106,7 +106,9 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 1) transfer_impl(
 
     const DeviceTask task = args.tasks[task_index];
     if (task.peer != peer || task.ordinal != ordinal ||
-        task.nbytes > args.slot_bytes || task.target_count == 0) {
+        task.nbytes > args.slot_bytes || task.target_count == 0 ||
+        task.tensor_row_bytes == 0 ||
+        task.tensor_row_stride < task.tensor_row_bytes) {
       if (threadIdx.x == 0) {
         atomicExch_system(&local_control->error, 1U);
       }
@@ -173,12 +175,30 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 1) transfer_impl(
     __syncthreads();
     if (sender) {
       if (multicast) {
-        copy_contiguous_1d_multicast(slot.data, tensor_data, task.nbytes);
+        copy_tensor_to_contiguous_multicast(
+            slot.data,
+            tensor_data,
+            task.tensor_offset,
+            task.nbytes,
+            task.tensor_row_bytes,
+            task.tensor_row_stride);
       } else {
-        copy_contiguous_1d(slot.data, tensor_data, task.nbytes);
+        copy_tensor_to_contiguous(
+            slot.data,
+            tensor_data,
+            task.tensor_offset,
+            task.nbytes,
+            task.tensor_row_bytes,
+            task.tensor_row_stride);
       }
     } else {
-      copy_contiguous_1d(tensor_data, slot.data, task.nbytes);
+      copy_contiguous_to_tensor(
+          tensor_data,
+          slot.data,
+          task.tensor_offset,
+          task.nbytes,
+          task.tensor_row_bytes,
+          task.tensor_row_stride);
     }
     __syncthreads();
 

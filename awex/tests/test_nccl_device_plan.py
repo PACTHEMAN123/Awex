@@ -372,7 +372,7 @@ def test_strict_plan_lowers_static_partial_columns_without_staging(monkeypatch):
     assert torch.equal(destination, expected)
 
 
-def test_strict_send_plan_rejects_staging_copy():
+def test_strict_send_plan_lowers_strided_view_without_staging(monkeypatch):
     tensor = torch.arange(16, dtype=torch.int32).reshape(4, 4)
     shard = SimpleNamespace(name="weight", shape=(4, 4))
     operation = CommunicationOperation(
@@ -387,17 +387,25 @@ def test_strict_send_plan_rejects_staging_copy():
         inf_slices=(slice(None), slice(0, 2)),
     )
 
-    with pytest.raises(NCCLDeviceUnavailableError, match="sender staging copy"):
-        _build_send_batch(
-            {"weight": tensor},
-            TransferPlan(operations={0: [operation]}),
-            rank=1,
-            world_size=2,
-            allow_staging=False,
-        )
+    monkeypatch.setattr(nccl_device, "_ensure_cuda_tensor", lambda *_: None)
+    batch = _build_send_batch(
+        {"weight": tensor},
+        TransferPlan(operations={0: [operation]}),
+        rank=1,
+        world_size=2,
+        chunk_bytes=16,
+        allow_staging=False,
+    )
+
+    assert batch.copybacks == []
+    assert batch.lengths == [16, 16]
+    assert batch.tensor_offsets == [0, 16]
+    assert batch.tensor_row_bytes == [8, 8]
+    assert batch.tensor_row_strides == [16, 16]
+    assert all(not task.is_contiguous() for task in batch.tensors)
 
 
-def test_strict_recv_plan_rejects_staging_copy():
+def test_strict_recv_plan_lowers_strided_view_without_staging(monkeypatch):
     tensor = torch.empty((4, 4), dtype=torch.int32)
     shard = SimpleNamespace(name="weight", shape=(4, 4))
     operation = CommunicationOperation(
@@ -412,11 +420,21 @@ def test_strict_recv_plan_rejects_staging_copy():
         inf_slices=(slice(None), slice(1, 3)),
     )
 
-    with pytest.raises(NCCLDeviceUnavailableError, match="receiver staging copy"):
-        _build_recv_batch(
-            {"weight": tensor},
-            TransferPlan(operations={1: [operation]}),
-            rank=0,
-            world_size=2,
-            allow_staging=False,
-        )
+    monkeypatch.setattr(nccl_device, "_ensure_cuda_tensor", lambda *_: None)
+    batch = _build_recv_batch(
+        {"weight": tensor},
+        TransferPlan(operations={1: [operation]}),
+        rank=0,
+        world_size=2,
+        chunk_bytes=16,
+        allow_staging=False,
+    )
+
+    target = tensor[:, 1:3]
+    assert batch.copybacks == []
+    assert batch.lengths == [16, 16]
+    assert batch.tensor_offsets == [0, 16]
+    assert batch.tensor_row_bytes == [8, 8]
+    assert batch.tensor_row_strides == [16, 16]
+    assert all(task.data_ptr() == target.data_ptr() for task in batch.tensors)
+    assert all(not task.is_contiguous() for task in batch.tensors)

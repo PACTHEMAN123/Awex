@@ -62,6 +62,66 @@ __device__ __forceinline__ void copy_contiguous_1d(
   }
 }
 
+__device__ __forceinline__ void copy_tensor_to_contiguous(
+    std::uint8_t* __restrict__ destination,
+    const std::uint8_t* __restrict__ tensor,
+    std::uint64_t tensor_offset,
+    std::uint64_t nbytes,
+    std::uint64_t row_bytes,
+    std::uint64_t row_stride) {
+  if (row_bytes == row_stride) {
+    copy_contiguous_1d(destination, tensor + tensor_offset, nbytes);
+    return;
+  }
+
+  std::uint64_t row = tensor_offset / row_bytes;
+  std::uint64_t column = tensor_offset % row_bytes;
+  std::uint64_t copied = 0;
+  while (copied < nbytes) {
+    const std::uint64_t row_remaining = row_bytes - column;
+    const std::uint64_t task_remaining = nbytes - copied;
+    const std::uint64_t span =
+        row_remaining < task_remaining ? row_remaining : task_remaining;
+    copy_contiguous_1d(
+        destination + copied,
+        tensor + row * row_stride + column,
+        span);
+    copied += span;
+    ++row;
+    column = 0;
+  }
+}
+
+__device__ __forceinline__ void copy_contiguous_to_tensor(
+    std::uint8_t* __restrict__ tensor,
+    const std::uint8_t* __restrict__ source,
+    std::uint64_t tensor_offset,
+    std::uint64_t nbytes,
+    std::uint64_t row_bytes,
+    std::uint64_t row_stride) {
+  if (row_bytes == row_stride) {
+    copy_contiguous_1d(tensor + tensor_offset, source, nbytes);
+    return;
+  }
+
+  std::uint64_t row = tensor_offset / row_bytes;
+  std::uint64_t column = tensor_offset % row_bytes;
+  std::uint64_t copied = 0;
+  while (copied < nbytes) {
+    const std::uint64_t row_remaining = row_bytes - column;
+    const std::uint64_t task_remaining = nbytes - copied;
+    const std::uint64_t span =
+        row_remaining < task_remaining ? row_remaining : task_remaining;
+    copy_contiguous_1d(
+        tensor + row * row_stride + column,
+        source + copied,
+        span);
+    copied += span;
+    ++row;
+    column = 0;
+  }
+}
+
 __device__ __forceinline__ void fence_proxy_alias() {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
   asm volatile("fence.proxy.alias;" ::: "memory");
@@ -145,6 +205,37 @@ __device__ __forceinline__ void copy_contiguous_1d_multicast(
   (void)source;
   (void)nbytes;
 #endif
+}
+
+__device__ __forceinline__ void copy_tensor_to_contiguous_multicast(
+    std::uint8_t* destination,
+    const std::uint8_t* tensor,
+    std::uint64_t tensor_offset,
+    std::uint64_t nbytes,
+    std::uint64_t row_bytes,
+    std::uint64_t row_stride) {
+  if (row_bytes == row_stride) {
+    copy_contiguous_1d_multicast(
+        destination, tensor + tensor_offset, nbytes);
+    return;
+  }
+
+  std::uint64_t row = tensor_offset / row_bytes;
+  std::uint64_t column = tensor_offset % row_bytes;
+  std::uint64_t copied = 0;
+  while (copied < nbytes) {
+    const std::uint64_t row_remaining = row_bytes - column;
+    const std::uint64_t task_remaining = nbytes - copied;
+    const std::uint64_t span =
+        row_remaining < task_remaining ? row_remaining : task_remaining;
+    copy_contiguous_1d_multicast(
+        destination + copied,
+        tensor + row * row_stride + column,
+        span);
+    copied += span;
+    ++row;
+    column = 0;
+  }
 }
 
 }  // namespace device_transfer
