@@ -25,6 +25,7 @@ import torch.distributed as dist
 from awex import logging
 from awex.transfer.nccl_comm import batch_send_recv, nccl_build_send_ops
 from awex.transfer.nccl_device import NCCLDeviceTransport
+from awex.transfer.nccl_device_v2 import NCCLDeviceV2Transport
 from awex.transfer.transfer_plan import (
     TransferPlanBuilder,
     compute_transfer_plan_hash,
@@ -69,7 +70,7 @@ class NCCLWeightsWriter(WeightsExchangeShardingWriter):
             self.transfer_rank,
         )
         if (
-            self.comm_backend == "nccl_device"
+            self.comm_backend in ("nccl_device", "nccl_device_v2")
             and self.model_arch_name == "Qwen3ForCausalLM"
         ):
             from awex.models.qwen3 import annotate_qwen3_dense_transfer_plan
@@ -101,7 +102,7 @@ class NCCLWeightsWriter(WeightsExchangeShardingWriter):
         }
         self.device_parameters = None
         if (
-            self.comm_backend == "nccl_device"
+            self.comm_backend in ("nccl_device", "nccl_device_v2")
             and self.model_arch_name == "Qwen3ForCausalLM"
         ):
             self.device_parameters = self.compile_device_parameters(
@@ -141,8 +142,13 @@ class NCCLWeightsWriter(WeightsExchangeShardingWriter):
         self._set_device()
         self._init_weights_exchange_process_group()
         self._shake_hands_with_reader()
-        if self.comm_backend == "nccl_device":
-            self.device_transport = NCCLDeviceTransport(
+        if self.comm_backend in ("nccl_device", "nccl_device_v2"):
+            transport_type = (
+                NCCLDeviceV2Transport
+                if self.comm_backend == "nccl_device_v2"
+                else NCCLDeviceTransport
+            )
+            self.device_transport = transport_type(
                 self.weights_update_group,
                 self.transfer_rank,
                 self.transfer_world_size,
@@ -199,7 +205,9 @@ class NCCLWeightsWriter(WeightsExchangeShardingWriter):
             world_size=self.transfer_world_size,
             group_name="weights_exchange",
             backend=(
-                "nccl" if self.comm_backend == "nccl_device" else self.comm_backend
+                "nccl"
+                if self.comm_backend in ("nccl_device", "nccl_device_v2")
+                else self.comm_backend
             ),
             role="train",
         )

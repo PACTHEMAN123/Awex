@@ -26,6 +26,7 @@ from awex import logging
 from awex.reader.weights_reader import WorkerWeightsReader
 from awex.transfer.nccl_comm import batch_send_recv, nccl_build_recv_ops
 from awex.transfer.nccl_device import NCCLDeviceTransport
+from awex.transfer.nccl_device_v2 import NCCLDeviceV2Transport
 from awex.transfer.transfer_plan import (
     TransferPlanBuilder,
     compute_transfer_plan_hash,
@@ -70,7 +71,7 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
             self.transfer_rank,
         )
         if (
-            self.comm_backend == "nccl_device"
+            self.comm_backend in ("nccl_device", "nccl_device_v2")
             and self.model_arch_name == "Qwen3ForCausalLM"
         ):
             from awex.models.qwen3 import annotate_qwen3_dense_transfer_plan
@@ -125,8 +126,13 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
         self._set_device()
         self._init_weights_exchange_process_group()
         self._shake_hands_with_writer()
-        if self.comm_backend == "nccl_device":
-            self.device_transport = NCCLDeviceTransport(
+        if self.comm_backend in ("nccl_device", "nccl_device_v2"):
+            transport_type = (
+                NCCLDeviceV2Transport
+                if self.comm_backend == "nccl_device_v2"
+                else NCCLDeviceTransport
+            )
+            self.device_transport = transport_type(
                 self.weights_update_group,
                 self.transfer_rank,
                 self.world_size,
@@ -236,7 +242,11 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
             rank=self.transfer_rank,
             world_size=self.world_size,
             group_name="weights_exchange",
-            backend=("nccl" if self.comm_backend == "nccl_device" else self.backend),
+            backend=(
+                "nccl"
+                if self.comm_backend in ("nccl_device", "nccl_device_v2")
+                else self.backend
+            ),
             role="inference",
         )
         logger.info(
