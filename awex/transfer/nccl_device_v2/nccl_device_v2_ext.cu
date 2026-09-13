@@ -33,6 +33,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -437,6 +438,40 @@ py::dict launch(
       active_peers,
       sender ? v2::V2Direction::kSend : v2::V2Direction::kRecv,
       config);
+
+  // Keep a compact host-side fingerprint in the build logs. It is useful when
+  // diagnosing a peer that waits on a different FIFO generation, and does not
+  // change the fixed TransferPlan or device ABI.
+  std::uint64_t schedule_hash = 1469598103934665603ULL;
+  for (const v2::V2Work& work : schedule.works) {
+    const std::uint64_t values[] = {
+        work.peer,
+        work.task_ordinal,
+        work.chunk_ordinal,
+        work.send.nbytes,
+        work.recv.nbytes,
+        work.send.step_begin[0],
+        work.recv.step_begin[0],
+    };
+    for (const std::uint64_t value : values) {
+      schedule_hash ^= value;
+      schedule_hash *= 1099511628211ULL;
+    }
+  }
+  std::fprintf(
+      stderr,
+      "nccl_device_v2 schedule rank=%d sender=%d hash=%016llx works=%zu batches=%zu channels=%u first_peer=%u first_send_bytes=%llu first_recv_bytes=%llu first_send_step=%llu first_recv_step=%llu\n",
+      state->rank,
+      sender ? 1 : 0,
+      static_cast<unsigned long long>(schedule_hash),
+      schedule.works.size(),
+      schedule.batches.size(),
+      schedule.channel_count,
+      schedule.works.empty() ? 0U : schedule.works.front().peer,
+      schedule.works.empty() ? 0ULL : static_cast<unsigned long long>(schedule.works.front().send.nbytes),
+      schedule.works.empty() ? 0ULL : static_cast<unsigned long long>(schedule.works.front().recv.nbytes),
+      schedule.works.empty() ? 0ULL : static_cast<unsigned long long>(schedule.works.front().send.step_begin[0]),
+      schedule.works.empty() ? 0ULL : static_cast<unsigned long long>(schedule.works.front().recv.step_begin[0]));
 
   py::dict metrics;
   metrics["work_count"] = py::int_(schedule.works.size());
