@@ -143,6 +143,27 @@ __device__ __forceinline__ void multimem_store_u32(
 #endif
 }
 
+__device__ __forceinline__ void multimem_store_v4_f32(
+    std::uint8_t* destination,
+    float x,
+    float y,
+    float z,
+    float w) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  asm volatile(
+      "multimem.st.weak.global.v4.f32 [%0], {%1, %2, %3, %4};"
+      :
+      : "l"(destination), "f"(x), "f"(y), "f"(z), "f"(w)
+      : "memory");
+#else
+  (void)destination;
+  (void)x;
+  (void)y;
+  (void)z;
+  (void)w;
+#endif
+}
+
 __device__ __forceinline__ void multimem_store_release_u64(
     unsigned long long* destination,
     unsigned long long value) {
@@ -176,10 +197,12 @@ __device__ __forceinline__ void copy_contiguous_1d_multicast(
          vector += blockDim.x) {
       const uint4 value = source_vectors[vector];
       auto* vector_destination = destination + vector * kVectorBytes;
-      multimem_store_u32(vector_destination, value.x);
-      multimem_store_u32(vector_destination + 4, value.y);
-      multimem_store_u32(vector_destination + 8, value.z);
-      multimem_store_u32(vector_destination + 12, value.w);
+      multimem_store_v4_f32(
+          vector_destination,
+          __uint_as_float(value.x),
+          __uint_as_float(value.y),
+          __uint_as_float(value.z),
+          __uint_as_float(value.w));
     }
     copied = vector_count * kVectorBytes;
   }
