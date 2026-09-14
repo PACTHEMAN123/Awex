@@ -94,8 +94,8 @@ inline std::uint64_t v2DivUp(std::uint64_t value, std::uint64_t divisor) {
   return value == 0 ? 0 : (value - 1) / divisor + 1;
 }
 
-inline std::uint32_t v2ChannelsForBytes(std::uint64_t bytes, std::uint32_t min_channels,
-                                        std::uint32_t max_channels, std::size_t step_bytes) {
+inline std::uint32_t v2ChannelsForBytes(std::uint64_t bytes, std::uint32_t min_channels, std::uint32_t max_channels,
+                                        std::size_t step_bytes) {
   if (bytes == 0) return 1;
 
   // Mirrors NCCL addP2pToPlan for an intra-node SIMPLE P2P operation.
@@ -156,8 +156,7 @@ inline V2Schedule lowerFixedTasks(const std::vector<V2LoweringTask>& tasks,
   }
 
   V2Schedule schedule;
-  schedule.next_steps = config.initial_steps.empty() ? std::vector<std::uint64_t>(step_count, 1)
-                                                      : config.initial_steps;
+  schedule.next_steps = config.initial_steps.empty() ? std::vector<std::uint64_t>(step_count, 1) : config.initial_steps;
 
   std::vector<std::int32_t> peer_index(config.world_size, -1);
   for (std::size_t index = 0; index < active_peers.size(); ++index) {
@@ -217,8 +216,8 @@ inline V2Schedule lowerFixedTasks(const std::vector<V2LoweringTask>& tasks,
       continue;
     }
     for (std::uint32_t part = 0; part < side->channel_count; ++part) {
-      const std::size_t connection = static_cast<std::size_t>(schedule.works[index - 1].peer) * config.max_channels +
-                                     side->channel_base + part;
+      const std::size_t connection =
+        static_cast<std::size_t>(schedule.works[index - 1].peer) * config.max_channels + side->channel_base + part;
       if (seen_final[connection] == 0) {
         side->final_parts |= 1U << part;
         seen_final[connection] = 1;

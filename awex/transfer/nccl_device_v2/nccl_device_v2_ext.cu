@@ -76,8 +76,7 @@ struct LaunchBuffers {
 };
 
 [[noreturn]] void throw_nccl(ncclResult_t result, const char* expression) {
-  throw std::runtime_error(
-      std::string(expression) + " failed: " + ncclGetErrorString(result));
+  throw std::runtime_error(std::string(expression) + " failed: " + ncclGetErrorString(result));
 }
 
 void check_nccl(ncclResult_t result, const char* expression) {
@@ -88,8 +87,7 @@ void check_nccl(ncclResult_t result, const char* expression) {
 
 void check_cuda(cudaError_t result, const char* expression) {
   if (result != cudaSuccess) {
-    throw std::runtime_error(
-        std::string(expression) + " failed: " + cudaGetErrorString(result));
+    throw std::runtime_error(std::string(expression) + " failed: " + cudaGetErrorString(result));
   }
 }
 
@@ -109,16 +107,9 @@ std::uint32_t power_of_two_down(std::uint32_t value) {
   return result;
 }
 
-std::unique_ptr<DeviceState> make_state(
-    const std::string& unique_id_bytes,
-    int world_size,
-    int rank,
-    int device,
-    int timeout_ms,
-    std::uint32_t max_channels,
-    std::uint32_t fifo_depth,
-    std::size_t step_bytes,
-    std::size_t chunk_bytes) {
+std::unique_ptr<DeviceState> make_state(const std::string& unique_id_bytes, int world_size, int rank, int device,
+                                        int timeout_ms, std::uint32_t max_channels, std::uint32_t fifo_depth,
+                                        std::size_t step_bytes, std::size_t chunk_bytes) {
   if (world_size < 2 || world_size > kMaxRanks) {
     throw std::runtime_error("nccl_device_v2 world_size must be in [2, 256]");
   }
@@ -154,48 +145,29 @@ std::unique_ptr<DeviceState> make_state(
     checked_multiply(static_cast<std::size_t>(world_size), state->max_channels, "nccl_device_v2 step table"), 1);
 
   int clock_rate_khz = 0;
-  AWEX_CUDA_V2_CHECK(cudaDeviceGetAttribute(
-      &clock_rate_khz,
-      cudaDevAttrClockRate,
-      device));
-  state->timeout_cycles = static_cast<std::uint64_t>(std::max(timeout_ms, 1)) *
-      static_cast<std::uint64_t>(clock_rate_khz);
+  AWEX_CUDA_V2_CHECK(cudaDeviceGetAttribute(&clock_rate_khz, cudaDevAttrClockRate, device));
+  state->timeout_cycles =
+    static_cast<std::uint64_t>(std::max(timeout_ms, 1)) * static_cast<std::uint64_t>(clock_rate_khz);
 
   ncclUniqueId unique_id;
   std::memcpy(&unique_id, unique_id_bytes.data(), sizeof(unique_id));
   try {
-    AWEX_NCCL_V2_CHECK(ncclCommInitRank(
-        &state->comm,
-        world_size,
-        unique_id,
-        rank));
+    AWEX_NCCL_V2_CHECK(ncclCommInitRank(&state->comm, world_size, unique_id, rank));
 
     ncclCommProperties_t properties = NCCL_COMM_PROPERTIES_INITIALIZER;
     AWEX_NCCL_V2_CHECK(ncclCommQueryProperties(state->comm, &properties));
     if (!properties.deviceApiSupport) {
-      throw std::runtime_error(
-          "The loaded NCCL communicator does not support the Device API");
+      throw std::runtime_error("The loaded NCCL communicator does not support the Device API");
     }
     const ncclTeam_t lsa_team = ncclTeamLsa(state->comm);
-    if (lsa_team.nRanks != world_size || lsa_team.rank != rank ||
-        lsa_team.stride != 1) {
-      throw std::runtime_error(
-          "nccl_device_v2 requires a contiguous LSA domain");
+    if (lsa_team.nRanks != world_size || lsa_team.rank != rank || lsa_team.stride != 1) {
+      throw std::runtime_error("nccl_device_v2 requires a contiguous LSA domain");
     }
 
-    AWEX_NCCL_V2_CHECK(ncclMemAlloc(
-        &state->local_base,
-        state->window_bytes));
-    AWEX_NCCL_V2_CHECK(ncclCommWindowRegister(
-        state->comm,
-        state->local_base,
-        state->window_bytes,
-        &state->window,
-        NCCL_WIN_COLL_SYMMETRIC));
-    AWEX_CUDA_V2_CHECK(cudaMemset(
-        state->local_base,
-        0,
-        state->layout.payload_offset));
+    AWEX_NCCL_V2_CHECK(ncclMemAlloc(&state->local_base, state->window_bytes));
+    AWEX_NCCL_V2_CHECK(ncclCommWindowRegister(state->comm, state->local_base, state->window_bytes, &state->window,
+                                              NCCL_WIN_COLL_SYMMETRIC));
+    AWEX_CUDA_V2_CHECK(cudaMemset(state->local_base, 0, state->layout.payload_offset));
 
     state->remote_bases.resize(world_size, nullptr);
     state->remote_bases[rank] = state->local_base;
@@ -203,27 +175,17 @@ std::unique_ptr<DeviceState> make_state(
       if (peer == rank) {
         continue;
       }
-      AWEX_NCCL_V2_CHECK(ncclGetLsaDevicePointer(
-          state->window,
-          0,
-          peer,
-          &state->remote_bases[peer]));
+      AWEX_NCCL_V2_CHECK(ncclGetLsaDevicePointer(state->window, 0, peer, &state->remote_bases[peer]));
     }
     AWEX_CUDA_V2_CHECK(cudaMalloc(
-        reinterpret_cast<void**>(&state->device_peer_windows),
-        checked_multiply(
-            static_cast<std::size_t>(world_size),
-            sizeof(uintptr_t),
-            "nccl_device_v2 peer window table")));
+      reinterpret_cast<void**>(&state->device_peer_windows),
+      checked_multiply(static_cast<std::size_t>(world_size), sizeof(uintptr_t), "nccl_device_v2 peer window table")));
     std::vector<uintptr_t> peer_windows(world_size, 0);
     for (int peer = 0; peer < world_size; ++peer) {
       peer_windows[peer] = reinterpret_cast<uintptr_t>(state->remote_bases[peer]);
     }
-    AWEX_CUDA_V2_CHECK(cudaMemcpy(
-        state->device_peer_windows,
-        peer_windows.data(),
-        peer_windows.size() * sizeof(uintptr_t),
-        cudaMemcpyHostToDevice));
+    AWEX_CUDA_V2_CHECK(cudaMemcpy(state->device_peer_windows, peer_windows.data(),
+                                  peer_windows.size() * sizeof(uintptr_t), cudaMemcpyHostToDevice));
   } catch (...) {
     if (state->device_peer_windows != nullptr) {
       cudaFree(state->device_peer_windows);
@@ -280,24 +242,19 @@ void release_buffers(LaunchBuffers* buffers) {
   }
 }
 
-void allocate_buffers(
-    const v2::V2Schedule& schedule,
-    LaunchBuffers* buffers) {
+void allocate_buffers(const v2::V2Schedule& schedule, LaunchBuffers* buffers) {
   try {
     if (!schedule.works.empty()) {
-      AWEX_CUDA_V2_CHECK(cudaMalloc(
-          reinterpret_cast<void**>(&buffers->works),
-          schedule.works.size() * sizeof(v2::V2Work)));
+      AWEX_CUDA_V2_CHECK(
+        cudaMalloc(reinterpret_cast<void**>(&buffers->works), schedule.works.size() * sizeof(v2::V2Work)));
     }
     if (!schedule.batches.empty()) {
-      AWEX_CUDA_V2_CHECK(cudaMalloc(
-          reinterpret_cast<void**>(&buffers->batches),
-          schedule.batches.size() * sizeof(v2::V2WorkBatch)));
+      AWEX_CUDA_V2_CHECK(
+        cudaMalloc(reinterpret_cast<void**>(&buffers->batches), schedule.batches.size() * sizeof(v2::V2WorkBatch)));
     }
     if (!schedule.channels.empty()) {
-      AWEX_CUDA_V2_CHECK(cudaMalloc(
-          reinterpret_cast<void**>(&buffers->channels),
-          schedule.channels.size() * sizeof(v2::V2ChannelQueue)));
+      AWEX_CUDA_V2_CHECK(cudaMalloc(reinterpret_cast<void**>(&buffers->channels),
+                                    schedule.channels.size() * sizeof(v2::V2ChannelQueue)));
     }
   } catch (...) {
     release_buffers(buffers);
@@ -305,23 +262,17 @@ void allocate_buffers(
   }
 }
 
-std::vector<v2::V2LoweringTask> build_tasks(
-    const DeviceState& state,
-    const py::list& tensors,
-    const std::vector<int64_t>& lengths,
-    const std::vector<int64_t>& tensor_offsets,
-    const std::vector<int64_t>& tensor_row_bytes,
-    const std::vector<int64_t>& tensor_row_strides,
-    const std::vector<int64_t>& peers,
-    const std::vector<int64_t>& ordinals,
-    const std::vector<int64_t>& expected_counts,
-    std::vector<std::uint32_t>* active_peers) {
-  if (tensors.size() != lengths.size() ||
-      tensors.size() != tensor_offsets.size() ||
-      tensors.size() != tensor_row_bytes.size() ||
-      tensors.size() != tensor_row_strides.size() ||
-      tensors.size() != peers.size() ||
-      tensors.size() != ordinals.size()) {
+std::vector<v2::V2LoweringTask> build_tasks(const DeviceState& state, const py::list& tensors,
+                                            const std::vector<int64_t>& lengths,
+                                            const std::vector<int64_t>& tensor_offsets,
+                                            const std::vector<int64_t>& tensor_row_bytes,
+                                            const std::vector<int64_t>& tensor_row_strides,
+                                            const std::vector<int64_t>& peers, const std::vector<int64_t>& ordinals,
+                                            const std::vector<int64_t>& expected_counts,
+                                            std::vector<std::uint32_t>* active_peers) {
+  if (tensors.size() != lengths.size() || tensors.size() != tensor_offsets.size() ||
+      tensors.size() != tensor_row_bytes.size() || tensors.size() != tensor_row_strides.size() ||
+      tensors.size() != peers.size() || tensors.size() != ordinals.size()) {
     throw std::runtime_error("nccl_device_v2 tensor/task descriptor lengths do not match");
   }
   if (expected_counts.size() != static_cast<std::size_t>(state.world_size)) {
@@ -330,8 +281,7 @@ std::vector<v2::V2LoweringTask> build_tasks(
 
   std::vector<std::uint32_t> expected(state.world_size, 0);
   for (int peer = 0; peer < state.world_size; ++peer) {
-    if (expected_counts[peer] < 0 ||
-        static_cast<std::uint64_t>(expected_counts[peer]) > UINT32_MAX) {
+    if (expected_counts[peer] < 0 || static_cast<std::uint64_t>(expected_counts[peer]) > UINT32_MAX) {
       throw std::runtime_error("nccl_device_v2 expected count is invalid");
     }
     expected[peer] = static_cast<std::uint32_t>(expected_counts[peer]);
@@ -354,8 +304,7 @@ std::vector<v2::V2LoweringTask> build_tasks(
     if (ordinal < 0 || static_cast<std::uint64_t>(ordinal) >= expected[peer]) {
       throw std::runtime_error("nccl_device_v2 task ordinal is invalid");
     }
-    if (lengths[index] < 0 || tensor_offsets[index] < 0 ||
-        tensor_row_bytes[index] <= 0 ||
+    if (lengths[index] < 0 || tensor_offsets[index] < 0 || tensor_row_bytes[index] <= 0 ||
         tensor_row_strides[index] < tensor_row_bytes[index]) {
       throw std::runtime_error("nccl_device_v2 task byte range is invalid");
     }
@@ -364,13 +313,13 @@ std::vector<v2::V2LoweringTask> build_tasks(
       active_peers->push_back(static_cast<std::uint32_t>(peer));
     }
     tasks.push_back(v2::V2LoweringTask{
-        reinterpret_cast<uintptr_t>(tensor.data_ptr()),
-        static_cast<std::uint64_t>(lengths[index]),
-        static_cast<std::uint64_t>(tensor_offsets[index]),
-        static_cast<std::uint64_t>(tensor_row_bytes[index]),
-        static_cast<std::uint64_t>(tensor_row_strides[index]),
-        static_cast<std::uint32_t>(peer),
-        static_cast<std::uint32_t>(ordinal),
+      reinterpret_cast<uintptr_t>(tensor.data_ptr()),
+      static_cast<std::uint64_t>(lengths[index]),
+      static_cast<std::uint64_t>(tensor_offsets[index]),
+      static_cast<std::uint64_t>(tensor_row_bytes[index]),
+      static_cast<std::uint64_t>(tensor_row_strides[index]),
+      static_cast<std::uint32_t>(peer),
+      static_cast<std::uint32_t>(ordinal),
     });
     ++actual[peer];
   }
@@ -380,18 +329,11 @@ std::vector<v2::V2LoweringTask> build_tasks(
   return tasks;
 }
 
-py::dict launch(
-    int64_t handle,
-    const py::list& tensors,
-    const std::vector<int64_t>& lengths,
-    const std::vector<int64_t>& tensor_offsets,
-    const std::vector<int64_t>& tensor_row_bytes,
-    const std::vector<int64_t>& tensor_row_strides,
-    const std::vector<int64_t>& peers,
-    const std::vector<int64_t>& ordinals,
-    const std::vector<int64_t>& expected_counts,
-    bool sender,
-    int64_t sequence) {
+py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64_t>& lengths,
+                const std::vector<int64_t>& tensor_offsets, const std::vector<int64_t>& tensor_row_bytes,
+                const std::vector<int64_t>& tensor_row_strides, const std::vector<int64_t>& peers,
+                const std::vector<int64_t>& ordinals, const std::vector<int64_t>& expected_counts, bool sender,
+                int64_t sequence) {
   using Clock = std::chrono::steady_clock;
   const auto launch_start = Clock::now();
   auto* state = reinterpret_cast<DeviceState*>(handle);
@@ -403,17 +345,8 @@ py::dict launch(
   }
 
   std::vector<std::uint32_t> active_peers;
-  const auto tasks = build_tasks(
-      *state,
-      tensors,
-      lengths,
-      tensor_offsets,
-      tensor_row_bytes,
-      tensor_row_strides,
-      peers,
-      ordinals,
-      expected_counts,
-      &active_peers);
+  const auto tasks = build_tasks(*state, tensors, lengths, tensor_offsets, tensor_row_bytes, tensor_row_strides, peers,
+                                 ordinals, expected_counts, &active_peers);
   v2::V2LoweringConfig config;
   config.world_size = static_cast<std::uint32_t>(state->world_size);
   config.max_channels = state->max_channels;
@@ -421,11 +354,8 @@ py::dict launch(
   config.chunk_bytes = state->chunk_bytes;
   config.step_bytes = state->step_bytes;
   config.initial_steps = state->next_steps;
-  const auto schedule = v2::lowerFixedTasks(
-      tasks,
-      active_peers,
-      sender ? v2::V2Direction::kSend : v2::V2Direction::kRecv,
-      config);
+  const auto schedule =
+    v2::lowerFixedTasks(tasks, active_peers, sender ? v2::V2Direction::kSend : v2::V2Direction::kRecv, config);
 
   py::dict metrics;
   metrics["work_count"] = py::int_(schedule.works.size());
@@ -441,8 +371,7 @@ py::dict launch(
   metrics["channel_limit"] = py::int_(state->max_channels);
   metrics["slot_bytes"] = py::int_(state->step_bytes);
   metrics["registered_window_bytes"] = py::int_(state->window_bytes);
-  metrics["host_lowering_time_ms"] =
-      std::chrono::duration<double, std::milli>(Clock::now() - launch_start).count();
+  metrics["host_lowering_time_ms"] = std::chrono::duration<double, std::milli>(Clock::now() - launch_start).count();
 
   AWEX_CUDA_V2_CHECK(cudaSetDevice(state->device));
   auto stream = at::cuda::getCurrentCUDAStream(state->device).stream();
@@ -450,68 +379,51 @@ py::dict launch(
   allocate_buffers(schedule, &buffers);
   try {
     if (!schedule.works.empty()) {
-      AWEX_CUDA_V2_CHECK(cudaMemcpyAsync(
-          buffers.works,
-          schedule.works.data(),
-          schedule.works.size() * sizeof(v2::V2Work),
-          cudaMemcpyHostToDevice,
-          stream));
+      AWEX_CUDA_V2_CHECK(cudaMemcpyAsync(buffers.works, schedule.works.data(),
+                                         schedule.works.size() * sizeof(v2::V2Work), cudaMemcpyHostToDevice, stream));
     }
     if (!schedule.batches.empty()) {
-      AWEX_CUDA_V2_CHECK(cudaMemcpyAsync(
-          buffers.batches,
-          schedule.batches.data(),
-          schedule.batches.size() * sizeof(v2::V2WorkBatch),
-          cudaMemcpyHostToDevice,
-          stream));
+      AWEX_CUDA_V2_CHECK(cudaMemcpyAsync(buffers.batches, schedule.batches.data(),
+                                         schedule.batches.size() * sizeof(v2::V2WorkBatch), cudaMemcpyHostToDevice,
+                                         stream));
     }
     if (!schedule.channels.empty()) {
-      AWEX_CUDA_V2_CHECK(cudaMemcpyAsync(
-          buffers.channels,
-          schedule.channels.data(),
-          schedule.channels.size() * sizeof(v2::V2ChannelQueue),
-          cudaMemcpyHostToDevice,
-          stream));
+      AWEX_CUDA_V2_CHECK(cudaMemcpyAsync(buffers.channels, schedule.channels.data(),
+                                         schedule.channels.size() * sizeof(v2::V2ChannelQueue), cudaMemcpyHostToDevice,
+                                         stream));
     }
     const auto metadata_done = Clock::now();
     metrics["metadata_upload_time_ms"] =
-        std::chrono::duration<double, std::milli>(metadata_done - launch_start).count();
+      std::chrono::duration<double, std::milli>(metadata_done - launch_start).count();
 
     const v2::V2KernelArgs args{
-        buffers.works,
-        buffers.batches,
-        buffers.channels,
-        schedule.channel_count,
-        static_cast<std::uint32_t>(state->rank),
-        static_cast<std::uint32_t>(state->world_size),
-        state->layout,
-        reinterpret_cast<std::uint8_t*>(state->local_base),
-        state->device_peer_windows,
-        static_cast<unsigned long long>(sequence),
-        state->timeout_cycles,
+      buffers.works,
+      buffers.batches,
+      buffers.channels,
+      schedule.channel_count,
+      static_cast<std::uint32_t>(state->rank),
+      static_cast<std::uint32_t>(state->world_size),
+      state->layout,
+      reinterpret_cast<std::uint8_t*>(state->local_base),
+      state->device_peer_windows,
+      static_cast<unsigned long long>(sequence),
+      state->timeout_cycles,
     };
     const auto kernel_start = Clock::now();
     AWEX_CUDA_V2_CHECK(v2::launchDeviceV2(args, stream));
     AWEX_CUDA_V2_CHECK(cudaStreamSynchronize(stream));
-    metrics["kernel_transfer_time_ms"] =
-        std::chrono::duration<double, std::milli>(Clock::now() - kernel_start).count();
+    metrics["kernel_transfer_time_ms"] = std::chrono::duration<double, std::milli>(Clock::now() - kernel_start).count();
 
     v2::V2WindowHeader header{};
-    AWEX_CUDA_V2_CHECK(cudaMemcpy(
-        &header,
-        state->local_base,
-        sizeof(header),
-        cudaMemcpyDeviceToHost));
+    AWEX_CUDA_V2_CHECK(cudaMemcpy(&header, state->local_base, sizeof(header), cudaMemcpyDeviceToHost));
     if (header.error != 0) {
       throw std::runtime_error(
-          "nccl_device_v2 kernel aborted while waiting for the peer (error=" +
-          std::to_string(header.error) + ")");
+        "nccl_device_v2 kernel aborted while waiting for the peer (error=" + std::to_string(header.error) + ")");
     }
     state->next_steps = schedule.next_steps;
     state->last_sequence = static_cast<std::uint64_t>(sequence);
     metrics["next_step"] = py::int_(schedule.next_step);
-    metrics["extension_total_time_ms"] =
-        std::chrono::duration<double, std::milli>(Clock::now() - launch_start).count();
+    metrics["extension_total_time_ms"] = std::chrono::duration<double, std::milli>(Clock::now() - launch_start).count();
     release_buffers(&buffers);
   } catch (...) {
     release_buffers(&buffers);
@@ -527,37 +439,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.def("get_unique_id", []() {
     ncclUniqueId unique_id;
     AWEX_NCCL_V2_CHECK(ncclGetUniqueId(&unique_id));
-    return py::bytes(
-        reinterpret_cast<const char*>(&unique_id),
-        sizeof(unique_id));
+    return py::bytes(reinterpret_cast<const char*>(&unique_id), sizeof(unique_id));
   });
-  module.def(
-      "create",
-      [](const py::bytes& id,
-         int world_size,
-         int rank,
-         int device,
-         int timeout_ms,
-         int max_channels,
-         int fifo_depth,
-         int64_t step_bytes,
-         int64_t chunk_bytes) {
-        if (step_bytes <= 0 || chunk_bytes < 0) {
-          throw std::runtime_error("invalid nccl_device_v2 step/chunk bytes");
-        }
-        const std::string unique_id = id;
-        auto state = make_state(
-            unique_id,
-            world_size,
-            rank,
-            device,
-            timeout_ms,
-            static_cast<std::uint32_t>(max_channels),
-            static_cast<std::uint32_t>(fifo_depth),
-            static_cast<std::size_t>(step_bytes),
-            static_cast<std::size_t>(chunk_bytes));
-        return reinterpret_cast<int64_t>(state.release());
-      });
+  module.def("create", [](const py::bytes& id, int world_size, int rank, int device, int timeout_ms, int max_channels,
+                          int fifo_depth, int64_t step_bytes, int64_t chunk_bytes) {
+    if (step_bytes <= 0 || chunk_bytes < 0) {
+      throw std::runtime_error("invalid nccl_device_v2 step/chunk bytes");
+    }
+    const std::string unique_id = id;
+    auto state = make_state(unique_id, world_size, rank, device, timeout_ms, static_cast<std::uint32_t>(max_channels),
+                            static_cast<std::uint32_t>(fifo_depth), static_cast<std::size_t>(step_bytes),
+                            static_cast<std::size_t>(chunk_bytes));
+    return reinterpret_cast<int64_t>(state.release());
+  });
   module.def("launch", &launch);
   module.def("destroy", [](int64_t handle) {
     auto* state = reinterpret_cast<DeviceState*>(handle);

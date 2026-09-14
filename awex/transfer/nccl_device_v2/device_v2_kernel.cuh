@@ -62,8 +62,7 @@ __device__ __forceinline__ void v2RunSend(const V2KernelArgs& args, const V2Work
     const std::uint64_t slice_bytes =
       args.layout.slot_bytes < part_bytes - cursor ? args.layout.slot_bytes : part_bytes - cursor;
     V2FifoSlot* slot = v2FifoSlot(args, work.peer, args.local_rank, channel, step, false);
-    if (tid == 0)
-      *group_ready = v2WaitFree(slot, step, args.layout.fifo_depth, error, args.timeout_cycles);
+    if (tid == 0) *group_ready = v2WaitFree(slot, step, args.layout.fifo_depth, error, args.timeout_cycles);
     v2GroupBarrier(group, nthreads);
     if (!*group_ready) return;
 

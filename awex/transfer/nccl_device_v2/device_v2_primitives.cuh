@@ -98,10 +98,7 @@ __device__ __forceinline__ V2Pack128 v2Load128(const void* address) {
 }
 
 __device__ __forceinline__ void v2Store128(void* address, const V2Pack128& value) {
-  asm volatile("st.global.v2.u64 [%0], {%1,%2};"
-               :
-               : "l"(address), "l"(value.first), "l"(value.second)
-               : "memory");
+  asm volatile("st.global.v2.u64 [%0], {%1,%2};" : : "l"(address), "l"(value.first), "l"(value.second) : "memory");
 }
 
 __device__ __forceinline__ V2FifoSlot* v2FifoSlot(const V2KernelArgs& args, std::uint32_t window_rank,
