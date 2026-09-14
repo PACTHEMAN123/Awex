@@ -97,12 +97,12 @@ def main() -> None:
             )
         if metrics["topology_requested_channels_per_peer"] != 64:
             raise AssertionError(f"expected 64 requested channels, got {dict(metrics)}")
-        if metrics["topology_channels_per_peer"] != 32:
+        if metrics["topology_channels_per_peer"] != 64:
             raise AssertionError(
-                f"expected 32 effective topology channels, got {dict(metrics)}"
+                f"expected 64 effective topology channels, got {dict(metrics)}"
             )
-        if metrics["channel_count"] != 16:
-            raise AssertionError(f"expected 16 active channels, got {dict(metrics)}")
+        if metrics["channel_count"] != 32:
+            raise AssertionError(f"expected 32 active channels, got {dict(metrics)}")
         if metrics["fragment_count"] <= metrics["work_count"]:
             raise AssertionError(
                 f"expected a chunk crossing tensor spans, got {dict(metrics)}"

@@ -385,17 +385,14 @@ inline V2Topology discoverV2Topology(ncclComm_t comm, int world_size, int rank, 
         communicator_raw_channels = std::min(communicator_raw_channels, raw_channels);
       }
     }
-    // NCCL rounds the path demand up, then caps it by the communicator's
-    // channel pool. Its public communicator properties do not expose that
-    // internal pool, so v2 derives a non-oversubscribed pool from the same
-    // path bandwidth budget by rounding the raw capacity down.
+    // Keep the topology demand separate from the user/SM channel ceiling.
+    // NCCL's internal comm->nChannels is not exposed by its public API and is
+    // not a suitable execution cap for this backend's different CTA shape.
     communicator_raw_channels = std::max<std::uint32_t>(1, communicator_raw_channels);
-    topology.requested_channels_per_peer = std::min(channel_ceiling, powerOfTwoUp(communicator_raw_channels));
-    topology.total_channels = std::min(channel_ceiling, powerOfTwoDown(communicator_raw_channels));
+    topology.requested_channels_per_peer = powerOfTwoUp(communicator_raw_channels);
     topology.channels_per_peer = std::min(topology.total_channels, topology.requested_channels_per_peer);
     for (int peer = 0; peer < world_size; ++peer) {
       if (peer != rank) {
-        topology.peer_paths[peer].channels = std::min(topology.peer_paths[peer].channels, topology.total_channels);
         topology.peer_channels[peer] = topology.channels_per_peer;
       }
     }

@@ -28,9 +28,11 @@ For intra-node SIMPLE traffic, work channel count follows NCCL's
 `addP2pToPlan` sizing: `minPartSize = stepSize / 8`,
 `maxPartSize = stepSize * 32`. The topology layer mirrors NCCL's NVLink path
 formula, `2 * max(1, pathBandwidth / linkBandwidth)`. It rounds the per-peer
-path demand up to a power of two, derives the non-oversubscribed communicator
-pool by rounding the raw bandwidth capacity down, and caps the peer demand by
-that pool. Both values are exposed in launch metrics. Work groups use CUDA named barriers,
+path demand up to a power of two, then caps it by the configured channel
+ceiling and the device's SM capacity. The raw, requested, and effective values
+are exposed in launch metrics. NCCL's internal collective-graph channel count
+is not used as a v2 execution cap because this backend has a different CTA
+shape. Work groups use CUDA named barriers,
 leaving barrier 0 to CTA-wide synchronization. When a work has at least three
 warps, its final warp is reserved for the Post role so it can publish the
 previous step while worker warps begin the next one.
