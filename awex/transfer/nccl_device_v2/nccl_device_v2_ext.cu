@@ -402,15 +402,19 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
   metrics["vector_bytes"] = py::int_(v2::kCopyPackBytes);
   metrics["copy_unroll"] = py::int_(v2::kCopyUnroll);
   metrics["channel_limit"] = py::int_(state->total_channels);
+  metrics["topology_requested_channels_per_peer"] = py::int_(state->topology.requested_channels_per_peer);
   metrics["topology_channels_per_peer"] = py::int_(state->topology.channels_per_peer);
   metrics["topology_nvml_available"] = py::bool_(state->topology.nvml_available);
   std::uint32_t active_nvlink_count = 0;
+  std::uint32_t active_raw_channels = 0;
   float active_path_bandwidth_gbps = 0.0F;
   for (const std::uint32_t peer : active_peers) {
     active_nvlink_count = std::max(active_nvlink_count, state->topology.peer_paths[peer].nvlink_count);
+    active_raw_channels = std::max(active_raw_channels, state->topology.peer_paths[peer].raw_channels);
     active_path_bandwidth_gbps = std::max(active_path_bandwidth_gbps, state->topology.peer_paths[peer].bandwidth_gbps);
   }
   metrics["topology_nvlink_count"] = py::int_(active_nvlink_count);
+  metrics["topology_raw_channels"] = py::int_(active_raw_channels);
   metrics["topology_path_bandwidth_gbps"] = py::float_(active_path_bandwidth_gbps);
   metrics["slot_bytes"] = py::int_(state->step_bytes);
   metrics["registered_window_bytes"] = py::int_(state->window_bytes);

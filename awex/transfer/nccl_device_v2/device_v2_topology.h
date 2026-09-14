@@ -39,6 +39,7 @@ namespace nccl_device_v2 {
 
 struct V2PeerPath {
   std::uint32_t nvlink_count = 0;
+  std::uint32_t raw_channels = 2;
   std::uint32_t channels = 2;
   float bandwidth_gbps = 0.0F;
 };
@@ -46,6 +47,7 @@ struct V2PeerPath {
 struct V2Topology {
   bool nvml_available = false;
   std::uint32_t total_channels = 1;
+  std::uint32_t requested_channels_per_peer = 1;
   std::uint32_t channels_per_peer = 1;
   std::vector<std::uint32_t> peer_channels;
   std::vector<V2PeerPath> peer_paths;
@@ -311,8 +313,9 @@ inline V2Topology discoverV2Topology(ncclComm_t comm, int world_size, int rank, 
                                      std::uint32_t channel_limit) {
   using namespace topology_detail;
   V2Topology topology;
-  topology.total_channels =
+  const std::uint32_t channel_ceiling =
     powerOfTwoDown(std::max<std::uint32_t>(1, std::min(channel_limit, static_cast<std::uint32_t>(kMaxChannels))));
+  topology.total_channels = channel_ceiling;
   topology.peer_channels.assign(world_size, 1);
   topology.peer_paths.resize(world_size);
 
@@ -362,15 +365,14 @@ inline V2Topology discoverV2Topology(ncclComm_t comm, int world_size, int rank, 
       V2PeerPath path;
       path.nvlink_count = links;
       path.bandwidth_gbps = links * link_bw;
-      const std::uint32_t raw_channels =
-        links == 0 ? 2 : 2 * std::max(1, static_cast<int>(path.bandwidth_gbps / link_bw));
-      path.channels = std::min(topology.total_channels, powerOfTwoUp(raw_channels));
+      path.raw_channels = links == 0 ? 2 : 2 * std::max(1, static_cast<int>(path.bandwidth_gbps / link_bw));
+      path.channels = std::min(channel_ceiling, powerOfTwoUp(path.raw_channels));
       topology.peer_paths[peer] = path;
     }
 
     // NCCL uses the communicator-wide minimum so both ends of every peer pair
     // choose the same p2pnChannelsPerPeer value.
-    std::uint32_t communicator_channels = topology.total_channels;
+    std::uint32_t communicator_raw_channels = kMaxChannels;
     for (int source = 0; source < world_size; ++source) {
       for (int peer = source + 1; peer < world_size; ++peer) {
         const std::uint32_t links =
@@ -380,13 +382,22 @@ inline V2Topology discoverV2Topology(ncclComm_t comm, int world_size, int rank, 
                                        nvlinkBandwidth(static_cast<int>(records[peer].compute_capability)));
         const float path_bw = links * link_bw;
         const std::uint32_t raw_channels = links == 0 ? 2 : 2 * std::max(1, static_cast<int>(path_bw / link_bw));
-        communicator_channels =
-          std::min(communicator_channels, std::min(topology.total_channels, powerOfTwoUp(raw_channels)));
+        communicator_raw_channels = std::min(communicator_raw_channels, raw_channels);
       }
     }
-    topology.channels_per_peer = std::max<std::uint32_t>(1, communicator_channels);
+    // NCCL rounds the path demand up, then caps it by the communicator's
+    // channel pool. Its public communicator properties do not expose that
+    // internal pool, so v2 derives a non-oversubscribed pool from the same
+    // path bandwidth budget by rounding the raw capacity down.
+    communicator_raw_channels = std::max<std::uint32_t>(1, communicator_raw_channels);
+    topology.requested_channels_per_peer = std::min(channel_ceiling, powerOfTwoUp(communicator_raw_channels));
+    topology.total_channels = std::min(channel_ceiling, powerOfTwoDown(communicator_raw_channels));
+    topology.channels_per_peer = std::min(topology.total_channels, topology.requested_channels_per_peer);
     for (int peer = 0; peer < world_size; ++peer) {
-      if (peer != rank) topology.peer_channels[peer] = topology.channels_per_peer;
+      if (peer != rank) {
+        topology.peer_paths[peer].channels = std::min(topology.peer_paths[peer].channels, topology.total_channels);
+        topology.peer_channels[peer] = topology.channels_per_peer;
+      }
     }
     checkCuda(cudaStreamDestroy(stream), "cudaStreamDestroy(topology)");
     return topology;
