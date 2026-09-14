@@ -71,24 +71,35 @@ def main() -> None:
         4 * 1024 * 1024,
     )
     try:
-        metrics = extension.launch(
-            handle,
-            tensors,
-            list(_TENSOR_BYTES),
-            [0] * len(tensors),
-            list(_TENSOR_BYTES),
-            list(_TENSOR_BYTES),
-            [peer] * len(tensors),
-            list(range(len(tensors))),
-            [len(tensors), 0] if rank == 1 else [0, len(tensors)],
-            rank == 0,
-            1,
-        )
-        dist.barrier()
-        if rank == 1:
-            for index, tensor in enumerate(tensors):
-                if not torch.all(tensor == _PATTERNS[index]).item():
-                    raise AssertionError(f"payload mismatch in tensor {index}")
+        launch_metrics = []
+        for sequence in (1, 2):
+            if rank == 1 and sequence > 1:
+                for tensor in tensors:
+                    tensor.zero_()
+            dist.barrier()
+            metrics = extension.launch(
+                handle,
+                tensors,
+                list(_TENSOR_BYTES),
+                [0] * len(tensors),
+                list(_TENSOR_BYTES),
+                list(_TENSOR_BYTES),
+                [peer] * len(tensors),
+                list(range(len(tensors))),
+                [len(tensors), 0] if rank == 1 else [0, len(tensors)],
+                rank == 0,
+                sequence,
+            )
+            launch_metrics.append(metrics)
+            dist.barrier()
+            if rank == 1:
+                for index, tensor in enumerate(tensors):
+                    if not torch.all(tensor == _PATTERNS[index]).item():
+                        raise AssertionError(
+                            f"payload mismatch in tensor {index} at sequence {sequence}"
+                        )
+
+        metrics = launch_metrics[-1]
         if metrics["topology_nvlink_count"] != 18:
             raise AssertionError(f"expected NV18 topology, got {dict(metrics)}")
         if metrics["topology_raw_channels"] != 36:
@@ -103,12 +114,35 @@ def main() -> None:
             )
         if metrics["channel_count"] != 32:
             raise AssertionError(f"expected 32 active channels, got {dict(metrics)}")
+        if metrics["threads_per_channel"] != 672:
+            raise AssertionError(f"expected 672 channel threads, got {dict(metrics)}")
+        if metrics["warps_per_channel"] != 21:
+            raise AssertionError(f"expected 21 channel warps, got {dict(metrics)}")
+        expected_payload_peers = 1 if rank == 0 else 0
+        if metrics["payload_peer_count"] != expected_payload_peers:
+            raise AssertionError(
+                f"expected {expected_payload_peers} payload peers, got {dict(metrics)}"
+            )
+        if metrics["registered_window_bytes"] >= metrics["dense_window_bytes"]:
+            raise AssertionError(f"expected a sparse window, got {dict(metrics)}")
+        if launch_metrics[0]["plan_cache_hit"]:
+            raise AssertionError(f"first launch unexpectedly hit cache: {dict(metrics)}")
+        if not launch_metrics[1]["plan_cache_hit"]:
+            raise AssertionError(f"second launch missed cache: {dict(metrics)}")
+        if launch_metrics[1]["host_lowering_time_ms"] != 0.0:
+            raise AssertionError(f"cached launch repeated lowering: {dict(metrics)}")
+        if launch_metrics[1]["metadata_upload_time_ms"] != 0.0:
+            raise AssertionError(f"cached launch repeated metadata upload: {dict(metrics)}")
         if metrics["fragment_count"] <= metrics["work_count"]:
             raise AssertionError(
                 f"expected a chunk crossing tensor spans, got {dict(metrics)}"
             )
         dist.barrier()
-        print(f"rank={rank} metrics={dict(metrics)}", flush=True)
+        print(
+            f"rank={rank} first={dict(launch_metrics[0])} "
+            f"cached={dict(launch_metrics[1])}",
+            flush=True,
+        )
     finally:
         extension.destroy(handle)
         dist.destroy_process_group()

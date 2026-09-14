@@ -23,92 +23,98 @@ namespace awex {
 namespace nccl_device_v2 {
 
 struct V2BatchShared {
-  int ready[kMaxWorksPerBatch];
-  unsigned long long step_cache[kMaxWorksPerBatch];
+  volatile unsigned long long ready_steps[kMaxWorksPerBatch];
+  unsigned int completed_worker_warps[kMaxWorksPerBatch];
 };
 
-__device__ __forceinline__ std::uint32_t v2Roles(V2Direction direction, int tid, int nthreads, int* nworkers) {
-  const bool send = direction == V2Direction::kSend;
-  *nworkers = nthreads - (nthreads >= 3 * kWarpSize ? kWarpSize : 0);
-  std::uint32_t roles = tid < *nworkers ? kRoleWorker : 0;
-  if (tid == 0) roles |= send ? kRoleWaitSend : kRoleWaitRecv;
-  if (tid == nthreads - 1) roles |= send ? kRolePostSend : kRolePostRecv;
-  return roles;
+__device__ __forceinline__ int v2WorkerWarps(std::uint32_t group, std::uint32_t work_count) {
+  return kWorkerWarpsPerBlock / work_count + (group < kWorkerWarpsPerBlock % work_count ? 1 : 0);
 }
 
-// In read mode the producer owns the FIFO payload. The sender only writes its
-// local window; the receiver performs the NVLink read and returns credits by
-// writing consumed_step back into the sender's window.
-__device__ __forceinline__ void v2RunSend(const V2KernelArgs& args, const V2Work& work, std::uint32_t channel, int tid,
-                                          int nthreads, int main_barrier, int wait_barrier, int* ready,
-                                          unsigned long long* step_cache) {
-  int nworkers = 0;
-  const std::uint32_t roles = v2Roles(V2Direction::kSend, tid, nthreads, &nworkers);
+__device__ __forceinline__ int v2WorkerWarpBegin(std::uint32_t group, std::uint32_t work_count) {
+  const int base = kWorkerWarpsPerBlock / work_count;
+  const int remainder = kWorkerWarpsPerBlock % work_count;
+  return 1 + static_cast<int>(group) * base +
+         (static_cast<int>(group) < remainder ? static_cast<int>(group) : remainder);
+}
+
+__device__ __forceinline__ void v2WaitWork(const V2KernelArgs& args, const V2Work& work, std::uint32_t channel,
+                                           std::uint32_t group, V2BatchShared* shared) {
   auto* error = &reinterpret_cast<V2WindowHeader*>(args.local_window)->error;
+  unsigned long long step_cache = 0;
   std::uint64_t cursor = 0;
   std::uint64_t step = work.step_begin;
   while (cursor < work.nbytes) {
-    const std::uint64_t slice_bytes =
-      args.layout.slot_bytes < work.nbytes - cursor ? args.layout.slot_bytes : work.nbytes - cursor;
-    V2FifoSlot* slot = v2FifoSlot(args, args.local_rank, work.peer, channel, step, true);
-    if (roles & kRoleWaitSend) {
-      *ready = v2WaitFree(slot, step, args.layout.fifo_depth, step_cache, error, args.timeout_cycles);
-    }
-    if (roles & kRoleWorker) {
-      v2GroupBarrier(wait_barrier, nworkers);
-      if (*ready) {
-        std::uint8_t* payload = v2FifoPayload(args, args.local_rank, work.peer, channel, step, true);
-        v2CopyFragmentsToContiguous(args, work, payload, cursor, slice_bytes, tid, nworkers);
-      }
-    }
-
-    // The post warp is not a worker for sufficiently wide groups. After this
-    // barrier, workers can start the next step while RolePostSend fences and
-    // publishes the step that has just completed.
-    v2GroupBarrier(main_barrier, nthreads);
-    if ((roles & kRolePostSend) && v2LoadError(error) == 0) {
-      slot->bytes = static_cast<std::uint32_t>(slice_bytes);
-      v2Publish(&slot->ready_step, step);
-    }
-    if (v2LoadError(error) != 0) return;
-    cursor += slice_bytes;
+    V2FifoSlot* slot = args.direction == V2Direction::kSend
+                         ? v2FifoSlot(args, args.local_rank, work.peer, channel, step, true)
+                         : v2FifoSlot(args, work.peer, args.local_rank, channel, step, false);
+    const bool ready = args.direction == V2Direction::kSend
+                         ? v2WaitFree(slot, step, args.layout.fifo_depth, &step_cache, error, args.timeout_cycles)
+                         : v2WaitReady(&slot->ready_step, step, &step_cache, error, args.timeout_cycles);
+    if (!ready) break;
+    __threadfence_block();
+    shared->ready_steps[group] = step;
+    cursor += args.layout.slot_bytes < work.nbytes - cursor ? args.layout.slot_bytes : work.nbytes - cursor;
     ++step;
   }
 
-  if (work.final && work.nbytes != 0) {
+  if (args.direction == V2Direction::kSend && work.final && work.nbytes != 0 && v2LoadError(error) == 0) {
     V2FifoSlot* slot = v2FifoSlot(args, args.local_rank, work.peer, channel, step - 1, true);
-    if (roles & kRoleWaitSend) {
-      *ready = v2WaitConsumed(slot, step - 1, step_cache, error, args.timeout_cycles);
-    }
-    v2GroupBarrier(main_barrier, nthreads);
+    v2WaitConsumed(slot, step - 1, &step_cache, error, args.timeout_cycles);
   }
 }
 
-__device__ __forceinline__ void v2RunRecv(const V2KernelArgs& args, const V2Work& work, std::uint32_t channel, int tid,
-                                          int nthreads, int barrier, int* ready, unsigned long long* step_cache) {
-  int nworkers = 0;
-  const std::uint32_t roles = v2Roles(V2Direction::kRecv, tid, nthreads, &nworkers);
+__device__ __forceinline__ void v2CopyWork(const V2KernelArgs& args, const V2Work& work, std::uint32_t channel,
+                                           std::uint32_t group, int subtid, int nworkers, V2BatchShared* shared) {
   auto* error = &reinterpret_cast<V2WindowHeader*>(args.local_window)->error;
   std::uint64_t cursor = 0;
   std::uint64_t step = work.step_begin;
   while (cursor < work.nbytes) {
+    while (shared->ready_steps[group] < step && v2LoadError(error) == 0) {
+    }
+    if (v2LoadError(error) != 0) break;
+
     const std::uint64_t slice_bytes =
       args.layout.slot_bytes < work.nbytes - cursor ? args.layout.slot_bytes : work.nbytes - cursor;
-    V2FifoSlot* slot = v2FifoSlot(args, work.peer, args.local_rank, channel, step, false);
-    if (roles & kRoleWaitRecv) {
-      *ready = v2WaitReady(&slot->ready_step, step, step_cache, error, args.timeout_cycles);
-    }
-    v2GroupBarrier(barrier, nthreads);
-    if (*ready && (roles & kRoleWorker)) {
+    if (args.direction == V2Direction::kSend) {
+      std::uint8_t* payload = v2FifoPayload(args, args.local_rank, work.peer, channel, step, true);
+      v2CopyFragmentsToContiguous(args, work, payload, cursor, slice_bytes, subtid, nworkers);
+    } else {
       const std::uint8_t* payload = v2FifoPayload(args, work.peer, args.local_rank, channel, step, false);
-      v2CopyContiguousToFragments(args, work, payload, cursor, slice_bytes, tid, nworkers);
+      v2CopyContiguousToFragments(args, work, payload, cursor, slice_bytes, subtid, nworkers);
     }
-
-    v2GroupBarrier(barrier, nthreads);
-    if ((roles & kRolePostRecv) && v2LoadError(error) == 0) v2Publish(&slot->consumed_step, step);
-    if (v2LoadError(error) != 0) return;
+    __syncwarp();
+    if (subtid % kWarpSize == 0) {
+      __threadfence_block();
+      atomicAdd_block(&shared->completed_worker_warps[group], 1U);
+    }
     cursor += slice_bytes;
     ++step;
+  }
+}
+
+__device__ __forceinline__ void v2PostWork(const V2KernelArgs& args, const V2Work& work, std::uint32_t channel,
+                                           std::uint32_t group, std::uint32_t worker_warps, V2BatchShared* shared) {
+  auto* error = &reinterpret_cast<V2WindowHeader*>(args.local_window)->error;
+  unsigned int completed_target = worker_warps;
+  std::uint64_t cursor = 0;
+  std::uint64_t step = work.step_begin;
+  while (cursor < work.nbytes) {
+    while (atomicAdd_block(&shared->completed_worker_warps[group], 0U) < completed_target &&
+           v2LoadError(error) == 0) {
+    }
+    if (v2LoadError(error) != 0) break;
+
+    const std::uint64_t slice_bytes =
+      args.layout.slot_bytes < work.nbytes - cursor ? args.layout.slot_bytes : work.nbytes - cursor;
+    V2FifoSlot* slot = args.direction == V2Direction::kSend
+                         ? v2FifoSlot(args, args.local_rank, work.peer, channel, step, true)
+                         : v2FifoSlot(args, work.peer, args.local_rank, channel, step, false);
+    if (args.direction == V2Direction::kSend) slot->bytes = static_cast<std::uint32_t>(slice_bytes);
+    v2Publish(args.direction == V2Direction::kSend ? &slot->ready_step : &slot->consumed_step, step);
+    cursor += slice_bytes;
+    ++step;
+    completed_target += worker_warps;
   }
 }
 
@@ -117,27 +123,28 @@ __device__ __forceinline__ void v2RunBatch(const V2KernelArgs& args, const V2Wor
   const int tid = threadIdx.x;
   const int wid = tid / kWarpSize;
   const int lane = tid % kWarpSize;
-  const int warps_per_work = kWarpsPerBlock / batch.work_count;
-  const int group = wid / warps_per_work;
-  if (group < batch.work_count) {
-    const int subtid = (wid - group * warps_per_work) * kWarpSize + lane;
-    const int subthreads = warps_per_work * kWarpSize;
-    const bool extra_send_barrier = args.direction == V2Direction::kSend && subthreads >= 3 * kWarpSize;
-    const int barrier_width = extra_send_barrier ? 2 : 1;
-    const int main_barrier = 1 + group * barrier_width;
-    const int wait_barrier = extra_send_barrier ? main_barrier + 1 : main_barrier;
-    if (subtid == 0) {
-      shared.ready[group] = 1;
-      shared.step_cache[group] = 0;
-    }
-    v2GroupBarrier(main_barrier, subthreads);
+  if (tid < kMaxWorksPerBatch) {
+    shared.ready_steps[tid] = 0;
+    shared.completed_worker_warps[tid] = 0;
+  }
+  __syncthreads();
 
-    const V2Work& work = args.works[batch.work_begin + group];
-    if (args.direction == V2Direction::kSend) {
-      v2RunSend(args, work, channel, subtid, subthreads, main_barrier, wait_barrier, &shared.ready[group],
-                &shared.step_cache[group]);
-    } else {
-      v2RunRecv(args, work, channel, subtid, subthreads, main_barrier, &shared.ready[group], &shared.step_cache[group]);
+  if (wid == 0 && lane < batch.work_count) {
+    const V2Work& work = args.works[batch.work_begin + lane];
+    v2WaitWork(args, work, channel, lane, &shared);
+  } else if (wid == kWarpsPerBlock - 1 && lane < batch.work_count) {
+    const V2Work& work = args.works[batch.work_begin + lane];
+    v2PostWork(args, work, channel, lane, v2WorkerWarps(lane, batch.work_count), &shared);
+  } else if (wid > 0 && wid < kWarpsPerBlock - 1) {
+    for (std::uint32_t group = 0; group < batch.work_count; ++group) {
+      const int worker_begin = v2WorkerWarpBegin(group, batch.work_count);
+      const int worker_warps = v2WorkerWarps(group, batch.work_count);
+      if (wid >= worker_begin && wid < worker_begin + worker_warps) {
+        const int subtid = (wid - worker_begin) * kWarpSize + lane;
+        const V2Work& work = args.works[batch.work_begin + group];
+        v2CopyWork(args, work, channel, group, subtid, worker_warps * kWarpSize, &shared);
+        break;
+      }
     }
   }
   __syncthreads();

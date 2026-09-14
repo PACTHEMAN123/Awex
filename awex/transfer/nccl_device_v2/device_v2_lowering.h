@@ -67,19 +67,26 @@ struct V2Schedule {
 };
 
 inline V2WindowLayout makeV2WindowLayout(std::uint32_t world_size, std::uint32_t channel_count,
-                                         std::uint32_t fifo_depth, std::size_t slot_bytes) {
+                                         std::uint32_t fifo_depth, std::size_t slot_bytes,
+                                         std::uint32_t payload_peer_count) {
   if (world_size == 0 || channel_count == 0 || fifo_depth == 0 || slot_bytes == 0) {
     throw std::invalid_argument("invalid v2 window dimensions");
   }
-  const std::size_t connection_count = static_cast<std::size_t>(world_size) * channel_count;
-  const std::size_t slot_count = connection_count * fifo_depth;
+  if (payload_peer_count > world_size) {
+    throw std::invalid_argument("invalid v2 payload peer count");
+  }
+  const std::size_t state_connection_count = static_cast<std::size_t>(world_size) * channel_count;
+  const std::size_t state_slot_count = state_connection_count * fifo_depth;
+  const std::size_t payload_connection_count = static_cast<std::size_t>(payload_peer_count) * channel_count;
+  const std::size_t payload_slot_count = payload_connection_count * fifo_depth;
   const std::size_t state_offset = ((sizeof(V2WindowHeader) + kFifoAlignment - 1) / kFifoAlignment) * kFifoAlignment;
   const std::size_t payload_offset =
-    ((state_offset + slot_count * sizeof(V2FifoSlot) + kFifoAlignment - 1) / kFifoAlignment) * kFifoAlignment;
+    ((state_offset + state_slot_count * sizeof(V2FifoSlot) + kFifoAlignment - 1) / kFifoAlignment) * kFifoAlignment;
   const std::size_t window_bytes =
-    ((payload_offset + slot_count * slot_bytes + kWindowAlignment - 1) / kWindowAlignment) * kWindowAlignment;
+    ((payload_offset + payload_slot_count * slot_bytes + kWindowAlignment - 1) / kWindowAlignment) *
+    kWindowAlignment;
   return V2WindowLayout{
-    state_offset, payload_offset, slot_bytes, fifo_depth, channel_count, world_size, window_bytes,
+    state_offset, payload_offset, slot_bytes, fifo_depth, channel_count, world_size, payload_peer_count, window_bytes,
   };
 }
 

@@ -27,14 +27,6 @@ struct alignas(16) V2Pack128 {
   unsigned long long second;
 };
 
-enum V2Role : std::uint32_t {
-  kRoleWorker = 1U << 0,
-  kRoleWaitSend = 1U << 1,
-  kRoleWaitRecv = 1U << 2,
-  kRolePostSend = 1U << 3,
-  kRolePostRecv = 1U << 4,
-};
-
 __device__ __forceinline__ unsigned long long v2LoadStep(const volatile unsigned long long* address) {
   unsigned long long value;
   asm volatile("ld.volatile.global.u64 %0, [%1];" : "=l"(value) : "l"(address) : "memory");
@@ -111,14 +103,6 @@ __device__ __forceinline__ void v2Publish(volatile unsigned long long* address, 
   v2StoreStep(address, step);
 }
 
-__device__ __forceinline__ void v2GroupBarrier(int barrier, int nthreads) {
-  if (nthreads == kWarpSize) {
-    __syncwarp();
-  } else {
-    asm volatile("barrier.sync.aligned %0, %1;" : : "r"(barrier), "r"(nthreads) : "memory");
-  }
-}
-
 __device__ __forceinline__ V2Pack128 v2Load128(const void* address) {
   V2Pack128 value;
   asm volatile("ld.volatile.global.v2.u64 {%0,%1}, [%2];"
@@ -156,7 +140,9 @@ __device__ __forceinline__ std::uint8_t* v2FifoPayload(const V2KernelArgs& args,
                                                        std::uint32_t connection_rank, std::uint32_t channel,
                                                        unsigned long long step, bool local_window) {
   auto* window = local_window ? args.local_window : reinterpret_cast<std::uint8_t*>(args.peer_windows[window_rank]);
-  const std::size_t connection = (static_cast<std::size_t>(connection_rank) * args.layout.channel_count) + channel;
+  const std::uint32_t payload_peer =
+    args.payload_peer_slots[static_cast<std::size_t>(window_rank) * args.world_size + connection_rank];
+  const std::size_t connection = (static_cast<std::size_t>(payload_peer) * args.layout.channel_count) + channel;
   const std::size_t slot =
     connection * args.layout.fifo_depth + static_cast<std::size_t>(step % args.layout.fifo_depth);
   return window + args.layout.payload_offset + slot * args.layout.slot_bytes;
