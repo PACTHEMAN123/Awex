@@ -23,7 +23,7 @@ namespace awex {
 namespace nccl_device_v2 {
 
 struct V2BatchShared {
-  volatile unsigned long long ready_steps[kMaxWorksPerBatch];
+  unsigned long long ready_steps[kMaxWorksPerBatch];
   unsigned int completed_worker_warps[kMaxWorksPerBatch];
 };
 
@@ -53,7 +53,7 @@ __device__ __forceinline__ void v2WaitWork(const V2KernelArgs& args, const V2Wor
                          : v2WaitReady(&slot->ready_step, step, &step_cache, error, args.timeout_cycles);
     if (!ready) break;
     v2FenceSystem();
-    shared->ready_steps[group] = step;
+    atomicExch_block(&shared->ready_steps[group], step);
     cursor += args.layout.slot_bytes < work.nbytes - cursor ? args.layout.slot_bytes : work.nbytes - cursor;
     ++step;
   }
@@ -70,9 +70,10 @@ __device__ __forceinline__ void v2CopyWork(const V2KernelArgs& args, const V2Wor
   std::uint64_t cursor = 0;
   std::uint64_t step = work.step_begin;
   while (cursor < work.nbytes) {
-    while (shared->ready_steps[group] < step && v2LoadError(error) == 0) {
+    while (atomicAdd_block(&shared->ready_steps[group], 0ULL) < step && v2LoadError(error) == 0) {
     }
     if (v2LoadError(error) != 0) break;
+    v2FenceSystem();
 
     const std::uint64_t slice_bytes =
       args.layout.slot_bytes < work.nbytes - cursor ? args.layout.slot_bytes : work.nbytes - cursor;
