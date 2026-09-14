@@ -31,7 +31,8 @@ import os
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
+
 
 class NCCLDeviceV2UnavailableError(RuntimeError):
     """Raised when the isolated NCCL Device v2 path cannot be initialized."""
@@ -60,44 +61,44 @@ def _preload_configured_nccl() -> None:
 
 _preload_configured_nccl()
 
-import torch
-import torch.distributed as dist
+import torch  # noqa: E402
+import torch.distributed as dist  # noqa: E402
 
-from awex import logging
-from awex.transfer.tensor_layout import (
+from awex import logging  # noqa: E402
+from awex.transfer.tensor_layout import (  # noqa: E402
     StaticTensorLayout,
     slice_layout_fragments,
 )
-from awex.transfer.transfer_plan import (
+from awex.transfer.transfer_plan import (  # noqa: E402
     CommunicationOperation,
     TransferPlan,
     slice_tensor,
 )
-from awex.util import device as device_util
+from awex.util import device as device_util  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
 _extension_lock = threading.Lock()
-_extension: Optional[Any] = None
+_extension: Any | None = None
 
 
 @dataclass
 class _V2Batch:
-    tensors: List[torch.Tensor]
-    offsets: List[int]
-    lengths: List[int]
-    tensor_offsets: List[int]
-    tensor_row_bytes: List[int]
-    tensor_row_strides: List[int]
-    peers: List[int]
-    ordinals: List[int]
-    region_indices: List[int]
-    region_bytes: List[int]
-    expected_counts: List[int]
-    copybacks: List[Tuple[torch.Tensor, torch.Tensor]]
+    tensors: list[torch.Tensor]
+    offsets: list[int]
+    lengths: list[int]
+    tensor_offsets: list[int]
+    tensor_row_bytes: list[int]
+    tensor_row_strides: list[int]
+    peers: list[int]
+    ordinals: list[int]
+    region_indices: list[int]
+    region_bytes: list[int]
+    expected_counts: list[int]
+    copybacks: list[tuple[torch.Tensor, torch.Tensor]]
 
 
-def _candidate_include_paths() -> List[str]:
+def _candidate_include_paths() -> list[str]:
     values = []
     configured = os.environ.get("AWEX_NCCL_INCLUDE", "")
     if configured:
@@ -114,7 +115,7 @@ def _candidate_include_paths() -> List[str]:
     return list(dict.fromkeys(values))
 
 
-def _candidate_library_paths() -> List[str]:
+def _candidate_library_paths() -> list[str]:
     values = []
     configured = os.environ.get("AWEX_NCCL_LIB", "")
     if configured:
@@ -133,7 +134,7 @@ def _candidate_library_paths() -> List[str]:
 
 def _operation_groups(
     plan: TransferPlan, rank: int, world_size: int
-) -> List[Tuple[int, List[CommunicationOperation]]]:
+) -> list[tuple[int, list[CommunicationOperation]]]:
     peers = sorted(plan.operations)
     if any(peer < 0 or peer >= world_size for peer in peers):
         raise NCCLDeviceV2UnavailableError(
@@ -146,7 +147,7 @@ def _operation_groups(
     return [(peer, list(plan.operations[peer])) for peer in peers]
 
 
-def _resolve_chunk_bytes(chunk_bytes: Optional[int]) -> int:
+def _resolve_chunk_bytes(chunk_bytes: int | None) -> int:
     if chunk_bytes is None:
         configured = os.environ.get("AWEX_NCCL_DEVICE_CHUNK_BYTES")
         try:
@@ -183,7 +184,7 @@ def _ensure_cuda_tensor(tensor: torch.Tensor, description: str) -> None:
         )
 
 
-def _tensor_copy_layout(tensor: torch.Tensor, name: str) -> Tuple[int, int]:
+def _tensor_copy_layout(tensor: torch.Tensor, name: str) -> tuple[int, int]:
     element_size = int(tensor.element_size())
     total_bytes = int(tensor.numel()) * element_size
     if tensor.is_contiguous() or tensor.dim() < 2:
@@ -195,9 +196,7 @@ def _tensor_copy_layout(tensor: torch.Tensor, name: str) -> Tuple[int, int]:
             f"stride={tuple(tensor.stride())}"
         )
     for dimension in range(tensor.dim() - 2):
-        expected = int(tensor.shape[dimension + 1]) * int(
-            tensor.stride(dimension + 1)
-        )
+        expected = int(tensor.shape[dimension + 1]) * int(tensor.stride(dimension + 1))
         if int(tensor.stride(dimension)) != expected:
             raise NCCLDeviceV2UnavailableError(
                 "v2 tensor view cannot be represented by one row stride: "
@@ -215,15 +214,15 @@ def _tensor_copy_layout(tensor: torch.Tensor, name: str) -> Tuple[int, int]:
 
 def _append_tensor_range(
     *,
-    tensors: List[torch.Tensor],
-    tensor_offsets: List[int],
-    tensor_row_bytes: List[int],
-    tensor_row_strides: List[int],
-    offsets: List[int],
-    lengths: List[int],
-    peers: List[int],
-    ordinals: List[int],
-    region_indices: List[int],
+    tensors: list[torch.Tensor],
+    tensor_offsets: list[int],
+    tensor_row_bytes: list[int],
+    tensor_row_strides: list[int],
+    offsets: list[int],
+    lengths: list[int],
+    peers: list[int],
+    ordinals: list[int],
+    region_indices: list[int],
     tensor: torch.Tensor,
     tensor_offset: int,
     nbytes: int,
@@ -258,15 +257,15 @@ def _build_send_batch(
     allow_staging: bool = True,
 ) -> _V2Batch:
     _resolve_chunk_bytes(chunk_bytes)
-    tensors: List[torch.Tensor] = []
-    offsets: List[int] = []
-    lengths: List[int] = []
-    tensor_offsets: List[int] = []
-    tensor_row_bytes: List[int] = []
-    tensor_row_strides: List[int] = []
-    peers: List[int] = []
-    ordinals: List[int] = []
-    region_indices: List[int] = []
+    tensors: list[torch.Tensor] = []
+    offsets: list[int] = []
+    lengths: list[int] = []
+    tensor_offsets: list[int] = []
+    tensor_row_bytes: list[int] = []
+    tensor_row_strides: list[int] = []
+    peers: list[int] = []
+    ordinals: list[int] = []
+    region_indices: list[int] = []
     region_bytes = [0] * world_size
     expected_counts = [0] * world_size
     context = {}
@@ -347,18 +346,18 @@ def _build_recv_batch(
     allow_staging: bool = True,
 ) -> _V2Batch:
     _resolve_chunk_bytes(chunk_bytes)
-    tensors: List[torch.Tensor] = []
-    offsets: List[int] = []
-    lengths: List[int] = []
-    tensor_offsets: List[int] = []
-    tensor_row_bytes: List[int] = []
-    tensor_row_strides: List[int] = []
-    peers: List[int] = []
-    ordinals: List[int] = []
-    region_indices: List[int] = []
+    tensors: list[torch.Tensor] = []
+    offsets: list[int] = []
+    lengths: list[int] = []
+    tensor_offsets: list[int] = []
+    tensor_row_bytes: list[int] = []
+    tensor_row_strides: list[int] = []
+    peers: list[int] = []
+    ordinals: list[int] = []
+    region_indices: list[int] = []
     region_bytes = [0] * world_size
     expected_counts = [0] * world_size
-    copybacks: List[Tuple[torch.Tensor, torch.Tensor]] = []
+    copybacks: list[tuple[torch.Tensor, torch.Tensor]] = []
     for peer, operations in _operation_groups(plan, rank, world_size):
         peer_offset = 0
         ordinal = 0
@@ -510,9 +509,7 @@ def _load_extension() -> Any:
         if not os.path.exists(source):
             raise NCCLDeviceV2UnavailableError(f"Missing CUDA source: {source}")
         if not os.path.exists(kernel_source):
-            raise NCCLDeviceV2UnavailableError(
-                f"Missing CUDA source: {kernel_source}"
-            )
+            raise NCCLDeviceV2UnavailableError(f"Missing CUDA source: {kernel_source}")
 
         library_paths = _candidate_library_paths()
         try:
@@ -549,8 +546,8 @@ class NCCLDeviceV2Transport:
         group: Any,
         rank: int,
         world_size: int,
-        timeout_ms: Optional[int] = None,
-        chunk_bytes: Optional[int] = None,
+        timeout_ms: int | None = None,
+        chunk_bytes: int | None = None,
         infer_instance_world_size: int = 0,
         num_infer_engines: int = 1,
     ):
@@ -565,9 +562,7 @@ class NCCLDeviceV2Transport:
             timeout_ms or os.environ.get("AWEX_NCCL_DEVICE_TIMEOUT_MS", "120000")
         )
         self.chunk_bytes = _resolve_chunk_bytes(chunk_bytes)
-        self.max_channels = _env_int(
-            "AWEX_NCCL_DEVICE_V2_MAX_CHANNELS", 64, minimum=1
-        )
+        self.max_channels = _env_int("AWEX_NCCL_DEVICE_V2_MAX_CHANNELS", 64, minimum=1)
         if self.max_channels > 64:
             raise NCCLDeviceV2UnavailableError(
                 "nccl_device_v2 max_channels must be at most 64"
@@ -583,7 +578,7 @@ class NCCLDeviceV2Transport:
         self.infer_instance_world_size = int(infer_instance_world_size)
         self.num_infer_engines = int(num_infer_engines)
         self._extension = None
-        self._handle: Optional[int] = None
+        self._handle: int | None = None
         self._initialized = False
         self._logged_batch_shape = False
         self._prepared_send = None
@@ -605,9 +600,7 @@ class NCCLDeviceV2Transport:
         self._extension = _load_extension()
         device = torch.device(device_util.get_torch_device())
         unique_id_size = int(self._extension.unique_id_size())
-        unique_id_tensor = torch.empty(
-            unique_id_size, dtype=torch.uint8, device=device
-        )
+        unique_id_tensor = torch.empty(unique_id_size, dtype=torch.uint8, device=device)
         if self.rank == 0:
             unique_id = self._extension.get_unique_id()
             if len(unique_id) != unique_id_size:
@@ -644,13 +637,11 @@ class NCCLDeviceV2Transport:
         )
         return (time.perf_counter() - start_time) * 1000.0
 
-    def _run(
-        self, batch: _V2Batch, sender: bool, sequence: int
-    ) -> Dict[str, float]:
+    def _run(self, batch: _V2Batch, sender: bool, sequence: int) -> dict[str, float]:
         run_start = time.perf_counter()
         if not self._logged_batch_shape:
             logger.info(
-            "Lowered nccl_device_v2 plan rank=%s sender=%s spans=%s "
+                "Lowered nccl_device_v2 plan rank=%s sender=%s spans=%s "
                 "payload_bytes=%s chunk_bytes=%s expected_counts=%s",
                 self.rank,
                 sender,
@@ -689,19 +680,17 @@ class NCCLDeviceV2Transport:
                 "payload_bytes": float(sum(batch.lengths)),
                 "transport_init_time_ms": init_time_ms,
                 "python_copyback_time_ms": copyback_time_ms,
-                "transport_total_time_ms": (time.perf_counter() - run_start)
-                * 1000.0,
+                "transport_total_time_ms": (time.perf_counter() - run_start) * 1000.0,
             }
         )
         extension_metrics["reader_copyback_total_time_ms"] = (
-            extension_metrics.get("reader_copyback_time_ms", 0.0)
-            + copyback_time_ms
+            extension_metrics.get("reader_copyback_time_ms", 0.0) + copyback_time_ms
         )
         return extension_metrics
 
     def send(
         self, parameters: dict, plan: TransferPlan, step_id: int
-    ) -> Dict[str, float]:
+    ) -> dict[str, float]:
         build_batch_time_ms = 0.0
         prepared = self._prepared_send
         if prepared is not None and prepared[0] is parameters and prepared[1] is plan:
@@ -722,7 +711,7 @@ class NCCLDeviceV2Transport:
 
     def recv(
         self, parameters: dict, plan: TransferPlan, step_id: int
-    ) -> Dict[str, float]:
+    ) -> dict[str, float]:
         build_batch_time_ms = 0.0
         prepared = self._prepared_recv
         if prepared is not None and prepared[0] is parameters and prepared[1] is plan:

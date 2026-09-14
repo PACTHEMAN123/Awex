@@ -17,7 +17,7 @@
 
 """Two-rank CUDA smoke test for the experimental NCCL Device v2 backend."""
 
-from __future__ import annotations
+from __future__ import annotations  # noqa: I001
 
 import os
 
@@ -50,7 +50,12 @@ def main() -> None:
     extension = _load_extension()
     unique_id = _broadcast_unique_id(extension, rank)
     tensors = [
-        torch.full((nbytes,), _PATTERNS[index] if rank == 0 else 0, dtype=torch.uint8, device="cuda")
+        torch.full(
+            (nbytes,),
+            _PATTERNS[index] if rank == 0 else 0,
+            dtype=torch.uint8,
+            device="cuda",
+        )
         for index, nbytes in enumerate(_TENSOR_BYTES)
     ]
     peer = 1 - rank
@@ -91,7 +96,9 @@ def main() -> None:
         if metrics["channel_count"] != 32:
             raise AssertionError(f"expected 32 active channels, got {dict(metrics)}")
         if metrics["fragment_count"] <= metrics["work_count"]:
-            raise AssertionError(f"expected a chunk crossing tensor spans, got {dict(metrics)}")
+            raise AssertionError(
+                f"expected a chunk crossing tensor spans, got {dict(metrics)}"
+            )
         dist.barrier()
         print(f"rank={rank} metrics={dict(metrics)}", flush=True)
     finally:
