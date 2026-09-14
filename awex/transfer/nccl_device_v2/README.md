@@ -11,15 +11,19 @@ hierarchy follows the useful NCCL P2P shape:
 fixed task
   -> chunk
   -> channel work batch
-  -> one CUDA CTA per channel
-  -> one warp per active send/recv side
-  -> FIFO step = absolute step % fifo_depth
+  -> NCCL P2P size formula selects active channels
+  -> one 640-thread CUDA CTA per channel
+  -> 20 warps divided across the active works in a batch
+  -> 16-byte vector copy, unrolled across 8 instructions
+  -> FIFO slot = absolute step % 8
 ```
 
-The draft intentionally starts with one warp per active side. This keeps the
-work-level synchronization local to a warp while the channel, batch, and step
-protocol are being validated. A later pass can add NCCL's multi-warp
-`nWarpPerWork` path using named barriers without changing the host task model.
+For intra-node SIMPLE traffic, work channel count follows NCCL's
+`addP2pToPlan` sizing: `minPartSize = stepSize / 8`,
+`maxPartSize = stepSize * 32`, bounded by the power-of-two channel capacity of
+the GPU. Work groups use CUDA named barriers, leaving barrier 0 to CTA-wide
+synchronization. A full eight-work batch gives each work two warps and maps the
+eight independent work steps onto all eight FIFO generations.
 
 The FIFO payload is a registered window slot. The control protocol is separate
 from task ordering: every `(peer, channel)` owns an independent monotonically

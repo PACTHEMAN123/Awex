@@ -32,14 +32,13 @@ namespace nccl_device_v2 {
 
 struct V2LoweringConfig {
   std::uint32_t world_size = 0;
-  std::uint32_t channels_per_peer = kDefaultChannelsPerPeer;
   std::uint32_t max_channels = 32;
   std::uint32_t fifo_depth = kDefaultFifoDepth;
   std::size_t chunk_bytes = kDefaultChunkBytes;
   std::size_t step_bytes = kDefaultStepBytes;
-  // The caller owns this monotonic counter. Sender and receiver must use the
-  // same initial value for a fixed plan launch.
-  std::uint64_t initial_step = 1;
+  // Indexed by peer * max_channels + channel. Each connection owns an
+  // independent NCCL-style monotonically increasing FIFO step stream.
+  std::vector<std::uint64_t> initial_steps;
 };
 
 struct V2LoweringTask {
@@ -59,6 +58,7 @@ struct V2Schedule {
   std::uint32_t channel_count = 0;
   std::uint32_t chunk_count = 0;
   std::uint64_t next_step = 1;
+  std::vector<std::uint64_t> next_steps;
 };
 
 inline V2WindowLayout makeV2WindowLayout(std::uint32_t world_size, std::uint32_t channel_count,
@@ -94,23 +94,41 @@ inline std::uint64_t v2DivUp(std::uint64_t value, std::uint64_t divisor) {
   return value == 0 ? 0 : (value - 1) / divisor + 1;
 }
 
+inline std::uint32_t v2ChannelsForBytes(std::uint64_t bytes, std::uint32_t min_channels,
+                                        std::uint32_t max_channels, std::size_t step_bytes) {
+  if (bytes == 0) return 1;
+
+  // Mirrors NCCL addP2pToPlan for an intra-node SIMPLE P2P operation.
+  const std::uint64_t min_part_bytes = std::max<std::uint64_t>(1, step_bytes / 8);
+  const std::uint64_t max_part_bytes = static_cast<std::uint64_t>(step_bytes) * 32;
+  const std::uint64_t initial_channels = std::min<std::uint64_t>(min_channels, v2DivUp(bytes, min_part_bytes));
+  std::uint32_t channels = static_cast<std::uint32_t>(initial_channels);
+  std::uint64_t part_bytes = std::max<std::uint64_t>(min_part_bytes, v2DivUp(bytes, channels));
+  while (part_bytes > max_part_bytes && channels <= max_channels / 2) {
+    channels *= 2;
+    part_bytes = v2DivUp(bytes, channels);
+  }
+  return channels;
+}
+
 inline void v2SetSide(V2WorkSide* side, const V2LoweringTask& task, std::uint64_t chunk_offset,
-                      std::uint64_t chunk_bytes, std::uint32_t channel_base, const V2LoweringConfig& config,
+                      std::uint64_t chunk_bytes, std::uint32_t channel_count, const V2LoweringConfig& config,
                       std::vector<std::uint64_t>* next_steps) {
   side->enabled = 1;
-  side->channel_base = channel_base;
-  side->channel_count = config.channels_per_peer;
+  side->channel_base = 0;
+  side->channel_count = channel_count;
   side->tensor_ptr = task.tensor_ptr;
   side->nbytes = chunk_bytes;
   side->tensor_offset = task.tensor_offset + chunk_offset;
   side->tensor_row_bytes = task.tensor_row_bytes;
   side->tensor_row_stride = task.tensor_row_stride;
 
-  for (std::uint32_t part = 0; part < config.channels_per_peer; ++part) {
-    const auto bounds = v2PartBounds(config.channels_per_peer, part, chunk_bytes);
+  const std::size_t peer_base = static_cast<std::size_t>(task.peer) * config.max_channels;
+  for (std::uint32_t part = 0; part < channel_count; ++part) {
+    const auto bounds = v2PartBounds(channel_count, part, chunk_bytes);
     const std::uint64_t part_bytes = bounds.second - bounds.first;
-    side->step_begin[part] = (*next_steps)[channel_base + part];
-    (*next_steps)[channel_base + part] += std::max<std::uint64_t>(1, v2DivUp(part_bytes, config.step_bytes));
+    side->step_begin[part] = (*next_steps)[peer_base + part];
+    (*next_steps)[peer_base + part] += std::max<std::uint64_t>(1, v2DivUp(part_bytes, config.step_bytes));
   }
 }
 
@@ -122,8 +140,8 @@ inline V2Schedule lowerFixedTasks(const std::vector<V2LoweringTask>& tasks,
   if (config.world_size == 0 || config.world_size > 256) {
     throw std::invalid_argument("invalid v2 world size");
   }
-  if (config.channels_per_peer == 0 || config.channels_per_peer > kMaxChannelsPerPeer) {
-    throw std::invalid_argument("invalid v2 channels_per_peer");
+  if (config.max_channels == 0 || config.max_channels > kMaxChannelsPerPeer) {
+    throw std::invalid_argument("invalid v2 max_channels");
   }
   if (config.fifo_depth == 0 || config.step_bytes == 0) {
     throw std::invalid_argument("v2 FIFO depth and step size must be positive");
@@ -132,12 +150,14 @@ inline V2Schedule lowerFixedTasks(const std::vector<V2LoweringTask>& tasks,
     throw std::invalid_argument("v2 chunk_bytes must be zero or at least step_bytes");
   }
 
-  V2Schedule schedule;
-  schedule.channel_count = static_cast<std::uint32_t>(active_peers.size() * config.channels_per_peer);
-  if (schedule.channel_count > config.max_channels) {
-    throw std::invalid_argument("v2 active channels exceed max_channels");
+  const std::size_t step_count = static_cast<std::size_t>(config.world_size) * config.max_channels;
+  if (!config.initial_steps.empty() && config.initial_steps.size() != step_count) {
+    throw std::invalid_argument("invalid v2 initial step table");
   }
-  schedule.channels.resize(schedule.channel_count);
+
+  V2Schedule schedule;
+  schedule.next_steps = config.initial_steps.empty() ? std::vector<std::uint64_t>(step_count, 1)
+                                                      : config.initial_steps;
 
   std::vector<std::int32_t> peer_index(config.world_size, -1);
   for (std::size_t index = 0; index < active_peers.size(); ++index) {
@@ -148,7 +168,10 @@ inline V2Schedule lowerFixedTasks(const std::vector<V2LoweringTask>& tasks,
     peer_index[peer] = static_cast<std::int32_t>(index);
   }
 
-  std::vector<std::uint64_t> next_steps(schedule.channel_count, config.initial_step);
+  std::uint32_t min_channels = config.max_channels;
+  while (static_cast<std::uint64_t>(min_channels) * config.world_size > config.max_channels && min_channels > 1) {
+    min_channels /= 2;
+  }
   for (const V2LoweringTask& task : tasks) {
     if (task.peer >= config.world_size || peer_index[task.peer] < 0) {
       throw std::invalid_argument("v2 task peer is not active");
@@ -161,7 +184,9 @@ inline V2Schedule lowerFixedTasks(const std::vector<V2LoweringTask>& tasks,
     if (chunk_count > std::numeric_limits<std::uint32_t>::max()) {
       throw std::invalid_argument("v2 task has too many chunks");
     }
-    const std::uint32_t channel_base = static_cast<std::uint32_t>(peer_index[task.peer]) * config.channels_per_peer;
+    const std::uint32_t channel_count =
+      v2ChannelsForBytes(task.nbytes, min_channels, config.max_channels, config.step_bytes);
+    schedule.channel_count = std::max(schedule.channel_count, channel_count);
 
     for (std::uint64_t chunk = 0; chunk < chunk_count; ++chunk) {
       const std::uint64_t chunk_offset = std::min<std::uint64_t>(chunk * effective_chunk_bytes, task.nbytes);
@@ -172,9 +197,9 @@ inline V2Schedule lowerFixedTasks(const std::vector<V2LoweringTask>& tasks,
       work.chunk_ordinal = static_cast<std::uint32_t>(chunk);
       work.chunk_count = static_cast<std::uint32_t>(chunk_count);
       if (direction == V2Direction::kSend) {
-        v2SetSide(&work.send, task, chunk_offset, chunk_bytes, channel_base, config, &next_steps);
+        v2SetSide(&work.send, task, chunk_offset, chunk_bytes, channel_count, config, &schedule.next_steps);
       } else {
-        v2SetSide(&work.recv, task, chunk_offset, chunk_bytes, channel_base, config, &next_steps);
+        v2SetSide(&work.recv, task, chunk_offset, chunk_bytes, channel_count, config, &schedule.next_steps);
       }
       schedule.works.push_back(work);
       ++schedule.chunk_count;
@@ -183,7 +208,8 @@ inline V2Schedule lowerFixedTasks(const std::vector<V2LoweringTask>& tasks,
 
   // Preserve the FIFO pipeline across work records. Only the last work seen
   // for a peer/channel partition waits for its final consumer acknowledgement.
-  std::vector<std::uint8_t> seen_final(schedule.channel_count, 0);
+  schedule.channels.resize(schedule.channel_count);
+  std::vector<std::uint8_t> seen_final(step_count, 0);
   for (std::size_t index = schedule.works.size(); index > 0; --index) {
     V2WorkSide* side =
       direction == V2Direction::kSend ? &schedule.works[index - 1].send : &schedule.works[index - 1].recv;
@@ -191,10 +217,11 @@ inline V2Schedule lowerFixedTasks(const std::vector<V2LoweringTask>& tasks,
       continue;
     }
     for (std::uint32_t part = 0; part < side->channel_count; ++part) {
-      const std::uint32_t channel = side->channel_base + part;
-      if (seen_final[channel] == 0) {
+      const std::size_t connection = static_cast<std::size_t>(schedule.works[index - 1].peer) * config.max_channels +
+                                     side->channel_base + part;
+      if (seen_final[connection] == 0) {
         side->final_parts |= 1U << part;
-        seen_final[channel] = 1;
+        seen_final[connection] = 1;
       }
     }
   }
@@ -210,7 +237,7 @@ inline V2Schedule lowerFixedTasks(const std::vector<V2LoweringTask>& tasks,
     channel.batch_count = static_cast<std::uint32_t>(schedule.batches.size());
   }
   schedule.next_step = 1;
-  for (const std::uint64_t step : next_steps) {
+  for (const std::uint64_t step : schedule.next_steps) {
     schedule.next_step = std::max(schedule.next_step, step);
   }
   return schedule;

@@ -586,15 +586,16 @@ class NCCLDeviceV2Transport:
             timeout_ms or os.environ.get("AWEX_NCCL_DEVICE_TIMEOUT_MS", "120000")
         )
         self.chunk_bytes = _resolve_chunk_bytes(chunk_bytes)
-        self.channels_per_peer = _env_int(
-            "AWEX_NCCL_DEVICE_V2_CHANNELS_PER_PEER", 2, minimum=1
-        )
         self.max_channels = _env_int(
             "AWEX_NCCL_DEVICE_V2_MAX_CHANNELS", 32, minimum=1
         )
-        self.fifo_depth = _env_int("AWEX_NCCL_DEVICE_V2_FIFO_DEPTH", 8, minimum=1)
+        if self.max_channels > 32:
+            raise NCCLDeviceV2UnavailableError(
+                "nccl_device_v2 max_channels must be at most 32"
+            )
+        self.fifo_depth = 8
         self.step_bytes = _env_int(
-            "AWEX_NCCL_DEVICE_V2_STEP_BYTES", 256 * 1024, minimum=1
+            "AWEX_NCCL_DEVICE_V2_STEP_BYTES", 512 * 1024, minimum=1
         )
         if self.chunk_bytes and self.chunk_bytes < self.step_bytes:
             raise NCCLDeviceV2UnavailableError(
@@ -609,11 +610,11 @@ class NCCLDeviceV2Transport:
         self._prepared_send = None
         self._prepared_recv = None
         logger.info(
-            "Configured nccl_device_v2 rank=%s chunk_bytes=%s channels_per_peer=%s "
+            "Configured nccl_device_v2 rank=%s chunk_bytes=%s max_channels=%s "
             "fifo_depth=%s step_bytes=%s",
             self.rank,
             self.chunk_bytes,
-            self.channels_per_peer,
+            self.max_channels,
             self.fifo_depth,
             self.step_bytes,
         )
@@ -646,7 +647,6 @@ class NCCLDeviceV2Transport:
                 self.rank,
                 int(device.index or 0),
                 self.timeout_ms,
-                self.channels_per_peer,
                 self.max_channels,
                 self.fifo_depth,
                 self.step_bytes,
@@ -659,7 +659,7 @@ class NCCLDeviceV2Transport:
             "channels:%s fifo:%s step_bytes:%s",
             self.rank,
             self.world_size,
-            self.channels_per_peer,
+            self.max_channels,
             self.fifo_depth,
             self.step_bytes,
         )

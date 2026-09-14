@@ -26,18 +26,21 @@ namespace awex {
 namespace nccl_device_v2 {
 
 constexpr int kWarpSize = 32;
-constexpr int kThreadsPerBlock = 256;
+constexpr int kThreadsPerBlock = 640;
+constexpr int kWarpsPerBlock = kThreadsPerBlock / kWarpSize;
 constexpr int kMaxWorksPerBatch = 8;
-constexpr int kMaxChannelsPerPeer = 8;
-constexpr std::uint32_t kDefaultChannelsPerPeer = 2;
+constexpr int kMaxChannelsPerPeer = 32;
+constexpr int kCopyPackBytes = 16;
+constexpr int kCopyUnroll = 8;
 constexpr std::uint32_t kDefaultFifoDepth = 8;
 constexpr std::size_t kDefaultChunkBytes = 4 * 1024 * 1024;
-constexpr std::size_t kDefaultStepBytes = 256 * 1024;
+constexpr std::size_t kDefaultStepBytes = 512 * 1024;
 constexpr std::size_t kWindowAlignment = 4096;
 constexpr std::size_t kFifoAlignment = 256;
 
 static_assert(kThreadsPerBlock % kWarpSize == 0, "block must contain full warps");
-static_assert(kMaxWorksPerBatch <= kThreadsPerBlock / kWarpSize, "draft requires one warp per work side");
+static_assert(kMaxWorksPerBatch <= 15, "work groups use CUDA named barriers 1-15");
+static_assert(kMaxChannelsPerPeer <= 32, "final_parts is a 32-bit channel mask");
 
 enum class V2Direction : std::uint32_t {
   kSend,

@@ -22,6 +22,11 @@
 namespace awex {
 namespace nccl_device_v2 {
 
+struct alignas(16) V2Pack128 {
+  unsigned long long first;
+  unsigned long long second;
+};
+
 __device__ __forceinline__ unsigned long long v2LoadSystem(volatile unsigned long long* address) {
   return atomicAdd_system(const_cast<unsigned long long*>(address), 0ULL);
 }
@@ -73,6 +78,32 @@ __device__ __forceinline__ void v2Publish(volatile unsigned long long* address, 
   atomicExch_system(const_cast<unsigned long long*>(address), step);
 }
 
+__device__ __forceinline__ void v2GroupBarrier(int group, int nthreads) {
+  if (nthreads == kWarpSize) {
+    __syncwarp();
+  } else {
+    // Keep barrier 0 for CTA-wide __syncthreads, as NCCL primitives do.
+    const int barrier = 15 - group;
+    asm volatile("barrier.sync.aligned %0, %1;" : : "r"(barrier), "r"(nthreads) : "memory");
+  }
+}
+
+__device__ __forceinline__ V2Pack128 v2Load128(const void* address) {
+  V2Pack128 value;
+  asm volatile("ld.volatile.global.v2.u64 {%0,%1}, [%2];"
+               : "=l"(value.first), "=l"(value.second)
+               : "l"(address)
+               : "memory");
+  return value;
+}
+
+__device__ __forceinline__ void v2Store128(void* address, const V2Pack128& value) {
+  asm volatile("st.global.v2.u64 [%0], {%1,%2};"
+               :
+               : "l"(address), "l"(value.first), "l"(value.second)
+               : "memory");
+}
+
 __device__ __forceinline__ V2FifoSlot* v2FifoSlot(const V2KernelArgs& args, std::uint32_t window_rank,
                                                   std::uint32_t connection_rank, std::uint32_t channel,
                                                   unsigned long long step, bool local_window) {
@@ -95,8 +126,37 @@ __device__ __forceinline__ std::uint8_t* v2FifoPayload(const V2KernelArgs& args,
 
 __device__ __forceinline__ void v2CopyContiguous(std::uint8_t* destination, const std::uint8_t* source,
                                                  std::uint64_t nbytes, int tid, int nthreads) {
-  for (std::uint64_t byte = static_cast<std::uint64_t>(tid); byte < nbytes;
-       byte += static_cast<std::uint64_t>(nthreads)) {
+  const std::uintptr_t source_address = reinterpret_cast<std::uintptr_t>(source);
+  const std::uintptr_t destination_address = reinterpret_cast<std::uintptr_t>(destination);
+  if ((source_address | destination_address) % kCopyPackBytes == 0) {
+    const std::uint64_t pack_count = nbytes / kCopyPackBytes;
+    const std::uint64_t packs_per_hunk = static_cast<std::uint64_t>(nthreads) * kCopyUnroll;
+    const std::uint64_t unrolled_packs = (pack_count / packs_per_hunk) * packs_per_hunk;
+
+    for (std::uint64_t hunk = 0; hunk < unrolled_packs; hunk += packs_per_hunk) {
+      V2Pack128 values[kCopyUnroll];
+#pragma unroll
+      for (int unroll = 0; unroll < kCopyUnroll; ++unroll) {
+        const std::uint64_t pack = hunk + tid + static_cast<std::uint64_t>(unroll) * nthreads;
+        values[unroll] = v2Load128(source + pack * kCopyPackBytes);
+      }
+#pragma unroll
+      for (int unroll = 0; unroll < kCopyUnroll; ++unroll) {
+        const std::uint64_t pack = hunk + tid + static_cast<std::uint64_t>(unroll) * nthreads;
+        v2Store128(destination + pack * kCopyPackBytes, values[unroll]);
+      }
+    }
+    for (std::uint64_t pack = unrolled_packs + tid; pack < pack_count; pack += nthreads) {
+      v2Store128(destination + pack * kCopyPackBytes, v2Load128(source + pack * kCopyPackBytes));
+    }
+    const std::uint64_t vector_bytes = pack_count * kCopyPackBytes;
+    for (std::uint64_t byte = vector_bytes + tid; byte < nbytes; byte += nthreads) {
+      destination[byte] = source[byte];
+    }
+    return;
+  }
+
+  for (std::uint64_t byte = tid; byte < nbytes; byte += nthreads) {
     destination[byte] = source[byte];
   }
 }

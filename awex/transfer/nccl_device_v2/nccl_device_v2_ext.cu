@@ -58,13 +58,12 @@ struct DeviceState {
   v2::V2WindowLayout layout{};
   std::size_t window_bytes = 0;
   std::uint64_t timeout_cycles = 0;
-  std::uint64_t next_step = 1;
   std::uint64_t last_sequence = 0;
-  std::uint32_t channels_per_peer = v2::kDefaultChannelsPerPeer;
   std::uint32_t max_channels = 32;
   std::uint32_t fifo_depth = v2::kDefaultFifoDepth;
   std::size_t chunk_bytes = v2::kDefaultChunkBytes;
   std::size_t step_bytes = v2::kDefaultStepBytes;
+  std::vector<std::uint64_t> next_steps;
   int rank = 0;
   int world_size = 0;
   int device = 0;
@@ -104,13 +103,18 @@ std::size_t checked_multiply(std::size_t left, std::size_t right, const char* de
   return left * right;
 }
 
+std::uint32_t power_of_two_down(std::uint32_t value) {
+  std::uint32_t result = 1;
+  while (result <= value / 2) result *= 2;
+  return result;
+}
+
 std::unique_ptr<DeviceState> make_state(
     const std::string& unique_id_bytes,
     int world_size,
     int rank,
     int device,
     int timeout_ms,
-    std::uint32_t channels_per_peer,
     std::uint32_t max_channels,
     std::uint32_t fifo_depth,
     std::size_t step_bytes,
@@ -124,10 +128,7 @@ std::unique_ptr<DeviceState> make_state(
   if (unique_id_bytes.size() != sizeof(ncclUniqueId)) {
     throw std::runtime_error("Invalid NCCL unique id size");
   }
-  if (channels_per_peer == 0 || channels_per_peer > v2::kMaxChannelsPerPeer) {
-    throw std::runtime_error("invalid nccl_device_v2 channels_per_peer");
-  }
-  if (max_channels == 0 || max_channels < channels_per_peer) {
+  if (max_channels == 0 || max_channels > v2::kMaxChannelsPerPeer) {
     throw std::runtime_error("invalid nccl_device_v2 max_channels");
   }
   if (fifo_depth == 0 || step_bytes == 0) {
@@ -136,33 +137,22 @@ std::unique_ptr<DeviceState> make_state(
   if (chunk_bytes != 0 && chunk_bytes < step_bytes) {
     throw std::runtime_error("nccl_device_v2 chunk_bytes must be zero or at least step_bytes");
   }
-  const std::size_t layout_channels = std::min<std::size_t>(
-      max_channels,
-      checked_multiply(
-          static_cast<std::size_t>(world_size),
-          channels_per_peer,
-          "nccl_device_v2 layout channels"));
-  if (layout_channels == 0) {
-    throw std::runtime_error("nccl_device_v2 layout has no channels");
-  }
-
   auto state = std::make_unique<DeviceState>();
   state->rank = rank;
   state->world_size = world_size;
   state->device = device;
-  state->channels_per_peer = channels_per_peer;
-  state->max_channels = max_channels;
   state->fifo_depth = fifo_depth;
   state->step_bytes = step_bytes;
   state->chunk_bytes = chunk_bytes;
-  state->layout = v2::makeV2WindowLayout(
-      world_size,
-      static_cast<std::uint32_t>(layout_channels),
-      fifo_depth,
-      step_bytes);
-  state->window_bytes = state->layout.window_bytes;
-
   AWEX_CUDA_V2_CHECK(cudaSetDevice(device));
+  int multiprocessor_count = 0;
+  AWEX_CUDA_V2_CHECK(cudaDeviceGetAttribute(&multiprocessor_count, cudaDevAttrMultiProcessorCount, device));
+  state->max_channels = power_of_two_down(std::min<std::uint32_t>(max_channels, multiprocessor_count));
+  state->layout = v2::makeV2WindowLayout(world_size, state->max_channels, fifo_depth, step_bytes);
+  state->window_bytes = state->layout.window_bytes;
+  state->next_steps.assign(
+    checked_multiply(static_cast<std::size_t>(world_size), state->max_channels, "nccl_device_v2 step table"), 1);
+
   int clock_rate_khz = 0;
   AWEX_CUDA_V2_CHECK(cudaDeviceGetAttribute(
       &clock_rate_khz,
@@ -426,12 +416,11 @@ py::dict launch(
       &active_peers);
   v2::V2LoweringConfig config;
   config.world_size = static_cast<std::uint32_t>(state->world_size);
-  config.channels_per_peer = state->channels_per_peer;
   config.max_channels = state->max_channels;
   config.fifo_depth = state->fifo_depth;
   config.chunk_bytes = state->chunk_bytes;
   config.step_bytes = state->step_bytes;
-  config.initial_step = state->next_step;
+  config.initial_steps = state->next_steps;
   const auto schedule = v2::lowerFixedTasks(
       tasks,
       active_peers,
@@ -445,6 +434,11 @@ py::dict launch(
   metrics["channel_count"] = py::int_(schedule.channel_count);
   metrics["active_peer_count"] = py::int_(active_peers.size());
   metrics["fifo_depth"] = py::int_(state->fifo_depth);
+  metrics["threads_per_channel"] = py::int_(v2::kThreadsPerBlock);
+  metrics["warps_per_channel"] = py::int_(v2::kWarpsPerBlock);
+  metrics["vector_bytes"] = py::int_(v2::kCopyPackBytes);
+  metrics["copy_unroll"] = py::int_(v2::kCopyUnroll);
+  metrics["channel_limit"] = py::int_(state->max_channels);
   metrics["slot_bytes"] = py::int_(state->step_bytes);
   metrics["registered_window_bytes"] = py::int_(state->window_bytes);
   metrics["host_lowering_time_ms"] =
@@ -513,9 +507,9 @@ py::dict launch(
           "nccl_device_v2 kernel aborted while waiting for the peer (error=" +
           std::to_string(header.error) + ")");
     }
-    state->next_step = schedule.next_step;
+    state->next_steps = schedule.next_steps;
     state->last_sequence = static_cast<std::uint64_t>(sequence);
-    metrics["next_step"] = py::int_(state->next_step);
+    metrics["next_step"] = py::int_(schedule.next_step);
     metrics["extension_total_time_ms"] =
         std::chrono::duration<double, std::milli>(Clock::now() - launch_start).count();
     release_buffers(&buffers);
@@ -544,7 +538,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
          int rank,
          int device,
          int timeout_ms,
-         int channels_per_peer,
          int max_channels,
          int fifo_depth,
          int64_t step_bytes,
@@ -559,7 +552,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
             rank,
             device,
             timeout_ms,
-            static_cast<std::uint32_t>(channels_per_peer),
             static_cast<std::uint32_t>(max_channels),
             static_cast<std::uint32_t>(fifo_depth),
             static_cast<std::size_t>(step_bytes),
