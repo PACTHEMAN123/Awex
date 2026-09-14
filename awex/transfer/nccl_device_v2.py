@@ -26,10 +26,10 @@ side while the draft is stabilized.
 
 from __future__ import annotations
 
+import ctypes
 import os
 import threading
 import time
-import ctypes
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -71,7 +71,6 @@ from awex.transfer.tensor_layout import (
 from awex.transfer.transfer_plan import (
     CommunicationOperation,
     TransferPlan,
-    build_transfer_chunks,
     slice_tensor,
 )
 from awex.util import device as device_util
@@ -234,39 +233,20 @@ def _append_tensor_range(
     peer_offset: int,
     ordinal: int,
     region_index: int,
-    chunk_bytes: int,
 ) -> int:
-    element_size = int(tensor.element_size())
-    for chunk in build_transfer_chunks(nbytes, chunk_bytes):
-        logical_offset = tensor_offset + chunk.byte_offset
-        task_tensor = tensor
-        task_tensor_offset = logical_offset
-        task_row_bytes = row_bytes
-        task_row_stride = row_stride
-        if tensor.is_contiguous():
-            if logical_offset % element_size or chunk.nbytes % element_size:
-                raise NCCLDeviceV2UnavailableError(
-                    "v2 chunk boundaries must align to tensor elements"
-                )
-            task_tensor = tensor.reshape(-1).narrow(
-                0,
-                logical_offset // element_size,
-                chunk.nbytes // element_size,
-            )
-            task_tensor_offset = 0
-            task_row_bytes = chunk.nbytes
-            task_row_stride = chunk.nbytes
-        tensors.append(task_tensor)
-        tensor_offsets.append(task_tensor_offset)
-        tensor_row_bytes.append(task_row_bytes)
-        tensor_row_strides.append(task_row_stride)
-        offsets.append(peer_offset + chunk.byte_offset)
-        lengths.append(chunk.nbytes)
-        peers.append(peer)
-        ordinals.append(ordinal)
-        region_indices.append(region_index)
-        ordinal += 1
-    return ordinal
+    # Preserve one descriptor per physical TransferPlan span. C++ concatenates
+    # these descriptors into a virtual peer stream before selecting channels
+    # and lowering transport chunks, so chunk boundaries may cross tensors.
+    tensors.append(tensor)
+    tensor_offsets.append(tensor_offset)
+    tensor_row_bytes.append(row_bytes)
+    tensor_row_strides.append(row_stride)
+    offsets.append(peer_offset)
+    lengths.append(nbytes)
+    peers.append(peer)
+    ordinals.append(ordinal)
+    region_indices.append(region_index)
+    return ordinal + 1
 
 
 def _build_send_batch(
@@ -277,7 +257,7 @@ def _build_send_batch(
     chunk_bytes: int,
     allow_staging: bool = True,
 ) -> _V2Batch:
-    chunk_bytes = _resolve_chunk_bytes(chunk_bytes)
+    _resolve_chunk_bytes(chunk_bytes)
     tensors: List[torch.Tensor] = []
     offsets: List[int] = []
     lengths: List[int] = []
@@ -338,7 +318,6 @@ def _build_send_batch(
                     peer_offset=peer_offset,
                     ordinal=ordinal,
                     region_index=rank,
-                    chunk_bytes=chunk_bytes,
                 )
                 peer_offset += length
         expected_counts[peer] = ordinal
@@ -367,7 +346,7 @@ def _build_recv_batch(
     chunk_bytes: int,
     allow_staging: bool = True,
 ) -> _V2Batch:
-    chunk_bytes = _resolve_chunk_bytes(chunk_bytes)
+    _resolve_chunk_bytes(chunk_bytes)
     tensors: List[torch.Tensor] = []
     offsets: List[int] = []
     lengths: List[int] = []
@@ -436,7 +415,6 @@ def _build_recv_batch(
                     peer_offset=peer_offset,
                     ordinal=ordinal,
                     region_index=peer,
-                    chunk_bytes=chunk_bytes,
                 )
                 target_offset += length
                 peer_offset += length
@@ -550,6 +528,7 @@ def _load_extension() -> Any:
                         for path in library_paths
                     ),
                     "-lnccl",
+                    "-ldl",
                 ],
                 with_cuda=True,
                 verbose=os.environ.get("AWEX_NCCL_DEVICE_VERBOSE_BUILD", "0") == "1",
@@ -587,11 +566,11 @@ class NCCLDeviceV2Transport:
         )
         self.chunk_bytes = _resolve_chunk_bytes(chunk_bytes)
         self.max_channels = _env_int(
-            "AWEX_NCCL_DEVICE_V2_MAX_CHANNELS", 32, minimum=1
+            "AWEX_NCCL_DEVICE_V2_MAX_CHANNELS", 64, minimum=1
         )
-        if self.max_channels > 32:
+        if self.max_channels > 64:
             raise NCCLDeviceV2UnavailableError(
-                "nccl_device_v2 max_channels must be at most 32"
+                "nccl_device_v2 max_channels must be at most 64"
             )
         self.fifo_depth = 8
         self.step_bytes = _env_int(
@@ -671,7 +650,7 @@ class NCCLDeviceV2Transport:
         run_start = time.perf_counter()
         if not self._logged_batch_shape:
             logger.info(
-                "Lowered nccl_device_v2 plan rank=%s sender=%s tasks=%s "
+            "Lowered nccl_device_v2 plan rank=%s sender=%s spans=%s "
                 "payload_bytes=%s chunk_bytes=%s expected_counts=%s",
                 self.rank,
                 sender,

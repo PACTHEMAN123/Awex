@@ -27,18 +27,48 @@ struct alignas(16) V2Pack128 {
   unsigned long long second;
 };
 
-__device__ __forceinline__ unsigned long long v2LoadSystem(volatile unsigned long long* address) {
-  return atomicAdd_system(const_cast<unsigned long long*>(address), 0ULL);
+enum V2Role : std::uint32_t {
+  kRoleWorker = 1U << 0,
+  kRoleWaitSend = 1U << 1,
+  kRoleWaitRecv = 1U << 2,
+  kRolePostSend = 1U << 3,
+  kRolePostRecv = 1U << 4,
+};
+
+__device__ __forceinline__ unsigned long long v2LoadStep(const volatile unsigned long long* address) {
+  unsigned long long value;
+  asm volatile("ld.volatile.global.u64 %0, [%1];" : "=l"(value) : "l"(address) : "memory");
+  return value;
 }
 
-__device__ __forceinline__ unsigned int v2LoadError(volatile unsigned int* address) {
-  return atomicAdd(const_cast<unsigned int*>(address), 0U);
+__device__ __forceinline__ unsigned int v2LoadError(const volatile unsigned int* address) {
+  unsigned int value;
+  asm volatile("ld.volatile.global.u32 %0, [%1];" : "=r"(value) : "l"(address) : "memory");
+  return value;
 }
 
-__device__ __forceinline__ bool v2WaitReady(volatile unsigned long long* ready, unsigned long long step,
-                                            volatile unsigned int* error, unsigned long long timeout_cycles) {
+__device__ __forceinline__ void v2FenceSystem() {
+#if __CUDA_ARCH__ >= 700
+  asm volatile("fence.acq_rel.sys;" ::: "memory");
+#else
+  __threadfence_system();
+#endif
+}
+
+__device__ __forceinline__ void v2StoreStep(volatile unsigned long long* address, unsigned long long step) {
+#if __CUDA_ARCH__ >= 700
+  asm volatile("st.relaxed.sys.global.u64 [%0], %1;" : : "l"(address), "l"(step) : "memory");
+#else
+  atomicExch_system(const_cast<unsigned long long*>(address), step);
+#endif
+}
+
+__device__ __forceinline__ bool v2WaitReady(const volatile unsigned long long* ready, unsigned long long step,
+                                            unsigned long long* cache, volatile unsigned int* error,
+                                            unsigned long long timeout_cycles) {
   const unsigned long long start = clock64();
-  while (v2LoadSystem(ready) < step) {
+  while (*cache < step) {
+    *cache = v2LoadStep(ready);
     if (v2LoadError(error) != 0) {
       return false;
     }
@@ -50,13 +80,15 @@ __device__ __forceinline__ bool v2WaitReady(volatile unsigned long long* ready, 
   return true;
 }
 
-__device__ __forceinline__ bool v2WaitFree(volatile V2FifoSlot* slot, unsigned long long step, std::uint32_t fifo_depth,
+__device__ __forceinline__ bool v2WaitFree(const volatile V2FifoSlot* slot, unsigned long long step,
+                                           std::uint32_t fifo_depth, unsigned long long* cache,
                                            volatile unsigned int* error, unsigned long long timeout_cycles) {
   const unsigned long long start = clock64();
   // A zeroed slot is free for its first generation. The slot is blocked only
   // once the producer is more than fifo_depth steps ahead of the last
   // consumer acknowledgement; equality is still the initial use of a slot.
-  while (v2LoadSystem(&slot->consumed_step) + fifo_depth < step) {
+  while (*cache + fifo_depth < step) {
+    *cache = v2LoadStep(&slot->consumed_step);
     if (v2LoadError(error) != 0) {
       return false;
     }
@@ -68,22 +100,21 @@ __device__ __forceinline__ bool v2WaitFree(volatile V2FifoSlot* slot, unsigned l
   return true;
 }
 
-__device__ __forceinline__ bool v2WaitConsumed(volatile V2FifoSlot* slot, unsigned long long step,
-                                               volatile unsigned int* error, unsigned long long timeout_cycles) {
-  return v2WaitReady(&slot->consumed_step, step, error, timeout_cycles);
+__device__ __forceinline__ bool v2WaitConsumed(const volatile V2FifoSlot* slot, unsigned long long step,
+                                               unsigned long long* cache, volatile unsigned int* error,
+                                               unsigned long long timeout_cycles) {
+  return v2WaitReady(&slot->consumed_step, step, cache, error, timeout_cycles);
 }
 
 __device__ __forceinline__ void v2Publish(volatile unsigned long long* address, unsigned long long step) {
-  __threadfence_system();
-  atomicExch_system(const_cast<unsigned long long*>(address), step);
+  v2FenceSystem();
+  v2StoreStep(address, step);
 }
 
-__device__ __forceinline__ void v2GroupBarrier(int group, int nthreads) {
+__device__ __forceinline__ void v2GroupBarrier(int barrier, int nthreads) {
   if (nthreads == kWarpSize) {
     __syncwarp();
   } else {
-    // Keep barrier 0 for CTA-wide __syncthreads, as NCCL primitives do.
-    const int barrier = 15 - group;
     asm volatile("barrier.sync.aligned %0, %1;" : : "r"(barrier), "r"(nthreads) : "memory");
   }
 }
@@ -97,8 +128,18 @@ __device__ __forceinline__ V2Pack128 v2Load128(const void* address) {
   return value;
 }
 
+__device__ __forceinline__ std::uint8_t v2Load8(const void* address) {
+  std::uint32_t value;
+  asm volatile("ld.volatile.global.u8 %0, [%1];" : "=r"(value) : "l"(address) : "memory");
+  return static_cast<std::uint8_t>(value);
+}
+
 __device__ __forceinline__ void v2Store128(void* address, const V2Pack128& value) {
   asm volatile("st.global.v2.u64 [%0], {%1,%2};" : : "l"(address), "l"(value.first), "l"(value.second) : "memory");
+}
+
+__device__ __forceinline__ void v2Store8(void* address, std::uint8_t value) {
+  asm volatile("st.global.u8 [%0], %1;" : : "l"(address), "r"(static_cast<std::uint32_t>(value)) : "memory");
 }
 
 __device__ __forceinline__ V2FifoSlot* v2FifoSlot(const V2KernelArgs& args, std::uint32_t window_rank,
@@ -148,13 +189,13 @@ __device__ __forceinline__ void v2CopyContiguous(std::uint8_t* destination, cons
     }
     const std::uint64_t vector_bytes = pack_count * kCopyPackBytes;
     for (std::uint64_t byte = vector_bytes + tid; byte < nbytes; byte += nthreads) {
-      destination[byte] = source[byte];
+      v2Store8(destination + byte, v2Load8(source + byte));
     }
     return;
   }
 
   for (std::uint64_t byte = tid; byte < nbytes; byte += nthreads) {
-    destination[byte] = source[byte];
+    v2Store8(destination + byte, v2Load8(source + byte));
   }
 }
 
@@ -199,6 +240,40 @@ __device__ __forceinline__ void v2CopyContiguousToTensor(std::uint8_t* tensor, c
     copied += span;
     ++row;
     column = 0;
+  }
+}
+
+__device__ __forceinline__ void v2CopyFragmentsToContiguous(const V2KernelArgs& args, const V2Work& work,
+                                                            std::uint8_t* destination, std::uint64_t work_offset,
+                                                            std::uint64_t nbytes, int tid, int nthreads) {
+  const std::uint64_t copy_end = work_offset + nbytes;
+  for (std::uint32_t index = 0; index < work.fragment_count; ++index) {
+    const V2Fragment& fragment = args.fragments[work.fragment_begin + index];
+    const std::uint64_t fragment_end = fragment.work_offset + fragment.nbytes;
+    if (fragment_end <= work_offset || copy_end <= fragment.work_offset) continue;
+    const std::uint64_t begin = fragment.work_offset < work_offset ? work_offset : fragment.work_offset;
+    const std::uint64_t end = fragment_end < copy_end ? fragment_end : copy_end;
+    const auto* tensor = reinterpret_cast<const std::uint8_t*>(fragment.tensor_ptr);
+    v2CopyTensorToContiguous(destination + begin - work_offset, tensor,
+                             fragment.tensor_offset + begin - fragment.work_offset, end - begin,
+                             fragment.tensor_row_bytes, fragment.tensor_row_stride, tid, nthreads);
+  }
+}
+
+__device__ __forceinline__ void v2CopyContiguousToFragments(const V2KernelArgs& args, const V2Work& work,
+                                                            const std::uint8_t* source, std::uint64_t work_offset,
+                                                            std::uint64_t nbytes, int tid, int nthreads) {
+  const std::uint64_t copy_end = work_offset + nbytes;
+  for (std::uint32_t index = 0; index < work.fragment_count; ++index) {
+    const V2Fragment& fragment = args.fragments[work.fragment_begin + index];
+    const std::uint64_t fragment_end = fragment.work_offset + fragment.nbytes;
+    if (fragment_end <= work_offset || copy_end <= fragment.work_offset) continue;
+    const std::uint64_t begin = fragment.work_offset < work_offset ? work_offset : fragment.work_offset;
+    const std::uint64_t end = fragment_end < copy_end ? fragment_end : copy_end;
+    auto* tensor = reinterpret_cast<std::uint8_t*>(fragment.tensor_ptr);
+    v2CopyContiguousToTensor(tensor, source + begin - work_offset,
+                             fragment.tensor_offset + begin - fragment.work_offset, end - begin,
+                             fragment.tensor_row_bytes, fragment.tensor_row_stride, tid, nthreads);
   }
 }
 

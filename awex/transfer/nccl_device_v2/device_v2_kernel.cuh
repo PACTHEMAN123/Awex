@@ -22,149 +22,125 @@
 namespace awex {
 namespace nccl_device_v2 {
 
-__device__ __forceinline__ bool v2SideUsesChannel(const V2WorkSide& side, std::uint32_t channel, std::uint32_t* part) {
-  if (!side.enabled || channel < side.channel_base) {
-    return false;
-  }
-  const std::uint32_t relative = channel - side.channel_base;
-  if (relative >= side.channel_count) {
-    return false;
-  }
-  *part = relative;
-  return true;
+struct V2BatchShared {
+  int ready[kMaxWorksPerBatch];
+  unsigned long long step_cache[kMaxWorksPerBatch];
+};
+
+__device__ __forceinline__ std::uint32_t v2Roles(V2Direction direction, int tid, int nthreads, int* nworkers) {
+  const bool send = direction == V2Direction::kSend;
+  *nworkers = nthreads - (nthreads >= 3 * kWarpSize ? kWarpSize : 0);
+  std::uint32_t roles = tid < *nworkers ? kRoleWorker : 0;
+  if (tid == 0) roles |= send ? kRoleWaitSend : kRoleWaitRecv;
+  if (tid == nthreads - 1) roles |= send ? kRolePostSend : kRolePostRecv;
+  return roles;
 }
 
-__device__ __forceinline__ void v2PartBounds(std::uint32_t parts, std::uint32_t part, std::uint64_t bytes,
-                                             std::uint64_t* begin, std::uint64_t* end) {
-  *begin = (bytes * part) / parts;
-  *end = (bytes * (part + 1)) / parts;
-}
-
+// In read mode the producer owns the FIFO payload. The sender only writes its
+// local window; the receiver performs the NVLink read and returns credits by
+// writing consumed_step back into the sender's window.
 __device__ __forceinline__ void v2RunSend(const V2KernelArgs& args, const V2Work& work, std::uint32_t channel,
-                                          std::uint32_t part, int group, int tid, int nthreads, int* group_ready) {
-  const V2WorkSide& side = work.send;
-  std::uint64_t part_begin = 0;
-  std::uint64_t part_end = 0;
-  v2PartBounds(side.channel_count, part, side.nbytes, &part_begin, &part_end);
-  const std::uint64_t part_bytes = part_end - part_begin;
-  std::uint64_t cursor = 0;
-  std::uint64_t step = side.step_begin[part];
+                                          int tid, int nthreads, int main_barrier, int wait_barrier, int* ready,
+                                          unsigned long long* step_cache) {
+  int nworkers = 0;
+  const std::uint32_t roles = v2Roles(V2Direction::kSend, tid, nthreads, &nworkers);
   auto* error = &reinterpret_cast<V2WindowHeader*>(args.local_window)->error;
-  if (tid == 0) {
-    auto* remote_header = reinterpret_cast<V2WindowHeader*>(args.peer_windows[work.peer]);
-    *group_ready = v2WaitReady(&remote_header->epoch, args.epoch, error, args.timeout_cycles);
-    if (!*group_ready) atomicExch_system(error, 4U);
-  }
-  v2GroupBarrier(group, nthreads);
-  if (!*group_ready) return;
-
-  while (cursor < part_bytes) {
+  std::uint64_t cursor = 0;
+  std::uint64_t step = work.step_begin;
+  while (cursor < work.nbytes) {
     const std::uint64_t slice_bytes =
-      args.layout.slot_bytes < part_bytes - cursor ? args.layout.slot_bytes : part_bytes - cursor;
-    V2FifoSlot* slot = v2FifoSlot(args, work.peer, args.local_rank, channel, step, false);
-    if (tid == 0) *group_ready = v2WaitFree(slot, step, args.layout.fifo_depth, error, args.timeout_cycles);
-    v2GroupBarrier(group, nthreads);
-    if (!*group_ready) return;
+      args.layout.slot_bytes < work.nbytes - cursor ? args.layout.slot_bytes : work.nbytes - cursor;
+    V2FifoSlot* slot = v2FifoSlot(args, args.local_rank, work.peer, channel, step, true);
+    if (roles & kRoleWaitSend) {
+      *ready = v2WaitFree(slot, step, args.layout.fifo_depth, step_cache, error, args.timeout_cycles);
+    }
+    if (roles & kRoleWorker) {
+      v2GroupBarrier(wait_barrier, nworkers);
+      if (*ready) {
+        std::uint8_t* payload = v2FifoPayload(args, args.local_rank, work.peer, channel, step, true);
+        v2CopyFragmentsToContiguous(args, work, payload, cursor, slice_bytes, tid, nworkers);
+      }
+    }
 
-    std::uint8_t* payload = v2FifoPayload(args, work.peer, args.local_rank, channel, step, false);
-    const auto* tensor = reinterpret_cast<const std::uint8_t*>(side.tensor_ptr);
-    v2CopyTensorToContiguous(payload, tensor, side.tensor_offset + part_begin + cursor, slice_bytes,
-                             side.tensor_row_bytes, side.tensor_row_stride, tid, nthreads);
-    v2GroupBarrier(group, nthreads);
-    if (tid == 0) {
+    // The post warp is not a worker for sufficiently wide groups. After this
+    // barrier, workers can start the next step while RolePostSend fences and
+    // publishes the step that has just completed.
+    v2GroupBarrier(main_barrier, nthreads);
+    if ((roles & kRolePostSend) && v2LoadError(error) == 0) {
       slot->bytes = static_cast<std::uint32_t>(slice_bytes);
       v2Publish(&slot->ready_step, step);
     }
-    v2GroupBarrier(group, nthreads);
+    if (v2LoadError(error) != 0) return;
     cursor += slice_bytes;
     ++step;
   }
 
-  // The final consume acknowledgement protects the source tensor lifetime
-  // when the caller reuses it as soon as the kernel returns.
-  if (part_bytes != 0 && (side.final_parts & (1U << part)) != 0) {
-    V2FifoSlot* final_slot = v2FifoSlot(args, work.peer, args.local_rank, channel, step - 1, false);
-    if (tid == 0) *group_ready = v2WaitConsumed(final_slot, step - 1, error, args.timeout_cycles);
-    v2GroupBarrier(group, nthreads);
+  if (work.final && work.nbytes != 0) {
+    V2FifoSlot* slot = v2FifoSlot(args, args.local_rank, work.peer, channel, step - 1, true);
+    if (roles & kRoleWaitSend) {
+      *ready = v2WaitConsumed(slot, step - 1, step_cache, error, args.timeout_cycles);
+    }
+    v2GroupBarrier(main_barrier, nthreads);
   }
 }
 
 __device__ __forceinline__ void v2RunRecv(const V2KernelArgs& args, const V2Work& work, std::uint32_t channel,
-                                          std::uint32_t part, int group, int tid, int nthreads, int* group_ready) {
-  const V2WorkSide& side = work.recv;
-  std::uint64_t part_begin = 0;
-  std::uint64_t part_end = 0;
-  v2PartBounds(side.channel_count, part, side.nbytes, &part_begin, &part_end);
-  const std::uint64_t part_bytes = part_end - part_begin;
-  std::uint64_t cursor = 0;
-  std::uint64_t step = side.step_begin[part];
+                                          int tid, int nthreads, int barrier, int* ready,
+                                          unsigned long long* step_cache) {
+  int nworkers = 0;
+  const std::uint32_t roles = v2Roles(V2Direction::kRecv, tid, nthreads, &nworkers);
   auto* error = &reinterpret_cast<V2WindowHeader*>(args.local_window)->error;
-  if (tid == 0) {
-    auto* remote_header = reinterpret_cast<V2WindowHeader*>(args.peer_windows[work.peer]);
-    *group_ready = v2WaitReady(&remote_header->epoch, args.epoch, error, args.timeout_cycles);
-    if (!*group_ready) atomicExch_system(error, 4U);
-  }
-  v2GroupBarrier(group, nthreads);
-  if (!*group_ready) return;
-
-  while (cursor < part_bytes) {
+  std::uint64_t cursor = 0;
+  std::uint64_t step = work.step_begin;
+  while (cursor < work.nbytes) {
     const std::uint64_t slice_bytes =
-      args.layout.slot_bytes < part_bytes - cursor ? args.layout.slot_bytes : part_bytes - cursor;
-    V2FifoSlot* slot = v2FifoSlot(args, work.peer, work.peer, channel, step, true);
-    if (tid == 0) *group_ready = v2WaitReady(&slot->ready_step, step, error, args.timeout_cycles);
-    v2GroupBarrier(group, nthreads);
-    if (!*group_ready) return;
+      args.layout.slot_bytes < work.nbytes - cursor ? args.layout.slot_bytes : work.nbytes - cursor;
+    V2FifoSlot* slot = v2FifoSlot(args, work.peer, args.local_rank, channel, step, false);
+    if (roles & kRoleWaitRecv) {
+      *ready = v2WaitReady(&slot->ready_step, step, step_cache, error, args.timeout_cycles);
+    }
+    v2GroupBarrier(barrier, nthreads);
+    if (*ready && (roles & kRoleWorker)) {
+      const std::uint8_t* payload = v2FifoPayload(args, work.peer, args.local_rank, channel, step, false);
+      v2CopyContiguousToFragments(args, work, payload, cursor, slice_bytes, tid, nworkers);
+    }
 
-    const std::uint8_t* payload = v2FifoPayload(args, work.peer, work.peer, channel, step, true);
-    auto* tensor = reinterpret_cast<std::uint8_t*>(side.tensor_ptr);
-    v2CopyContiguousToTensor(tensor, payload, side.tensor_offset + part_begin + cursor, slice_bytes,
-                             side.tensor_row_bytes, side.tensor_row_stride, tid, nthreads);
-    v2GroupBarrier(group, nthreads);
-    if (tid == 0) v2Publish(&slot->consumed_step, step);
-    v2GroupBarrier(group, nthreads);
+    v2GroupBarrier(barrier, nthreads);
+    if ((roles & kRolePostRecv) && v2LoadError(error) == 0) v2Publish(&slot->consumed_step, step);
+    if (v2LoadError(error) != 0) return;
     cursor += slice_bytes;
     ++step;
   }
 }
 
-struct V2BatchShared {
-  std::uint32_t active_count;
-  std::uint32_t work_index[kMaxWorksPerBatch];
-  int group_ready[kMaxWorksPerBatch];
-};
-
-__device__ __forceinline__ void v2RunBatch(const V2KernelArgs& args, const V2WorkBatch& batch, std::uint32_t channel) {
+__device__ __forceinline__ void v2RunBatch(const V2KernelArgs& args, const V2WorkBatch& batch,
+                                           std::uint32_t channel) {
   __shared__ V2BatchShared shared;
   const int tid = threadIdx.x;
   const int wid = tid / kWarpSize;
   const int lane = tid % kWarpSize;
-
-  if (wid == 0 && lane == 0) {
-    shared.active_count = 0;
-    for (std::uint32_t index = 0; index < batch.work_count; ++index) {
-      const V2Work& work = args.works[batch.work_begin + index];
-      std::uint32_t part = 0;
-      if (v2SideUsesChannel(work.send, channel, &part) || v2SideUsesChannel(work.recv, channel, &part)) {
-        shared.work_index[shared.active_count++] = index;
-      }
+  const int warps_per_work = kWarpsPerBlock / batch.work_count;
+  const int group = wid / warps_per_work;
+  if (group < batch.work_count) {
+    const int subtid = (wid - group * warps_per_work) * kWarpSize + lane;
+    const int subthreads = warps_per_work * kWarpSize;
+    const bool extra_send_barrier = args.direction == V2Direction::kSend && subthreads >= 3 * kWarpSize;
+    const int barrier_width = extra_send_barrier ? 2 : 1;
+    const int main_barrier = 1 + group * barrier_width;
+    const int wait_barrier = extra_send_barrier ? main_barrier + 1 : main_barrier;
+    if (subtid == 0) {
+      shared.ready[group] = 1;
+      shared.step_cache[group] = 0;
     }
-  }
-  __syncthreads();
+    v2GroupBarrier(main_barrier, subthreads);
 
-  if (shared.active_count != 0) {
-    const int warps_per_work = kWarpsPerBlock / shared.active_count;
-    const int group = wid / warps_per_work;
-    if (group < shared.active_count) {
-      const std::uint32_t work_index = shared.work_index[group];
-      const V2Work& work = args.works[batch.work_begin + work_index];
-      const int subtid = (wid - group * warps_per_work) * kWarpSize + lane;
-      const int subthreads = warps_per_work * kWarpSize;
-      std::uint32_t part = 0;
-      if (v2SideUsesChannel(work.send, channel, &part)) {
-        v2RunSend(args, work, channel, part, group, subtid, subthreads, &shared.group_ready[group]);
-      } else if (v2SideUsesChannel(work.recv, channel, &part)) {
-        v2RunRecv(args, work, channel, part, group, subtid, subthreads, &shared.group_ready[group]);
-      }
+    const V2Work& work = args.works[batch.work_begin + group];
+    if (args.direction == V2Direction::kSend) {
+      v2RunSend(args, work, channel, subtid, subthreads, main_barrier, wait_barrier, &shared.ready[group],
+                &shared.step_cache[group]);
+    } else {
+      v2RunRecv(args, work, channel, subtid, subthreads, main_barrier, &shared.ready[group],
+                &shared.step_cache[group]);
     }
   }
   __syncthreads();
@@ -172,17 +148,26 @@ __device__ __forceinline__ void v2RunBatch(const V2KernelArgs& args, const V2Wor
 
 __global__ void __launch_bounds__(kThreadsPerBlock, 1) device_v2_kernel(V2KernelArgs args) {
   auto* local_header = reinterpret_cast<V2WindowHeader*>(args.local_window);
-  if (blockIdx.x == 0 && threadIdx.x == 0) {
-    __threadfence_system();
-    atomicExch_system(&local_header->epoch, args.epoch);
-  }
+  if (blockIdx.x == 0 && threadIdx.x == 0) v2Publish(&local_header->epoch, args.epoch);
 
-  if (blockIdx.x >= args.channel_count) {
-    return;
+  __shared__ int peers_ready;
+  if (threadIdx.x == 0) {
+    peers_ready = 1;
+    for (std::uint32_t index = 0; index < args.active_peer_count && peers_ready; ++index) {
+      const std::uint32_t peer = args.active_peers[index];
+      auto* remote_header = reinterpret_cast<V2WindowHeader*>(args.peer_windows[peer]);
+      unsigned long long cache = 0;
+      peers_ready = v2WaitReady(&remote_header->epoch, args.epoch, &cache, &local_header->error, args.timeout_cycles);
+    }
+    if (!peers_ready) atomicExch_system(&local_header->error, 4U);
   }
+  __syncthreads();
+  if (!peers_ready) return;
+
+  const std::uint32_t channel = args.channel_ids[blockIdx.x];
   const V2ChannelQueue queue = args.channels[blockIdx.x];
   for (std::uint32_t index = 0; index < queue.batch_count; ++index) {
-    v2RunBatch(args, args.batches[queue.first_batch + index], blockIdx.x);
+    v2RunBatch(args, args.batches[queue.first_batch + index], channel);
   }
 }
 
