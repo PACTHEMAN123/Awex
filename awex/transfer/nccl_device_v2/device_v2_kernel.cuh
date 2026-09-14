@@ -24,7 +24,7 @@ namespace nccl_device_v2 {
 
 struct V2BatchShared {
   unsigned long long ready_steps[kMaxWorksPerBatch];
-  unsigned int completed_worker_warps[kMaxWorksPerBatch];
+  unsigned long long completed_steps[kWorkerWarpsPerBlock];
 };
 
 __device__ __forceinline__ int v2WorkerWarps(std::uint32_t group, std::uint32_t work_count) {
@@ -65,7 +65,8 @@ __device__ __forceinline__ void v2WaitWork(const V2KernelArgs& args, const V2Wor
 }
 
 __device__ __forceinline__ void v2CopyWork(const V2KernelArgs& args, const V2Work& work, std::uint32_t channel,
-                                           std::uint32_t group, int subtid, int nworkers, V2BatchShared* shared) {
+                                           std::uint32_t group, std::uint32_t worker_slot, int subtid, int nworkers,
+                                           V2BatchShared* shared) {
   auto* error = &reinterpret_cast<V2WindowHeader*>(args.local_window)->error;
   std::uint64_t cursor = 0;
   std::uint64_t step = work.step_begin;
@@ -86,21 +87,25 @@ __device__ __forceinline__ void v2CopyWork(const V2KernelArgs& args, const V2Wor
     }
     if (args.direction == V2Direction::kSend) v2FenceSystem();
     __syncwarp();
-    if (subtid % kWarpSize == 0) atomicAdd_block(&shared->completed_worker_warps[group], 1U);
+    if (subtid % kWarpSize == 0) atomicExch_block(&shared->completed_steps[worker_slot], step);
     cursor += slice_bytes;
     ++step;
   }
 }
 
 __device__ __forceinline__ void v2PostWork(const V2KernelArgs& args, const V2Work& work, std::uint32_t channel,
-                                           std::uint32_t group, std::uint32_t worker_warps, V2BatchShared* shared) {
+                                           std::uint32_t worker_begin, std::uint32_t worker_warps,
+                                           V2BatchShared* shared) {
   auto* error = &reinterpret_cast<V2WindowHeader*>(args.local_window)->error;
-  unsigned int completed_target = worker_warps;
   std::uint64_t cursor = 0;
   std::uint64_t step = work.step_begin;
   while (cursor < work.nbytes) {
-    while (atomicAdd_block(&shared->completed_worker_warps[group], 0U) < completed_target &&
-           v2LoadError(error) == 0) {
+    bool completed = false;
+    while (!completed && v2LoadError(error) == 0) {
+      completed = true;
+      for (std::uint32_t worker = 0; worker < worker_warps; ++worker) {
+        completed &= atomicAdd_block(&shared->completed_steps[worker_begin - 1 + worker], 0ULL) >= step;
+      }
     }
     if (v2LoadError(error) != 0) break;
 
@@ -113,7 +118,6 @@ __device__ __forceinline__ void v2PostWork(const V2KernelArgs& args, const V2Wor
     v2Publish(args.direction == V2Direction::kSend ? &slot->ready_step : &slot->consumed_step, step);
     cursor += slice_bytes;
     ++step;
-    completed_target += worker_warps;
   }
 }
 
@@ -124,8 +128,8 @@ __device__ __forceinline__ void v2RunBatch(const V2KernelArgs& args, const V2Wor
   const int lane = tid % kWarpSize;
   if (tid < kMaxWorksPerBatch) {
     shared.ready_steps[tid] = 0;
-    shared.completed_worker_warps[tid] = 0;
   }
+  if (tid < kWorkerWarpsPerBlock) shared.completed_steps[tid] = 0;
   __syncthreads();
 
   if (wid == 0 && lane < batch.work_count) {
@@ -133,7 +137,8 @@ __device__ __forceinline__ void v2RunBatch(const V2KernelArgs& args, const V2Wor
     v2WaitWork(args, work, channel, lane, &shared);
   } else if (wid == kWarpsPerBlock - 1 && lane < batch.work_count) {
     const V2Work& work = args.works[batch.work_begin + lane];
-    v2PostWork(args, work, channel, lane, v2WorkerWarps(lane, batch.work_count), &shared);
+    v2PostWork(args, work, channel, v2WorkerWarpBegin(lane, batch.work_count),
+               v2WorkerWarps(lane, batch.work_count), &shared);
   } else if (wid > 0 && wid < kWarpsPerBlock - 1) {
     for (std::uint32_t group = 0; group < batch.work_count; ++group) {
       const int worker_begin = v2WorkerWarpBegin(group, batch.work_count);
@@ -141,7 +146,7 @@ __device__ __forceinline__ void v2RunBatch(const V2KernelArgs& args, const V2Wor
       if (wid >= worker_begin && wid < worker_begin + worker_warps) {
         const int subtid = (wid - worker_begin) * kWarpSize + lane;
         const V2Work& work = args.works[batch.work_begin + group];
-        v2CopyWork(args, work, channel, group, subtid, worker_warps * kWarpSize, &shared);
+        v2CopyWork(args, work, channel, group, wid - 1, subtid, worker_warps * kWarpSize, &shared);
         break;
       }
     }
