@@ -52,7 +52,7 @@ __device__ __forceinline__ void v2WaitWork(const V2KernelArgs& args, const V2Wor
                          ? v2WaitFree(slot, step, args.layout.fifo_depth, &step_cache, error, args.timeout_cycles)
                          : v2WaitReady(&slot->ready_step, step, &step_cache, error, args.timeout_cycles);
     if (!ready) break;
-    __threadfence_block();
+    v2FenceSystem();
     shared->ready_steps[group] = step;
     cursor += args.layout.slot_bytes < work.nbytes - cursor ? args.layout.slot_bytes : work.nbytes - cursor;
     ++step;
@@ -83,11 +83,9 @@ __device__ __forceinline__ void v2CopyWork(const V2KernelArgs& args, const V2Wor
       const std::uint8_t* payload = v2FifoPayload(args, work.peer, args.local_rank, channel, step, false);
       v2CopyContiguousToFragments(args, work, payload, cursor, slice_bytes, subtid, nworkers);
     }
+    if (args.direction == V2Direction::kSend) v2FenceSystem();
     __syncwarp();
-    if (subtid % kWarpSize == 0) {
-      __threadfence_block();
-      atomicAdd_block(&shared->completed_worker_warps[group], 1U);
-    }
+    if (subtid % kWarpSize == 0) atomicAdd_block(&shared->completed_worker_warps[group], 1U);
     cursor += slice_bytes;
     ++step;
   }
