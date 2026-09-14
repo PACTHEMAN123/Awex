@@ -92,11 +92,15 @@ def main() -> None:
         if metrics["topology_nvlink_count"] != 18:
             raise AssertionError(f"expected NV18 topology, got {dict(metrics)}")
         if metrics["topology_raw_channels"] != 36:
-            raise AssertionError(f"expected 36 raw topology channels, got {dict(metrics)}")
+            raise AssertionError(
+                f"expected 36 raw topology channels, got {dict(metrics)}"
+            )
         if metrics["topology_requested_channels_per_peer"] != 64:
             raise AssertionError(f"expected 64 requested channels, got {dict(metrics)}")
         if metrics["topology_channels_per_peer"] != 32:
-            raise AssertionError(f"expected 32 effective topology channels, got {dict(metrics)}")
+            raise AssertionError(
+                f"expected 32 effective topology channels, got {dict(metrics)}"
+            )
         if metrics["channel_count"] != 16:
             raise AssertionError(f"expected 16 active channels, got {dict(metrics)}")
         if metrics["fragment_count"] <= metrics["work_count"]:
