@@ -178,7 +178,7 @@ struct NvmlFieldValue {
 };
 
 class NvmlApi {
- public:
+public:
   NvmlApi() {
     library_ = dlopen("libnvidia-ml.so.1", RTLD_LAZY | RTLD_LOCAL);
     if (library_ == nullptr) return;
@@ -205,7 +205,9 @@ class NvmlApi {
   NvmlApi(const NvmlApi&) = delete;
   NvmlApi& operator=(const NvmlApi&) = delete;
 
-  bool available() const { return available_; }
+  bool available() const {
+    return available_;
+  }
 
   NvmlDevice device(const char* pci_bus_id) const {
     NvmlDevice result = nullptr;
@@ -239,7 +241,7 @@ class NvmlApi {
     return encodePciBus(pci.domain, pci.bus, pci.device);
   }
 
- private:
+private:
   template <typename T>
   T load(const char* name) {
     return reinterpret_cast<T>(dlsym(library_, name));
@@ -280,9 +282,11 @@ inline LocalLinks queryLocalLinks(const char* pci_bus_id, int compute_capability
   NvmlApi nvml;
   NvmlDevice device = nvml.device(pci_bus_id);
   if (device == nullptr) return result;
-  const int max_links = compute_capability < 60 ? 0 : compute_capability < 70 ? 4 : compute_capability < 80 ? 6 :
-                        compute_capability < 90   ? 12 :
-                                                   18;
+  const int max_links = compute_capability < 60 ? 0 :
+                        compute_capability < 70 ? 4 :
+                        compute_capability < 80 ? 6 :
+                        compute_capability < 90 ? 12 :
+                                                  18;
   result.available = true;
   for (int link = 0; link < max_links; ++link) {
     if (!nvml.activeP2pLink(device, link)) continue;
@@ -307,8 +311,8 @@ inline V2Topology discoverV2Topology(ncclComm_t comm, int world_size, int rank, 
                                      std::uint32_t channel_limit) {
   using namespace topology_detail;
   V2Topology topology;
-  topology.total_channels = powerOfTwoDown(
-    std::max<std::uint32_t>(1, std::min(channel_limit, static_cast<std::uint32_t>(kMaxChannels))));
+  topology.total_channels =
+    powerOfTwoDown(std::max<std::uint32_t>(1, std::min(channel_limit, static_cast<std::uint32_t>(kMaxChannels))));
   topology.peer_channels.assign(world_size, 1);
   topology.peer_paths.resize(world_size);
 
@@ -338,8 +342,8 @@ inline V2Topology discoverV2Topology(ncclComm_t comm, int world_size, int rank, 
       if (local_links.switch_links != 0 && records[peer].switch_links != 0) {
         links = std::min(local_links.switch_links, records[peer].switch_links);
       } else {
-        links = static_cast<std::uint32_t>(
-          std::count(local_links.direct_peers.begin(), local_links.direct_peers.end(), records[peer].pci_bus));
+        links = static_cast<std::uint32_t>(std::count(local_links.direct_peers.begin(), local_links.direct_peers.end(),
+                                                      records[peer].pci_bus));
       }
       local_path_links[peer] = static_cast<std::uint8_t>(std::min<std::uint32_t>(links, 255));
     }
@@ -350,15 +354,16 @@ inline V2Topology discoverV2Topology(ncclComm_t comm, int world_size, int rank, 
     for (const TopologyRecord& record : records) topology.nvml_available &= record.nvml_available != 0;
     for (int peer = 0; peer < world_size; ++peer) {
       if (peer == rank) continue;
-      const std::uint32_t links = std::min<std::uint32_t>(
-        link_matrix[static_cast<std::size_t>(rank) * world_size + peer],
-        link_matrix[static_cast<std::size_t>(peer) * world_size + rank]);
+      const std::uint32_t links =
+        std::min<std::uint32_t>(link_matrix[static_cast<std::size_t>(rank) * world_size + peer],
+                                link_matrix[static_cast<std::size_t>(peer) * world_size + rank]);
       const float link_bw = std::min(nvlinkBandwidth(compute_capability),
                                      nvlinkBandwidth(static_cast<int>(records[peer].compute_capability)));
       V2PeerPath path;
       path.nvlink_count = links;
       path.bandwidth_gbps = links * link_bw;
-      const std::uint32_t raw_channels = links == 0 ? 2 : 2 * std::max(1, static_cast<int>(path.bandwidth_gbps / link_bw));
+      const std::uint32_t raw_channels =
+        links == 0 ? 2 : 2 * std::max(1, static_cast<int>(path.bandwidth_gbps / link_bw));
       path.channels = std::min(topology.total_channels, powerOfTwoUp(raw_channels));
       topology.peer_paths[peer] = path;
     }
@@ -368,10 +373,10 @@ inline V2Topology discoverV2Topology(ncclComm_t comm, int world_size, int rank, 
     std::uint32_t communicator_channels = topology.total_channels;
     for (int source = 0; source < world_size; ++source) {
       for (int peer = source + 1; peer < world_size; ++peer) {
-        const std::uint32_t links = std::min<std::uint32_t>(
-          link_matrix[static_cast<std::size_t>(source) * world_size + peer],
-          link_matrix[static_cast<std::size_t>(peer) * world_size + source]);
-      const float link_bw = std::min(nvlinkBandwidth(static_cast<int>(records[source].compute_capability)),
+        const std::uint32_t links =
+          std::min<std::uint32_t>(link_matrix[static_cast<std::size_t>(source) * world_size + peer],
+                                  link_matrix[static_cast<std::size_t>(peer) * world_size + source]);
+        const float link_bw = std::min(nvlinkBandwidth(static_cast<int>(records[source].compute_capability)),
                                        nvlinkBandwidth(static_cast<int>(records[peer].compute_capability)));
         const float path_bw = links * link_bw;
         const std::uint32_t raw_channels = links == 0 ? 2 : 2 * std::max(1, static_cast<int>(path_bw / link_bw));

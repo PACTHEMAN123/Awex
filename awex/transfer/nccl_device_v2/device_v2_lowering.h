@@ -104,8 +104,8 @@ inline std::pair<std::uint64_t, std::uint64_t> v2PartBounds(std::uint32_t parts,
   };
 }
 
-inline std::uint32_t v2ChannelsForBytes(std::uint64_t bytes, std::uint32_t min_channels,
-                                        std::uint32_t max_channels, std::size_t step_bytes) {
+inline std::uint32_t v2ChannelsForBytes(std::uint64_t bytes, std::uint32_t min_channels, std::uint32_t max_channels,
+                                        std::size_t step_bytes) {
   if (bytes == 0) return 1;
 
   // Mirrors NCCL addP2pToPlan for an intra-node SIMPLE P2P operation. The
@@ -150,8 +150,8 @@ struct V2StreamSpan {
   std::uint64_t end;
 };
 
-inline void v2AppendFragments(const std::vector<V2StreamSpan>& spans, std::uint64_t work_begin,
-                              std::uint64_t work_end, V2Schedule* schedule, V2Work* work) {
+inline void v2AppendFragments(const std::vector<V2StreamSpan>& spans, std::uint64_t work_begin, std::uint64_t work_end,
+                              V2Schedule* schedule, V2Work* work) {
   work->fragment_begin = static_cast<std::uint32_t>(schedule->fragments.size());
   for (const V2StreamSpan& span : spans) {
     if (span.end <= work_begin || work_end <= span.begin) continue;
@@ -251,11 +251,9 @@ inline V2Schedule lowerFixedTasks(const std::vector<V2LoweringTask>& tasks,
     while (static_cast<std::uint64_t>(min_channels) * config.world_size > config.total_channels && min_channels > 1) {
       min_channels /= 2;
     }
-    const std::uint32_t channel_count =
-      v2ChannelsForBytes(stream_bytes, min_channels, max_channels, config.step_bytes);
+    const std::uint32_t channel_count = v2ChannelsForBytes(stream_bytes, min_channels, max_channels, config.step_bytes);
     schedule.peer_channel_counts[peer] = channel_count;
-    const std::uint32_t channel_base =
-      v2ChannelBase(config.local_rank, peer, config.world_size, config.total_channels);
+    const std::uint32_t channel_base = v2ChannelBase(config.local_rank, peer, config.world_size, config.total_channels);
 
     for (std::uint32_t part = 0; part < channel_count; ++part) {
       const auto bounds = v2PartBounds(channel_count, part, stream_bytes);

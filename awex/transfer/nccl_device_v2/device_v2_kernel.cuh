@@ -39,8 +39,8 @@ __device__ __forceinline__ std::uint32_t v2Roles(V2Direction direction, int tid,
 // In read mode the producer owns the FIFO payload. The sender only writes its
 // local window; the receiver performs the NVLink read and returns credits by
 // writing consumed_step back into the sender's window.
-__device__ __forceinline__ void v2RunSend(const V2KernelArgs& args, const V2Work& work, std::uint32_t channel,
-                                          int tid, int nthreads, int main_barrier, int wait_barrier, int* ready,
+__device__ __forceinline__ void v2RunSend(const V2KernelArgs& args, const V2Work& work, std::uint32_t channel, int tid,
+                                          int nthreads, int main_barrier, int wait_barrier, int* ready,
                                           unsigned long long* step_cache) {
   int nworkers = 0;
   const std::uint32_t roles = v2Roles(V2Direction::kSend, tid, nthreads, &nworkers);
@@ -84,9 +84,8 @@ __device__ __forceinline__ void v2RunSend(const V2KernelArgs& args, const V2Work
   }
 }
 
-__device__ __forceinline__ void v2RunRecv(const V2KernelArgs& args, const V2Work& work, std::uint32_t channel,
-                                          int tid, int nthreads, int barrier, int* ready,
-                                          unsigned long long* step_cache) {
+__device__ __forceinline__ void v2RunRecv(const V2KernelArgs& args, const V2Work& work, std::uint32_t channel, int tid,
+                                          int nthreads, int barrier, int* ready, unsigned long long* step_cache) {
   int nworkers = 0;
   const std::uint32_t roles = v2Roles(V2Direction::kRecv, tid, nthreads, &nworkers);
   auto* error = &reinterpret_cast<V2WindowHeader*>(args.local_window)->error;
@@ -113,8 +112,7 @@ __device__ __forceinline__ void v2RunRecv(const V2KernelArgs& args, const V2Work
   }
 }
 
-__device__ __forceinline__ void v2RunBatch(const V2KernelArgs& args, const V2WorkBatch& batch,
-                                           std::uint32_t channel) {
+__device__ __forceinline__ void v2RunBatch(const V2KernelArgs& args, const V2WorkBatch& batch, std::uint32_t channel) {
   __shared__ V2BatchShared shared;
   const int tid = threadIdx.x;
   const int wid = tid / kWarpSize;
@@ -139,8 +137,7 @@ __device__ __forceinline__ void v2RunBatch(const V2KernelArgs& args, const V2Wor
       v2RunSend(args, work, channel, subtid, subthreads, main_barrier, wait_barrier, &shared.ready[group],
                 &shared.step_cache[group]);
     } else {
-      v2RunRecv(args, work, channel, subtid, subthreads, main_barrier, &shared.ready[group],
-                &shared.step_cache[group]);
+      v2RunRecv(args, work, channel, subtid, subthreads, main_barrier, &shared.ready[group], &shared.step_cache[group]);
     }
   }
   __syncthreads();
