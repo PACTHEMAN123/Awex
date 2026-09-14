@@ -307,7 +307,8 @@ inline V2Topology discoverV2Topology(ncclComm_t comm, int world_size, int rank, 
                                      std::uint32_t channel_limit) {
   using namespace topology_detail;
   V2Topology topology;
-  topology.total_channels = powerOfTwoDown(std::max<std::uint32_t>(1, std::min(channel_limit, kMaxChannels)));
+  topology.total_channels = powerOfTwoDown(
+    std::max<std::uint32_t>(1, std::min(channel_limit, static_cast<std::uint32_t>(kMaxChannels))));
   topology.peer_channels.assign(world_size, 1);
   topology.peer_paths.resize(world_size);
 
