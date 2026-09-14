@@ -26,9 +26,8 @@ namespace awex {
 namespace nccl_device_v2 {
 
 constexpr int kWarpSize = 32;
-constexpr int kThreadsPerBlock = 672;
+constexpr int kThreadsPerBlock = 640;
 constexpr int kWarpsPerBlock = kThreadsPerBlock / kWarpSize;
-constexpr int kWorkerWarpsPerBlock = kWarpsPerBlock - 2;
 constexpr int kMaxWorksPerBatch = 8;
 constexpr int kMaxChannels = 64;
 constexpr int kCopyPackBytes = 16;
@@ -40,7 +39,7 @@ constexpr std::size_t kWindowAlignment = 4096;
 constexpr std::size_t kFifoAlignment = 256;
 
 static_assert(kThreadsPerBlock % kWarpSize == 0, "block must contain full warps");
-static_assert(kWorkerWarpsPerBlock >= kMaxWorksPerBatch, "each work needs at least one worker warp");
+static_assert(kMaxWorksPerBatch <= 15, "work groups use CUDA named barriers 1-15");
 static_assert(kMaxChannels <= 64, "channel masks use 64-bit values");
 
 enum class V2Direction : std::uint32_t {

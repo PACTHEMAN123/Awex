@@ -114,10 +114,10 @@ def main() -> None:
             )
         if metrics["channel_count"] != 32:
             raise AssertionError(f"expected 32 active channels, got {dict(metrics)}")
-        if metrics["threads_per_channel"] != 672:
-            raise AssertionError(f"expected 672 channel threads, got {dict(metrics)}")
-        if metrics["warps_per_channel"] != 21:
-            raise AssertionError(f"expected 21 channel warps, got {dict(metrics)}")
+        if metrics["threads_per_channel"] != 640:
+            raise AssertionError(f"expected 640 channel threads, got {dict(metrics)}")
+        if metrics["warps_per_channel"] != 20:
+            raise AssertionError(f"expected 20 channel warps, got {dict(metrics)}")
         expected_payload_peers = 1 if rank == 0 else 0
         if metrics["payload_peer_count"] != expected_payload_peers:
             raise AssertionError(

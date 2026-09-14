@@ -27,6 +27,14 @@ struct alignas(16) V2Pack128 {
   unsigned long long second;
 };
 
+enum V2Role : std::uint32_t {
+  kRoleWorker = 1U << 0,
+  kRoleWaitSend = 1U << 1,
+  kRoleWaitRecv = 1U << 2,
+  kRolePostSend = 1U << 3,
+  kRolePostRecv = 1U << 4,
+};
+
 __device__ __forceinline__ unsigned long long v2LoadStep(const volatile unsigned long long* address) {
   unsigned long long value;
   asm volatile("ld.volatile.global.u64 %0, [%1];" : "=l"(value) : "l"(address) : "memory");
@@ -101,6 +109,14 @@ __device__ __forceinline__ bool v2WaitConsumed(const volatile V2FifoSlot* slot, 
 __device__ __forceinline__ void v2Publish(volatile unsigned long long* address, unsigned long long step) {
   v2FenceSystem();
   v2StoreStep(address, step);
+}
+
+__device__ __forceinline__ void v2GroupBarrier(int barrier, int nthreads) {
+  if (nthreads == kWarpSize) {
+    __syncwarp();
+  } else {
+    asm volatile("barrier.sync.aligned %0, %1;" : : "r"(barrier), "r"(nthreads) : "memory");
+  }
 }
 
 __device__ __forceinline__ V2Pack128 v2Load128(const void* address) {
