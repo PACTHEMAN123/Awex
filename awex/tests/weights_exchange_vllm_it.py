@@ -59,6 +59,13 @@ def _non_negative_int(value: str) -> int:
     return parsed
 
 
+def _unit_interval_float(value: str) -> float:
+    parsed = float(value)
+    if not 0 < parsed <= 1:
+        raise argparse.ArgumentTypeError("must be greater than 0 and at most 1")
+    return parsed
+
+
 vllm_inference_config = {
     "model_path": "/home/model/Qwen3-0.6B",
     "tp_size": DEFAULT_VLLM_TP_SIZE,
@@ -275,6 +282,16 @@ class VLLMWeightsExchangeIT:
             "--disable-log-requests",
             "--enforce-eager",
         ]
+        gpu_memory_utilization = self.inference_config.get(
+            "gpu_memory_utilization"
+        )
+        if gpu_memory_utilization is not None:
+            cmd.extend(
+                [
+                    "--gpu-memory-utilization",
+                    str(gpu_memory_utilization),
+                ]
+            )
         logger.info("Starting vLLM server: %s", " ".join(cmd))
         logger.info("vLLM subprocess %s=%s", visible_env, env.get(visible_env, ""))
 
@@ -461,6 +478,9 @@ def main(args):
     if args.model_path:
         inference_config["model_path"] = args.model_path
     inference_config["tp_size"] = args.vllm_tp_size
+    inference_config["gpu_memory_utilization"] = (
+        args.vllm_gpu_memory_utilization
+    )
 
     weights_exchange_it = VLLMWeightsExchangeIT(
         inference_config=inference_config,
@@ -560,6 +580,16 @@ if __name__ == "__main__":
         default=vllm_inference_config["tp_size"],
         metavar="N",
         help="vLLM tensor-parallel size. Requires train TP size + N visible devices.",
+    )
+    parser.add_argument(
+        "--vllm-gpu-memory-utilization",
+        type=_unit_interval_float,
+        default=None,
+        metavar="FRACTION",
+        help=(
+            "Optional vLLM per-GPU memory utilization fraction; by default "
+            "vLLM uses its own setting."
+        ),
     )
     parser.add_argument(
         "--nccl-device-chunk-mb",
