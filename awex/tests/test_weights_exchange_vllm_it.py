@@ -16,6 +16,7 @@
 # under the License.
 
 import copy
+import sys
 
 import pytest
 
@@ -25,6 +26,9 @@ from awex.tests.experimental.compare_megatron_vllm_weights_multi import (
 from awex.tests.weights_exchange_vllm_it import (
     VLLMWeightsExchangeIT,
     vllm_inference_config,
+)
+from awex.tests.weights_exchange_multi_vllm_it import (
+    MultiVLLMWeightsExchangeIT,
 )
 from awex.util import device as device_util
 
@@ -125,3 +129,36 @@ def test_explicit_expert_tp_can_share_world_ranks_with_dense_tp(monkeypatch):
 
     assert integration.train_parallelism.required_world_size_multiple == 2
     assert integration.vllm_visible_devices == [2]
+
+
+@pytest.mark.parametrize(
+    "integration_class", [VLLMWeightsExchangeIT, MultiVLLMWeightsExchangeIT]
+)
+def test_vllm_child_uses_current_python(monkeypatch, integration_class):
+    _set_distributed_env(monkeypatch, world_size=1)
+    monkeypatch.setattr(
+        device_util, "visible_devices_env_value", lambda: "0,1"
+    )
+    config = copy.deepcopy(vllm_inference_config)
+    config["tp_size"] = 1
+    launched = []
+
+    class _Process:
+        returncode = None
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(
+        "subprocess.Popen",
+        lambda command, **kwargs: launched.append(command) or _Process(),
+    )
+    integration = integration_class(
+        inference_config=config,
+        comm_backend="nccl",
+    )
+    monkeypatch.setattr(integration, "_wait_for_health", lambda *args: None)
+
+    integration._start_vllm_server()
+
+    assert launched[0][0] == sys.executable

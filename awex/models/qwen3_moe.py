@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 
 class SGlangToHFWeightConverterQwen3Moe(SGlangToHFWeightConverter):
-    """SGLang -> HF converter for Qwen3-MoE.
+    """SGLang/vLLM -> HF converter for Qwen3-MoE.
 
     Splits the SGLang fused qkv_proj into canonical q/k/v projections
     (GQA-aware split in the base class) so that inference-side weight
@@ -115,6 +115,38 @@ def _build_mcore_converter_qwen3_moe():
             )
             return q.contiguous(), k.contiguous(), v.contiguous()
 
+        def convert_param_to_device_layout(
+            self, name: str, parameter: torch.Tensor, vp_stage: int = None
+        ):
+            canonical_name = self._canonicalize_source_name(name, vp_stage)
+            is_qkv_parameter = (
+                "self_attention.linear_qkv.weight" in canonical_name
+                or "self_attention.linear_qkv.bias" in canonical_name
+            )
+            if not is_qkv_parameter:
+                return self.convert_param(name, parameter, vp_stage=vp_stage)
+
+            layer_number, remaining_name = canonical_name.replace(
+                "decoder.layers.", "", 1
+            ).split(".", 1)
+            if remaining_name not in {
+                "self_attention.linear_qkv.weight",
+                "self_attention.linear_qkv.bias",
+            }:
+                raise ValueError(f"Unexpected Qwen3-MoE QKV name: {canonical_name}")
+            suffix = "weight" if canonical_name.endswith("weight") else "bias"
+            # Import lazily because qwen3.py reuses this converter factory.
+            from awex.models.qwen3 import build_qwen3_dense_qkv_layouts
+
+            layouts = build_qwen3_dense_qkv_layouts(parameter, self.hf_config)
+            return [
+                (
+                    f"model.layers.{layer_number}.self_attn.{projection}_proj.{suffix}",
+                    layouts[projection],
+                )
+                for projection in ("q", "k", "v")
+            ]
+
         def _convert_attention_param(
             self, name: str, parameter: torch.Tensor, layer_number: str
         ) -> List[Tuple[str, torch.Tensor]]:
@@ -137,4 +169,5 @@ CONFIG = {
     "model_name": "Qwen3MoeForCausalLM",
     "mcore_converter": _build_mcore_converter_qwen3_moe,
     "sglang_converter": SGlangToHFWeightConverterQwen3Moe,
+    "vllm_converter": SGlangToHFWeightConverterQwen3Moe,
 }

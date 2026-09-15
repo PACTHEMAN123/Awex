@@ -47,6 +47,11 @@ from awex.writer.weights_writer import WeightsExchangeShardingWriter
 
 logger = logging.getLogger(__name__)
 
+_QWEN3_STATIC_DEVICE_LAYOUT_ARCHITECTURES = {
+    "Qwen3ForCausalLM",
+    "Qwen3MoeForCausalLM",
+}
+
 
 class NCCLWeightsWriter(WeightsExchangeShardingWriter):
     def _initialize(self):
@@ -71,7 +76,7 @@ class NCCLWeightsWriter(WeightsExchangeShardingWriter):
         )
         if (
             self.comm_backend in ("nccl_device", "nccl_device_v2")
-            and self.model_arch_name == "Qwen3ForCausalLM"
+            and self.model_arch_name in _QWEN3_STATIC_DEVICE_LAYOUT_ARCHITECTURES
         ):
             from awex.models.qwen3 import annotate_qwen3_dense_transfer_plan
 
@@ -79,7 +84,7 @@ class NCCLWeightsWriter(WeightsExchangeShardingWriter):
                 self.transfer_plan, self.hf_config
             )
             logger.info(
-                "Writer rank %s annotated %s Qwen3 dense device operations",
+                "Writer rank %s annotated %s Qwen3 device operations",
                 self.transfer_rank,
                 annotated,
             )
@@ -103,7 +108,7 @@ class NCCLWeightsWriter(WeightsExchangeShardingWriter):
         self.device_parameters = None
         if (
             self.comm_backend in ("nccl_device", "nccl_device_v2")
-            and self.model_arch_name == "Qwen3ForCausalLM"
+            and self.model_arch_name in _QWEN3_STATIC_DEVICE_LAYOUT_ARCHITECTURES
         ):
             self.device_parameters = self.compile_device_parameters(
                 self.required_param_names
@@ -282,7 +287,7 @@ class NCCLWeightsWriter(WeightsExchangeShardingWriter):
                 parameters = self.device_parameters
                 parameters_are_static = True
                 logger.info(
-                    "Writer: using compiled Qwen3 dense device parameters; "
+                    "Writer: using compiled Qwen3 device parameters; "
                     "skipping format conversion"
                 )
             else:

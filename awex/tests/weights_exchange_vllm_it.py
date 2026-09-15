@@ -19,6 +19,7 @@ import argparse
 import copy
 import os
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -266,7 +267,7 @@ class VLLMWeightsExchangeIT:
         env.update({"RANK": "0", "LOCAL_RANK": "0", "WORLD_SIZE": "1"})
 
         cmd = [
-            "python",
+            sys.executable,
             "-m",
             "awex.awex_vllm_server",
             "--model",
@@ -302,6 +303,10 @@ class VLLMWeightsExchangeIT:
         url = f"http://{self.host}:{self.port}/health"
         start = time.time()
         while time.time() - start < timeout:
+            if self.vllm_process.poll() is not None:
+                raise RuntimeError(
+                    f"vLLM server exited with code {self.vllm_process.returncode}."
+                )
             try:
                 resp = requests.get(url, timeout=5)
                 if resp.status_code == 200:
