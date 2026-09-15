@@ -54,8 +54,56 @@ def test_select_devices_reserves_disjoint_train_and_vllm_gpus(monkeypatch):
 def test_train_tp_requires_matching_torchrun_world_size(monkeypatch):
     _set_distributed_env(monkeypatch, world_size=1)
 
-    with pytest.raises(RuntimeError, match="WORLD_SIZE.*train TP size"):
+    with pytest.raises(RuntimeError, match="Invalid Megatron parallel config"):
         VLLMWeightsExchangeIT(
             comm_backend="nccl",
             train_tp_size=2,
         )
+
+
+def test_train_ep_reserves_actual_world_size_before_vllm_gpus(monkeypatch):
+    _set_distributed_env(monkeypatch, rank=1, local_rank=1, world_size=2)
+    monkeypatch.setattr(
+        device_util, "visible_devices_env_value", lambda: "2,3,4,5"
+    )
+    config = copy.deepcopy(vllm_inference_config)
+    config["tp_size"] = 2
+
+    integration = VLLMWeightsExchangeIT(
+        inference_config=config,
+        comm_backend="nccl",
+        train_tp_size=1,
+        train_ep_size=2,
+        train_expert_tp_size=1,
+    )
+
+    assert integration.megatron_device == 3
+    assert integration.vllm_visible_devices == [4, 5]
+
+
+def test_train_parallelism_defaults_expert_tp_to_dense_tp(monkeypatch):
+    _set_distributed_env(monkeypatch, world_size=2)
+
+    with pytest.raises(RuntimeError, match="required multiple=4"):
+        VLLMWeightsExchangeIT(
+            comm_backend="nccl",
+            train_tp_size=2,
+            train_ep_size=2,
+        )
+
+
+def test_explicit_expert_tp_can_share_world_ranks_with_dense_tp(monkeypatch):
+    _set_distributed_env(monkeypatch, world_size=2)
+    monkeypatch.setattr(
+        device_util, "visible_devices_env_value", lambda: "0,1,2"
+    )
+
+    integration = VLLMWeightsExchangeIT(
+        comm_backend="nccl",
+        train_tp_size=2,
+        train_ep_size=2,
+        train_expert_tp_size=1,
+    )
+
+    assert integration.train_parallelism.required_world_size_multiple == 2
+    assert integration.vllm_visible_devices == [2]
