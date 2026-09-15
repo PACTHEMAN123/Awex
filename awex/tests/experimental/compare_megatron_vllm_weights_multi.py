@@ -32,7 +32,7 @@ def _hash_name(name: str) -> str:
     return hashlib.sha256(name.encode("utf-8")).hexdigest()
 
 
-_LAYER_ID_RE = re.compile(r"(?:^|\\.)layers\\.(\\d+)\\.")
+_LAYER_ID_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.")
 
 
 def _layer_id_from_name(name: str) -> int | None:

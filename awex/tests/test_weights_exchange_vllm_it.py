@@ -19,6 +19,9 @@ import copy
 
 import pytest
 
+from awex.tests.experimental.compare_megatron_vllm_weights_multi import (
+    _should_include_name,
+)
 from awex.tests.weights_exchange_vllm_it import (
     VLLMWeightsExchangeIT,
     vllm_inference_config,
@@ -31,6 +34,21 @@ def _set_distributed_env(monkeypatch, rank=0, local_rank=0, world_size=2):
     monkeypatch.setenv("RANK", str(rank))
     monkeypatch.setenv("LOCAL_RANK", str(local_rank))
     monkeypatch.setenv("WORLD_SIZE", str(world_size))
+
+
+@pytest.mark.parametrize(
+    ("name", "max_layers", "include_non_layer", "expected"),
+    [
+        ("model.layers.0.mlp.experts.0.gate_proj.weight", 1, False, True),
+        ("model.layers.1.mlp.experts.0.gate_proj.weight", 1, True, False),
+        ("model.embed_tokens.weight", 1, False, False),
+        ("model.embed_tokens.weight", 1, True, True),
+    ],
+)
+def test_megatron_compare_layer_filter(
+    name, max_layers, include_non_layer, expected
+):
+    assert _should_include_name(name, max_layers, include_non_layer) is expected
 
 
 def test_select_devices_reserves_disjoint_train_and_vllm_gpus(monkeypatch):
