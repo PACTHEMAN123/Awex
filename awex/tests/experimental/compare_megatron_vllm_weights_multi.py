@@ -2,13 +2,14 @@
 import argparse
 import hashlib
 import json
-import math
 import os
 import re
 import subprocess
 import sys
 from pathlib import Path
 from typing import List, Optional
+
+from awex.tests.megatron_parallel import resolve_megatron_parallelism
 
 
 def _apply_device_backend(device_backend: str) -> str:
@@ -31,7 +32,7 @@ def _hash_name(name: str) -> str:
     return hashlib.sha256(name.encode("utf-8")).hexdigest()
 
 
-_LAYER_ID_RE = re.compile(r"(?:^|\\.)layers\\.(\\d+)\\.")
+_LAYER_ID_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.")
 
 
 def _layer_id_from_name(name: str) -> int | None:
@@ -136,22 +137,14 @@ def _dump_megatron_hf_weights_multi(args: argparse.Namespace) -> None:
     )
     device_util.set_device(train_devices[local_rank])
 
-    expert_tp_size = (
-        args.train_expert_tp_size
-        if args.train_expert_tp_size is not None
-        else args.train_tp_size
+    train_parallelism = resolve_megatron_parallelism(
+        tp_size=args.train_tp_size,
+        pp_size=args.train_pp_size,
+        ep_size=args.train_ep_size,
+        expert_tp_size=args.train_expert_tp_size,
     )
-    dense_parallel = args.train_tp_size * args.train_pp_size
-    expert_parallel = expert_tp_size * args.train_ep_size * args.train_pp_size
-    required_world = math.lcm(dense_parallel, expert_parallel)
-    if world_size % dense_parallel != 0 or world_size % expert_parallel != 0:
-        raise RuntimeError(
-            "Invalid train parallel config for WORLD_SIZE. "
-            f"dense(tp*pp)={dense_parallel}, "
-            f"expert(expert_tp*ep*pp)={expert_parallel}, "
-            f"WORLD_SIZE={world_size}, required multiple={required_world}. "
-            "Try adjusting --train-expert-tp-size / --train-ep-size / --train-tp-size."
-        )
+    train_parallelism.validate_world_size(world_size)
+    expert_tp_size = train_parallelism.expert_tp_size
 
     from megatron.core import parallel_state as mpu
     from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed

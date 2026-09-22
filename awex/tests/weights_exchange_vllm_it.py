@@ -19,6 +19,7 @@ import argparse
 import copy
 import os
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -31,6 +32,7 @@ import torch.distributed as dist
 
 from awex import logging
 from awex.meta.meta_server import start_meta_server, stop_meta_server
+from awex.tests.megatron_parallel import resolve_megatron_parallelism
 from awex.util import device as device_util
 from awex.util.profile import emit_profile, profile_phase
 
@@ -58,6 +60,13 @@ def _non_negative_int(value: str) -> int:
     return parsed
 
 
+def _unit_interval_float(value: str) -> float:
+    parsed = float(value)
+    if not 0 < parsed <= 1:
+        raise argparse.ArgumentTypeError("must be greater than 0 and at most 1")
+    return parsed
+
+
 vllm_inference_config = {
     "model_path": "/home/model/Qwen3-0.6B",
     "tp_size": DEFAULT_VLLM_TP_SIZE,
@@ -73,7 +82,7 @@ vllm_inference_config = {
 
 class VLLMWeightsExchangeIT:
     """
-    Megatron ranks use the first train_tp_size visible GPUs. The vLLM child
+    Megatron ranks use the first WORLD_SIZE visible GPUs. The vLLM child
     process, started only by training rank 0, uses the next inference TP GPUs.
 
     Key rule: Do NOT rely on changing os.environ["CUDA_VISIBLE_DEVICES"] in the same process
@@ -81,7 +90,8 @@ class VLLMWeightsExchangeIT:
       - Each training process is pinned by LOCAL_RANK.
       - The child process receives its own CUDA_VISIBLE_DEVICES list.
 
-    Launch train_tp_size > 1 with torchrun and one process per training TP rank.
+    Launch with one torchrun process per Megatron rank. WORLD_SIZE must satisfy
+    both the dense TP and expert TP x EP parallel layouts.
     """
 
     def __init__(
@@ -89,6 +99,8 @@ class VLLMWeightsExchangeIT:
         inference_config=None,
         comm_backend=None,
         train_tp_size=1,
+        train_ep_size=1,
+        train_expert_tp_size=None,
         use_mbridge=False,
         host="127.0.0.1",
         port=8000,
@@ -98,19 +110,21 @@ class VLLMWeightsExchangeIT:
     ):
         self.comm_backend = comm_backend
         self.device_backend = device_util.get_device_type()
-        self.train_tp_size = train_tp_size
+        self.train_parallelism = resolve_megatron_parallelism(
+            tp_size=train_tp_size,
+            ep_size=train_ep_size,
+            expert_tp_size=train_expert_tp_size,
+        )
+        self.train_tp_size = self.train_parallelism.tp_size
+        self.train_ep_size = self.train_parallelism.ep_size
+        self.train_expert_tp_size = self.train_parallelism.expert_tp_size
         self.rank = int(os.environ.get("RANK", "0"))
         self.local_rank = int(os.environ.get("LOCAL_RANK", "0"))
         self.world_size = int(os.environ.get("WORLD_SIZE", "1"))
         self.is_driver = self.rank == 0
-        if self.world_size != self.train_tp_size:
-            raise RuntimeError(
-                f"WORLD_SIZE ({self.world_size}) must equal train TP size "
-                f"({self.train_tp_size}). Launch with torchrun "
-                f"--nproc-per-node={self.train_tp_size}."
-            )
-        if self.train_tp_size > 1 and comm_backend == "file":
-            raise RuntimeError("Training TP > 1 requires the NCCL or HCCL backend.")
+        self.train_parallelism.validate_world_size(self.world_size)
+        if self.world_size > 1 and comm_backend == "file":
+            raise RuntimeError("Multi-rank training requires the NCCL or HCCL backend.")
 
         self.meta_server_addr = None
         self.inference_config = inference_config or copy.deepcopy(vllm_inference_config)
@@ -144,21 +158,21 @@ class VLLMWeightsExchangeIT:
             # Fallback: use torch to detect. (May touch CUDA, but that's OK with set_device below.)
             visible_devices = list(range(device_util.device_count()))
 
-        need = self.train_tp_size + inference_tp
+        need = self.world_size + inference_tp
         if len(visible_devices) < need:
             raise RuntimeError(
-                f"Need at least {need} visible devices ({self.train_tp_size} for "
+                f"Need at least {need} visible devices ({self.world_size} for "
                 f"Megatron + {inference_tp} for vLLM). "
                 f"Found {len(visible_devices)} via visible devices env='{visible_env or '(unset)'}'."
             )
-        if not 0 <= self.local_rank < self.train_tp_size:
+        if not 0 <= self.local_rank < self.world_size:
             raise RuntimeError(
-                f"LOCAL_RANK ({self.local_rank}) must be in [0, {self.train_tp_size})."
+                f"LOCAL_RANK ({self.local_rank}) must be in [0, {self.world_size})."
             )
 
         megatron_device = visible_devices[self.local_rank]
         vllm_devices = visible_devices[
-            self.train_tp_size : self.train_tp_size + inference_tp
+            self.world_size : self.world_size + inference_tp
         ]
         return vllm_devices, megatron_device
 
@@ -253,7 +267,7 @@ class VLLMWeightsExchangeIT:
         env.update({"RANK": "0", "LOCAL_RANK": "0", "WORLD_SIZE": "1"})
 
         cmd = [
-            "python",
+            sys.executable,
             "-m",
             "awex.awex_vllm_server",
             "--model",
@@ -269,6 +283,16 @@ class VLLMWeightsExchangeIT:
             "--disable-log-requests",
             "--enforce-eager",
         ]
+        gpu_memory_utilization = self.inference_config.get(
+            "gpu_memory_utilization"
+        )
+        if gpu_memory_utilization is not None:
+            cmd.extend(
+                [
+                    "--gpu-memory-utilization",
+                    str(gpu_memory_utilization),
+                ]
+            )
         logger.info("Starting vLLM server: %s", " ".join(cmd))
         logger.info("vLLM subprocess %s=%s", visible_env, env.get(visible_env, ""))
 
@@ -279,6 +303,10 @@ class VLLMWeightsExchangeIT:
         url = f"http://{self.host}:{self.port}/health"
         start = time.time()
         while time.time() - start < timeout:
+            if self.vllm_process.poll() is not None:
+                raise RuntimeError(
+                    f"vLLM server exited with code {self.vllm_process.returncode}."
+                )
             try:
                 resp = requests.get(url, timeout=5)
                 if resp.status_code == 200:
@@ -318,7 +346,10 @@ class VLLMWeightsExchangeIT:
     def _init_megatron_engine(self):
         self.train_config["tensor_model_parallel_size"] = self.train_tp_size
         self.train_config["pipeline_model_parallel_size"] = 1
-        self.train_config["expert_model_parallel_size"] = 1
+        self.train_config["expert_model_parallel_size"] = self.train_ep_size
+        self.train_config["expert_tensor_parallel_size"] = (
+            self.train_expert_tp_size
+        )
 
         try:
             logger.info(
@@ -354,7 +385,8 @@ class VLLMWeightsExchangeIT:
             tensor_model_parallel_size=self.train_tp_size,
             virtual_pipeline_model_parallel_size=None,
             context_parallel_size=1,
-            expert_model_parallel_size=1,
+            expert_model_parallel_size=self.train_ep_size,
+            expert_tensor_parallel_size=self.train_expert_tp_size,
         )
 
         try:
@@ -451,11 +483,16 @@ def main(args):
     if args.model_path:
         inference_config["model_path"] = args.model_path
     inference_config["tp_size"] = args.vllm_tp_size
+    inference_config["gpu_memory_utilization"] = (
+        args.vllm_gpu_memory_utilization
+    )
 
     weights_exchange_it = VLLMWeightsExchangeIT(
         inference_config=inference_config,
         comm_backend=comm_backend,
         train_tp_size=args.train_tp_size,
+        train_ep_size=args.train_ep_size,
+        train_expert_tp_size=args.train_expert_tp_size,
         use_mbridge=args.use_mbridge,
         host=args.host,
         port=args.port,
@@ -521,8 +558,25 @@ if __name__ == "__main__":
         default=1,
         metavar="N",
         help=(
-            "Megatron tensor-parallel size. Values greater than 1 require "
-            "torchrun --nproc-per-node=N."
+            "Megatron dense tensor-parallel size. Torchrun WORLD_SIZE must "
+            "satisfy both the dense and expert parallel layouts."
+        ),
+    )
+    parser.add_argument(
+        "--train-ep-size",
+        type=_positive_int,
+        default=1,
+        metavar="N",
+        help="Megatron expert-parallel size.",
+    )
+    parser.add_argument(
+        "--train-expert-tp-size",
+        type=_positive_int,
+        default=None,
+        metavar="N",
+        help=(
+            "Megatron expert tensor-parallel size (default: train TP size, "
+            "matching Megatron Core)."
         ),
     )
     parser.add_argument(
@@ -531,6 +585,16 @@ if __name__ == "__main__":
         default=vllm_inference_config["tp_size"],
         metavar="N",
         help="vLLM tensor-parallel size. Requires train TP size + N visible devices.",
+    )
+    parser.add_argument(
+        "--vllm-gpu-memory-utilization",
+        type=_unit_interval_float,
+        default=None,
+        metavar="FRACTION",
+        help=(
+            "Optional vLLM per-GPU memory utilization fraction; by default "
+            "vLLM uses its own setting."
+        ),
     )
     parser.add_argument(
         "--nccl-device-chunk-mb",

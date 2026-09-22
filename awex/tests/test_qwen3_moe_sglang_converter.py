@@ -26,10 +26,12 @@ contract on CPU without requiring SGLang or Megatron.
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
-from awex.models.qwen3_moe import SGlangToHFWeightConverterQwen3Moe
+from awex.models.qwen3_moe import CONFIG, SGlangToHFWeightConverterQwen3Moe
 from awex.models.registry import get_infer_weights_converter
+from awex.transfer.tensor_layout import StaticTensorLayout
 from awex.util import device as device_util
 
 # Tiny Qwen3-MoE-like geometry: GQA with 8 query heads and 2 KV heads.
@@ -131,9 +133,10 @@ def _expected_hf_names(expert_ids):
     return names
 
 
-def test_registry_resolves_qwen3_moe_sglang_converter():
+@pytest.mark.parametrize("engine_name", ["sglang", "vllm"])
+def test_registry_resolves_qwen3_moe_converter(engine_name):
     converter = get_infer_weights_converter(
-        "sglang",
+        engine_name,
         "Qwen3MoeForCausalLM",
         _model_config(),
         _rank_info(),
@@ -176,6 +179,38 @@ def test_qkv_split_is_gqa_aware():
     assert torch.equal(result["model.layers.0.self_attn.q_proj.weight"], q)
     assert torch.equal(result["model.layers.0.self_attn.k_proj.weight"], k)
     assert torch.equal(result["model.layers.0.self_attn.v_proj.weight"], v)
+
+
+def test_mcore_qkv_device_layout_uses_stable_source_spans():
+    converter_class = CONFIG["mcore_converter"]()
+    converter = converter_class.__new__(converter_class)
+    converter.hf_config = _model_config()
+    converter.rank_info = SimpleNamespace(pp_rank=0, pp_size=1)
+    converter.tf_config = SimpleNamespace()
+    converter._pp_stage_layer_id_map = {}
+    group_rows = (NUM_HEADS // NUM_KV_HEADS + 2) * HEAD_DIM
+    fused = torch.arange(
+        NUM_KV_HEADS * group_rows * HIDDEN, dtype=torch.float32
+    ).reshape(NUM_KV_HEADS * group_rows, HIDDEN)
+
+    converted = dict(
+        converter.convert_param_to_device_layout(
+            "decoder.layers.0.self_attention.linear_qkv.weight", fused
+        )
+    )
+
+    assert set(converted) == {
+        "model.layers.0.self_attn.q_proj.weight",
+        "model.layers.0.self_attn.k_proj.weight",
+        "model.layers.0.self_attn.v_proj.weight",
+    }
+    source_storage = fused.untyped_storage().data_ptr()
+    for layout in converted.values():
+        assert isinstance(layout, StaticTensorLayout)
+        assert all(
+            span.untyped_storage().data_ptr() == source_storage
+            for span in layout.spans
+        )
 
 
 def test_qkv_split_rejects_indivisible_rows():

@@ -29,7 +29,7 @@ constexpr int kWarpSize = 32;
 constexpr int kThreadsPerBlock = 640;
 constexpr int kWarpsPerBlock = kThreadsPerBlock / kWarpSize;
 constexpr int kMaxWorksPerBatch = 8;
-constexpr int kMaxChannelsPerPeer = 32;
+constexpr int kMaxChannels = 64;
 constexpr int kCopyPackBytes = 16;
 constexpr int kCopyUnroll = 8;
 constexpr std::uint32_t kDefaultFifoDepth = 8;
@@ -40,7 +40,7 @@ constexpr std::size_t kFifoAlignment = 256;
 
 static_assert(kThreadsPerBlock % kWarpSize == 0, "block must contain full warps");
 static_assert(kMaxWorksPerBatch <= 15, "work groups use CUDA named barriers 1-15");
-static_assert(kMaxChannelsPerPeer <= 32, "final_parts is a 32-bit channel mask");
+static_assert(kMaxChannels <= 64, "channel masks use 64-bit values");
 
 enum class V2Direction : std::uint32_t {
   kSend,
@@ -60,33 +60,29 @@ struct V2Task {
   std::uint32_t ordinal;
 };
 
-// A side is optional so the device work format can represent a future
-// send/recv pair in the same batch. The first draft normally enables only one
-// side because the existing Awex calls have a sender/receiver role.
-struct V2WorkSide {
-  std::uint32_t enabled;
-  std::uint32_t channel_base;
-  std::uint32_t channel_count;
-  // Bit p marks the final work for this peer/channel partition. Only those
-  // partitions drain the final consumed step before the kernel returns.
-  std::uint32_t final_parts;
+// One physical tensor span in a peer's virtual byte stream. Lowering may split
+// a channel chunk across multiple fragments without exposing tensor boundaries
+// to the FIFO protocol.
+struct alignas(16) V2Fragment {
   std::uintptr_t tensor_ptr;
   std::uint64_t nbytes;
   std::uint64_t tensor_offset;
   std::uint64_t tensor_row_bytes;
   std::uint64_t tensor_row_stride;
-  // One absolute step base for each channel partition. Keeping this in the
-  // work record makes channel-local connector state explicit in the draft.
-  std::uint64_t step_begin[kMaxChannelsPerPeer];
+  std::uint64_t work_offset;
 };
 
 struct alignas(16) V2Work {
   std::uint32_t peer;
-  std::uint32_t task_ordinal;
+  std::uint32_t fragment_begin;
+  std::uint32_t fragment_count;
   std::uint32_t chunk_ordinal;
   std::uint32_t chunk_count;
-  V2WorkSide send;
-  V2WorkSide recv;
+  std::uint32_t final;
+  std::uint32_t reserved;
+  std::uint64_t stream_offset;
+  std::uint64_t nbytes;
+  std::uint64_t step_begin;
 };
 
 struct V2WorkBatch {
@@ -120,19 +116,26 @@ struct V2WindowLayout {
   std::uint32_t fifo_depth;
   std::uint32_t channel_count;
   std::uint32_t world_size;
+  std::uint32_t payload_peer_count;
   std::size_t window_bytes;
 };
 
 struct V2KernelArgs {
   const V2Work* works;
+  const V2Fragment* fragments;
   const V2WorkBatch* batches;
   const V2ChannelQueue* channels;
+  const std::uint32_t* channel_ids;
+  const std::uint32_t* active_peers;
   std::uint32_t channel_count;
+  std::uint32_t active_peer_count;
   std::uint32_t local_rank;
   std::uint32_t world_size;
+  V2Direction direction;
   V2WindowLayout layout;
   std::uint8_t* local_window;
   const std::uintptr_t* peer_windows;
+  const std::uint32_t* payload_peer_slots;
   unsigned long long epoch;
   unsigned long long timeout_cycles;
 };
