@@ -35,6 +35,12 @@ using V2GinReadySignalInc = ncclGin_SignalInc;
 using V2GinCreditSignalInc = ncclGin_SignalInc;
 #endif
 
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 30, 7)
+constexpr ncclGinFenceLevel kV2GinNoFence = ncclGinFenceLevel::None;
+#else
+constexpr ncclGinFenceLevel kV2GinNoFence = ncclGinFenceLevel::Relaxed;
+#endif
+
 __device__ __forceinline__ ncclGinSignal_t v2GinReadySignal(const V2KernelArgs& args, std::uint32_t peer,
                                                             std::uint32_t channel) {
   return static_cast<ncclGinSignal_t>(static_cast<std::size_t>(peer) * args.layout.channel_count + channel);
@@ -177,7 +183,7 @@ __global__ void v2GinResetSignalsKernel(V2KernelArgs args) {
   ncclGin barrier_gin{args.dev_comm, 0};
   ncclGinBarrierSession<ncclCoopCta> barrier{coop, barrier_gin, ncclTeamTagWorld(), 0};
   const ncclResult_t result =
-    barrier.sync(coop, cuda::memory_order_acq_rel, ncclGinFenceLevel::None, args.timeout_cycles);
+    barrier.sync(coop, cuda::memory_order_acq_rel, kV2GinNoFence, args.timeout_cycles);
   if (threadIdx.x == 0 && result != ncclSuccess) {
     auto* error = &reinterpret_cast<V2WindowHeader*>(args.local_window)->error;
     atomicCAS(error, 0U, 1U);
