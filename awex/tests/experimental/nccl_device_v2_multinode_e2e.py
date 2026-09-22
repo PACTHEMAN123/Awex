@@ -23,10 +23,20 @@ from __future__ import annotations
 
 import json
 import os
+import sys
+import types
+from pathlib import Path
 from types import SimpleNamespace
 
 os.environ.setdefault("AWEX_NCCL_INCLUDE", "/usr/local/cuda/include")
 os.environ.setdefault("AWEX_NCCL_LIB", "/usr/local/cuda/targets/x86_64-linux/lib")
+
+# The transport has no model-stack dependency, but awex.__init__ eagerly imports
+# optional reader/model modules. Keep this standalone hardware test runnable in
+# the minimal NCCL containers by exposing the source tree as the package root.
+_awex_package = types.ModuleType("awex")
+_awex_package.__path__ = [str(Path(__file__).resolve().parents[2])]
+sys.modules.setdefault("awex", _awex_package)
 
 from awex.transfer.nccl_device_v2 import NCCLDeviceV2Transport
 from awex.transfer.transfer_plan import (
