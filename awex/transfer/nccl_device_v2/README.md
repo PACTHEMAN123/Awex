@@ -48,7 +48,7 @@ stream, and both paths share the same work/channel lowering and symmetric
 registered window.
 
 GIN is initialized only when the cached plan contains a non-LSA edge. That
-path requires Linux, CUDA 12.2 or newer, NCCL 2.30.7 or newer with aggregate
+path requires Linux, CUDA 12.2 or newer, NCCL 2.30.4 or newer with aggregate
 `nccl_device.h` headers, a GIN-capable communicator, and a fully connected
 supported RDMA fabric. The launch metrics expose `lsa_peer_count`,
 `gin_peer_count`, `gin_type`, and `gin_context_count` so a deployment can

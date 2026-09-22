@@ -382,15 +382,15 @@ void initialize_sparse_window(DeviceState* state, const std::vector<std::uint32_
   state->gin_enabled = std::any_of(gin_flags.begin(), gin_flags.end(), [](std::uint32_t value) { return value != 0; });
   if (state->gin_enabled) {
 #if AWEX_NCCL_DEVICE_V2_HAS_GIN
-    if (state->nccl_version < NCCL_VERSION(2, 30, 7)) {
-      throw std::runtime_error("nccl_device_v2 GIN transport requires NCCL 2.30.7 or newer at runtime");
+    if (state->nccl_version < NCCL_VERSION(2, 30, 4)) {
+      throw std::runtime_error("nccl_device_v2 GIN transport requires NCCL 2.30.4 or newer at runtime");
     }
     if (state->gin_type == NCCL_GIN_TYPE_NONE) {
       throw std::runtime_error("nccl_device_v2 found non-LSA peers, but the NCCL communicator has no GIN support");
     }
 #else
     throw std::runtime_error(
-      "nccl_device_v2 found non-LSA peers, but this extension was not built with NCCL 2.30.7+ GIN headers");
+      "nccl_device_v2 found non-LSA peers, but this extension was not built with NCCL 2.30.4+ GIN headers");
 #endif
   }
 
@@ -448,8 +448,10 @@ void initialize_sparse_window(DeviceState* state, const std::vector<std::uint32_
       requirements.ginSignalCount = static_cast<int>(state->gin_signal_count);
       requirements.ginConnectionType = NCCL_GIN_CONNECTION_FULL;
       requirements.worldGinBarrierCount = 1;
+#if AWEX_NCCL_DEVICE_V2_HAS_EXPLICIT_SIGNAL_STRENGTH
       requirements.ginStrongSignalsRequired = true;
       requirements.ginVaSignalsRequired = false;
+#endif
       AWEX_NCCL_V2_CHECK(ncclDevCommCreate(state->comm, &requirements, &state->dev_comm));
       state->dev_comm_created = true;
       if (state->dev_comm.ginContextCount == 0) {

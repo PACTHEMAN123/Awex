@@ -24,6 +24,17 @@ namespace nccl_device_v2 {
 
 #if AWEX_NCCL_DEVICE_V2_HAS_GIN
 
+#if AWEX_NCCL_DEVICE_V2_HAS_EXPLICIT_SIGNAL_STRENGTH
+using V2GinReadySignalInc = ncclGin_StrongSignalInc;
+using V2GinCreditSignalInc = ncclGin_WeakSignalInc;
+#else
+// NCCL 2.30.4 SignalInc has the strong ordering semantics later made
+// explicit by StrongSignalInc: the signal follows all earlier puts to the
+// same peer on the same context.
+using V2GinReadySignalInc = ncclGin_SignalInc;
+using V2GinCreditSignalInc = ncclGin_SignalInc;
+#endif
+
 __device__ __forceinline__ ncclGinSignal_t v2GinReadySignal(const V2KernelArgs& args, std::uint32_t peer,
                                                             std::uint32_t channel) {
   return static_cast<ncclGinSignal_t>(static_cast<std::size_t>(peer) * args.layout.channel_count + channel);
@@ -106,7 +117,7 @@ __device__ __forceinline__ void v2GinRunSend(const V2KernelArgs& args, const V2W
       // put cannot satisfy the wait for an earlier FIFO step.
       gin.put(world, work.peer, args.window, v2GinPayloadOffset(args, work.peer, args.local_rank, channel, step),
               args.window, v2GinPayloadOffset(args, args.local_rank, work.peer, channel, step), slice_bytes,
-              ncclGin_StrongSignalInc{ready_signal});
+              V2GinReadySignalInc{ready_signal});
     }
     if (v2LoadError(error) != 0) return;
     cursor += slice_bytes;
@@ -146,7 +157,7 @@ __device__ __forceinline__ void v2GinRunRecv(const V2KernelArgs& args, const V2W
 
     v2GroupBarrier(barrier, nthreads);
     if ((roles & kRolePostRecv) && v2LoadError(error) == 0) {
-      gin.signal(world, work.peer, ncclGin_WeakSignalInc{credit_signal});
+      gin.signal(world, work.peer, V2GinCreditSignalInc{credit_signal});
     }
     if (v2LoadError(error) != 0) return;
     cursor += slice_bytes;
