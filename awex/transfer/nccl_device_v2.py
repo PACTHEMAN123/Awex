@@ -517,7 +517,13 @@ def _load_extension() -> Any:
                 name="awex_nccl_device_ext_v2",
                 sources=[source, kernel_source],
                 extra_include_paths=include_paths,
-                extra_cuda_cflags=["-O3"],
+                extra_cuda_cflags=[
+                    "-O3",
+                    "-DNCCL_OS_LINUX",
+                    "--expt-extended-lambda",
+                    "--expt-relaxed-constexpr",
+                    "-Xptxas=-maxrregcount=96",
+                ],
                 extra_ldflags=[
                     *(f"-L{path}" for path in library_paths),
                     *(

@@ -15,21 +15,19 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""Two-rank CUDA smoke test for the experimental NCCL Device v2 backend."""
+"""Two-node smoke test for the GIN path inside nccl_device_v2."""
 
 from __future__ import annotations  # noqa: I001
 
 import os
 
-# Import this module before torch so its configured NCCL preload wins SONAME
-# resolution when the extension and PyTorch share one process.
 from awex.transfer.nccl_device_v2 import _load_extension
 import torch
 import torch.distributed as dist
 
 _MIB = 1024 * 1024
-_TENSOR_BYTES = (65 * _MIB, 64 * _MIB, 32 * _MIB)
-_PATTERNS = (0x11, 0x5A, 0xE3)
+_TENSOR_BYTES = (8 * _MIB, 5 * _MIB)
+_PATTERNS = (0x2D, 0xC7)
 
 
 def _broadcast_unique_id(extension: object, rank: int) -> bytes:
@@ -43,12 +41,13 @@ def main() -> None:
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     if world_size != 2:
-        raise RuntimeError("nccl_device_v2_smoke requires exactly two ranks")
+        raise RuntimeError("nccl_device_v2_multinode_smoke requires two ranks")
 
     torch.cuda.set_device(local_rank)
     dist.init_process_group("gloo")
     extension = _load_extension()
     unique_id = _broadcast_unique_id(extension, rank)
+    peer = 1 - rank
     tensors = [
         torch.full(
             (nbytes,),
@@ -58,13 +57,12 @@ def main() -> None:
         )
         for index, nbytes in enumerate(_TENSOR_BYTES)
     ]
-    peer = 1 - rank
     handle = extension.create(
         unique_id,
         world_size,
         rank,
         local_rank,
-        60_000,
+        120_000,
         64,
         8,
         512 * 1024,
@@ -100,51 +98,18 @@ def main() -> None:
                         )
 
         metrics = launch_metrics[-1]
-        if metrics["topology_nvlink_count"] != 18:
-            raise AssertionError(f"expected NV18 topology, got {dict(metrics)}")
-        if metrics["topology_raw_channels"] != 36:
-            raise AssertionError(
-                f"expected 36 raw topology channels, got {dict(metrics)}"
-            )
-        if metrics["topology_requested_channels_per_peer"] != 64:
-            raise AssertionError(f"expected 64 requested channels, got {dict(metrics)}")
-        if metrics["topology_channels_per_peer"] != 64:
-            raise AssertionError(
-                f"expected 64 effective topology channels, got {dict(metrics)}"
-            )
-        if metrics["channel_count"] != 32:
-            raise AssertionError(f"expected 32 active channels, got {dict(metrics)}")
-        if metrics["threads_per_channel"] != 640:
-            raise AssertionError(f"expected 640 channel threads, got {dict(metrics)}")
-        if metrics["warps_per_channel"] != 20:
-            raise AssertionError(f"expected 20 channel warps, got {dict(metrics)}")
-        expected_payload_peers = 1
-        if metrics["payload_peer_count"] != expected_payload_peers:
-            raise AssertionError(
-                f"expected {expected_payload_peers} payload peers, got {dict(metrics)}"
-            )
-        if metrics["registered_window_bytes"] >= metrics["dense_window_bytes"]:
-            raise AssertionError(f"expected a sparse window, got {dict(metrics)}")
-        if metrics["lsa_peer_count"] != 1 or metrics["gin_peer_count"] != 0:
-            raise AssertionError(f"expected the LSA path, got {dict(metrics)}")
-        if metrics["gin_enabled"]:
-            raise AssertionError(f"GIN unexpectedly enabled: {dict(metrics)}")
+        if metrics["lsa_peer_count"] != 0 or metrics["gin_peer_count"] != 1:
+            raise AssertionError(f"expected the GIN path, got {dict(metrics)}")
+        if not metrics["gin_enabled"] or metrics["gin_context_count"] <= 0:
+            raise AssertionError(f"GIN was not initialized: {dict(metrics)}")
+        if metrics["payload_peer_count"] != 1:
+            raise AssertionError(f"expected one payload peer, got {dict(metrics)}")
         if launch_metrics[0]["plan_cache_hit"]:
             raise AssertionError(
                 f"first launch unexpectedly hit cache: {dict(metrics)}"
             )
         if not launch_metrics[1]["plan_cache_hit"]:
             raise AssertionError(f"second launch missed cache: {dict(metrics)}")
-        if launch_metrics[1]["host_lowering_time_ms"] != 0.0:
-            raise AssertionError(f"cached launch repeated lowering: {dict(metrics)}")
-        if launch_metrics[1]["metadata_upload_time_ms"] != 0.0:
-            raise AssertionError(
-                f"cached launch repeated metadata upload: {dict(metrics)}"
-            )
-        if metrics["fragment_count"] <= metrics["work_count"]:
-            raise AssertionError(
-                f"expected a chunk crossing tensor spans, got {dict(metrics)}"
-            )
         dist.barrier()
         print(
             f"rank={rank} first={dict(launch_metrics[0])} "

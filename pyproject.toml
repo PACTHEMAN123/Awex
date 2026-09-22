@@ -56,7 +56,12 @@ packages = ["awex"]
 version = {attr = "awex.reader.__version__"}
 
 [tool.setuptools.package-data]
-awex = ["py.typed", "transfer/nccl_device_ext.cu", "transfer/impls/*.cuh"]
+awex = [
+    "py.typed",
+    "transfer/nccl_device_ext.cu",
+    "transfer/impls/*.cuh",
+    "transfer/nccl_device_v2/*",
+]
 
 [tool.pytest.ini_options]
 minversion = "7.0"

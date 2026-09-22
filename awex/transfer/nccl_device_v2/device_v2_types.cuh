@@ -18,6 +18,22 @@
 #pragma once
 
 #include <cuda_runtime.h>
+#include <nccl.h>
+
+#if __has_include(<nccl_device.h>)
+#include <nccl_device.h>
+#define AWEX_NCCL_DEVICE_V2_AGGREGATE_HEADER 1
+#else
+#include <nccl_device/core.h>
+#define AWEX_NCCL_DEVICE_V2_AGGREGATE_HEADER 0
+#endif
+
+#if AWEX_NCCL_DEVICE_V2_AGGREGATE_HEADER && defined(NCCL_OS_LINUX) && \
+  NCCL_VERSION_CODE >= NCCL_VERSION(2, 30, 7)
+#define AWEX_NCCL_DEVICE_V2_HAS_GIN 1
+#else
+#define AWEX_NCCL_DEVICE_V2_HAS_GIN 0
+#endif
 
 #include <cstddef>
 #include <cstdint>
@@ -45,6 +61,11 @@ static_assert(kMaxChannels <= 64, "channel masks use 64-bit values");
 enum class V2Direction : std::uint32_t {
   kSend,
   kRecv,
+};
+
+enum class V2Transport : std::uint8_t {
+  kLsa,
+  kGin,
 };
 
 // This is the fixed-plan task shape consumed by the v2 lowering layer. The
@@ -127,6 +148,7 @@ struct V2KernelArgs {
   const V2ChannelQueue* channels;
   const std::uint32_t* channel_ids;
   const std::uint32_t* active_peers;
+  const std::uint8_t* peer_transports;
   std::uint32_t channel_count;
   std::uint32_t active_peer_count;
   std::uint32_t local_rank;
@@ -136,6 +158,12 @@ struct V2KernelArgs {
   std::uint8_t* local_window;
   const std::uintptr_t* peer_windows;
   const std::uint32_t* payload_peer_slots;
+  std::uint32_t gin_enabled;
+  std::uint32_t gin_signal_count;
+#if AWEX_NCCL_DEVICE_V2_HAS_GIN
+  ncclWindow_t window;
+  ncclDevComm dev_comm;
+#endif
   unsigned long long epoch;
   unsigned long long timeout_cycles;
 };

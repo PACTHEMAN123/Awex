@@ -37,15 +37,23 @@ leaving barrier 0 to CTA-wide synchronization. When a work has at least three
 warps, its final warp is reserved for the Post role so it can publish the
 previous step while worker warps begin the next one.
 
-The transport is fixed to NVLink read mode. A sender's worker warps stage source
-data into its local registered FIFO window and publish `ready_step`; receiver
-warps issue volatile loads from that remote window, scatter into local tensor
-fragments, then publish `consumed_step` back to the sender. Every
-`(peer, channel)` owns an independent monotonically increasing step stream.
-Wait roles cache observed steps and poll with volatile loads. Post roles use a
-system fence followed by a relaxed system store, avoiding system-scope RMWs on
-the normal control path. Eight 512 KiB FIFO steps provide 4 MiB of in-flight
-payload per channel-peer connection.
+The backend selects a transport per peer without changing the fixed plan or
+the public `nccl_device_v2` backend name. Peers in the local LSA team keep the
+NVLink read protocol: a sender stages into its local FIFO, the receiver reads
+that window, and `ready_step`/`consumed_step` carry ownership. Peers outside the
+LSA team use GIN puts into the receiver's FIFO. Strong ready signals order the
+put stream and weak credit signals release reusable sender slots. Every
+`(peer, channel)` still owns an independent monotonically increasing step
+stream, and both paths share the same work/channel lowering and symmetric
+registered window.
+
+GIN is initialized only when the cached plan contains a non-LSA edge. That
+path requires Linux, CUDA 12.2 or newer, NCCL 2.30.7 or newer with aggregate
+`nccl_device.h` headers, a GIN-capable communicator, and a fully connected
+supported RDMA fabric. The launch metrics expose `lsa_peer_count`,
+`gin_peer_count`, `gin_type`, and `gin_context_count` so a deployment can
+confirm which path was selected. Indexed GIN signals are reset behind a world
+barrier before each cached-plan launch.
 
 The Python transport entry point lives next to this directory in
 `awex/transfer/nccl_device_v2.py`. It has its own task binding and extension
