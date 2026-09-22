@@ -82,9 +82,9 @@ vllm_inference_config = {
 
 class MultiVLLMWeightsExchangeIT:
     """
-    Megatron ranks use the first WORLD_SIZE visible GPUs. The vLLM child
-    processes, started only by training rank 0, each use a disjoint inference
-    TP group from the remaining GPUs.
+    Megatron ranks use the first LOCAL_WORLD_SIZE visible GPUs on each node.
+    The vLLM children, started only by global training rank 0, each use a
+    disjoint inference TP group from the remaining GPUs on that node.
 
     Key rule: Do NOT rely on changing os.environ["CUDA_VISIBLE_DEVICES"] in the same process
               after torch.cuda has been touched. Instead:
@@ -122,6 +122,9 @@ class MultiVLLMWeightsExchangeIT:
         self.rank = int(os.environ.get("RANK", "0"))
         self.local_rank = int(os.environ.get("LOCAL_RANK", "0"))
         self.world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        self.local_world_size = int(
+            os.environ.get("LOCAL_WORLD_SIZE", str(self.world_size))
+        )
         self.is_driver = self.rank == 0
         self.train_parallelism.validate_world_size(self.world_size)
         if self.world_size > 1 and comm_backend == "file":
@@ -161,23 +164,29 @@ class MultiVLLMWeightsExchangeIT:
             # Fallback: use torch to detect. (May touch CUDA, but that's OK with set_device below.)
             visible_devices = list(range(device_util.device_count()))
 
-        need = self.world_size + total_inference_gpus
+        inference_gpus = total_inference_gpus if self.is_driver else 0
+        need = self.local_world_size + inference_gpus
         if len(visible_devices) < need:
             raise RuntimeError(
-                f"Need at least {need} visible devices ({self.world_size} for "
-                f"Megatron + {total_inference_gpus} for {num_engines} vLLM "
-                f"engines at TP{inference_tp}). "
+                f"Need at least {need} visible devices ({self.local_world_size} "
+                f"local Megatron ranks + {inference_gpus} for {num_engines} "
+                f"vLLM engines at TP{inference_tp} on this rank). "
                 f"Found {len(visible_devices)} via visible devices env='{visible_env or '(unset)'}'."
             )
-        if not 0 <= self.local_rank < self.world_size:
+        if not 0 <= self.local_rank < self.local_world_size:
             raise RuntimeError(
-                f"LOCAL_RANK ({self.local_rank}) must be in [0, {self.world_size})."
+                f"LOCAL_RANK ({self.local_rank}) must be in "
+                f"[0, {self.local_world_size})."
             )
 
         megatron_device = visible_devices[self.local_rank]
-        vllm_devices = visible_devices[
-            self.world_size : self.world_size + total_inference_gpus
-        ]
+        vllm_devices = (
+            visible_devices[
+                self.local_world_size : self.local_world_size + total_inference_gpus
+            ]
+            if self.is_driver
+            else []
+        )
         return vllm_devices, megatron_device
 
     def initialize(self):
@@ -212,7 +221,10 @@ class MultiVLLMWeightsExchangeIT:
             os.environ.setdefault("WORLD_SIZE", "1")
             os.environ.setdefault("MASTER_PORT", "17443")
             os.environ.setdefault("MASTER_ADDR", "localhost")
-        os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo")
+        default_socket_ifname = (
+            "eth0" if self.world_size > self.local_world_size else "lo"
+        )
+        os.environ.setdefault("GLOO_SOCKET_IFNAME", default_socket_ifname)
 
         device_util.set_device(self.local_rank)
         if not dist.is_initialized():
@@ -516,7 +528,7 @@ class MultiVLLMWeightsExchangeIT:
 
 
 def main(args):
-    os.environ["NCCL_DEBUG"] = "WARNING"
+    os.environ.setdefault("NCCL_DEBUG", "WARNING")
     if getattr(args, "nccl_device_chunk_mb", None) is not None:
         os.environ["AWEX_NCCL_DEVICE_CHUNK_BYTES"] = str(
             args.nccl_device_chunk_mb * 1024 * 1024

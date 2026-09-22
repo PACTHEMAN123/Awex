@@ -33,11 +33,17 @@ from awex.tests.weights_exchange_multi_vllm_it import (
 from awex.util import device as device_util
 
 
-def _set_distributed_env(monkeypatch, rank=0, local_rank=0, world_size=2):
+def _set_distributed_env(
+    monkeypatch, rank=0, local_rank=0, world_size=2, local_world_size=None
+):
     monkeypatch.setenv("AWEX_DEVICE_TYPE", "cuda")
     monkeypatch.setenv("RANK", str(rank))
     monkeypatch.setenv("LOCAL_RANK", str(local_rank))
     monkeypatch.setenv("WORLD_SIZE", str(world_size))
+    if local_world_size is None:
+        monkeypatch.delenv("LOCAL_WORLD_SIZE", raising=False)
+    else:
+        monkeypatch.setenv("LOCAL_WORLD_SIZE", str(local_world_size))
 
 
 @pytest.mark.parametrize(
@@ -129,6 +135,54 @@ def test_explicit_expert_tp_can_share_world_ranks_with_dense_tp(monkeypatch):
 
     assert integration.train_parallelism.required_world_size_multiple == 2
     assert integration.vllm_visible_devices == [2]
+
+
+@pytest.mark.parametrize(
+    "integration_class", [VLLMWeightsExchangeIT, MultiVLLMWeightsExchangeIT]
+)
+def test_multinode_device_selection_uses_local_world_size(
+    monkeypatch, integration_class
+):
+    _set_distributed_env(
+        monkeypatch, rank=0, local_rank=0, world_size=2, local_world_size=1
+    )
+    monkeypatch.setattr(
+        device_util, "visible_devices_env_value", lambda: "0,1,2"
+    )
+    config = copy.deepcopy(vllm_inference_config)
+    config["tp_size"] = 2
+
+    integration = integration_class(
+        inference_config=config,
+        comm_backend="nccl",
+        train_tp_size=2,
+    )
+
+    assert integration.megatron_device == 0
+    assert integration.vllm_visible_devices == [1, 2]
+
+
+@pytest.mark.parametrize(
+    "integration_class", [VLLMWeightsExchangeIT, MultiVLLMWeightsExchangeIT]
+)
+def test_multinode_non_driver_does_not_reserve_vllm_devices(
+    monkeypatch, integration_class
+):
+    _set_distributed_env(
+        monkeypatch, rank=1, local_rank=0, world_size=2, local_world_size=1
+    )
+    monkeypatch.setattr(device_util, "visible_devices_env_value", lambda: "4")
+    config = copy.deepcopy(vllm_inference_config)
+    config["tp_size"] = 2
+
+    integration = integration_class(
+        inference_config=config,
+        comm_backend="nccl",
+        train_tp_size=2,
+    )
+
+    assert integration.megatron_device == 4
+    assert integration.vllm_visible_devices == []
 
 
 @pytest.mark.parametrize(
