@@ -85,7 +85,8 @@ struct DeviceState {
   std::size_t network_step_bytes = v2::kDefaultNetworkStepBytes;
   std::uint32_t requested_network_channels_per_peer = 0;
   std::uint32_t network_channels_per_peer = 1;
-  std::uint32_t requested_gin_context_count = 8;
+  std::uint32_t requested_gin_context_count = 4;
+  std::uint32_t gin_doorbell_batch = 1;
   std::uint32_t gin_connection_count = 0;
   bool plan_initialized = false;
   bool window_initialized = false;
@@ -151,7 +152,7 @@ std::unique_ptr<DeviceState> make_state(const std::string& unique_id_bytes, int 
                                         int timeout_ms, std::uint32_t max_channels, std::uint32_t fifo_depth,
                                         std::size_t step_bytes, std::size_t network_step_bytes,
                                         std::size_t chunk_bytes, std::uint32_t network_channels_per_peer,
-                                        std::uint32_t gin_context_count) {
+                                        std::uint32_t gin_context_count, std::uint32_t gin_doorbell_batch) {
   if (world_size < 2 || world_size > kMaxRanks) {
     throw std::runtime_error("nccl_device_v2 world_size must be in [2, 256]");
   }
@@ -170,6 +171,9 @@ std::unique_ptr<DeviceState> make_state(const std::string& unique_id_bytes, int 
   if (gin_context_count == 0 || gin_context_count > v2::kMaxChannels) {
     throw std::runtime_error("invalid nccl_device_v2 GIN context count");
   }
+  if (gin_doorbell_batch == 0 || gin_doorbell_batch > fifo_depth) {
+    throw std::runtime_error("invalid nccl_device_v2 GIN doorbell batch");
+  }
   if (fifo_depth == 0 || step_bytes == 0 || network_step_bytes == 0 ||
       step_bytes > std::numeric_limits<std::uint32_t>::max() ||
       network_step_bytes > std::numeric_limits<std::uint32_t>::max()) {
@@ -187,6 +191,7 @@ std::unique_ptr<DeviceState> make_state(const std::string& unique_id_bytes, int 
   state->network_step_bytes = network_step_bytes;
   state->requested_network_channels_per_peer = network_channels_per_peer;
   state->requested_gin_context_count = gin_context_count;
+  state->gin_doorbell_batch = gin_doorbell_batch;
   state->chunk_bytes = chunk_bytes;
   AWEX_CUDA_V2_CHECK(cudaSetDevice(device));
   int multiprocessor_count = 0;
@@ -730,6 +735,7 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
   metrics["gin_signal_count"] = py::int_(state->gin_signal_count);
   metrics["gin_connection_count"] = py::int_(state->gin_connection_count);
   metrics["requested_gin_context_count"] = py::int_(state->requested_gin_context_count);
+  metrics["gin_doorbell_batch"] = py::int_(state->gin_doorbell_batch);
   metrics["requested_network_channels_per_peer"] = py::int_(state->requested_network_channels_per_peer);
   metrics["network_channels_per_peer"] = py::int_(state->network_channels_per_peer);
 #if AWEX_NCCL_DEVICE_V2_HAS_GIN
@@ -776,6 +782,7 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
   args.payload_peer_slots = state->device_payload_peer_slots;
   args.gin_enabled = state->gin_enabled ? 1U : 0U;
   args.gin_signal_count = state->gin_signal_count;
+  args.gin_doorbell_batch = state->gin_doorbell_batch;
 #if AWEX_NCCL_DEVICE_V2_HAS_GIN
   args.window = state->window;
   if (state->dev_comm_created) args.dev_comm = state->dev_comm;
@@ -811,11 +818,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   });
   module.def("create", [](const py::bytes& id, int world_size, int rank, int device, int timeout_ms, int max_channels,
                           int fifo_depth, int64_t step_bytes, int64_t network_step_bytes, int64_t chunk_bytes,
-                          int network_channels_per_peer, int gin_context_count) {
+                          int network_channels_per_peer, int gin_context_count, int gin_doorbell_batch) {
     if (step_bytes <= 0 || network_step_bytes <= 0 || chunk_bytes < 0) {
       throw std::runtime_error("invalid nccl_device_v2 step/chunk bytes");
     }
-    if (network_channels_per_peer < 0 || gin_context_count <= 0) {
+    if (network_channels_per_peer < 0 || gin_context_count <= 0 || gin_doorbell_batch <= 0) {
       throw std::runtime_error("invalid nccl_device_v2 network parallelism");
     }
     const std::string unique_id = id;
@@ -823,7 +830,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
                             static_cast<std::uint32_t>(fifo_depth), static_cast<std::size_t>(step_bytes),
                             static_cast<std::size_t>(network_step_bytes), static_cast<std::size_t>(chunk_bytes),
                             static_cast<std::uint32_t>(network_channels_per_peer),
-                            static_cast<std::uint32_t>(gin_context_count));
+                            static_cast<std::uint32_t>(gin_context_count),
+                            static_cast<std::uint32_t>(gin_doorbell_batch));
     return reinterpret_cast<int64_t>(state.release());
   });
   module.def("launch", &launch);

@@ -156,7 +156,7 @@ payload 小于一个 step 时使用 `step / 4`，小于八个 step 时使用 `st
 创建 device communicator 时，v2 请求：
 
 ```text
-ginContextCount = min(8, total_channels)
+ginContextCount = min(4, total_channels)
 ```
 
 执行时每个 channel 选择：
@@ -165,7 +165,7 @@ ginContextCount = min(8, total_channels)
 context = channel % ginContextCount
 ```
 
-默认同时请求 4 个 GIN connection，因此每个 connection 可以分配两个 context。NCCL 可能根据
+默认同时请求 4 个 GIN connection，因此每个 connection 分配一个 context，两个 channel 共享它。NCCL 可能根据
 connection 数向上取整实际 context 数，kernel 始终使用返回的 `dev_comm.ginContextCount` 做
 channel 取模。两个请求值都可由环境变量覆盖。
 
@@ -199,7 +199,7 @@ v2 现在区分三层并行度：物理/后端 GIN connection、GIN context、CU
 和 plugin/proxy 共同决定，仍比 v2 的公开信息更完整。
 
 需要注意，GIN context、NCCL channel、network flow 和 RDMA QP 不是一一等价的对象。v2 请求最多
-4 个 GIN connection 和 8 个 GIN context，使默认的 8 个网络 channel 各有独立 context；NCCL 返回的
+4 个 GIN connection 和 4 个 GIN context，使默认的 8 个网络 channel 每两个共享一个 context；NCCL 返回的
 实际数量仍可能因 connection 数向上取整。可通过 `AWEX_NCCL_DEVICE_V2_GIN_CONNECTIONS` 和
 `AWEX_NCCL_DEVICE_V2_GIN_CONTEXTS` 分别覆盖这两个请求值，并结合以下指标做 sweep：
 
@@ -210,6 +210,7 @@ requested_network_channels_per_peer
 gin_connection_count
 gin_context_count
 requested_gin_context_count
+gin_doorbell_batch
 gin_type
 network_step_bytes
 min_work_step_bytes
@@ -223,8 +224,8 @@ backend_execute_time_ms
 ## 结论
 
 本轮已经对齐跨机分片公式、128 KiB 网络 step、SIMPLE 小消息调节，并将默认 GIN 并行度提高到
-4 个 connection、8 个 context 和每个 remote peer 8 个 channel。三个维度都保留独立覆盖项，便于
-针对实际 NIC 数量和消息规模复测。
+4 个 connection、4 个 context 和每个 remote peer 8 个 channel。connection、context、channel 以及
+doorbell batch 都保留独立覆盖项，便于针对实际 NIC 数量和消息规模复测。
 
 仍未完全对齐的部分是标准 NCCL 内部基于 NIC 总带宽的 channel 增量、LL protocol 选择，以及
 NET plugin/proxy 的动态 flow 调度。因此这次修改需要通过真实双机吞吐测试确认收益，不能仅根据

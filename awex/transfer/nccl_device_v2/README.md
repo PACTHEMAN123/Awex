@@ -36,9 +36,9 @@ fallback.
 The topology layer mirrors NCCL's NVLink path formula,
 `2 * max(1, pathBandwidth / linkBandwidth)`. Once GIN is initialized, remote
 peer channel demand is raised to two channels per negotiated GIN connection,
-rounded up to a power of two. Four connections and eight contexts are
-requested by default so each connection can drive two independent network
-channels. Both paths remain capped by the configured channel ceiling and the
+rounded up to a power of two. Four connections and four contexts are requested
+by default; the eight network channels share one context per connection. Both
+paths remain capped by the configured channel ceiling and the
 device's SM capacity. The raw, requested, effective, and network-specific
 values are exposed in launch metrics.
 `AWEX_NCCL_DEVICE_V2_NET_CHANNELS_PER_PEER` can override the automatic channel
@@ -47,6 +47,8 @@ device paths can share an explicit channel setting.
 `AWEX_NCCL_DEVICE_V2_GIN_CONNECTIONS` controls the requested connection count
 and falls back to `NCCL_GIN_NCONNECTIONS` when unset.
 `AWEX_NCCL_DEVICE_V2_GIN_CONTEXTS` controls the requested context count.
+`AWEX_NCCL_DEVICE_V2_GIN_DOORBELL_BATCH` can aggregate up to eight consecutive
+puts before ringing the GDAKI doorbell; its conservative default is one.
 NCCL's internal
 collective-graph channel count is not used as a v2 execution cap because this
 backend has a different CTA shape. Work groups use CUDA named barriers,

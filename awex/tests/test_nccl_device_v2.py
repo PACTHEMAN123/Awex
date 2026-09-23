@@ -21,6 +21,7 @@ from awex.transfer.nccl_device_v2 import (
     NCCLDeviceV2UnavailableError,
     _resolve_gin_connections,
     _resolve_gin_context_count,
+    _resolve_gin_doorbell_batch,
     _resolve_network_channels_per_peer,
     _resolve_network_step_bytes,
 )
@@ -105,13 +106,31 @@ def test_gin_connections_reject_out_of_range_values(value):
         _resolve_gin_connections(value)
 
 
-def test_gin_contexts_default_to_two_per_connection(monkeypatch):
+def test_gin_contexts_default_to_one_per_connection(monkeypatch):
     monkeypatch.delenv("AWEX_NCCL_DEVICE_V2_GIN_CONTEXTS", raising=False)
 
-    assert _resolve_gin_context_count(None) == 8
+    assert _resolve_gin_context_count(None) == 4
 
 
 @pytest.mark.parametrize("value", [0, 65])
 def test_gin_contexts_reject_out_of_range_values(value):
     with pytest.raises(NCCLDeviceV2UnavailableError, match=r"must be in \[1, 64\]"):
         _resolve_gin_context_count(value)
+
+
+def test_gin_doorbell_batch_defaults_to_disabled(monkeypatch):
+    monkeypatch.delenv("AWEX_NCCL_DEVICE_V2_GIN_DOORBELL_BATCH", raising=False)
+
+    assert _resolve_gin_doorbell_batch(None) == 1
+
+
+def test_gin_doorbell_batch_honors_environment(monkeypatch):
+    monkeypatch.setenv("AWEX_NCCL_DEVICE_V2_GIN_DOORBELL_BATCH", "8")
+
+    assert _resolve_gin_doorbell_batch(None) == 8
+
+
+@pytest.mark.parametrize("value", [0, 9])
+def test_gin_doorbell_batch_rejects_values_beyond_fifo(value):
+    with pytest.raises(NCCLDeviceV2UnavailableError, match=r"must be in \[1, 8\]"):
+        _resolve_gin_doorbell_batch(value)

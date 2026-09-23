@@ -235,7 +235,7 @@ def _resolve_gin_context_count(gin_context_count: int | None) -> int:
     if gin_context_count is None:
         configured = os.environ.get("AWEX_NCCL_DEVICE_V2_GIN_CONTEXTS")
         try:
-            gin_context_count = 8 if configured is None else int(configured)
+            gin_context_count = 4 if configured is None else int(configured)
         except ValueError as exc:
             raise NCCLDeviceV2UnavailableError(
                 "AWEX_NCCL_DEVICE_V2_GIN_CONTEXTS must be an integer"
@@ -246,6 +246,23 @@ def _resolve_gin_context_count(gin_context_count: int | None) -> int:
             "nccl_device_v2 GIN contexts must be in [1, 64]"
         )
     return gin_context_count
+
+
+def _resolve_gin_doorbell_batch(gin_doorbell_batch: int | None) -> int:
+    if gin_doorbell_batch is None:
+        configured = os.environ.get("AWEX_NCCL_DEVICE_V2_GIN_DOORBELL_BATCH")
+        try:
+            gin_doorbell_batch = 1 if configured is None else int(configured)
+        except ValueError as exc:
+            raise NCCLDeviceV2UnavailableError(
+                "AWEX_NCCL_DEVICE_V2_GIN_DOORBELL_BATCH must be an integer"
+            ) from exc
+    gin_doorbell_batch = int(gin_doorbell_batch)
+    if gin_doorbell_batch < 1 or gin_doorbell_batch > 8:
+        raise NCCLDeviceV2UnavailableError(
+            "nccl_device_v2 GIN doorbell batch must be in [1, 8]"
+        )
+    return gin_doorbell_batch
 
 
 def _sequence_from_step(step_id: int) -> int:
@@ -640,6 +657,7 @@ class NCCLDeviceV2Transport:
         network_channels_per_peer: int | None = None,
         gin_connections: int | None = None,
         gin_context_count: int | None = None,
+        gin_doorbell_batch: int | None = None,
     ):
         if world_size < 2 or world_size > 256:
             raise NCCLDeviceV2UnavailableError(
@@ -667,6 +685,7 @@ class NCCLDeviceV2Transport:
         )
         self.gin_connections = _resolve_gin_connections(gin_connections)
         self.gin_context_count = _resolve_gin_context_count(gin_context_count)
+        self.gin_doorbell_batch = _resolve_gin_doorbell_batch(gin_doorbell_batch)
         os.environ["NCCL_GIN_NCONNECTIONS"] = str(self.gin_connections)
         if self.chunk_bytes and self.chunk_bytes < max(
             self.step_bytes, self.network_step_bytes
@@ -687,7 +706,7 @@ class NCCLDeviceV2Transport:
             "Configured nccl_device_v2 rank=%s chunk_bytes=%s max_channels=%s "
             "fifo_depth=%s step_bytes=%s network_step_bytes=%s "
             "requested_network_channels_per_peer=%s gin_connections=%s "
-            "gin_context_count=%s",
+            "gin_context_count=%s gin_doorbell_batch=%s",
             self.rank,
             self.chunk_bytes,
             self.max_channels,
@@ -697,6 +716,7 @@ class NCCLDeviceV2Transport:
             self.requested_network_channels_per_peer,
             self.gin_connections,
             self.gin_context_count,
+            self.gin_doorbell_batch,
         )
 
     def _ensure_initialized(self) -> float:
@@ -732,6 +752,7 @@ class NCCLDeviceV2Transport:
                 self.chunk_bytes,
                 self.requested_network_channels_per_peer,
                 self.gin_context_count,
+                self.gin_doorbell_batch,
             )
         )
         self._initialized = True
@@ -739,7 +760,7 @@ class NCCLDeviceV2Transport:
             "Initialized nccl_device_v2 rank=%s world_size=%s window_config="
             "channels:%s fifo:%s step_bytes:%s network_step_bytes:%s "
             "requested_network_channels_per_peer:%s gin_connections:%s "
-            "gin_context_count:%s",
+            "gin_context_count:%s gin_doorbell_batch:%s",
             self.rank,
             self.world_size,
             self.max_channels,
@@ -749,6 +770,7 @@ class NCCLDeviceV2Transport:
             self.requested_network_channels_per_peer,
             self.gin_connections,
             self.gin_context_count,
+            self.gin_doorbell_batch,
         )
         return (time.perf_counter() - start_time) * 1000.0
 

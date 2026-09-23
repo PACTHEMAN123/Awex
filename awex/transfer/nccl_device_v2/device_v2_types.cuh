@@ -167,6 +167,7 @@ struct V2KernelArgs {
   const std::uint32_t* payload_peer_slots;
   std::uint32_t gin_enabled;
   std::uint32_t gin_signal_count;
+  std::uint32_t gin_doorbell_batch;
 #if AWEX_NCCL_DEVICE_V2_HAS_GIN
   ncclWindow_t window;
   ncclDevComm dev_comm;
