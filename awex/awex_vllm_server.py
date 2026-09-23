@@ -20,7 +20,11 @@
 import uvloop
 from vllm.entrypoints.openai.api_server import run_server
 from vllm.entrypoints.openai.cli_args import make_arg_parser, validate_parsed_serve_args
-from vllm.entrypoints.utils import cli_env_setup
+
+try:
+    from vllm.entrypoints.utils import cli_env_setup
+except ImportError:
+    from vllm.entrypoints.serve.utils.api_utils import cli_env_setup
 
 try:
     from vllm.utils import FlexibleArgumentParser
