@@ -22,6 +22,7 @@ from awex.transfer.nccl_device_v2 import (
     _resolve_gin_connections,
     _resolve_gin_context_count,
     _resolve_gin_doorbell_batch,
+    _resolve_gin_skip_credit_check,
     _resolve_network_channels_per_peer,
     _resolve_network_step_bytes,
 )
@@ -134,3 +135,22 @@ def test_gin_doorbell_batch_honors_environment(monkeypatch):
 def test_gin_doorbell_batch_rejects_values_beyond_fifo(value):
     with pytest.raises(NCCLDeviceV2UnavailableError, match=r"must be in \[1, 8\]"):
         _resolve_gin_doorbell_batch(value)
+
+
+def test_gin_skip_credit_check_defaults_to_disabled(monkeypatch):
+    monkeypatch.delenv("AWEX_NCCL_DEVICE_V2_GIN_SKIP_CREDIT_CHECK", raising=False)
+
+    assert not _resolve_gin_skip_credit_check(None)
+
+
+def test_gin_skip_credit_check_honors_environment(monkeypatch):
+    monkeypatch.setenv("AWEX_NCCL_DEVICE_V2_GIN_SKIP_CREDIT_CHECK", "1")
+
+    assert _resolve_gin_skip_credit_check(None)
+
+
+def test_gin_skip_credit_check_rejects_invalid_environment(monkeypatch):
+    monkeypatch.setenv("AWEX_NCCL_DEVICE_V2_GIN_SKIP_CREDIT_CHECK", "true")
+
+    with pytest.raises(NCCLDeviceV2UnavailableError, match="must be 0 or 1"):
+        _resolve_gin_skip_credit_check(None)

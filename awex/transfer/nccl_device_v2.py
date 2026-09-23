@@ -265,6 +265,19 @@ def _resolve_gin_doorbell_batch(gin_doorbell_batch: int | None) -> int:
     return gin_doorbell_batch
 
 
+def _resolve_gin_skip_credit_check(gin_skip_credit_check: bool | None) -> bool:
+    if gin_skip_credit_check is None:
+        configured = os.environ.get(
+            "AWEX_NCCL_DEVICE_V2_GIN_SKIP_CREDIT_CHECK", "0"
+        )
+        if configured not in {"0", "1"}:
+            raise NCCLDeviceV2UnavailableError(
+                "AWEX_NCCL_DEVICE_V2_GIN_SKIP_CREDIT_CHECK must be 0 or 1"
+            )
+        return configured == "1"
+    return bool(gin_skip_credit_check)
+
+
 def _sequence_from_step(step_id: int) -> int:
     sequence = int(step_id) + 2
     if sequence <= 0:
@@ -658,6 +671,7 @@ class NCCLDeviceV2Transport:
         gin_connections: int | None = None,
         gin_context_count: int | None = None,
         gin_doorbell_batch: int | None = None,
+        gin_skip_credit_check: bool | None = None,
     ):
         if world_size < 2 or world_size > 256:
             raise NCCLDeviceV2UnavailableError(
@@ -686,6 +700,9 @@ class NCCLDeviceV2Transport:
         self.gin_connections = _resolve_gin_connections(gin_connections)
         self.gin_context_count = _resolve_gin_context_count(gin_context_count)
         self.gin_doorbell_batch = _resolve_gin_doorbell_batch(gin_doorbell_batch)
+        self.gin_skip_credit_check = _resolve_gin_skip_credit_check(
+            gin_skip_credit_check
+        )
         os.environ["NCCL_GIN_NCONNECTIONS"] = str(self.gin_connections)
         if self.chunk_bytes and self.chunk_bytes < max(
             self.step_bytes, self.network_step_bytes
@@ -706,7 +723,8 @@ class NCCLDeviceV2Transport:
             "Configured nccl_device_v2 rank=%s chunk_bytes=%s max_channels=%s "
             "fifo_depth=%s step_bytes=%s network_step_bytes=%s "
             "requested_network_channels_per_peer=%s gin_connections=%s "
-            "gin_context_count=%s gin_doorbell_batch=%s",
+            "gin_context_count=%s gin_doorbell_batch=%s "
+            "gin_skip_credit_check=%s",
             self.rank,
             self.chunk_bytes,
             self.max_channels,
@@ -717,6 +735,7 @@ class NCCLDeviceV2Transport:
             self.gin_connections,
             self.gin_context_count,
             self.gin_doorbell_batch,
+            self.gin_skip_credit_check,
         )
 
     def _ensure_initialized(self) -> float:
@@ -753,6 +772,7 @@ class NCCLDeviceV2Transport:
                 self.requested_network_channels_per_peer,
                 self.gin_context_count,
                 self.gin_doorbell_batch,
+                self.gin_skip_credit_check,
             )
         )
         self._initialized = True
@@ -760,7 +780,8 @@ class NCCLDeviceV2Transport:
             "Initialized nccl_device_v2 rank=%s world_size=%s window_config="
             "channels:%s fifo:%s step_bytes:%s network_step_bytes:%s "
             "requested_network_channels_per_peer:%s gin_connections:%s "
-            "gin_context_count:%s gin_doorbell_batch:%s",
+            "gin_context_count:%s gin_doorbell_batch:%s "
+            "gin_skip_credit_check:%s",
             self.rank,
             self.world_size,
             self.max_channels,
@@ -771,6 +792,7 @@ class NCCLDeviceV2Transport:
             self.gin_connections,
             self.gin_context_count,
             self.gin_doorbell_batch,
+            self.gin_skip_credit_check,
         )
         return (time.perf_counter() - start_time) * 1000.0
 

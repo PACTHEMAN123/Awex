@@ -168,6 +168,7 @@ struct V2KernelArgs {
   std::uint32_t gin_enabled;
   std::uint32_t gin_signal_count;
   std::uint32_t gin_doorbell_batch;
+  std::uint32_t gin_skip_credit_check;
 #if AWEX_NCCL_DEVICE_V2_HAS_GIN
   ncclWindow_t window;
   ncclDevComm dev_comm;
