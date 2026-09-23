@@ -105,6 +105,9 @@ class MultiVLLMWeightsExchangeIT:
         use_mbridge=False,
         host="127.0.0.1",
         port=8000,
+        train_only=False,
+        meta_server_host="",
+        meta_server_port=0,
         validate=False,
         dump_weights_list_for_validation=None,
         dump_weights_dir_for_validation=None,
@@ -139,6 +142,9 @@ class MultiVLLMWeightsExchangeIT:
         }
         self.host = host
         self.port = port
+        self.train_only = train_only
+        self.meta_server_host = meta_server_host
+        self.meta_server_port = meta_server_port
         self.use_mbridge = use_mbridge
         self.validate = validate
         self.dump_weights_list_for_validation = dump_weights_list_for_validation or []
@@ -164,7 +170,11 @@ class MultiVLLMWeightsExchangeIT:
             # Fallback: use torch to detect. (May touch CUDA, but that's OK with set_device below.)
             visible_devices = list(range(device_util.device_count()))
 
-        inference_gpus = total_inference_gpus if self.is_driver else 0
+        inference_gpus = (
+            total_inference_gpus
+            if self.is_driver and not self.train_only
+            else 0
+        )
         need = self.local_world_size + inference_gpus
         if len(visible_devices) < need:
             raise RuntimeError(
@@ -194,7 +204,7 @@ class MultiVLLMWeightsExchangeIT:
         self._init_distributed()
         self._share_meta_server_address()
         self._init_megatron_engine()
-        if self.is_driver:
+        if self.is_driver and not self.train_only:
             self._start_vllm_server()
             self._awex_init()
         self._training_barrier()
@@ -253,7 +263,9 @@ class MultiVLLMWeightsExchangeIT:
 
     def _start_meta_server(self):
         if self.is_driver:
-            ip, port = start_meta_server()
+            ip, port = start_meta_server(
+                host=self.meta_server_host, port=self.meta_server_port
+            )
             self.meta_server_addr = f"{ip}:{port}"
 
     def _share_meta_server_address(self):
@@ -473,7 +485,7 @@ class MultiVLLMWeightsExchangeIT:
             else:
                 executor_context = (
                     ThreadPoolExecutor(max_workers=1)
-                    if self.is_driver
+                    if self.is_driver and not self.train_only
                     else nullcontext()
                 )
                 with executor_context as executor:
@@ -557,6 +569,9 @@ def main(args):
         use_mbridge=args.use_mbridge,
         host=args.host,
         port=args.port,
+        train_only=args.train_only,
+        meta_server_host=args.meta_server_host,
+        meta_server_port=args.meta_server_port,
         validate=args.validate,
         dump_weights_list_for_validation=args.dump_weights_list_for_validation,
         dump_weights_dir_for_validation=args.dump_weights_dir_for_validation,
@@ -714,6 +729,25 @@ if __name__ == "__main__":
     )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument(
+        "--train-only",
+        action="store_true",
+        help=(
+            "Run only the Megatron writer. Inference nodes must run their own "
+            "Awex reader controllers against the same meta server."
+        ),
+    )
+    parser.add_argument(
+        "--meta-server-host",
+        default="",
+        help="Address on which the training node exposes the Awex meta server.",
+    )
+    parser.add_argument(
+        "--meta-server-port",
+        type=int,
+        default=0,
+        help="Fixed Awex meta-server port (0 selects a free port).",
+    )
     parser.add_argument(
         "--validate",
         action="store_true",

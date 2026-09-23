@@ -23,12 +23,12 @@ import pytest
 from awex.tests.experimental.compare_megatron_vllm_weights_multi import (
     _should_include_name,
 )
+from awex.tests.weights_exchange_multi_vllm_it import (
+    MultiVLLMWeightsExchangeIT,
+)
 from awex.tests.weights_exchange_vllm_it import (
     VLLMWeightsExchangeIT,
     vllm_inference_config,
-)
-from awex.tests.weights_exchange_multi_vllm_it import (
-    MultiVLLMWeightsExchangeIT,
 )
 from awex.util import device as device_util
 
@@ -183,6 +183,60 @@ def test_multinode_non_driver_does_not_reserve_vllm_devices(
 
     assert integration.megatron_device == 4
     assert integration.vllm_visible_devices == []
+
+
+@pytest.mark.parametrize(
+    "integration_class", [VLLMWeightsExchangeIT, MultiVLLMWeightsExchangeIT]
+)
+def test_train_only_does_not_reserve_inference_devices(
+    monkeypatch, integration_class
+):
+    _set_distributed_env(monkeypatch, world_size=1)
+    monkeypatch.setattr(device_util, "visible_devices_env_value", lambda: "4")
+    config = copy.deepcopy(vllm_inference_config)
+    config["tp_size"] = 2
+
+    integration = integration_class(
+        inference_config=config,
+        comm_backend="nccl_device_v2",
+        train_only=True,
+    )
+
+    assert integration.megatron_device == 4
+    assert integration.vllm_visible_devices == []
+
+
+@pytest.mark.parametrize(
+    "integration_class", [VLLMWeightsExchangeIT, MultiVLLMWeightsExchangeIT]
+)
+def test_train_only_initialize_does_not_control_inference_server(
+    monkeypatch, integration_class
+):
+    _set_distributed_env(monkeypatch, world_size=1)
+    monkeypatch.setattr(device_util, "visible_devices_env_value", lambda: "0")
+    config = copy.deepcopy(vllm_inference_config)
+    config["num_engines"] = 2
+    integration = integration_class(
+        inference_config=config,
+        comm_backend="nccl_device_v2",
+        train_only=True,
+    )
+    calls = []
+    monkeypatch.setattr(integration, "_start_meta_server", lambda: None)
+    monkeypatch.setattr(integration, "_init_distributed", lambda: None)
+    monkeypatch.setattr(integration, "_share_meta_server_address", lambda: None)
+    monkeypatch.setattr(integration, "_init_megatron_engine", lambda: None)
+    for method_name in ("_start_vllm_server", "_wait_for_health", "_awex_init"):
+        monkeypatch.setattr(
+            integration,
+            method_name,
+            lambda *args, name=method_name: calls.append((name, args)),
+        )
+    monkeypatch.setattr(integration, "_training_barrier", lambda: None)
+
+    integration.initialize()
+
+    assert calls == []
 
 
 @pytest.mark.parametrize(

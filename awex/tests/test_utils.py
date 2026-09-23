@@ -383,6 +383,15 @@ def initialize_megatron_and_load_hf_with_mbridge(hf_config, hf_model_dir):
     from mbridge import AutoBridge
 
     bridge = AutoBridge.from_pretrained(hf_model_dir)
+    rope_parameters = getattr(bridge.hf_config, "rope_parameters", None)
+    if (
+        getattr(bridge.hf_config, "rope_theta", None) is None
+        and isinstance(rope_parameters, dict)
+        and rope_parameters.get("rope_theta") is not None
+    ):
+        # Transformers 5 moved this value under rope_parameters, while
+        # mbridge 0.15 still reads the legacy top-level attribute.
+        bridge.hf_config.rope_theta = rope_parameters["rope_theta"]
     model = bridge.get_model()
     bridge.load_weights(model, hf_model_dir)
 

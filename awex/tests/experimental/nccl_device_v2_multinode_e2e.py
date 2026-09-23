@@ -129,13 +129,13 @@ def main() -> None:
                 _set_values(parameters, values)
             else:
                 _set_values(parameters, (0.0, 0.0, 0.0))
-            dist.barrier()
+            dist.barrier(device_ids=[local_rank])
             if rank == 0:
                 metrics = transport.send(parameters, plan, step_id)
             else:
                 metrics = transport.recv(parameters, plan, step_id)
             launch_metrics.append(metrics)
-            dist.barrier()
+            dist.barrier(device_ids=[local_rank])
             if rank == 1:
                 _verify_values(parameters, values)
 
@@ -151,7 +151,7 @@ def main() -> None:
         if metrics["build_batch_time_ms"] != 0.0:
             raise AssertionError(f"prepared update rebuilt its batch: {metrics}")
 
-        dist.barrier()
+        dist.barrier(device_ids=[local_rank])
         print(
             "AWEX_V2_MULTINODE_E2E_PASS "
             + json.dumps(
