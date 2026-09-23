@@ -336,3 +336,30 @@ def test_inference_only_vllm_children_require_enough_devices(monkeypatch):
 
     with pytest.raises(RuntimeError, match="Need 4 visible GPUs"):
         weights_exchange_vllm_infer_it._inference_device_groups(args)
+
+
+def test_inference_only_profiles_multi_engine_end_to_end_update(monkeypatch):
+    args = SimpleNamespace(num_engines=2, comm_backend="nccl_device_v2")
+    updates = []
+    profiles = []
+    monkeypatch.setattr(
+        weights_exchange_vllm_infer_it,
+        "_update_engine",
+        lambda _args, rank, step_id: updates.append((rank, step_id)),
+    )
+    monkeypatch.setattr(
+        weights_exchange_vllm_infer_it,
+        "emit_profile",
+        lambda _logger, **values: profiles.append(values),
+    )
+
+    weights_exchange_vllm_infer_it._update_engines(args, step_id=3)
+
+    assert sorted(updates) == [(0, 3), (1, 3)]
+    assert len(profiles) == 1
+    assert profiles[0]["event"] == "end_to_end_update"
+    assert profiles[0]["role"] == "driver"
+    assert profiles[0]["backend"] == "nccl_device_v2"
+    assert profiles[0]["step_id"] == 3
+    assert profiles[0]["num_engines"] == 2
+    assert profiles[0]["end_to_end_update_time_ms"] >= 0

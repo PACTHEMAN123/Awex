@@ -27,6 +27,7 @@ from concurrent.futures import ThreadPoolExecutor
 import requests
 
 from awex import logging
+from awex.util.profile import emit_profile, profile_phase
 
 logger = logging.getLogger(__name__)
 
@@ -174,6 +175,28 @@ def _update_engine(args, engine_rank: int, step_id: int) -> None:
     )
 
 
+def _update_engines(args, step_id: int) -> None:
+    end_to_end_start = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=args.num_engines) as executor:
+        list(
+            executor.map(
+                lambda rank: _update_engine(args, rank, step_id),
+                range(args.num_engines),
+            )
+        )
+    emit_profile(
+        logger,
+        event="end_to_end_update",
+        role="driver",
+        backend=args.comm_backend,
+        phase=profile_phase(step_id),
+        step_id=step_id,
+        rank=0,
+        num_engines=args.num_engines,
+        end_to_end_update_time_ms=(time.perf_counter() - end_to_end_start) * 1000.0,
+    )
+
+
 def main(args) -> None:
     if args.profile:
         os.environ["AWEX_PROFILE"] = "1"
@@ -218,13 +241,7 @@ def main(args) -> None:
                 update_index + 1,
                 args.num_updates,
             )
-            with ThreadPoolExecutor(max_workers=args.num_engines) as executor:
-                list(
-                    executor.map(
-                        lambda rank: _update_engine(args, rank, step_id),
-                        range(args.num_engines),
-                    )
-                )
+            _update_engines(args, step_id)
     finally:
         for process in processes:
             if process.poll() is None:
