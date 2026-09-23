@@ -105,7 +105,7 @@ __device__ __forceinline__ void v2GinRunSend(const V2KernelArgs& args, const V2W
   std::uint64_t step = work.step_begin;
   while (cursor < work.nbytes) {
     const std::uint64_t slice_bytes =
-      args.layout.slot_bytes < work.nbytes - cursor ? args.layout.slot_bytes : work.nbytes - cursor;
+      work.step_bytes < work.nbytes - cursor ? work.step_bytes : work.nbytes - cursor;
     if ((roles & kRoleWaitSend) && step > args.layout.fifo_depth) {
       *ready = v2GinWaitSignal(args, gin, credit_signal, step - args.layout.fifo_depth, 3U);
     }
@@ -151,7 +151,7 @@ __device__ __forceinline__ void v2GinRunRecv(const V2KernelArgs& args, const V2W
   std::uint64_t step = work.step_begin;
   while (cursor < work.nbytes) {
     const std::uint64_t slice_bytes =
-      args.layout.slot_bytes < work.nbytes - cursor ? args.layout.slot_bytes : work.nbytes - cursor;
+      work.step_bytes < work.nbytes - cursor ? work.step_bytes : work.nbytes - cursor;
     if (roles & kRoleWaitRecv) {
       *ready = v2GinWaitSignal(args, gin, ready_signal, step, 2U);
     }

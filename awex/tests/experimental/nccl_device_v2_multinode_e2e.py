@@ -144,6 +144,12 @@ def main() -> None:
             raise AssertionError(f"expected the GIN path, got {metrics}")
         if not metrics["gin_enabled"] or metrics["gin_context_count"] <= 0:
             raise AssertionError(f"GIN was not initialized: {metrics}")
+        if metrics["gin_connection_count"] <= 0:
+            raise AssertionError(f"GIN has no network connections: {metrics}")
+        if metrics["network_step_bytes"] != transport.network_step_bytes:
+            raise AssertionError(f"expected NCCL network step size: {metrics}")
+        if metrics["channel_count"] != metrics["network_channels_per_peer"]:
+            raise AssertionError(f"GIN did not use its network channels: {metrics}")
         if launch_metrics[0]["plan_cache_hit"]:
             raise AssertionError(f"first update unexpectedly hit cache: {metrics}")
         if not launch_metrics[1]["plan_cache_hit"]:
@@ -160,7 +166,12 @@ def main() -> None:
                     "payload_bytes": metrics["payload_bytes"],
                     "gin_type": metrics["gin_type"],
                     "gin_context_count": metrics["gin_context_count"],
+                    "gin_connection_count": metrics["gin_connection_count"],
                     "channel_count": metrics["channel_count"],
+                    "network_channels_per_peer": metrics[
+                        "network_channels_per_peer"
+                    ],
+                    "network_step_bytes": metrics["network_step_bytes"],
                     "registered_window_bytes": metrics["registered_window_bytes"],
                     "kernel_transfer_time_ms": metrics["kernel_transfer_time_ms"],
                     "plan_cache_hit": metrics["plan_cache_hit"],

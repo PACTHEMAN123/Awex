@@ -24,15 +24,26 @@ fixed TransferPlan spans for one peer
   -> FIFO slot = absolute step % 8
 ```
 
-For intra-node SIMPLE traffic, work channel count follows NCCL's
-`addP2pToPlan` sizing: `minPartSize = stepSize / 8`,
-`maxPartSize = stepSize * 32`. The topology layer mirrors NCCL's NVLink path
-formula, `2 * max(1, pathBandwidth / linkBandwidth)`. It rounds the per-peer
-path demand up to a power of two, then caps it by the configured channel
-ceiling and the device's SM capacity. The raw, requested, and effective values
-are exposed in launch metrics. NCCL's internal collective-graph channel count
-is not used as a v2 execution cap because this backend has a different CTA
-shape. Work groups use CUDA named barriers,
+Channel sizing follows NCCL's `addP2pToPlan` policy for each transport.
+Intra-node SIMPLE traffic uses `minPartSize = stepSize / 8` and
+`maxPartSize = stepSize * 32`; cross-node GIN traffic uses the multi-node
+range `stepSize / 2` through `stepSize`. LSA keeps the 512 KiB default step,
+while GIN defaults to NCCL's 128 KiB network P2P chunk and applies NCCL's
+small-message `/4` and `/2` tuning. The network step can be overridden with
+`AWEX_NCCL_DEVICE_V2_NET_STEP_BYTES`, with `NCCL_P2P_NET_CHUNKSIZE` used as a
+fallback.
+
+The topology layer mirrors NCCL's NVLink path formula,
+`2 * max(1, pathBandwidth / linkBandwidth)`. Once GIN is initialized, remote
+peer channel demand is raised to at least two and to the available GIN
+connection count, rounded up to a power of two. Both paths remain capped by
+the configured channel ceiling and the device's SM capacity. The raw,
+requested, effective, and network-specific values are exposed in launch
+metrics. `AWEX_NCCL_DEVICE_V2_NET_CHANNELS_PER_PEER` can override the automatic
+choice; `NCCL_NCHANNELS_PER_NET_PEER` is used as a fallback so the regular and
+device paths can share an explicit channel setting. NCCL's internal
+collective-graph channel count is not used as a v2 execution cap because this
+backend has a different CTA shape. Work groups use CUDA named barriers,
 leaving barrier 0 to CTA-wide synchronization. When a work has at least three
 warps, its final warp is reserved for the Post role so it can publish the
 previous step while worker warps begin the next one.
@@ -51,9 +62,13 @@ GIN is initialized only when the cached plan contains a non-LSA edge. That
 path requires Linux, CUDA 12.2 or newer, NCCL 2.30.4 or newer with aggregate
 `nccl_device.h` headers, a GIN-capable communicator, and a fully connected
 supported RDMA fabric. The launch metrics expose `lsa_peer_count`,
-`gin_peer_count`, `gin_type`, and `gin_context_count` so a deployment can
-confirm which path was selected. Indexed GIN signals are reset behind a world
-barrier before each cached-plan launch.
+`gin_peer_count`, `gin_type`, `gin_connection_count`, `gin_context_count`,
+`requested_network_channels_per_peer`, `network_channels_per_peer`, and the
+effective work step sizes so a deployment can confirm which path and
+parallelism were selected. Four GIN contexts remain the default because that
+is also NCCL Device API's default; contexts are distinct from physical GIN
+connections. Indexed GIN signals are reset behind a world barrier before each
+cached-plan launch.
 
 The Python transport entry point lives next to this directory in
 `awex/transfer/nccl_device_v2.py`. It has its own task binding and extension

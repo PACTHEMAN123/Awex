@@ -68,7 +68,9 @@ def main() -> None:
         64,
         8,
         512 * 1024,
+        128 * 1024,
         4 * 1024 * 1024,
+        0,
     )
     try:
         launch_metrics = []
@@ -114,6 +116,8 @@ def main() -> None:
             )
         if metrics["channel_count"] != 32:
             raise AssertionError(f"expected 32 active channels, got {dict(metrics)}")
+        if metrics["min_work_step_bytes"] != 512 * 1024:
+            raise AssertionError(f"expected 512 KiB LSA steps, got {dict(metrics)}")
         if metrics["threads_per_channel"] != 640:
             raise AssertionError(f"expected 640 channel threads, got {dict(metrics)}")
         if metrics["warps_per_channel"] != 20:

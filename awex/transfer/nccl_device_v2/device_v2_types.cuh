@@ -57,6 +57,7 @@ constexpr int kCopyUnroll = 8;
 constexpr std::uint32_t kDefaultFifoDepth = 8;
 constexpr std::size_t kDefaultChunkBytes = 4 * 1024 * 1024;
 constexpr std::size_t kDefaultStepBytes = 512 * 1024;
+constexpr std::size_t kDefaultNetworkStepBytes = 128 * 1024;
 constexpr std::size_t kWindowAlignment = 4096;
 constexpr std::size_t kFifoAlignment = 256;
 
@@ -106,7 +107,7 @@ struct alignas(16) V2Work {
   std::uint32_t chunk_ordinal;
   std::uint32_t chunk_count;
   std::uint32_t final;
-  std::uint32_t reserved;
+  std::uint32_t step_bytes;
   std::uint64_t stream_offset;
   std::uint64_t nbytes;
   std::uint64_t step_begin;

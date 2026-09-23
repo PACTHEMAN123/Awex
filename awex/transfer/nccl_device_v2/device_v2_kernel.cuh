@@ -49,7 +49,7 @@ __device__ __forceinline__ void v2RunSend(const V2KernelArgs& args, const V2Work
   std::uint64_t step = work.step_begin;
   while (cursor < work.nbytes) {
     const std::uint64_t slice_bytes =
-      args.layout.slot_bytes < work.nbytes - cursor ? args.layout.slot_bytes : work.nbytes - cursor;
+      work.step_bytes < work.nbytes - cursor ? work.step_bytes : work.nbytes - cursor;
     V2FifoSlot* slot = v2FifoSlot(args, args.local_rank, work.peer, channel, step, true);
     if (roles & kRoleWaitSend) {
       *ready = v2WaitFree(slot, step, args.layout.fifo_depth, step_cache, error, args.timeout_cycles);
@@ -93,7 +93,7 @@ __device__ __forceinline__ void v2RunRecv(const V2KernelArgs& args, const V2Work
   std::uint64_t step = work.step_begin;
   while (cursor < work.nbytes) {
     const std::uint64_t slice_bytes =
-      args.layout.slot_bytes < work.nbytes - cursor ? args.layout.slot_bytes : work.nbytes - cursor;
+      work.step_bytes < work.nbytes - cursor ? work.step_bytes : work.nbytes - cursor;
     V2FifoSlot* slot = v2FifoSlot(args, work.peer, args.local_rank, channel, step, false);
     if (roles & kRoleWaitRecv) {
       *ready = v2WaitReady(&slot->ready_step, step, step_cache, error, args.timeout_cycles);

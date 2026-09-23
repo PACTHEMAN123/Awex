@@ -66,7 +66,9 @@ def main() -> None:
         64,
         8,
         512 * 1024,
+        128 * 1024,
         4 * 1024 * 1024,
+        0,
     )
     try:
         launch_metrics = []
@@ -102,6 +104,14 @@ def main() -> None:
             raise AssertionError(f"expected the GIN path, got {dict(metrics)}")
         if not metrics["gin_enabled"] or metrics["gin_context_count"] <= 0:
             raise AssertionError(f"GIN was not initialized: {dict(metrics)}")
+        if metrics["gin_connection_count"] <= 0:
+            raise AssertionError(f"GIN has no network connections: {dict(metrics)}")
+        if metrics["network_step_bytes"] != 128 * 1024:
+            raise AssertionError(f"expected NCCL network step size, got {dict(metrics)}")
+        if metrics["min_work_step_bytes"] != 128 * 1024:
+            raise AssertionError(f"expected 128 KiB GIN steps, got {dict(metrics)}")
+        if metrics["channel_count"] != metrics["network_channels_per_peer"]:
+            raise AssertionError(f"GIN did not use its network channels: {dict(metrics)}")
         if metrics["payload_peer_count"] != 1:
             raise AssertionError(f"expected one payload peer, got {dict(metrics)}")
         if launch_metrics[0]["plan_cache_hit"]:

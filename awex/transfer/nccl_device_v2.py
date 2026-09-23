@@ -168,6 +168,50 @@ def _resolve_chunk_bytes(chunk_bytes: int | None) -> int:
     return chunk_bytes
 
 
+def _resolve_network_step_bytes(network_step_bytes: int | None) -> int:
+    if network_step_bytes is None:
+        configured = os.environ.get("AWEX_NCCL_DEVICE_V2_NET_STEP_BYTES")
+        if configured is None:
+            configured = os.environ.get("NCCL_P2P_NET_CHUNKSIZE")
+        try:
+            network_step_bytes = 128 * 1024 if configured is None else int(configured)
+        except ValueError as exc:
+            raise NCCLDeviceV2UnavailableError(
+                "AWEX_NCCL_DEVICE_V2_NET_STEP_BYTES must be an integer"
+            ) from exc
+    network_step_bytes = int(network_step_bytes)
+    if network_step_bytes <= 0:
+        raise NCCLDeviceV2UnavailableError(
+            "nccl_device_v2 network_step_bytes must be positive"
+        )
+    if network_step_bytes % 16 != 0:
+        raise NCCLDeviceV2UnavailableError(
+            "nccl_device_v2 network_step_bytes must be a multiple of 16"
+        )
+    return network_step_bytes
+
+
+def _resolve_network_channels_per_peer(
+    network_channels_per_peer: int | None,
+) -> int:
+    if network_channels_per_peer is None:
+        configured = os.environ.get("AWEX_NCCL_DEVICE_V2_NET_CHANNELS_PER_PEER")
+        if configured is None:
+            configured = os.environ.get("NCCL_NCHANNELS_PER_NET_PEER")
+        try:
+            network_channels_per_peer = 0 if configured is None else int(configured)
+        except ValueError as exc:
+            raise NCCLDeviceV2UnavailableError(
+                "AWEX_NCCL_DEVICE_V2_NET_CHANNELS_PER_PEER must be an integer"
+            ) from exc
+    network_channels_per_peer = int(network_channels_per_peer)
+    if network_channels_per_peer < 0 or network_channels_per_peer > 64:
+        raise NCCLDeviceV2UnavailableError(
+            "nccl_device_v2 network_channels_per_peer must be in [0, 64]"
+        )
+    return network_channels_per_peer
+
+
 def _sequence_from_step(step_id: int) -> int:
     sequence = int(step_id) + 2
     if sequence <= 0:
@@ -556,6 +600,8 @@ class NCCLDeviceV2Transport:
         chunk_bytes: int | None = None,
         infer_instance_world_size: int = 0,
         num_infer_engines: int = 1,
+        network_step_bytes: int | None = None,
+        network_channels_per_peer: int | None = None,
     ):
         if world_size < 2 or world_size > 256:
             raise NCCLDeviceV2UnavailableError(
@@ -577,9 +623,16 @@ class NCCLDeviceV2Transport:
         self.step_bytes = _env_int(
             "AWEX_NCCL_DEVICE_V2_STEP_BYTES", 512 * 1024, minimum=1
         )
-        if self.chunk_bytes and self.chunk_bytes < self.step_bytes:
+        self.network_step_bytes = _resolve_network_step_bytes(network_step_bytes)
+        self.requested_network_channels_per_peer = (
+            _resolve_network_channels_per_peer(network_channels_per_peer)
+        )
+        if self.chunk_bytes and self.chunk_bytes < max(
+            self.step_bytes, self.network_step_bytes
+        ):
             raise NCCLDeviceV2UnavailableError(
-                "nccl_device_v2 chunk_bytes must be at least step_bytes"
+                "nccl_device_v2 chunk_bytes must be at least both local and network "
+                "step_bytes"
             )
         self.infer_instance_world_size = int(infer_instance_world_size)
         self.num_infer_engines = int(num_infer_engines)
@@ -591,12 +644,15 @@ class NCCLDeviceV2Transport:
         self._prepared_recv = None
         logger.info(
             "Configured nccl_device_v2 rank=%s chunk_bytes=%s max_channels=%s "
-            "fifo_depth=%s step_bytes=%s",
+            "fifo_depth=%s step_bytes=%s network_step_bytes=%s "
+            "requested_network_channels_per_peer=%s",
             self.rank,
             self.chunk_bytes,
             self.max_channels,
             self.fifo_depth,
             self.step_bytes,
+            self.network_step_bytes,
+            self.requested_network_channels_per_peer,
         )
 
     def _ensure_initialized(self) -> float:
@@ -628,18 +684,23 @@ class NCCLDeviceV2Transport:
                 self.max_channels,
                 self.fifo_depth,
                 self.step_bytes,
+                self.network_step_bytes,
                 self.chunk_bytes,
+                self.requested_network_channels_per_peer,
             )
         )
         self._initialized = True
         logger.info(
             "Initialized nccl_device_v2 rank=%s world_size=%s window_config="
-            "channels:%s fifo:%s step_bytes:%s",
+            "channels:%s fifo:%s step_bytes:%s network_step_bytes:%s "
+            "requested_network_channels_per_peer:%s",
             self.rank,
             self.world_size,
             self.max_channels,
             self.fifo_depth,
             self.step_bytes,
+            self.network_step_bytes,
+            self.requested_network_channels_per_peer,
         )
         return (time.perf_counter() - start_time) * 1000.0
 
