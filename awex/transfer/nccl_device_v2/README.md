@@ -35,13 +35,19 @@ fallback.
 
 The topology layer mirrors NCCL's NVLink path formula,
 `2 * max(1, pathBandwidth / linkBandwidth)`. Once GIN is initialized, remote
-peer channel demand is raised to at least two and to the available GIN
-connection count, rounded up to a power of two. Both paths remain capped by
-the configured channel ceiling and the device's SM capacity. The raw,
-requested, effective, and network-specific values are exposed in launch
-metrics. `AWEX_NCCL_DEVICE_V2_NET_CHANNELS_PER_PEER` can override the automatic
+peer channel demand is raised to two channels per negotiated GIN connection,
+rounded up to a power of two. Four connections and eight contexts are
+requested by default so each connection can drive two independent network
+channels. Both paths remain capped by the configured channel ceiling and the
+device's SM capacity. The raw, requested, effective, and network-specific
+values are exposed in launch metrics.
+`AWEX_NCCL_DEVICE_V2_NET_CHANNELS_PER_PEER` can override the automatic channel
 choice; `NCCL_NCHANNELS_PER_NET_PEER` is used as a fallback so the regular and
-device paths can share an explicit channel setting. NCCL's internal
+device paths can share an explicit channel setting.
+`AWEX_NCCL_DEVICE_V2_GIN_CONNECTIONS` controls the requested connection count
+and falls back to `NCCL_GIN_NCONNECTIONS` when unset.
+`AWEX_NCCL_DEVICE_V2_GIN_CONTEXTS` controls the requested context count.
+NCCL's internal
 collective-graph channel count is not used as a v2 execution cap because this
 backend has a different CTA shape. Work groups use CUDA named barriers,
 leaving barrier 0 to CTA-wide synchronization. When a work has at least three
@@ -63,10 +69,10 @@ path requires Linux, CUDA 12.2 or newer, NCCL 2.30.4 or newer with aggregate
 `nccl_device.h` headers, a GIN-capable communicator, and a fully connected
 supported RDMA fabric. The launch metrics expose `lsa_peer_count`,
 `gin_peer_count`, `gin_type`, `gin_connection_count`, `gin_context_count`,
+`requested_gin_context_count`,
 `requested_network_channels_per_peer`, `network_channels_per_peer`, and the
 effective work step sizes so a deployment can confirm which path and
-parallelism were selected. Four GIN contexts remain the default because that
-is also NCCL Device API's default; contexts are distinct from physical GIN
+parallelism were selected. GIN contexts are distinct from physical GIN
 connections. Indexed GIN signals are reset behind a world barrier before each
 cached-plan launch.
 

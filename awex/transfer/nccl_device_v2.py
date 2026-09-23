@@ -212,6 +212,42 @@ def _resolve_network_channels_per_peer(
     return network_channels_per_peer
 
 
+def _resolve_gin_connections(gin_connections: int | None) -> int:
+    if gin_connections is None:
+        configured = os.environ.get("AWEX_NCCL_DEVICE_V2_GIN_CONNECTIONS")
+        if configured is None:
+            configured = os.environ.get("NCCL_GIN_NCONNECTIONS")
+        try:
+            gin_connections = 4 if configured is None else int(configured)
+        except ValueError as exc:
+            raise NCCLDeviceV2UnavailableError(
+                "AWEX_NCCL_DEVICE_V2_GIN_CONNECTIONS must be an integer"
+            ) from exc
+    gin_connections = int(gin_connections)
+    if gin_connections < 1 or gin_connections > 4:
+        raise NCCLDeviceV2UnavailableError(
+            "nccl_device_v2 GIN connections must be in [1, 4]"
+        )
+    return gin_connections
+
+
+def _resolve_gin_context_count(gin_context_count: int | None) -> int:
+    if gin_context_count is None:
+        configured = os.environ.get("AWEX_NCCL_DEVICE_V2_GIN_CONTEXTS")
+        try:
+            gin_context_count = 8 if configured is None else int(configured)
+        except ValueError as exc:
+            raise NCCLDeviceV2UnavailableError(
+                "AWEX_NCCL_DEVICE_V2_GIN_CONTEXTS must be an integer"
+            ) from exc
+    gin_context_count = int(gin_context_count)
+    if gin_context_count < 1 or gin_context_count > 64:
+        raise NCCLDeviceV2UnavailableError(
+            "nccl_device_v2 GIN contexts must be in [1, 64]"
+        )
+    return gin_context_count
+
+
 def _sequence_from_step(step_id: int) -> int:
     sequence = int(step_id) + 2
     if sequence <= 0:
@@ -602,6 +638,8 @@ class NCCLDeviceV2Transport:
         num_infer_engines: int = 1,
         network_step_bytes: int | None = None,
         network_channels_per_peer: int | None = None,
+        gin_connections: int | None = None,
+        gin_context_count: int | None = None,
     ):
         if world_size < 2 or world_size > 256:
             raise NCCLDeviceV2UnavailableError(
@@ -627,6 +665,9 @@ class NCCLDeviceV2Transport:
         self.requested_network_channels_per_peer = (
             _resolve_network_channels_per_peer(network_channels_per_peer)
         )
+        self.gin_connections = _resolve_gin_connections(gin_connections)
+        self.gin_context_count = _resolve_gin_context_count(gin_context_count)
+        os.environ["NCCL_GIN_NCONNECTIONS"] = str(self.gin_connections)
         if self.chunk_bytes and self.chunk_bytes < max(
             self.step_bytes, self.network_step_bytes
         ):
@@ -645,7 +686,8 @@ class NCCLDeviceV2Transport:
         logger.info(
             "Configured nccl_device_v2 rank=%s chunk_bytes=%s max_channels=%s "
             "fifo_depth=%s step_bytes=%s network_step_bytes=%s "
-            "requested_network_channels_per_peer=%s",
+            "requested_network_channels_per_peer=%s gin_connections=%s "
+            "gin_context_count=%s",
             self.rank,
             self.chunk_bytes,
             self.max_channels,
@@ -653,6 +695,8 @@ class NCCLDeviceV2Transport:
             self.step_bytes,
             self.network_step_bytes,
             self.requested_network_channels_per_peer,
+            self.gin_connections,
+            self.gin_context_count,
         )
 
     def _ensure_initialized(self) -> float:
@@ -687,13 +731,15 @@ class NCCLDeviceV2Transport:
                 self.network_step_bytes,
                 self.chunk_bytes,
                 self.requested_network_channels_per_peer,
+                self.gin_context_count,
             )
         )
         self._initialized = True
         logger.info(
             "Initialized nccl_device_v2 rank=%s world_size=%s window_config="
             "channels:%s fifo:%s step_bytes:%s network_step_bytes:%s "
-            "requested_network_channels_per_peer:%s",
+            "requested_network_channels_per_peer:%s gin_connections:%s "
+            "gin_context_count:%s",
             self.rank,
             self.world_size,
             self.max_channels,
@@ -701,6 +747,8 @@ class NCCLDeviceV2Transport:
             self.step_bytes,
             self.network_step_bytes,
             self.requested_network_channels_per_peer,
+            self.gin_connections,
+            self.gin_context_count,
         )
         return (time.perf_counter() - start_time) * 1000.0
 

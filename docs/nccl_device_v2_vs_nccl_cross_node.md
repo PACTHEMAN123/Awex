@@ -74,8 +74,8 @@ maxPartSize = 128 KiB
 
 GIN 与标准 NCCL 现在使用相同的默认 `minPartSize=64 KiB`、`maxPartSize=128 KiB`。
 实际 channel 数仍受 per-peer channel 上限约束。v2 在 GIN 初始化完成后读取
-`ginConnectionCount`，以 `max(2, ginConnectionCount)` 作为跨机需求并向上取 2 次幂，最后受总
-channel 上限约束。这覆盖了标准 NCCL “每个 NIC 至少一个 channel”的部分；由于公开 Device API
+`ginConnectionCount`，以 `max(2, 2 * ginConnectionCount)` 作为跨机需求并向上取 2 次幂，最后受总
+channel 上限约束。实测每个 connection 使用两个 channel 可以更充分地驱动 200 Gb/s 端口；由于公开 Device API
 没有直接暴露标准 NCCL 内部的 NIC 总带宽，`ceil(netBw / 14 GB/s)` 这一项无法自动复刻。
 如需使用标准 NCCL 计算出的更大值，可以设置 `NCCL_NCHANNELS_PER_NET_PEER`；v2 会继承它，
 `AWEX_NCCL_DEVICE_V2_NET_CHANNELS_PER_PEER` 则提供优先级更高的单后端覆盖。显式值同样会向上取
@@ -156,7 +156,7 @@ payload 小于一个 step 时使用 `step / 4`，小于八个 step 时使用 `st
 创建 device communicator 时，v2 请求：
 
 ```text
-ginContextCount = min(4, total_channels)
+ginContextCount = min(8, total_channels)
 ```
 
 执行时每个 channel 选择：
@@ -165,9 +165,9 @@ ginContextCount = min(4, total_channels)
 context = channel % ginContextCount
 ```
 
-NCCL Device API 的 `NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER` 默认同样是 4 个 context，因此本轮
-保留这个值。NCCL 可能根据 connection 数向上取整实际 context 数，kernel 始终使用返回的
-`dev_comm.ginContextCount` 做 channel 取模。
+默认同时请求 4 个 GIN connection，因此每个 connection 可以分配两个 context。NCCL 可能根据
+connection 数向上取整实际 context 数，kernel 始终使用返回的 `dev_comm.ginContextCount` 做
+channel 取模。两个请求值都可由环境变量覆盖。
 
 源码：
 
@@ -194,13 +194,14 @@ NCCL Device API 的 `NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER` 默认同样是 4 �
 ### 当前对齐状态与剩余差异
 
 v2 现在区分三层并行度：物理/后端 GIN connection、GIN context、CUDA channel。跨机
-`network_channels_per_peer` 根据实际 `ginConnectionCount` 决定，而 channel 到 context 仍使用 NCCL
+`network_channels_per_peer` 根据实际 `ginConnectionCount` 的两倍决定，而 channel 到 context 仍使用 NCCL
 设备端示例采用的取模方式。标准 `nccl_comm` 的网络并行度则由 topology、per-peer flow、net device
 和 plugin/proxy 共同决定，仍比 v2 的公开信息更完整。
 
 需要注意，GIN context、NCCL channel、network flow 和 RDMA QP 不是一一等价的对象。v2 请求最多
-4 个 GIN context，但 NCCL 返回的实际数量可能因 connection 数向上取整；它是否成为当前机器上的
-吞吐瓶颈，需要结合以下指标做 sweep 才能确认：
+4 个 GIN connection 和 8 个 GIN context，使默认的 8 个网络 channel 各有独立 context；NCCL 返回的
+实际数量仍可能因 connection 数向上取整。可通过 `AWEX_NCCL_DEVICE_V2_GIN_CONNECTIONS` 和
+`AWEX_NCCL_DEVICE_V2_GIN_CONTEXTS` 分别覆盖这两个请求值，并结合以下指标做 sweep：
 
 ```text
 channel_count
@@ -208,6 +209,7 @@ network_channels_per_peer
 requested_network_channels_per_peer
 gin_connection_count
 gin_context_count
+requested_gin_context_count
 gin_type
 network_step_bytes
 min_work_step_bytes
@@ -216,13 +218,13 @@ backend_execute_time_ms
 ```
 
 建议重点观察 `gin_connection_count`、`gin_context_count` 和 `network_channels_per_peer` 是否符合
-机器 NIC 配置，再比较 channel 数 `2/4/8` 的吞吐变化。
+机器 NIC 配置，再比较 connection/context/channel 组合的吞吐变化。
 
 ## 结论
 
-本轮已经对齐跨机分片公式、128 KiB 网络 step、SIMPLE 小消息调节，以及基于实际 GIN connection
-数的 per-peer channel。4 个 context 保持不变，因为它是 NCCL Device API 默认值，而不是 Awex
-独有的限制。
+本轮已经对齐跨机分片公式、128 KiB 网络 step、SIMPLE 小消息调节，并将默认 GIN 并行度提高到
+4 个 connection、8 个 context 和每个 remote peer 8 个 channel。三个维度都保留独立覆盖项，便于
+针对实际 NIC 数量和消息规模复测。
 
 仍未完全对齐的部分是标准 NCCL 内部基于 NIC 总带宽的 channel 增量、LL protocol 选择，以及
 NET plugin/proxy 的动态 flow 调度。因此这次修改需要通过真实双机吞吐测试确认收益，不能仅根据
