@@ -315,7 +315,7 @@ class MultiVLLMWeightsExchangeIT:
                 str(inference_tp),
                 "--pipeline-parallel-size",
                 str(self.inference_config["pp_size"]),
-                "--disable-log-requests",
+                "--no-enable-log-requests",
                 "--enforce-eager",
             ]
             gpu_memory_utilization = self.inference_config.get(

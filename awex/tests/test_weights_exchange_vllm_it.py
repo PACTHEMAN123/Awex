@@ -17,9 +17,11 @@
 
 import copy
 import sys
+from types import SimpleNamespace
 
 import pytest
 
+from awex.tests import weights_exchange_vllm_infer_it
 from awex.tests.experimental.compare_megatron_vllm_weights_multi import (
     _should_include_name,
 )
@@ -270,3 +272,28 @@ def test_vllm_child_uses_current_python(monkeypatch, integration_class):
     integration._start_vllm_server()
 
     assert launched[0][0] == sys.executable
+    assert "--no-enable-log-requests" in launched[0]
+    assert "--disable-log-requests" not in launched[0]
+
+
+def test_inference_only_vllm_child_uses_current_request_log_flag(monkeypatch):
+    launched = []
+
+    monkeypatch.setattr(
+        weights_exchange_vllm_infer_it.subprocess,
+        "Popen",
+        lambda command, **kwargs: launched.append(command),
+    )
+    args = SimpleNamespace(
+        model_path="model",
+        host="127.0.0.1",
+        port=8000,
+        vllm_tp_size=1,
+        vllm_gpu_memory_utilization=0.8,
+    )
+
+    weights_exchange_vllm_infer_it._start_vllm_server(args)
+
+    assert launched[0][0] == sys.executable
+    assert "--no-enable-log-requests" in launched[0]
+    assert "--disable-log-requests" not in launched[0]

@@ -77,7 +77,7 @@ def _start_vllm_server(args) -> subprocess.Popen:
         str(args.vllm_tp_size),
         "--pipeline-parallel-size",
         "1",
-        "--disable-log-requests",
+        "--no-enable-log-requests",
         "--enforce-eager",
         "--gpu-memory-utilization",
         str(args.vllm_gpu_memory_utilization),
