@@ -288,6 +288,7 @@ def test_inference_only_vllm_child_uses_current_request_log_flag(monkeypatch):
         model_path="model",
         host="127.0.0.1",
         port=8000,
+        num_engines=1,
         vllm_tp_size=1,
         vllm_gpu_memory_utilization=0.8,
     )
@@ -297,3 +298,41 @@ def test_inference_only_vllm_child_uses_current_request_log_flag(monkeypatch):
     assert launched[0][0] == sys.executable
     assert "--no-enable-log-requests" in launched[0]
     assert "--disable-log-requests" not in launched[0]
+
+
+def test_inference_only_vllm_children_split_visible_devices(monkeypatch):
+    launched = []
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "2,3,5,7")
+    monkeypatch.setattr(
+        weights_exchange_vllm_infer_it.subprocess,
+        "Popen",
+        lambda command, **kwargs: launched.append((command, kwargs["env"])),
+    )
+    args = SimpleNamespace(
+        model_path="model",
+        host="127.0.0.1",
+        port=8000,
+        num_engines=2,
+        vllm_tp_size=2,
+        vllm_gpu_memory_utilization=0.8,
+    )
+
+    groups = weights_exchange_vllm_infer_it._inference_device_groups(args)
+    for engine_rank, devices in enumerate(groups):
+        weights_exchange_vllm_infer_it._start_vllm_server(
+            args, engine_rank, devices
+        )
+
+    assert groups == [["2", "3"], ["5", "7"]]
+    assert launched[0][0][launched[0][0].index("--port") + 1] == "8000"
+    assert launched[1][0][launched[1][0].index("--port") + 1] == "8001"
+    assert launched[0][1]["CUDA_VISIBLE_DEVICES"] == "2,3"
+    assert launched[1][1]["CUDA_VISIBLE_DEVICES"] == "5,7"
+
+
+def test_inference_only_vllm_children_require_enough_devices(monkeypatch):
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1,2")
+    args = SimpleNamespace(num_engines=2, vllm_tp_size=2)
+
+    with pytest.raises(RuntimeError, match="Need 4 visible GPUs"):
+        weights_exchange_vllm_infer_it._inference_device_groups(args)
