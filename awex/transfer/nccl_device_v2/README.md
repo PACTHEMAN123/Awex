@@ -49,9 +49,6 @@ and falls back to `NCCL_GIN_NCONNECTIONS` when unset.
 `AWEX_NCCL_DEVICE_V2_GIN_CONTEXTS` controls the requested context count.
 `AWEX_NCCL_DEVICE_V2_GIN_DOORBELL_BATCH` can aggregate up to eight consecutive
 puts before ringing the GDAKI doorbell; its conservative default is one.
-`AWEX_NCCL_DEVICE_V2_GIN_SKIP_CREDIT_CHECK=1` skips GIN's QP availability
-poll when the backend queue is known to be deeper than the eight-slot Awex
-FIFO; it is disabled by default.
 NCCL's internal
 collective-graph channel count is not used as a v2 execution cap because this
 backend has a different CTA shape. Work groups use CUDA named barriers,

@@ -211,7 +211,6 @@ gin_connection_count
 gin_context_count
 requested_gin_context_count
 gin_doorbell_batch
-gin_skip_credit_check
 gin_type
 network_step_bytes
 min_work_step_bytes
@@ -226,7 +225,7 @@ backend_execute_time_ms
 
 本轮已经对齐跨机分片公式、128 KiB 网络 step、SIMPLE 小消息调节，并将默认 GIN 并行度提高到
 4 个 connection、4 个 context 和每个 remote peer 8 个 channel。connection、context、channel 以及
-doorbell batch 和 QP credit check 都保留独立覆盖项，便于针对实际 NIC 数量和消息规模复测。
+doorbell batch 都保留独立覆盖项，便于针对实际 NIC 数量和消息规模复测。
 
 仍未完全对齐的部分是标准 NCCL 内部基于 NIC 总带宽的 channel 增量、LL protocol 选择，以及
 NET plugin/proxy 的动态 flow 调度。因此这次修改需要通过真实双机吞吐测试确认收益，不能仅根据
