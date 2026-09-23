@@ -115,32 +115,37 @@ def load_records(path: Path) -> list[dict]:
     return records
 
 
-def summarize(records: list[dict]) -> list[dict]:
+def summarize(
+    records: list[dict], *, transfer_only: bool = False
+) -> list[dict]:
     result = []
-    for role, metric, unit, reduction in METRICS:
-        by_step = defaultdict(list)
-        for record in records:
-            if record.get("role") != role or metric not in record:
-                continue
-            by_step[int(record["step_id"])].append(float(record[metric]))
-        values = []
-        for step_values in by_step.values():
-            values.append(
-                min(step_values) if reduction == "min" else max(step_values)
-            )
-        if values:
-            result.append(
-                {
-                    "role": role,
-                    "metric": metric,
-                    "unit": unit,
-                    "samples": len(values),
-                    "p50": percentile(values, 0.50),
-                    "p95": percentile(values, 0.95),
-                    "min": min(values),
-                    "max": max(values),
-                }
-            )
+    if not transfer_only:
+        for role, metric, unit, reduction in METRICS:
+            by_step = defaultdict(list)
+            for record in records:
+                if record.get("role") != role or metric not in record:
+                    continue
+                by_step[int(record["step_id"])].append(float(record[metric]))
+            values = []
+            for step_values in by_step.values():
+                values.append(
+                    min(step_values)
+                    if reduction == "min"
+                    else max(step_values)
+                )
+            if values:
+                result.append(
+                    {
+                        "role": role,
+                        "metric": metric,
+                        "unit": unit,
+                        "samples": len(values),
+                        "p50": percentile(values, 0.50),
+                        "p95": percentile(values, 0.95),
+                        "min": min(values),
+                        "max": max(values),
+                    }
+                )
     for metric, unit, reduction in CRITICAL_PATH_METRICS:
         by_step = defaultdict(list)
         for record in records:
@@ -165,6 +170,18 @@ def summarize(records: list[dict]) -> list[dict]:
                 }
             )
     return result
+
+
+def summarize_logs(
+    logs: list[tuple[str, Path]], *, transfer_only: bool = False
+) -> dict[str, list[dict]]:
+    records_by_backend = defaultdict(list)
+    for backend, path in logs:
+        records_by_backend[backend].extend(load_records(path))
+    return {
+        backend: summarize(records, transfer_only=transfer_only)
+        for backend, records in records_by_backend.items()
+    }
 
 
 def render_markdown(summaries: dict[str, list[dict]]) -> str:
@@ -194,14 +211,23 @@ def main() -> None:
     )
     parser.add_argument("--json-out", type=Path)
     parser.add_argument("--markdown-out", type=Path)
+    parser.add_argument(
+        "--transfer-only",
+        action="store_true",
+        help=(
+            "Only report the per-step transfer critical path. Pass writer and "
+            "reader logs with the same backend label to combine both sides."
+        ),
+    )
     args = parser.parse_args()
 
-    summaries = {}
+    logs = []
     for value in args.log:
         backend, separator, raw_path = value.partition("=")
         if not separator or not backend or not raw_path:
             parser.error(f"invalid --log value: {value!r}")
-        summaries[backend] = summarize(load_records(Path(raw_path)))
+        logs.append((backend, Path(raw_path)))
+    summaries = summarize_logs(logs, transfer_only=args.transfer_only)
 
     rendered = render_markdown(summaries)
     print(rendered, end="")

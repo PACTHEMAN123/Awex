@@ -22,6 +22,7 @@ from awex.tests.summarize_weights_exchange_profile import (
     load_records,
     percentile,
     summarize,
+    summarize_logs,
 )
 
 
@@ -104,3 +105,54 @@ def test_load_records_recovers_multiple_process_records_on_one_line(tmp_path):
     )
 
     assert load_records(log) == records
+
+
+def test_summarize_logs_merges_same_backend_and_can_hide_non_transfer_metrics(
+    tmp_path,
+):
+    writer_log = tmp_path / "writer.log"
+    reader_log = tmp_path / "reader.log"
+    writer_log.write_text(
+        PROFILE_MARKER
+        + json.dumps(
+            {
+                "role": "writer",
+                "phase": "measure",
+                "step_id": 0,
+                "backend_execute_time_ms": 8.0,
+                "gc_collect_time_ms": 100.0,
+            }
+        )
+    )
+    reader_log.write_text(
+        PROFILE_MARKER
+        + json.dumps(
+            {
+                "role": "reader",
+                "phase": "measure",
+                "step_id": 0,
+                "backend_execute_time_ms": 10.0,
+                "completion_barrier_time_ms": 50.0,
+            }
+        )
+    )
+
+    summaries = summarize_logs(
+        [("nccl", writer_log), ("nccl", reader_log)],
+        transfer_only=True,
+    )
+
+    assert summaries == {
+        "nccl": [
+            {
+                "role": "transfer_critical_path",
+                "metric": "backend_execute_time_ms",
+                "unit": "ms",
+                "samples": 1,
+                "p50": 10.0,
+                "p95": 10.0,
+                "min": 10.0,
+                "max": 10.0,
+            }
+        ]
+    }
