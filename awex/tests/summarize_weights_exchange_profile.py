@@ -21,7 +21,6 @@ import math
 from collections import defaultdict
 from pathlib import Path
 
-
 PROFILE_MARKER = "AWEX_PROFILE "
 METRICS = (
     ("writer", "convert_time_ms", "ms", "max"),
