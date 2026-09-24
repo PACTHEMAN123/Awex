@@ -40,7 +40,7 @@ rounded up to a power of two. By default NCCL discovers the available GIN
 connections and creates one context per connection. Network channel limits are
 then computed from the negotiated connection count and each active peer's byte
 share. Every peer receives at least two channels per connection, while a
-single heavy peer can consume a target issue budget of ten channels per
+single heavy peer can consume a target issue budget of six channels per
 connection. Peer pairs are symmetrically striped across disjoint channel groups
 until a rank's channel budget is exhausted, avoiding serialization of
 independent peer flows.
