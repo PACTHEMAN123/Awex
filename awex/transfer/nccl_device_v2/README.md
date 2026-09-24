@@ -37,8 +37,9 @@ fixed TransferPlan spans for one peer
 
 The Hopper block-wise FP8 path uses a separate 1024-thread CTA. Fifteen and
 sixteen worker warps quantize two 128 x 128 shared-memory stages concurrently;
-the remaining warp owns FIFO control, TMA refill, and ready-step publication.
-Only group-level named barriers participate in the tile loop.
+the remaining warp owns FIFO control, TMA refill, 16 KiB asynchronous bulk
+stores from FP8 shared memory, and ready-step publication. Only group-level
+named barriers participate in the tile loop.
 
 For intra-node SIMPLE traffic, work channel count follows NCCL's
 `addP2pToPlan` sizing: `minPartSize = stepSize / 8`,

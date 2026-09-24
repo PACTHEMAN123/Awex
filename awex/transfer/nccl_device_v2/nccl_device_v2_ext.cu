@@ -34,7 +34,6 @@
 
 #include <algorithm>
 #include <chrono>
-#include <cstdio>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -1073,12 +1072,6 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
       tma_schedule = build_tma_schedule(tasks, direction, config, &tma_handled);
       generic_tasks = remove_tma_tasks(tasks, tma_handled, static_cast<std::uint32_t>(state->world_size));
       config.initial_steps = tma_schedule.next_steps;
-      std::fprintf(stderr,
-                   "AWEX_TMA_PLAN rank=%d direction=%s matrices=%u tiles=%zu steps=%llu queues=%zu "
-                   "generic_tasks=%zu\n",
-                   state->rank, sender ? "send" : "recv", tma_schedule.matrix_count,
-                   tma_schedule.tiles.size(), static_cast<unsigned long long>(tma_schedule.step_count),
-                   tma_schedule.queues.size(), generic_tasks.size());
     }
     auto schedule = v2::lowerFixedTasks(generic_tasks, active_peers, direction, config);
     host_lowering_time_ms = std::chrono::duration<double, std::milli>(Clock::now() - lowering_start).count();
