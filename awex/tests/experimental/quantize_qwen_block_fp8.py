@@ -42,6 +42,18 @@ _QUANTIZED_SUFFIXES = (
     ".mlp.up_proj.weight",
     ".mlp.down_proj.weight",
 )
+_SAFETENSORS_DTYPES = {
+    "BF16": torch.bfloat16,
+    "F16": torch.float16,
+    "F32": torch.float32,
+    "F64": torch.float64,
+    "I8": torch.int8,
+    "I16": torch.int16,
+    "I32": torch.int32,
+    "I64": torch.int64,
+    "U8": torch.uint8,
+    "BOOL": torch.bool,
+}
 
 
 def _parse_args() -> argparse.Namespace:
@@ -49,12 +61,25 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument(
+        "--dummy",
+        action="store_true",
+        help="Create shape-correct dummy tensors without reading source tensor data.",
+    )
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
 
-def _should_quantize(name: str, tensor: torch.Tensor) -> bool:
-    return tensor.dim() == 2 and name.endswith(_QUANTIZED_SUFFIXES)
+def _should_quantize(name: str, shape: tuple[int, ...]) -> bool:
+    return len(shape) == 2 and name.endswith(_QUANTIZED_SUFFIXES)
+
+
+def _torch_dtype(safetensors_dtype) -> torch.dtype:
+    dtype_name = str(safetensors_dtype).rsplit(".", 1)[-1]
+    try:
+        return _SAFETENSORS_DTYPES[dtype_name]
+    except KeyError as error:
+        raise ValueError(f"Unsupported safetensors dtype: {dtype_name}") from error
 
 
 def _copy_auxiliary_files(source: Path, destination: Path) -> None:
@@ -88,6 +113,7 @@ def _quantize_shard(
     destination_path: Path,
     staging_path: Path,
     device: torch.device,
+    dummy: bool,
 ) -> tuple[dict[str, str], int, int]:
     tensors: dict[str, torch.Tensor] = {}
     weight_map = {}
@@ -96,27 +122,45 @@ def _quantize_shard(
     with safe_open(source_path, framework="pt", device="cpu") as source:
         metadata = source.metadata()
         for name in source.keys():
-            tensor = source.get_tensor(name)
-            if _should_quantize(name, tensor):
-                quantized, scale = per_block_cast_to_fp8(
-                    tensor.to(device=device, non_blocking=False), False
-                )
-                tensors[name] = quantized.cpu()
+            tensor_slice = source.get_slice(name)
+            shape = tuple(int(dim) for dim in tensor_slice.get_shape())
+            if _should_quantize(name, shape):
+                if dummy:
+                    tensors[name] = torch.zeros(shape, dtype=torch.float8_e4m3fn)
+                    scale = torch.ones(
+                        ((shape[0] + 127) // 128, (shape[1] + 127) // 128),
+                        dtype=torch.float32,
+                    )
+                else:
+                    tensor = source.get_tensor(name)
+                    quantized, scale = per_block_cast_to_fp8(
+                        tensor.to(device=device, non_blocking=False), False
+                    )
+                    tensors[name] = quantized.cpu()
+                    scale = scale.cpu()
                 scale_name = f"{name}_scale_inv"
-                tensors[scale_name] = scale.cpu()
+                tensors[scale_name] = scale
                 weight_map[scale_name] = destination_path.name
                 quantized_count += 1
             else:
-                tensors[name] = tensor
+                tensors[name] = (
+                    torch.zeros(shape, dtype=_torch_dtype(tensor_slice.get_dtype()))
+                    if dummy
+                    else source.get_tensor(name)
+                )
             weight_map[name] = destination_path.name
 
     for tensor in tensors.values():
         total_size += int(tensor.numel()) * int(tensor.element_size())
     save_file(tensors, staging_path, metadata=metadata)
-    shutil.copyfile(staging_path, destination_path)
-    if destination_path.stat().st_size != staging_path.stat().st_size:
+    staging_size = staging_path.stat().st_size
+    try:
+        staging_path.replace(destination_path)
+    except OSError:
+        shutil.copyfile(staging_path, destination_path)
+        staging_path.unlink()
+    if destination_path.stat().st_size != staging_size:
         raise OSError(f"Copied shard size mismatch: {destination_path}")
-    staging_path.unlink()
     del tensors
     gc.collect()
     if device.type == "cuda":
@@ -162,6 +206,7 @@ def main() -> None:
                 destination / shard_name,
                 staging / shard_name,
                 device,
+                args.dummy,
             )
             weight_map.update(shard_map)
             total_size += shard_size
