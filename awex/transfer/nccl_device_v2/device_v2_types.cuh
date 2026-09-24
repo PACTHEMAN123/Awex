@@ -38,7 +38,7 @@ constexpr std::size_t kDefaultChunkBytes = 4 * 1024 * 1024;
 constexpr std::size_t kDefaultStepBytes = 512 * 1024;
 constexpr std::size_t kWindowAlignment = 4096;
 constexpr std::size_t kFifoAlignment = 256;
-constexpr std::uint32_t kTmaQuantThreads = kThreadsPerBlock;
+constexpr std::uint32_t kTmaQuantThreads = 1024;
 constexpr std::uint32_t kTmaQuantBlockRows = 128;
 constexpr std::uint32_t kTmaQuantBlockCols = 128;
 constexpr std::size_t kTmaQuantElements =
@@ -48,6 +48,8 @@ constexpr std::size_t kTmaQuantHeaderBytes = 16;
 constexpr std::size_t kTmaQuantPacketBytes = kTmaQuantHeaderBytes + kTmaQuantPayloadBytes;
 
 static_assert(kThreadsPerBlock % kWarpSize == 0, "block must contain full warps");
+static_assert(kTmaQuantThreads % kWarpSize == 0, "TMA block must contain full warps");
+static_assert(kTmaQuantThreads <= 1024, "TMA block exceeds the CUDA thread limit");
 static_assert(kMaxWorksPerBatch <= 15, "work groups use CUDA named barriers 1-15");
 static_assert(kMaxChannels <= 64, "channel masks use 64-bit values");
 

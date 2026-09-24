@@ -216,11 +216,11 @@ def main() -> None:
             raise AssertionError(f"TMA path unexpectedly used fallback blocks: {metrics}")
         if not metrics["fused_tma_supported"]:
             raise AssertionError(f"TMA is not supported on the smoke-test GPU: {metrics}")
-        if metrics["fused_tma_threads"] != 640:
+        if metrics["fused_tma_threads"] != 1024:
             raise AssertionError(f"Unexpected fused TMA thread count: {metrics}")
         if metrics["fused_tma_control_warps"] != 1:
             raise AssertionError(f"Unexpected fused TMA control warp count: {metrics}")
-        if metrics["fused_tma_worker_warps"] != 19:
+        if metrics["fused_tma_worker_warps"] != 31:
             raise AssertionError(f"Unexpected fused TMA worker warp count: {metrics}")
         if metrics["fused_tma_matrix_count"] != 1:
             raise AssertionError(f"Unexpected fused TMA matrix count: {metrics}")
