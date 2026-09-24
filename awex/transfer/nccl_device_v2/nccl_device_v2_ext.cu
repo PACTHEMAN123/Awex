@@ -42,6 +42,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <numeric>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -487,8 +488,16 @@ struct GinFlowPart {
   std::uint64_t bytes = 0;
 };
 
+struct GinFlow {
+  std::uint32_t source = 0;
+  std::uint32_t destination = 0;
+  std::uint32_t part_count = 0;
+  std::uint64_t bytes = 0;
+};
+
 using GinPartKey = std::tuple<std::uint32_t, std::uint32_t, std::uint32_t>;
 using GinRailKey = std::pair<std::uint64_t, std::uint32_t>;
+using GinFlowKey = std::pair<std::uint32_t, std::uint32_t>;
 
 std::uint32_t gin_channels_for_record(const DeviceState& state, const GinRankLoadRecord& record,
                                       std::uint32_t peer) {
@@ -556,7 +565,8 @@ void configure_gin_peer_contexts(DeviceState* state, const std::vector<std::uint
       std::max(state->network_channels_per_peer, state->peer_channels[peer]);
   }
 
-  std::vector<GinFlowPart> parts;
+  std::vector<GinFlow> flows;
+  std::map<std::uint64_t, std::uint64_t> group_payload_bytes;
   for (int source = 0; source < state->world_size; ++source) {
     const auto& source_record = records[source];
     if (source_record.sender == 0 || source_record.rail_count == 0 || source_record.numa_group_id == 0) continue;
@@ -569,13 +579,87 @@ void configure_gin_peer_contexts(DeviceState* state, const std::vector<std::uint
         throw std::runtime_error("nccl_device_v2 sender/receiver byte totals differ during GIN rail scheduling");
       }
       const std::uint32_t part_count = gin_channels_for_record(*state, source_record, destination);
-      for (std::uint32_t part = 0; part < part_count; ++part) {
-        const auto bounds = v2::v2PartBounds(part_count, part, bytes);
-        if (bounds.first != bounds.second) {
-          parts.push_back(GinFlowPart{static_cast<std::uint32_t>(source),
-                                      static_cast<std::uint32_t>(destination), part, part_count,
-                                      bounds.second - bounds.first});
-        }
+      flows.push_back(GinFlow{static_cast<std::uint32_t>(source), static_cast<std::uint32_t>(destination),
+                              part_count, bytes});
+      group_payload_bytes[source_record.numa_group_id] += bytes;
+    }
+  }
+  std::sort(flows.begin(), flows.end(), [](const GinFlow& left, const GinFlow& right) {
+    if (left.bytes != right.bytes) return left.bytes > right.bytes;
+    return std::tie(left.source, left.destination) < std::tie(right.source, right.destination);
+  });
+
+  std::map<GinRailKey, long double> rail_load;
+  std::map<GinFlowKey, std::array<std::uint32_t, kMaxGinConnections>> connection_uses;
+  std::map<GinFlowKey, std::pair<std::uint32_t, std::uint32_t>> pinned_rails;
+  std::map<GinFlowKey, bool> split_flows;
+  std::map<GinPartKey, std::uint8_t> part_contexts;
+  const std::uint32_t contexts_per_connection = std::max<std::uint32_t>(1, context_count / connection_count);
+  for (const GinFlow& flow : flows) {
+    const auto& source = records[flow.source];
+    const auto& destination = records[flow.destination];
+    std::vector<long double> rail_capacities(source.rail_count, 0.0L);
+    for (std::uint32_t connection = 0; connection < connection_count; ++connection) {
+      const std::uint32_t source_rail = connection % source.rail_count;
+      const std::uint32_t destination_rail = connection % destination.rail_count;
+      rail_capacities[source_rail] = std::max<long double>(
+        rail_capacities[source_rail],
+        std::min(source.rail_bandwidths_gbps[source_rail],
+                 destination.rail_bandwidths_gbps[destination_rail]));
+    }
+    const long double total_capacity =
+      std::accumulate(rail_capacities.begin(), rail_capacities.end(), 0.0L);
+    const long double max_capacity = *std::max_element(rail_capacities.begin(), rail_capacities.end());
+    const std::uint64_t group_bytes = group_payload_bytes[source.numa_group_id];
+    const bool split = source.rail_count > 1 && total_capacity > 0.0L &&
+      static_cast<long double>(flow.bytes) * total_capacity >
+        static_cast<long double>(group_bytes) * max_capacity;
+    split_flows[{flow.source, flow.destination}] = split;
+    if (split) continue;
+
+    std::uint32_t selected_connection = 0;
+    auto selected_key = std::tuple<long double, unsigned int, std::uint32_t>{
+      std::numeric_limits<long double>::infinity(), std::numeric_limits<unsigned int>::max(),
+      std::numeric_limits<std::uint32_t>::max()};
+    for (std::uint32_t connection = 0; connection < connection_count; ++connection) {
+      const std::uint32_t source_rail = connection % source.rail_count;
+      const std::uint32_t destination_rail = connection % destination.rail_count;
+      const long double bandwidth = std::max<long double>(
+        1.0L, std::min(source.rail_bandwidths_gbps[source_rail],
+                       destination.rail_bandwidths_gbps[destination_rail]));
+      const long double work = static_cast<long double>(flow.bytes) / bandwidth;
+      const GinRailKey source_key{source.numa_group_id, source_rail};
+      const GinRailKey destination_key{destination.numa_group_id, destination_rail};
+      const long double projected = std::max(rail_load[source_key] + work, rail_load[destination_key] + work);
+      const unsigned int distance = static_cast<unsigned int>(source.rail_pci_distances[source_rail]) +
+                                    destination.rail_pci_distances[destination_rail];
+      const std::uint32_t rotated = (connection + connection_count -
+                                     ((flow.source + flow.destination) % connection_count)) %
+                                    connection_count;
+      const auto key = std::make_tuple(projected, distance, rotated);
+      if (key < selected_key) {
+        selected_key = key;
+        selected_connection = connection;
+      }
+    }
+    const std::uint32_t source_rail = selected_connection % source.rail_count;
+    const std::uint32_t destination_rail = selected_connection % destination.rail_count;
+    const long double bandwidth = std::max<long double>(
+      1.0L, std::min(source.rail_bandwidths_gbps[source_rail],
+                     destination.rail_bandwidths_gbps[destination_rail]));
+    const long double work = static_cast<long double>(flow.bytes) / bandwidth;
+    rail_load[{source.numa_group_id, source_rail}] += work;
+    rail_load[{destination.numa_group_id, destination_rail}] += work;
+    pinned_rails[{flow.source, flow.destination}] = {source_rail, destination_rail};
+  }
+
+  std::vector<GinFlowPart> parts;
+  for (const GinFlow& flow : flows) {
+    for (std::uint32_t part = 0; part < flow.part_count; ++part) {
+      const auto bounds = v2::v2PartBounds(flow.part_count, part, flow.bytes);
+      if (bounds.first != bounds.second) {
+        parts.push_back(GinFlowPart{flow.source, flow.destination, part, flow.part_count,
+                                    bounds.second - bounds.first});
       }
     }
   }
@@ -584,17 +668,13 @@ void configure_gin_peer_contexts(DeviceState* state, const std::vector<std::uint
     return std::tie(left.source, left.destination, left.part) <
            std::tie(right.source, right.destination, right.part);
   });
-
-  std::map<GinRailKey, long double> rail_load;
-  std::map<std::pair<std::uint32_t, std::uint32_t>, std::array<std::uint32_t, kMaxGinConnections>>
-    connection_uses;
-  std::map<GinPartKey, std::uint8_t> part_contexts;
-  const std::uint32_t contexts_per_connection = std::max<std::uint32_t>(1, context_count / connection_count);
   for (const GinFlowPart& part : parts) {
     const auto& source = records[part.source];
     const auto& destination = records[part.destination];
-    const auto edge = std::make_pair(part.source, part.destination);
+    const GinFlowKey edge{part.source, part.destination};
     auto& uses = connection_uses[edge];
+    const bool split = split_flows[edge];
+    const auto pinned = pinned_rails[edge];
     std::uint32_t selected_connection = 0;
     auto selected_key = std::tuple<long double, unsigned int, std::uint32_t, std::uint32_t>{
       std::numeric_limits<long double>::infinity(), std::numeric_limits<unsigned int>::max(),
@@ -602,13 +682,16 @@ void configure_gin_peer_contexts(DeviceState* state, const std::vector<std::uint
     for (std::uint32_t connection = 0; connection < connection_count; ++connection) {
       const std::uint32_t source_rail = connection % source.rail_count;
       const std::uint32_t destination_rail = connection % destination.rail_count;
+      if (!split && (source_rail != pinned.first || destination_rail != pinned.second)) continue;
       const long double bandwidth = std::max<long double>(
         1.0L, std::min(source.rail_bandwidths_gbps[source_rail],
                        destination.rail_bandwidths_gbps[destination_rail]));
       const long double work = static_cast<long double>(part.bytes) / bandwidth;
       const GinRailKey source_key{source.numa_group_id, source_rail};
       const GinRailKey destination_key{destination.numa_group_id, destination_rail};
-      const long double projected = std::max(rail_load[source_key] + work, rail_load[destination_key] + work);
+      const long double projected = split
+        ? std::max(rail_load[source_key] + work, rail_load[destination_key] + work)
+        : 0.0L;
       const unsigned int distance = static_cast<unsigned int>(source.rail_pci_distances[source_rail]) +
                                     destination.rail_pci_distances[destination_rail];
       const std::uint32_t rotated = (connection + connection_count -
@@ -622,12 +705,14 @@ void configure_gin_peer_contexts(DeviceState* state, const std::vector<std::uint
     }
     const std::uint32_t source_rail = selected_connection % source.rail_count;
     const std::uint32_t destination_rail = selected_connection % destination.rail_count;
-    const long double bandwidth = std::max<long double>(
-      1.0L, std::min(source.rail_bandwidths_gbps[source_rail],
-                     destination.rail_bandwidths_gbps[destination_rail]));
-    const long double work = static_cast<long double>(part.bytes) / bandwidth;
-    rail_load[{source.numa_group_id, source_rail}] += work;
-    rail_load[{destination.numa_group_id, destination_rail}] += work;
+    if (split) {
+      const long double bandwidth = std::max<long double>(
+        1.0L, std::min(source.rail_bandwidths_gbps[source_rail],
+                       destination.rail_bandwidths_gbps[destination_rail]));
+      const long double work = static_cast<long double>(part.bytes) / bandwidth;
+      rail_load[{source.numa_group_id, source_rail}] += work;
+      rail_load[{destination.numa_group_id, destination_rail}] += work;
+    }
     const std::uint32_t use = uses[selected_connection]++;
     const std::uint32_t context =
       selected_connection + (use % contexts_per_connection) * connection_count;
