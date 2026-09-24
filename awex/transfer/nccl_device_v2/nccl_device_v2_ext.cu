@@ -520,24 +520,64 @@ void initialize_sparse_window(DeviceState* state, const std::vector<std::uint32_
       state->network_channel_budget =
         std::min(state->total_channels, 6 * state->gin_connection_count);
       std::uint64_t total_gin_bytes = 0;
+      std::vector<std::uint32_t> gin_peers;
       for (const std::uint32_t peer : active_peers) {
         if (state->peer_transports[peer] == static_cast<std::uint8_t>(v2::V2Transport::kGin)) {
           total_gin_bytes += state->peer_payload_bytes[peer];
+          gin_peers.push_back(peer);
         }
       }
       state->network_channels_per_peer = 1;
-      for (const std::uint32_t peer : active_peers) {
-        if (state->peer_transports[peer] != static_cast<std::uint8_t>(v2::V2Transport::kGin)) continue;
-        std::uint32_t demand = state->requested_network_channels_per_peer;
-        if (demand == 0) {
+      if (state->requested_network_channels_per_peer != 0) {
+        const std::uint32_t channels = std::min(
+          state->total_channels, power_of_two_up(state->requested_network_channels_per_peer));
+        for (const std::uint32_t peer : gin_peers) state->peer_channels[peer] = channels;
+      } else if (gin_peers.size() == 1) {
+        // A single stream can use the whole issue budget without contending
+        // with another peer. Round up so all negotiated connections remain
+        // evenly striped.
+        state->peer_channels[gin_peers.front()] =
+          std::min(state->total_channels, power_of_two_up(state->network_channel_budget));
+      } else {
+        // First reserve only enough channels to keep one FIFO window in flight
+        // for each peer. Small control peers should not consume the same eight
+        // channels as multi-gigabyte weight streams.
+        const std::uint64_t fifo_window_bytes =
+          static_cast<std::uint64_t>(state->network_step_bytes) * state->fifo_depth;
+        std::uint32_t assigned_channels = 0;
+        for (const std::uint32_t peer : gin_peers) {
+          const std::uint64_t window_demand =
+            std::max<std::uint64_t>(1, v2::v2DivUp(state->peer_payload_bytes[peer], fifo_window_bytes));
+          const std::uint32_t capped_demand =
+            static_cast<std::uint32_t>(std::min<std::uint64_t>(base_channels, window_demand));
+          const std::uint32_t channels = power_of_two_up(capped_demand);
+          state->peer_channels[peer] = channels;
+          assigned_channels += channels;
+        }
+
+        // Promote only peers whose byte share justifies the next power of two,
+        // and charge every promotion against the shared per-rank budget.
+        std::sort(gin_peers.begin(), gin_peers.end(), [&](std::uint32_t left, std::uint32_t right) {
+          return state->peer_payload_bytes[left] > state->peer_payload_bytes[right];
+        });
+        std::uint32_t remaining_channels = assigned_channels < state->network_channel_budget
+          ? state->network_channel_budget - assigned_channels
+          : 0;
+        for (const std::uint32_t peer : gin_peers) {
           const std::uint64_t weighted_demand = total_gin_bytes == 0
             ? 1
             : v2::v2DivUp(static_cast<std::uint64_t>(state->network_channel_budget) *
                             state->peer_payload_bytes[peer],
                           total_gin_bytes);
-          demand = std::max(base_channels, static_cast<std::uint32_t>(weighted_demand));
+          while (state->peer_channels[peer] <= remaining_channels &&
+                 2 * state->peer_channels[peer] <= weighted_demand &&
+                 state->peer_channels[peer] <= state->total_channels / 2) {
+            remaining_channels -= state->peer_channels[peer];
+            state->peer_channels[peer] *= 2;
+          }
         }
-        state->peer_channels[peer] = std::min(state->total_channels, power_of_two_up(demand));
+      }
+      for (const std::uint32_t peer : gin_peers) {
         state->network_channels_per_peer =
           std::max(state->network_channels_per_peer, state->peer_channels[peer]);
       }

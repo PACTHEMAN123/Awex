@@ -39,11 +39,12 @@ peer channel demand is raised to two channels per negotiated GIN connection,
 rounded up to a power of two. By default NCCL discovers the available GIN
 connections and creates one context per connection. Network channel limits are
 then computed from the negotiated connection count and each active peer's byte
-share. Every peer receives at least two channels per connection, while a
-single heavy peer can consume a target issue budget of six channels per
-connection. Peer pairs are symmetrically striped across disjoint channel groups
-until a rank's channel budget is exhausted, avoiding serialization of
-independent peer flows.
+share. Each peer first receives enough power-of-two channels to keep one FIFO
+window in flight, capped at two channels per connection. Remaining channels
+are charged against one shared per-rank issue budget and only promote peers
+whose payload share justifies the next power of two. A single peer can use the
+rounded-up full budget. Peer pairs are symmetrically striped across disjoint
+channel groups until the channel ceiling is exhausted.
 
 GIN receive credits are coalesced from the FIFO depth rather than returned for
 every network step. The automatic batch is capped at four credits and every
