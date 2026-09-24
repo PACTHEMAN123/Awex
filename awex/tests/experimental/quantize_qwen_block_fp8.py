@@ -61,7 +61,10 @@ def _copy_auxiliary_files(source: Path, destination: Path) -> None:
     for path in source.iterdir():
         if not path.is_file():
             continue
-        if path.suffix == ".safetensors" or path.name == "config.json":
+        if path.suffix == ".safetensors" or path.name in {
+            "config.json",
+            "model.safetensors.index.json",
+        }:
             continue
         shutil.copyfile(path, destination / path.name)
 
