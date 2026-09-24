@@ -205,6 +205,11 @@ def test_blockwise_fp8_send_batch_uses_source_and_shared_scale(monkeypatch):
     assert batch.quant_scale_row_strides == [3, 0]
     assert batch.quant_block_rows == [128, 0]
     assert batch.quant_block_cols == [128, 0]
+    assert batch.tensor_row_bytes == [384 * source.element_size(), scale.numel() * 4]
+    assert batch.tensor_row_strides == [
+        384 * source.element_size(),
+        scale.numel() * 4,
+    ]
 
 
 def test_blockwise_fp8_rejects_unaligned_transfer_slice():

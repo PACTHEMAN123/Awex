@@ -263,6 +263,22 @@ def _tensor_copy_layout(tensor: torch.Tensor, name: str) -> tuple[int, int]:
     return row_bytes, row_stride
 
 
+def _quant_matrix_copy_layout(tensor: torch.Tensor, name: str) -> tuple[int, int]:
+    if tensor.dim() != 2 or int(tensor.stride(1)) != 1:
+        raise NCCLDeviceV2UnavailableError(
+            "v2 block-wise FP8 source must be a row-major 2-D view: "
+            f"parameter={name}, shape={tuple(tensor.shape)}, "
+            f"stride={tuple(tensor.stride())}"
+        )
+    row_bytes = int(tensor.shape[1]) * int(tensor.element_size())
+    row_stride = int(tensor.stride(0)) * int(tensor.element_size())
+    if row_stride < row_bytes:
+        raise NCCLDeviceV2UnavailableError(
+            f"v2 block-wise FP8 row stride is invalid: parameter={name}"
+        )
+    return row_bytes, row_stride
+
+
 def _append_tensor_range(
     *,
     tensors: list[torch.Tensor],
@@ -322,6 +338,36 @@ def _append_tensor_range(
         raise NCCLDeviceV2UnavailableError(
             "nccl_device_v2 wire range must contain complete elements"
         )
+    if quant_scale_tensor is not None:
+        descriptor = {
+            "shape": tuple(int(dim) for dim in tensor.shape),
+            "tensor_offset": int(tensor_offset),
+            "nbytes": int(nbytes),
+            "row_bytes": int(row_bytes),
+            "row_stride": int(row_stride),
+            "quant_rows": int(quant_rows_value),
+            "quant_cols": int(quant_cols_value),
+            "row_offset": int(quant_row_offset),
+            "col_offset": int(quant_col_offset),
+            "block_shape": tuple(int(dim) for dim in quant_block_shape),
+        }
+        valid = (
+            tensor.dim() == 2
+            and quant_rows_value > 0
+            and quant_cols_value > 0
+            and tensor_offset == 0
+            and row_bytes == quant_cols_value * tensor_element_bytes
+            and nbytes == quant_rows_value * quant_cols_value * wire_item_bytes
+            and tuple(quant_block_shape) == (128, 128)
+            and quant_row_offset % 128 == 0
+            and quant_col_offset % 128 == 0
+            and quant_scale_row_stride > 0
+        )
+        if not valid:
+            raise NCCLDeviceV2UnavailableError(
+                "Invalid nccl_device_v2 block-wise FP8 descriptor: "
+                f"{descriptor}"
+            )
 
     tensors.append(tensor)
     tensor_offsets.append(tensor_offset)
@@ -445,6 +491,9 @@ def _build_send_batch(
                 quant_fragment = None
                 if source_fragments is not None:
                     quant_fragment = source_fragments[fragment_number]
+                    row_bytes, row_stride = _quant_matrix_copy_layout(
+                        fragment, op.send_shard_meta.name
+                    )
                 ordinal = _append_tensor_range(
                     tensors=tensors,
                     tensor_offsets=tensor_offsets,
