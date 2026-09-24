@@ -85,6 +85,8 @@ __global__ void __launch_bounds__(kTmaQuantThreads, 1) tma_quant_send_kernel(V2T
 #if __CUDA_ARCH__ >= 900
   extern __shared__ __align__(128) unsigned char shared_bytes[];
   auto* shared_tiles = reinterpret_cast<__nv_bfloat16*>(shared_bytes);
+  auto* shared_quantized =
+    shared_bytes + kTmaWorkerGroups * kTmaQuantElements * sizeof(__nv_bfloat16);
   __shared__ V2TmaBarrier barriers[2];
   __shared__ float warp_max[kTmaWorkerGroups][kTmaMaxGroupWarps];
   __shared__ float block_scale[kTmaWorkerGroups];
@@ -153,8 +155,8 @@ __global__ void __launch_bounds__(kTmaQuantThreads, 1) tma_quant_send_kernel(V2T
       v2GroupBarrier(kTmaHandoffBarrierBase + worker_group, group_threads + kWarpSize);
       if (!fifo_ready) return;
 
-      auto* payload = v2FifoPayload(transport, transport.local_rank, queue.peer, queue.channel, tile.step, true) +
-                      tile.payload_offset;
+      auto* shared_output =
+        shared_quantized + static_cast<std::size_t>(worker_group) * kTmaQuantPayloadBytes;
       constexpr std::uint32_t pair_count = kTmaQuantElements / 2;
       for (std::uint32_t pair = group_tid; pair < pair_count; pair += group_threads) {
         const float2 values = __bfloat1622float2(reinterpret_cast<const __nv_bfloat162*>(shared_tile)[pair]);
@@ -163,7 +165,7 @@ __global__ void __launch_bounds__(kTmaQuantThreads, 1) tma_quant_send_kernel(V2T
           values.y / block_scale[worker_group],
         };
         const __nv_fp8x2_e4m3 encoded(scaled);
-        v2Store16(payload + kTmaQuantHeaderBytes + pair * 2, encoded.__x);
+        reinterpret_cast<std::uint16_t*>(shared_output)[pair] = encoded.__x;
       }
       v2GroupBarrier(kTmaHandoffBarrierBase + worker_group, group_threads + kWarpSize);
     }
@@ -207,12 +209,28 @@ __global__ void __launch_bounds__(kTmaQuantThreads, 1) tma_quant_send_kernel(V2T
         const int active_group_warps = group == 0 ? kTmaFirstGroupWarps : kTmaSecondGroupWarps;
         v2GroupBarrier(kTmaHandoffBarrierBase + group, (active_group_warps + 1) * kWarpSize);
         const std::uint32_t tile_index = index + group;
+        const V2TmaQuantTile& tile = args.tiles[queue.tile_begin + tile_index];
+        if (control_lane) {
+          auto* payload =
+            v2FifoPayload(transport, transport.local_rank, queue.peer, queue.channel, tile.step, true) +
+            tile.payload_offset;
+          ptx::fence_proxy_async(ptx::space_shared);
+          ptx::cp_async_bulk(ptx::space_global, ptx::space_shared, payload + kTmaQuantHeaderBytes,
+                             shared_quantized + static_cast<std::size_t>(group) * kTmaQuantPayloadBytes,
+                             static_cast<std::uint32_t>(kTmaQuantPayloadBytes));
+          ptx::cp_async_bulk_commit_group();
+        }
         const std::uint32_t fetch = tile_index + kTmaWorkerGroups;
         if (v2TmaElected(control) && fetch < queue.tile_count) {
           const V2TmaQuantTile& next = args.tiles[queue.tile_begin + fetch];
           v2TmaIssueLoad(args, next, shared_tiles + static_cast<std::size_t>(group) * kTmaQuantElements,
                          barriers[group]);
         }
+      }
+      if (control_lane) ptx::cp_async_bulk_wait_group(ptx::n32_t<0>());
+
+      for (std::uint32_t group = 0; group < active_groups; ++group) {
+        const std::uint32_t tile_index = index + group;
         const V2TmaQuantTile& tile = args.tiles[queue.tile_begin + tile_index];
         const bool packet_end =
           tile_index + 1 == queue.tile_count || args.tiles[queue.tile_begin + tile_index + 1].step != tile.step;

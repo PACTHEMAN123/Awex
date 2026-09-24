@@ -35,7 +35,8 @@ cudaError_t launchDeviceV2Tma(const V2TmaKernelArgs& args, V2Direction direction
     return cudaSuccess;
   }
   if (direction == V2Direction::kSend) {
-    constexpr int shared_bytes = 2 * kTmaQuantElements * sizeof(__nv_bfloat16);
+    constexpr int shared_bytes =
+      kTmaWorkerGroups * (kTmaQuantElements * sizeof(__nv_bfloat16) + kTmaQuantPayloadBytes);
     cudaError_t result = cudaFuncSetAttribute(tma_quant_send_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                              shared_bytes);
     if (result != cudaSuccess) return result;
