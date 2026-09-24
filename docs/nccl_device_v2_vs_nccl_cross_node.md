@@ -158,7 +158,7 @@ payload 小于一个 step 时使用 `step / 4`，小于八个 step 时使用 `st
 创建 device communicator 时，v2 默认请求：
 
 ```text
-ginContextCount = 1
+ginContextCount = detectedGinConnectionCount
 ```
 
 执行时每个 channel 选择：
@@ -167,7 +167,8 @@ ginContextCount = 1
 context = channel % ginContextCount
 ```
 
-NCCL 会把请求向上取整到实际 connection 数，因此默认结果是每个 connection 一个 context。
+默认结果是每个 connection 一个 context。这里由 Awex 显式传入数量，因为 NCCL 2.30.4 不会把单个
+context 请求向上取整到 connection 数；新版 NCCL 即使支持 round-up，也得到相同结果。
 connection 数由 Awex 在 communicator 创建前统计 sysfs 中 active 且带 netdev 的 RDMA 设备，最多使用
 4 个 GIN connection slot；sysfs 不可见时回退到 4。显式设置为 0 才使用 NCCL 的原生 local-device
 discovery。kernel 始终使用返回的 `dev_comm.ginContextCount` 做 channel 取模。两个请求值都可由环境变量覆盖。

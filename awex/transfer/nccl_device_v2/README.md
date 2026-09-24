@@ -56,7 +56,9 @@ counts active RDMA devices with visible netdevs in sysfs and caps the result at
 the four GIN connection slots. It falls back to four when sysfs is unavailable;
 an explicit zero requests NCCL's native local-device discovery.
 `AWEX_NCCL_DEVICE_V2_GIN_CONTEXTS` controls the requested context count. If it
-is absent, NCCL creates one context per negotiated connection.
+is absent, Awex requests one context per detected connection. This explicit
+mapping is required for NCCL 2.30.4, which does not round a one-context request
+up to the connection count.
 `AWEX_NCCL_DEVICE_V2_FIFO_DEPTH` controls the number of reusable payload slots
 per peer and channel, from 1 through 64; the default is 16.
 `AWEX_NCCL_DEVICE_V2_GIN_DOORBELL_BATCH` can aggregate up to eight consecutive

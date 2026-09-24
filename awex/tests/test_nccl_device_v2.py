@@ -18,6 +18,7 @@
 import pytest
 
 from awex.transfer.nccl_device_v2 import (
+    NCCLDeviceV2Transport,
     NCCLDeviceV2UnavailableError,
     _resolve_fifo_depth,
     _resolve_gin_connections,
@@ -143,6 +144,16 @@ def test_gin_contexts_default_to_one_per_connection(monkeypatch):
     monkeypatch.delenv("AWEX_NCCL_DEVICE_V2_GIN_CONTEXTS", raising=False)
 
     assert _resolve_gin_context_count(None) == 0
+
+
+def test_transport_maps_auto_contexts_to_detected_connections(monkeypatch):
+    monkeypatch.delenv("AWEX_NCCL_DEVICE_V2_GIN_CONTEXTS", raising=False)
+    monkeypatch.setenv("NCCL_GIN_NCONNECTIONS", "3")
+    monkeypatch.setenv("NCCL_GIN_GDAKI_USE_RELIABLE_DB", "2")
+
+    transport = NCCLDeviceV2Transport(None, 0, 2, gin_connections=3)
+
+    assert transport.gin_context_count == 3
 
 
 @pytest.mark.parametrize("value", [-1, 65])

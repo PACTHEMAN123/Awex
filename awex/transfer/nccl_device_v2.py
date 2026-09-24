@@ -758,6 +758,10 @@ class NCCLDeviceV2Transport:
         )
         self.gin_connections = _resolve_gin_connections(gin_connections)
         self.gin_context_count = _resolve_gin_context_count(gin_context_count)
+        if self.gin_context_count == 0:
+            # NCCL 2.30.4 does not round a one-context request up to the
+            # negotiated connection count. Keep every connection addressable.
+            self.gin_context_count = self.gin_connections or 1
         self.gin_doorbell_batch = _resolve_gin_doorbell_batch(gin_doorbell_batch)
         self.gin_reliable_doorbell = _resolve_gin_reliable_doorbell(
             gin_reliable_doorbell
