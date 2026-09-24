@@ -23,6 +23,7 @@ import argparse
 import gc
 import json
 import shutil
+import tempfile
 from pathlib import Path
 
 import torch
@@ -82,6 +83,7 @@ def _write_config(source: Path, destination: Path) -> None:
 def _quantize_shard(
     source_path: Path,
     destination_path: Path,
+    staging_path: Path,
     device: torch.device,
 ) -> tuple[dict[str, str], int, int]:
     tensors: dict[str, torch.Tensor] = {}
@@ -107,9 +109,11 @@ def _quantize_shard(
 
     for tensor in tensors.values():
         total_size += int(tensor.numel()) * int(tensor.element_size())
-    temporary_path = destination_path.with_suffix(".safetensors.incomplete")
-    save_file(tensors, temporary_path, metadata=metadata)
-    temporary_path.replace(destination_path)
+    save_file(tensors, staging_path, metadata=metadata)
+    shutil.copyfile(staging_path, destination_path)
+    if destination_path.stat().st_size != staging_path.stat().st_size:
+        raise OSError(f"Copied shard size mismatch: {destination_path}")
+    staging_path.unlink()
     del tensors
     gc.collect()
     if device.type == "cuda":
@@ -135,6 +139,8 @@ def main() -> None:
     output_index_path = destination / "model.safetensors.index.json"
     if output_index_path.exists():
         output_index_path.unlink()
+    for incomplete_path in destination.glob("*.incomplete"):
+        incomplete_path.unlink()
     _copy_auxiliary_files(source, destination)
     _write_config(source, destination)
 
@@ -142,16 +148,21 @@ def main() -> None:
     weight_map = {}
     total_size = 0
     total_quantized = 0
-    for index, shard_name in enumerate(shard_names, start=1):
-        print(f"[{index}/{len(shard_names)}] quantizing {shard_name}", flush=True)
-        shard_map, shard_size, quantized_count = _quantize_shard(
-            source / shard_name,
-            destination / shard_name,
-            device,
-        )
-        weight_map.update(shard_map)
-        total_size += shard_size
-        total_quantized += quantized_count
+    with tempfile.TemporaryDirectory(prefix="awex-qwen-block-fp8-") as staging_dir:
+        staging = Path(staging_dir)
+        for index, shard_name in enumerate(shard_names, start=1):
+            print(
+                f"[{index}/{len(shard_names)}] quantizing {shard_name}", flush=True
+            )
+            shard_map, shard_size, quantized_count = _quantize_shard(
+                source / shard_name,
+                destination / shard_name,
+                staging / shard_name,
+                device,
+            )
+            weight_map.update(shard_map)
+            total_size += shard_size
+            total_quantized += quantized_count
 
     index = {
         "metadata": {"total_size": total_size},
