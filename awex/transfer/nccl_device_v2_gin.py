@@ -268,9 +268,9 @@ def _rank_payload_bytes_from_environment(local_world_size: int) -> list[int]:
 def _configure_gin_hca_policy() -> None:
     """Bind each rank to one NUMA-local HCA before NCCL initialization."""
 
-    policy = os.environ.get(
-        "AWEX_NCCL_DEVICE_V2_HCA_POLICY", "balanced"
-    ).strip().lower()
+    policy = (
+        os.environ.get("AWEX_NCCL_DEVICE_V2_HCA_POLICY", "balanced").strip().lower()
+    )
     if policy == "topology" or "NCCL_IB_HCA" in os.environ:
         return
     if policy != "balanced":

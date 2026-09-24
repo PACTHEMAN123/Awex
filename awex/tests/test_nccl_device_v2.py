@@ -105,8 +105,7 @@ def test_weighted_hca_assignments_follow_capacity_and_payload():
 
 def test_weighted_hca_assignments_keep_ranks_on_local_numa_rails():
     endpoints = [
-        _RdmaEndpoint(f"mlx5_{index}", 1, 200.0, f"/pci/{index}")
-        for index in range(4)
+        _RdmaEndpoint(f"mlx5_{index}", 1, 200.0, f"/pci/{index}") for index in range(4)
     ]
     topology = [
         [3, 3, 4, 4],

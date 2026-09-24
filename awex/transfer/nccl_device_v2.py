@@ -635,9 +635,7 @@ class NCCLDeviceV2Transport:
             os.environ["NCCL_GIN_NCONNECTIONS"] = str(self.gin_connections)
         else:
             os.environ.pop("NCCL_GIN_NCONNECTIONS", None)
-        os.environ["NCCL_GIN_GDAKI_USE_RELIABLE_DB"] = str(
-            self.gin_reliable_doorbell
-        )
+        os.environ["NCCL_GIN_GDAKI_USE_RELIABLE_DB"] = str(self.gin_reliable_doorbell)
         if self.chunk_bytes and self.chunk_bytes < max(
             self.step_bytes, self.network_step_bytes
         ):
@@ -757,9 +755,7 @@ class NCCLDeviceV2Transport:
         extension_metrics["hca_policy"] = os.environ.get(
             "AWEX_NCCL_DEVICE_V2_HCA_POLICY", "balanced"
         )
-        extension_metrics["selected_hca"] = os.environ.get(
-            "NCCL_IB_HCA", "topology"
-        )
+        extension_metrics["selected_hca"] = os.environ.get("NCCL_IB_HCA", "topology")
         selected_hca_bandwidth = os.environ.get(
             "AWEX_NCCL_DEVICE_V2_SELECTED_HCA_BANDWIDTH_GBPS"
         )
