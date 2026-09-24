@@ -32,6 +32,14 @@ constexpr int kTmaWorkerThreads = kTmaQuantThreads - kTmaControlWarps * kWarpSiz
 constexpr int kTmaWorkerWarps = kTmaWorkerThreads / kWarpSize;
 constexpr int kTmaWorkerBarrier = 1;
 constexpr int kTmaHandoffBarrier = 2;
+constexpr std::uint32_t kTmaFp8PairsPerStore = kCopyPackBytes / sizeof(std::uint16_t);
+
+union alignas(16) V2TmaEncodedPack {
+  std::uint16_t pairs[kTmaFp8PairsPerStore];
+  V2Pack128 vector;
+};
+
+static_assert((kTmaQuantElements / 2) % kTmaFp8PairsPerStore == 0, "FP8 tile must contain full vector stores");
 
 __device__ __forceinline__ bool v2TmaElected(bool control) {
   return control && ptx::elect_sync(0xffffffffU);
@@ -132,8 +140,15 @@ __global__ void __launch_bounds__(kTmaQuantThreads, 1) tma_quant_send_kernel(V2T
     const auto* shared_tile = shared_tiles + static_cast<std::size_t>(stage) * kTmaQuantElements;
     if (worker) {
       float local_max = 0.0F;
-      for (std::uint32_t element = worker_tid; element < kTmaQuantElements; element += kTmaWorkerThreads) {
-        local_max = fmaxf(local_max, fabsf(__bfloat162float(shared_tile[element])));
+      constexpr std::uint32_t pair_count = kTmaQuantElements / 2;
+      constexpr std::uint32_t pack_count = pair_count / kTmaFp8PairsPerStore;
+      const auto* shared_pairs = reinterpret_cast<const __nv_bfloat162*>(shared_tile);
+      for (std::uint32_t pack = worker_tid; pack < pack_count; pack += kTmaWorkerThreads) {
+#pragma unroll
+        for (std::uint32_t pair = 0; pair < kTmaFp8PairsPerStore; ++pair) {
+          const float2 values = __bfloat1622float2(shared_pairs[pack * kTmaFp8PairsPerStore + pair]);
+          local_max = fmaxf(local_max, fmaxf(fabsf(values.x), fabsf(values.y)));
+        }
       }
       for (int offset = kWarpSize / 2; offset > 0; offset /= 2) {
         local_max = fmaxf(local_max, __shfl_down_sync(0xffffffffU, local_max, offset));
@@ -159,13 +174,19 @@ __global__ void __launch_bounds__(kTmaQuantThreads, 1) tma_quant_send_kernel(V2T
       scale[static_cast<std::uint64_t>(tile.tile_row) * (tile.scale_row_stride / sizeof(float)) + tile.tile_col] =
         block_scale;
     }
-    constexpr std::uint32_t pair_count = kTmaQuantElements / 2;
     if (worker) {
-      for (std::uint32_t pair = worker_tid; pair < pair_count; pair += kTmaWorkerThreads) {
-        const float2 values = __bfloat1622float2(reinterpret_cast<const __nv_bfloat162*>(shared_tile)[pair]);
-        const float2 scaled = {values.x / block_scale, values.y / block_scale};
-        const __nv_fp8x2_e4m3 encoded(scaled);
-        v2Store16(payload + kTmaQuantHeaderBytes + pair * 2, encoded.__x);
+      constexpr std::uint32_t pair_count = kTmaQuantElements / 2;
+      constexpr std::uint32_t pack_count = pair_count / kTmaFp8PairsPerStore;
+      const auto* shared_pairs = reinterpret_cast<const __nv_bfloat162*>(shared_tile);
+      for (std::uint32_t pack = worker_tid; pack < pack_count; pack += kTmaWorkerThreads) {
+        V2TmaEncodedPack encoded_pack;
+#pragma unroll
+        for (std::uint32_t pair = 0; pair < kTmaFp8PairsPerStore; ++pair) {
+          const float2 values = __bfloat1622float2(shared_pairs[pack * kTmaFp8PairsPerStore + pair]);
+          const float2 scaled = {values.x / block_scale, values.y / block_scale};
+          encoded_pack.pairs[pair] = __nv_fp8x2_e4m3(scaled).__x;
+        }
+        v2Store128(payload + kTmaQuantHeaderBytes + pack * kCopyPackBytes, encoded_pack.vector);
       }
     }
     v2GroupBarrier(kTmaHandoffBarrier, kTmaQuantThreads);
