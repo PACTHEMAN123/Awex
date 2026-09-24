@@ -36,10 +36,14 @@ fallback.
 The topology layer mirrors NCCL's NVLink path formula,
 `2 * max(1, pathBandwidth / linkBandwidth)`. Once GIN is initialized, remote
 peer channel demand is raised to two channels per negotiated GIN connection,
-rounded up to a power of two. Four connections and four contexts are requested
-by default; the eight network channels share one context per connection. Peer
-pairs are symmetrically striped across disjoint channel groups until a rank's
-channel budget is exhausted, avoiding serialization of independent peer flows.
+rounded up to a power of two. By default NCCL discovers the available GIN
+connections and creates one context per connection. Network channel limits are
+then computed from the negotiated connection count and each active peer's byte
+share. Every peer receives at least two channels per connection, while a
+single heavy peer can consume a target issue budget of six channels per
+connection. Peer pairs are symmetrically striped across disjoint channel groups
+until a rank's channel budget is exhausted, avoiding serialization of
+independent peer flows.
 Both paths remain capped by the configured channel ceiling and the
 device's SM capacity. The raw, requested, effective, and network-specific
 values are exposed in launch metrics.
@@ -47,8 +51,10 @@ values are exposed in launch metrics.
 choice; `NCCL_NCHANNELS_PER_NET_PEER` is used as a fallback so the regular and
 device paths can share an explicit channel setting.
 `AWEX_NCCL_DEVICE_V2_GIN_CONNECTIONS` controls the requested connection count
-and falls back to `NCCL_GIN_NCONNECTIONS` when unset.
-`AWEX_NCCL_DEVICE_V2_GIN_CONTEXTS` controls the requested context count.
+and falls back to `NCCL_GIN_NCONNECTIONS` when set. If both are absent, NCCL
+discovers the available connections.
+`AWEX_NCCL_DEVICE_V2_GIN_CONTEXTS` controls the requested context count. If it
+is absent, NCCL creates one context per negotiated connection.
 `AWEX_NCCL_DEVICE_V2_FIFO_DEPTH` controls the number of reusable payload slots
 per peer and channel, from 1 through 64; the default is 16.
 `AWEX_NCCL_DEVICE_V2_GIN_DOORBELL_BATCH` can aggregate up to eight consecutive

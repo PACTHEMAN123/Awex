@@ -99,11 +99,11 @@ def test_network_channels_reject_out_of_range_values(value):
         _resolve_network_channels_per_peer(value)
 
 
-def test_gin_connections_default_to_all_available_slots(monkeypatch):
+def test_gin_connections_default_to_nccl_discovery(monkeypatch):
     monkeypatch.delenv("AWEX_NCCL_DEVICE_V2_GIN_CONNECTIONS", raising=False)
     monkeypatch.delenv("NCCL_GIN_NCONNECTIONS", raising=False)
 
-    assert _resolve_gin_connections(None) == 4
+    assert _resolve_gin_connections(None) == 0
 
 
 def test_gin_connections_honor_nccl_configuration(monkeypatch):
@@ -120,21 +120,21 @@ def test_gin_connections_prefer_awex_override(monkeypatch):
     assert _resolve_gin_connections(None) == 3
 
 
-@pytest.mark.parametrize("value", [0, 5])
+@pytest.mark.parametrize("value", [-1, 5])
 def test_gin_connections_reject_out_of_range_values(value):
-    with pytest.raises(NCCLDeviceV2UnavailableError, match=r"must be in \[1, 4\]"):
+    with pytest.raises(NCCLDeviceV2UnavailableError, match=r"must be in \[0, 4\]"):
         _resolve_gin_connections(value)
 
 
 def test_gin_contexts_default_to_one_per_connection(monkeypatch):
     monkeypatch.delenv("AWEX_NCCL_DEVICE_V2_GIN_CONTEXTS", raising=False)
 
-    assert _resolve_gin_context_count(None) == 4
+    assert _resolve_gin_context_count(None) == 0
 
 
-@pytest.mark.parametrize("value", [0, 65])
+@pytest.mark.parametrize("value", [-1, 65])
 def test_gin_contexts_reject_out_of_range_values(value):
-    with pytest.raises(NCCLDeviceV2UnavailableError, match=r"must be in \[1, 64\]"):
+    with pytest.raises(NCCLDeviceV2UnavailableError, match=r"must be in \[0, 64\]"):
         _resolve_gin_context_count(value)
 
 

@@ -235,15 +235,15 @@ def _resolve_gin_connections(gin_connections: int | None) -> int:
         if configured is None:
             configured = os.environ.get("NCCL_GIN_NCONNECTIONS")
         try:
-            gin_connections = 4 if configured is None else int(configured)
+            gin_connections = 0 if configured is None else int(configured)
         except ValueError as exc:
             raise NCCLDeviceV2UnavailableError(
                 "AWEX_NCCL_DEVICE_V2_GIN_CONNECTIONS must be an integer"
             ) from exc
     gin_connections = int(gin_connections)
-    if gin_connections < 1 or gin_connections > 4:
+    if gin_connections < 0 or gin_connections > 4:
         raise NCCLDeviceV2UnavailableError(
-            "nccl_device_v2 GIN connections must be in [1, 4]"
+            "nccl_device_v2 GIN connections must be in [0, 4]"
         )
     return gin_connections
 
@@ -252,15 +252,15 @@ def _resolve_gin_context_count(gin_context_count: int | None) -> int:
     if gin_context_count is None:
         configured = os.environ.get("AWEX_NCCL_DEVICE_V2_GIN_CONTEXTS")
         try:
-            gin_context_count = 4 if configured is None else int(configured)
+            gin_context_count = 0 if configured is None else int(configured)
         except ValueError as exc:
             raise NCCLDeviceV2UnavailableError(
                 "AWEX_NCCL_DEVICE_V2_GIN_CONTEXTS must be an integer"
             ) from exc
     gin_context_count = int(gin_context_count)
-    if gin_context_count < 1 or gin_context_count > 64:
+    if gin_context_count < 0 or gin_context_count > 64:
         raise NCCLDeviceV2UnavailableError(
-            "nccl_device_v2 GIN contexts must be in [1, 64]"
+            "nccl_device_v2 GIN contexts must be in [0, 64]"
         )
     return gin_context_count
 
@@ -726,7 +726,10 @@ class NCCLDeviceV2Transport:
         self.gin_reliable_doorbell = _resolve_gin_reliable_doorbell(
             gin_reliable_doorbell
         )
-        os.environ["NCCL_GIN_NCONNECTIONS"] = str(self.gin_connections)
+        if self.gin_connections:
+            os.environ["NCCL_GIN_NCONNECTIONS"] = str(self.gin_connections)
+        else:
+            os.environ.pop("NCCL_GIN_NCONNECTIONS", None)
         os.environ["NCCL_GIN_GDAKI_USE_RELIABLE_DB"] = str(
             self.gin_reliable_doorbell
         )
