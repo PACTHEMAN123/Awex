@@ -146,6 +146,10 @@ __device__ __forceinline__ void v2Store8(void* address, std::uint8_t value) {
   asm volatile("st.global.u8 [%0], %1;" : : "l"(address), "r"(static_cast<std::uint32_t>(value)) : "memory");
 }
 
+__device__ __forceinline__ void v2Store16(void* address, std::uint16_t value) {
+  asm volatile("st.global.u16 [%0], %1;" : : "l"(address), "h"(value) : "memory");
+}
+
 __device__ __forceinline__ V2FifoSlot* v2FifoSlot(const V2KernelArgs& args, std::uint32_t window_rank,
                                                   std::uint32_t connection_rank, std::uint32_t channel,
                                                   unsigned long long step, bool local_window) {
@@ -315,6 +319,32 @@ __device__ __forceinline__ void v2CastBlockwiseBfloat16ToE4M3(
   const std::uint32_t element_end = static_cast<std::uint32_t>(wire_offset + nbytes);
   const auto* scales = reinterpret_cast<const float*>(quant_scale_ptr);
   const bool direct_rows = tensor_offset == 0 && row_bytes == static_cast<std::uint64_t>(quant_cols) * 2;
+
+  if ((first_element | element_end | quant_cols | quant_col_offset) % 2 == 0) {
+    const std::uint32_t first_pair = first_element / 2;
+    const std::uint32_t pair_end = element_end / 2;
+    for (std::uint32_t pair = first_pair + tid; pair < pair_end; pair += nthreads) {
+      const std::uint32_t element = pair * 2;
+      const std::uint32_t row = element / quant_cols;
+      const std::uint32_t col = element - row * quant_cols;
+      const std::uint8_t* source;
+      if (direct_rows) {
+        source = tensor + static_cast<std::uint64_t>(row) * row_stride + static_cast<std::uint64_t>(col) * 2;
+      } else {
+        source = v2TensorAddress(tensor, tensor_offset + static_cast<std::uint64_t>(element) * 2,
+                                 row_bytes, row_stride);
+      }
+      const std::uint32_t scale_row = (quant_row_offset + row) >> 7;
+      const std::uint32_t scale_col = (quant_col_offset + col) >> 7;
+      const float scale = scales[static_cast<std::uint64_t>(scale_row) * quant_scale_row_stride + scale_col];
+      float2 values = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(source));
+      values.x /= scale;
+      values.y /= scale;
+      const __nv_fp8x2_e4m3 encoded(values);
+      v2Store16(destination + element - first_element, encoded.__x);
+    }
+    return;
+  }
 
   for (std::uint32_t element = first_element + tid; element < element_end; element += nthreads) {
     const std::uint32_t row = element / quant_cols;
