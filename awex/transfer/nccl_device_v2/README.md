@@ -49,6 +49,11 @@ GIN receive credits are coalesced from the FIFO depth rather than returned for
 every network step. The automatic batch is capped at four credits and every
 work tail returns its remainder, reducing reverse-path WQEs without weakening
 FIFO reuse or completion guarantees.
+
+Ready publication uses the same automatic batch. Intermediate puts only move
+payload, while the batch tail performs a strong signal add after the preceding
+puts are settled. Receivers therefore observe complete FIFO slots while the
+network avoids one remote atomic operation per 128 KiB step.
 Both paths remain capped by the configured channel ceiling and the
 device's SM capacity. The raw, requested, effective, and network-specific
 values are exposed in launch metrics.
