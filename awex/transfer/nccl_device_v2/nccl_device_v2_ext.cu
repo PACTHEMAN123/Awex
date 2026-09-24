@@ -74,6 +74,7 @@ struct TmaSchedule {
   std::vector<v2::V2TmaChannelQueue> queues;
   std::vector<std::uint64_t> next_steps;
   std::uint32_t matrix_count = 0;
+  std::uint64_t step_count = 0;
 };
 
 struct DeviceState {
@@ -757,8 +758,18 @@ TmaSchedule build_tma_schedule(const std::vector<v2::V2LoweringTask>& tasks, v2:
         static_cast<std::uint32_t>(channel_tiles[part].size()),
       };
       const std::size_t connection = static_cast<std::size_t>(peer) * config.total_channels + channel;
-      for (auto tile : channel_tiles[part]) {
-        tile.step = schedule.next_steps[connection]++;
+      const std::uint32_t tiles_per_step =
+        static_cast<std::uint32_t>(config.step_bytes / v2::kTmaQuantPacketBytes);
+      std::uint64_t step = 0;
+      for (std::size_t tile_index = 0; tile_index < channel_tiles[part].size(); ++tile_index) {
+        auto tile = channel_tiles[part][tile_index];
+        const std::uint32_t packet_index = static_cast<std::uint32_t>(tile_index % tiles_per_step);
+        if (packet_index == 0) {
+          step = schedule.next_steps[connection]++;
+          ++schedule.step_count;
+        }
+        tile.step = step;
+        tile.payload_offset = packet_index * static_cast<std::uint32_t>(v2::kTmaQuantPacketBytes);
         schedule.tiles.push_back(tile);
       }
       schedule.queues.push_back(queue);
@@ -1063,9 +1074,11 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
       generic_tasks = remove_tma_tasks(tasks, tma_handled, static_cast<std::uint32_t>(state->world_size));
       config.initial_steps = tma_schedule.next_steps;
       std::fprintf(stderr,
-                   "AWEX_TMA_PLAN rank=%d direction=%s matrices=%u tiles=%zu queues=%zu generic_tasks=%zu\n",
+                   "AWEX_TMA_PLAN rank=%d direction=%s matrices=%u tiles=%zu steps=%llu queues=%zu "
+                   "generic_tasks=%zu\n",
                    state->rank, sender ? "send" : "recv", tma_schedule.matrix_count,
-                   tma_schedule.tiles.size(), tma_schedule.queues.size(), generic_tasks.size());
+                   tma_schedule.tiles.size(), static_cast<unsigned long long>(tma_schedule.step_count),
+                   tma_schedule.queues.size(), generic_tasks.size());
     }
     auto schedule = v2::lowerFixedTasks(generic_tasks, active_peers, direction, config);
     host_lowering_time_ms = std::chrono::duration<double, std::milli>(Clock::now() - lowering_start).count();
@@ -1139,8 +1152,10 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
   metrics["fused_tma_worker_warps"] = py::int_(v2::kTmaQuantThreads / v2::kWarpSize - 1);
   metrics["fused_tma_matrix_count"] = py::int_(state->tma_schedule.matrix_count);
   metrics["fused_tma_tile_count"] = py::int_(state->tma_schedule.tiles.size());
+  metrics["fused_tma_step_count"] = py::int_(state->tma_schedule.step_count);
   metrics["fused_tma_queue_count"] = py::int_(state->tma_schedule.queues.size());
   metrics["fused_tma_packet_bytes"] = py::int_(v2::kTmaQuantPacketBytes);
+  metrics["fused_tma_tiles_per_step"] = py::int_(state->step_bytes / v2::kTmaQuantPacketBytes);
   metrics["fused_tma_wire_bytes"] =
     py::int_(state->tma_schedule.tiles.size() * v2::kTmaQuantPacketBytes);
   metrics["channel_limit"] = py::int_(state->total_channels);

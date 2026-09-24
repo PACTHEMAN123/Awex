@@ -226,6 +226,10 @@ def main() -> None:
             raise AssertionError(f"Unexpected fused TMA matrix count: {metrics}")
         if metrics["fused_tma_tile_count"] != expected_quant_blocks:
             raise AssertionError(f"Unexpected fused TMA tile count: {metrics}")
+        if not 0 < metrics["fused_tma_step_count"] <= expected_quant_blocks:
+            raise AssertionError(f"Unexpected fused TMA step count: {metrics}")
+        if metrics["fused_tma_tiles_per_step"] <= 1:
+            raise AssertionError(f"Fused TMA did not batch FIFO packets: {metrics}")
         if metrics["fused_tma_queue_count"] <= 0:
             raise AssertionError(f"Fused TMA did not create a channel queue: {metrics}")
         if not metrics["plan_cache_hit"]:

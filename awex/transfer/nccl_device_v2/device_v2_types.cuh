@@ -140,7 +140,7 @@ struct alignas(16) V2TmaQuantTile {
   std::uint32_t tensor_map_index;
   std::uint32_t tile_row;
   std::uint32_t tile_col;
-  std::uint32_t reserved;
+  std::uint32_t payload_offset;
 };
 
 struct V2TmaChannelQueue {

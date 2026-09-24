@@ -124,7 +124,7 @@ __global__ void __launch_bounds__(kTmaQuantThreads, 1) tma_quant_send_kernel(V2T
 
     const V2TmaQuantTile tile = args.tiles[queue.tile_begin + index];
     V2FifoSlot* slot = v2FifoSlot(transport, transport.local_rank, queue.peer, queue.channel, tile.step, true);
-    if (control_lane) {
+    if (control_lane && tile.payload_offset == 0) {
       fifo_ready = v2WaitFree(slot, tile.step, transport.layout.fifo_depth, &fifo_cache, &local_header->error,
                               transport.timeout_cycles);
     }
@@ -151,7 +151,8 @@ __global__ void __launch_bounds__(kTmaQuantThreads, 1) tma_quant_send_kernel(V2T
     v2GroupBarrier(kTmaHandoffBarrier, kTmaQuantThreads);
     if (!fifo_ready) return;
 
-    auto* payload = v2FifoPayload(transport, transport.local_rank, queue.peer, queue.channel, tile.step, true);
+    auto* payload = v2FifoPayload(transport, transport.local_rank, queue.peer, queue.channel, tile.step, true) +
+                    tile.payload_offset;
     if (control_lane) {
       reinterpret_cast<V2TmaPacketHeader*>(payload)->scale = block_scale;
       auto* scale = reinterpret_cast<float*>(tile.scale_ptr);
@@ -175,8 +176,10 @@ __global__ void __launch_bounds__(kTmaQuantThreads, 1) tma_quant_send_kernel(V2T
       v2TmaIssueLoad(args, next, shared_tiles + static_cast<std::size_t>(stage) * kTmaQuantElements,
                      barriers[stage]);
     }
-    if (control_lane && v2LoadError(&local_header->error) == 0) {
-      slot->bytes = static_cast<std::uint32_t>(kTmaQuantPacketBytes);
+    const bool packet_end =
+      index + 1 == queue.tile_count || args.tiles[queue.tile_begin + index + 1].step != tile.step;
+    if (packet_end && control_lane && v2LoadError(&local_header->error) == 0) {
+      slot->bytes = tile.payload_offset + static_cast<std::uint32_t>(kTmaQuantPacketBytes);
       v2Publish(&slot->ready_step, tile.step);
     }
   }
@@ -210,18 +213,25 @@ __global__ void __launch_bounds__(kTmaQuantThreads, 1) tma_quant_recv_kernel(V2T
   for (std::uint32_t index = 0; index < queue.tile_count; ++index) {
     const V2TmaQuantTile tile = args.tiles[queue.tile_begin + index];
     V2FifoSlot* slot = v2FifoSlot(transport, queue.peer, transport.local_rank, queue.channel, tile.step, false);
-    if (control_lane) {
+    const bool packet_begin = tile.payload_offset == 0;
+    const bool packet_end =
+      index + 1 == queue.tile_count || args.tiles[queue.tile_begin + index + 1].step != tile.step;
+    if (packet_begin && control_lane) {
       fifo_ready = v2WaitReady(&slot->ready_step, tile.step, &fifo_cache, &local_header->error,
                                transport.timeout_cycles);
-      if (fifo_ready && slot->bytes != kTmaQuantPacketBytes) {
+      if (fifo_ready &&
+          (slot->bytes == 0 || slot->bytes > transport.layout.slot_bytes ||
+           slot->bytes % kTmaQuantPacketBytes != 0)) {
         atomicExch_system(&local_header->error, 5U);
         fifo_ready = 0;
       }
     }
-    v2GroupBarrier(kTmaHandoffBarrier, kTmaQuantThreads);
+    if (packet_begin) v2GroupBarrier(kTmaHandoffBarrier, kTmaQuantThreads);
     if (!fifo_ready) return;
 
-    const auto* payload = v2FifoPayload(transport, queue.peer, transport.local_rank, queue.channel, tile.step, false);
+    const auto* payload =
+      v2FifoPayload(transport, queue.peer, transport.local_rank, queue.channel, tile.step, false) +
+      tile.payload_offset;
     if (control_lane) {
       auto* scale = reinterpret_cast<float*>(tile.scale_ptr);
       scale[static_cast<std::uint64_t>(tile.tile_row) * (tile.scale_row_stride / sizeof(float)) + tile.tile_col] =
@@ -242,9 +252,11 @@ __global__ void __launch_bounds__(kTmaQuantThreads, 1) tma_quant_recv_kernel(V2T
         v2Store128(destination, value);
       }
     }
-    v2GroupBarrier(kTmaHandoffBarrier, kTmaQuantThreads);
-    if (control_lane && v2LoadError(&local_header->error) == 0) {
-      v2Publish(&slot->consumed_step, tile.step);
+    if (packet_end) {
+      v2GroupBarrier(kTmaHandoffBarrier, kTmaQuantThreads);
+      if (control_lane && v2LoadError(&local_header->error) == 0) {
+        v2Publish(&slot->consumed_step, tile.step);
+      }
     }
   }
 }
