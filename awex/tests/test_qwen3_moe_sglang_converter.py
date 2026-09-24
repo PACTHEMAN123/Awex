@@ -299,6 +299,7 @@ def test_mcore_qkv_device_layout_uses_stable_source_spans():
     converter.hf_config = _model_config()
     converter.rank_info = SimpleNamespace(pp_rank=0, pp_size=1)
     converter.tf_config = SimpleNamespace()
+    converter.blockwise_fp8 = False
     converter._pp_stage_layer_id_map = {}
     group_rows = (NUM_HEADS // NUM_KV_HEADS + 2) * HEAD_DIM
     fused = torch.arange(
