@@ -24,6 +24,7 @@ from awex.converter.sglang_converter import SGlangToHFWeightConverter
 from awex.transfer.tensor_layout import (
     StaticTensorLayout,
     make_blockwise_fp8_layouts,
+    make_blockwise_fp8_row_layouts,
 )
 
 logger = logging.getLogger(__name__)
@@ -287,10 +288,51 @@ def _build_mcore_converter_qwen3_moe():
 
         def _apply_blockwise_fp8(self, converted):
             outputs = []
-            for name, parameter in converted:
+            index = 0
+            while index < len(converted):
+                name, parameter = converted[index]
                 if not self._uses_blockwise_fp8(name, parameter):
                     outputs.append((name, parameter))
+                    index += 1
                     continue
+                if index + 1 < len(converted):
+                    next_name, next_parameter = converted[index + 1]
+                    gate_suffix = ".gate_proj.weight"
+                    up_suffix = ".up_proj.weight"
+                    can_share_fc1 = (
+                        name.endswith(gate_suffix)
+                        and next_name == name[: -len(gate_suffix)] + up_suffix
+                        and isinstance(parameter, torch.Tensor)
+                        and isinstance(next_parameter, torch.Tensor)
+                        and parameter.is_contiguous()
+                        and next_parameter.is_contiguous()
+                        and parameter.shape == next_parameter.shape
+                        and parameter.untyped_storage().data_ptr()
+                        == next_parameter.untyped_storage().data_ptr()
+                        and parameter.data_ptr()
+                        + parameter.numel() * parameter.element_size()
+                        == next_parameter.data_ptr()
+                    )
+                    if can_share_fc1:
+                        rows, cols = (int(dim) for dim in parameter.shape)
+                        source = StaticTensorLayout(
+                            (rows * 2, cols), (parameter, next_parameter)
+                        )
+                        (gate_weight, gate_scale), (up_weight, up_scale) = (
+                            make_blockwise_fp8_row_layouts(
+                                source, ((0, rows), (rows, rows * 2))
+                            )
+                        )
+                        outputs.extend(
+                            (
+                                (name, gate_weight),
+                                (f"{name}_scale_inv", gate_scale),
+                                (next_name, up_weight),
+                                (f"{next_name}_scale_inv", up_scale),
+                            )
+                        )
+                        index += 2
+                        continue
                 source = parameter
                 if isinstance(parameter, torch.Tensor):
                     source = StaticTensorLayout(
@@ -299,6 +341,7 @@ def _build_mcore_converter_qwen3_moe():
                 weight, scale = make_blockwise_fp8_layouts(source)
                 outputs.append((name, weight))
                 outputs.append((f"{name}_scale_inv", scale))
+                index += 1
             return outputs
 
         def _fuse_qkv(self, name: str) -> bool:

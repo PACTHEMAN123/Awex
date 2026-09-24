@@ -26,7 +26,10 @@ from awex.transfer.nccl_device_v2 import (
     _build_recv_batch,
     _build_send_batch,
 )
-from awex.transfer.tensor_layout import make_blockwise_fp8_layouts
+from awex.transfer.tensor_layout import (
+    make_blockwise_fp8_layouts,
+    make_blockwise_fp8_row_layouts,
+)
 from awex.transfer.transfer_plan import CommunicationOperation, TransferPlan
 
 
@@ -154,6 +157,59 @@ def test_blockwise_fp8_layout_matches_eager_quantization():
     assert torch.equal(actual_weight.float(), expected_weight.float())
     assert torch.equal(actual_scale, expected_scale)
     assert tuple(actual_scale.shape) == (2, 3)
+
+
+@pytest.mark.skipif(
+    not hasattr(torch, "float8_e4m3fn"), reason="PyTorch has no FP8 dtype"
+)
+def test_blockwise_fp8_row_layouts_share_state_and_translate_offsets(monkeypatch):
+    from awex.converter.weights_converter import per_block_cast_to_fp8
+
+    source = (
+        torch.arange(256 * 256, dtype=torch.float32)
+        .reshape(256, 256)
+        .to(torch.bfloat16)
+    )
+    (first_weight, first_scale), (second_weight, second_scale) = (
+        make_blockwise_fp8_row_layouts(source, ((0, 128), (128, 256)))
+    )
+    expected_weight, expected_scale = per_block_cast_to_fp8(source, False)
+
+    assert first_weight.state is second_weight.state
+    assert first_scale.state is second_scale.state
+    assert torch.equal(first_weight.materialize().float(), expected_weight[:128].float())
+    assert torch.equal(second_weight.materialize().float(), expected_weight[128:].float())
+    assert torch.equal(first_scale.materialize(), expected_scale[:1])
+    assert torch.equal(second_scale.materialize(), expected_scale[1:])
+
+    operations = [
+        _matrix_operation(
+            "weight",
+            torch.bfloat16,
+            torch.float8_e4m3fn,
+            tuple(second_weight.shape),
+        ),
+        _matrix_operation(
+            "weight_scale_inv",
+            torch.float32,
+            torch.float32,
+            tuple(second_scale.shape),
+        ),
+    ]
+    monkeypatch.setattr(nccl_device_v2, "_ensure_cuda_tensor", lambda *_: None)
+    batch = _build_send_batch(
+        {"weight": second_weight, "weight_scale_inv": second_scale},
+        TransferPlan(operations={0: operations}),
+        rank=1,
+        world_size=2,
+        chunk_bytes=16,
+        allow_staging=False,
+    )
+
+    assert batch.tensors[0].data_ptr() == source[128:].data_ptr()
+    assert batch.quant_scale_tensors[0] is second_weight.state.scale
+    assert batch.quant_row_offsets == [128, 0]
+    assert batch.quant_cols == [256, 0]
 
 
 @pytest.mark.skipif(

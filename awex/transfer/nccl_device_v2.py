@@ -448,11 +448,11 @@ def _build_send_batch(
                             "Compiled block-wise source layout does not match "
                             f"the transfer plan for {op.send_shard_meta.name}"
                         )
-                    source_fragments = blockwise_state.source_fragments(op.train_slices)
+                    source_fragments = parameter.source_fragments(op.train_slices)
                     fragments = [fragment.tensor for fragment in source_fragments]
                 else:
                     blockwise_state = parameter.state
-                    tensor = blockwise_state.scale[op.train_slices]
+                    tensor = parameter.scale_view(op.train_slices)
                     fragments = [tensor]
             elif isinstance(parameter, StaticTensorLayout):
                 if (

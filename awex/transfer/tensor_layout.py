@@ -291,14 +291,36 @@ class BlockwiseFp8Layout:
 
     state: BlockwiseFp8State
     kind: str
+    row_start: int = 0
+    row_stop: int | None = None
 
     def __post_init__(self):
         if self.kind not in {"weight", "scale"}:
             raise ValueError(f"Invalid block-wise FP8 layout kind: {self.kind}")
+        stop = self.state.shape[0] if self.row_stop is None else int(self.row_stop)
+        if (
+            self.row_start < 0
+            or stop <= self.row_start
+            or stop > self.state.shape[0]
+            or self.row_start % self.state.block_shape[0]
+            or (stop != self.state.shape[0] and stop % self.state.block_shape[0])
+        ):
+            raise ValueError(
+                "Block-wise FP8 layout rows must be non-empty, in bounds, and "
+                f"block aligned: rows=({self.row_start}, {stop}), "
+                f"state_shape={self.state.shape}"
+            )
+        object.__setattr__(self, "row_stop", stop)
 
     @property
     def shape(self) -> Tuple[int, ...]:
-        return self.state.shape if self.kind == "weight" else tuple(self.state.scale.shape)
+        rows = int(self.row_stop) - self.row_start
+        if self.kind == "weight":
+            return (rows, self.state.shape[1])
+        block_rows = self.state.block_shape[0]
+        scale_begin = self.row_start // block_rows
+        scale_end = ceil_div(int(self.row_stop), block_rows)
+        return (scale_end - scale_begin, self.state.scale.shape[1])
 
     @property
     def dtype(self) -> torch.dtype:
@@ -314,9 +336,43 @@ class BlockwiseFp8Layout:
     def is_contiguous(self) -> bool:
         return True
 
+    def source_fragments(
+        self, slices: Sequence[slice]
+    ) -> List[BlockwiseFp8SourceFragment]:
+        if self.kind != "weight":
+            raise ValueError("Only FP8 weight layouts expose source fragments")
+        if len(slices) != 2:
+            raise ValueError("Block-wise FP8 layouts require two slice dimensions")
+        row_start, row_stop, row_step = slices[0].indices(self.shape[0])
+        if row_step != 1:
+            raise ValueError("Block-wise FP8 layouts require unit-stride slices")
+        translated = (
+            slice(self.row_start + row_start, self.row_start + row_stop),
+            slices[1],
+        )
+        return self.state.source_fragments(translated)
+
+    def scale_view(self, slices: Sequence[slice]) -> torch.Tensor:
+        if self.kind != "scale":
+            raise ValueError("Only FP8 scale layouts expose scale views")
+        if len(slices) != 2:
+            raise ValueError("Block-wise FP8 scale layouts require two slices")
+        row_start, row_stop, row_step = slices[0].indices(self.shape[0])
+        if row_step != 1:
+            raise ValueError("Block-wise FP8 scale layouts require unit-stride slices")
+        base = self.row_start // self.state.block_shape[0]
+        return self.state.scale[
+            slice(base + row_start, base + row_stop), slices[1]
+        ]
+
     def materialize(self) -> torch.Tensor:
         weight, scale = self.state.materialize()
-        return weight if self.kind == "weight" else scale
+        if self.kind == "weight":
+            return weight[self.row_start : self.row_stop]
+        block_rows = self.state.block_shape[0]
+        return scale[
+            self.row_start // block_rows : ceil_div(int(self.row_stop), block_rows)
+        ]
 
 
 def ceil_div(value: int, divisor: int) -> int:
@@ -331,3 +387,19 @@ def make_blockwise_fp8_layouts(
         BlockwiseFp8Layout(state=state, kind="weight"),
         BlockwiseFp8Layout(state=state, kind="scale"),
     )
+
+
+def make_blockwise_fp8_row_layouts(
+    source: torch.Tensor | StaticTensorLayout,
+    row_ranges: Sequence[Tuple[int, int]],
+) -> List[Tuple[BlockwiseFp8Layout, BlockwiseFp8Layout]]:
+    """Create block-aligned row views that share one quantization state."""
+
+    state = BlockwiseFp8State(source=source)
+    return [
+        (
+            BlockwiseFp8Layout(state, "weight", row_start, row_stop),
+            BlockwiseFp8Layout(state, "scale", row_start, row_stop),
+        )
+        for row_start, row_stop in row_ranges
+    ]

@@ -31,7 +31,7 @@ import torch
 
 from awex.models.qwen3_moe import CONFIG, SGlangToHFWeightConverterQwen3Moe
 from awex.models.registry import get_infer_weights_converter
-from awex.transfer.tensor_layout import StaticTensorLayout
+from awex.transfer.tensor_layout import BlockwiseFp8Layout, StaticTensorLayout
 from awex.util import device as device_util
 
 # Tiny Qwen3-MoE-like geometry: GQA with 8 query heads and 2 KV heads.
@@ -324,6 +324,39 @@ def test_mcore_qkv_device_layout_uses_stable_source_spans():
             span.untyped_storage().data_ptr() == source_storage
             for span in layout.spans
         )
+
+
+def test_mcore_gate_up_block_fp8_layouts_share_fused_fc1_state():
+    converter_class = CONFIG["mcore_converter"]()
+    converter = converter_class.__new__(converter_class)
+    converter.blockwise_fp8 = True
+    fused = torch.arange(256 * 256, dtype=torch.float32).reshape(256, 256).to(
+        torch.bfloat16
+    )
+    prefix = "model.layers.0.mlp.experts.0"
+
+    converted = dict(
+        converter._apply_blockwise_fp8(
+            [
+                (f"{prefix}.gate_proj.weight", fused[:128]),
+                (f"{prefix}.up_proj.weight", fused[128:]),
+            ]
+        )
+    )
+
+    gate = converted[f"{prefix}.gate_proj.weight"]
+    up = converted[f"{prefix}.up_proj.weight"]
+    assert isinstance(gate, BlockwiseFp8Layout)
+    assert isinstance(up, BlockwiseFp8Layout)
+    assert gate.state is up.state
+    assert [span.data_ptr() for span in gate.state.source_spans] == [
+        fused[:128].data_ptr(),
+        fused[128:].data_ptr(),
+    ]
+    assert gate.row_start == 0
+    assert gate.row_stop == 128
+    assert up.row_start == 128
+    assert up.row_stop == 256
 
 
 def test_qkv_split_rejects_indivisible_rows():
