@@ -483,7 +483,13 @@ def compare_and_log_tensor_differences(
         ):
             return True
     logger.error(
-        f"Tensors are not close for {tensor_name}, get {tensor1.shape} \n{tensor1} expect {tensor2.shape} \n{tensor2}"
+        "Tensors are not close for %s: actual shape=%s dtype=%s, "
+        "expected shape=%s dtype=%s",
+        tensor_name,
+        tensor1.shape,
+        tensor1.dtype,
+        tensor2.shape,
+        tensor2.dtype,
     )
 
     # Find elements that are not close
