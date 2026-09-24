@@ -305,6 +305,36 @@ __device__ __forceinline__ V2ScalarBytes v2EncodeNumeric(float value, V2DataType
   return encoded;
 }
 
+__device__ __forceinline__ void v2CastBlockwiseBfloat16ToE4M3(
+  std::uint8_t* destination, const std::uint8_t* tensor, std::uint64_t tensor_offset,
+  std::uint64_t wire_offset, std::uint64_t nbytes, std::uint64_t row_bytes,
+  std::uint64_t row_stride, std::uintptr_t quant_scale_ptr, std::uint32_t quant_cols,
+  std::uint32_t quant_row_offset, std::uint32_t quant_col_offset,
+  std::uint64_t quant_scale_row_stride, int tid, int nthreads) {
+  const std::uint32_t first_element = static_cast<std::uint32_t>(wire_offset);
+  const std::uint32_t element_end = static_cast<std::uint32_t>(wire_offset + nbytes);
+  const auto* scales = reinterpret_cast<const float*>(quant_scale_ptr);
+  const bool direct_rows = tensor_offset == 0 && row_bytes == static_cast<std::uint64_t>(quant_cols) * 2;
+
+  for (std::uint32_t element = first_element + tid; element < element_end; element += nthreads) {
+    const std::uint32_t row = element / quant_cols;
+    const std::uint32_t col = element - row * quant_cols;
+    const std::uint8_t* source;
+    if (direct_rows) {
+      source = tensor + static_cast<std::uint64_t>(row) * row_stride + static_cast<std::uint64_t>(col) * 2;
+    } else {
+      source = v2TensorAddress(tensor, tensor_offset + static_cast<std::uint64_t>(element) * 2,
+                               row_bytes, row_stride);
+    }
+    const std::uint32_t scale_row = (quant_row_offset + row) >> 7;
+    const std::uint32_t scale_col = (quant_col_offset + col) >> 7;
+    const float value = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(source)) /
+                        scales[static_cast<std::uint64_t>(scale_row) * quant_scale_row_stride + scale_col];
+    const __nv_fp8_e4m3 encoded(value);
+    v2Store8(destination + element - first_element, *reinterpret_cast<const std::uint8_t*>(&encoded));
+  }
+}
+
 // Encode directly into a FIFO slice. The slice may begin or end inside one
 // wire element, so an element at a step boundary is encoded by both adjacent
 // steps and each step publishes only its own bytes.
@@ -316,6 +346,20 @@ __device__ __forceinline__ void v2CastTensorToContiguous(
   std::uint64_t quant_cols, std::uint64_t quant_row_offset, std::uint64_t quant_col_offset,
   std::uint64_t quant_scale_row_stride, V2QuantMode quant_mode, std::uint32_t quant_block_rows,
   std::uint32_t quant_block_cols, int tid, int nthreads) {
+  const std::uint64_t quant_elements = quant_rows * quant_cols;
+  if (quant_mode == V2QuantMode::kBlockwiseFloat8E4M3 &&
+      tensor_dtype == V2DataType::kBFloat16 && wire_dtype == V2DataType::kFloat8E4M3 &&
+      tensor_element_bytes == 2 && wire_element_bytes == 1 &&
+      quant_block_rows == 128 && quant_block_cols == 128 &&
+      quant_elements <= 0xffffffffULL && wire_offset + nbytes <= quant_elements &&
+      quant_row_offset <= 0xffffffffULL && quant_col_offset <= 0xffffffffULL) {
+    v2CastBlockwiseBfloat16ToE4M3(
+      destination, tensor, tensor_offset, wire_offset, nbytes, row_bytes, row_stride,
+      quant_scale_ptr, static_cast<std::uint32_t>(quant_cols),
+      static_cast<std::uint32_t>(quant_row_offset), static_cast<std::uint32_t>(quant_col_offset),
+      quant_scale_row_stride, tid, nthreads);
+    return;
+  }
   const std::uint64_t wire_end = wire_offset + nbytes;
   const std::uint64_t first_element = wire_offset / wire_element_bytes;
   const std::uint64_t element_end = (wire_end + wire_element_bytes - 1) / wire_element_bytes;
