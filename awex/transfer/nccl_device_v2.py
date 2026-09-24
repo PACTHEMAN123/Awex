@@ -87,9 +87,12 @@ class _V2Batch:
     tensors: list[torch.Tensor]
     offsets: list[int]
     lengths: list[int]
+    tensor_lengths: list[int]
     tensor_offsets: list[int]
     tensor_row_bytes: list[int]
     tensor_row_strides: list[int]
+    wire_dtypes: list[int]
+    wire_element_bytes: list[int]
     peers: list[int]
     ordinals: list[int]
     region_indices: list[int]
@@ -184,6 +187,44 @@ def _ensure_cuda_tensor(tensor: torch.Tensor, description: str) -> None:
         )
 
 
+_V2_DTYPE_CODES = {
+    torch.float16: 1,
+    torch.bfloat16: 2,
+    torch.float32: 3,
+}
+for _dtype_name, _dtype_code in (
+    ("float8_e4m3fn", 4),
+    ("float8_e5m2", 5),
+):
+    _dtype = getattr(torch, _dtype_name, None)
+    if _dtype is not None:
+        _V2_DTYPE_CODES[_dtype] = _dtype_code
+
+
+def _normalize_dtype(dtype: Any, description: str) -> torch.dtype:
+    if isinstance(dtype, str):
+        dtype = getattr(torch, dtype.replace("torch.", ""), None)
+    if not isinstance(dtype, torch.dtype):
+        raise NCCLDeviceV2UnavailableError(
+            f"nccl_device_v2 has an invalid dtype for {description}: {dtype!r}"
+        )
+    return dtype
+
+
+def _dtype_descriptor(dtype: Any, description: str) -> tuple[torch.dtype, int, int]:
+    dtype = _normalize_dtype(dtype, description)
+    return dtype, _V2_DTYPE_CODES.get(dtype, 0), int(dtype.itemsize)
+
+
+def _wire_dtype(
+    operation: CommunicationOperation, fallback: torch.dtype
+) -> torch.dtype:
+    dtype = getattr(operation.recv_shard_meta, "dtype", None)
+    if dtype is None:
+        return fallback
+    return _normalize_dtype(dtype, operation.recv_shard_meta.name)
+
+
 def _tensor_copy_layout(tensor: torch.Tensor, name: str) -> tuple[int, int]:
     element_size = int(tensor.element_size())
     total_bytes = int(tensor.numel()) * element_size
@@ -220,10 +261,14 @@ def _append_tensor_range(
     tensor_row_strides: list[int],
     offsets: list[int],
     lengths: list[int],
+    tensor_lengths: list[int],
+    wire_dtypes: list[int],
+    wire_element_bytes: list[int],
     peers: list[int],
     ordinals: list[int],
     region_indices: list[int],
     tensor: torch.Tensor,
+    wire_dtype: torch.dtype,
     tensor_offset: int,
     nbytes: int,
     row_bytes: int,
@@ -236,12 +281,31 @@ def _append_tensor_range(
     # Preserve one descriptor per physical TransferPlan span. C++ concatenates
     # these descriptors into a virtual peer stream before selecting channels
     # and lowering transport chunks, so chunk boundaries may cross tensors.
+    tensor_dtype, tensor_dtype_code, tensor_element_bytes = _dtype_descriptor(
+        tensor.dtype, "source tensor"
+    )
+    wire_dtype, wire_dtype_code, wire_item_bytes = _dtype_descriptor(
+        wire_dtype, "wire format"
+    )
+    if tensor_dtype != wire_dtype and (tensor_dtype_code == 0 or wire_dtype_code == 0):
+        raise NCCLDeviceV2UnavailableError(
+            "nccl_device_v2 streaming cast does not support "
+            f"{tensor_dtype} -> {wire_dtype}"
+        )
+    if nbytes % wire_item_bytes:
+        raise NCCLDeviceV2UnavailableError(
+            "nccl_device_v2 wire range must contain complete elements"
+        )
+
     tensors.append(tensor)
     tensor_offsets.append(tensor_offset)
     tensor_row_bytes.append(row_bytes)
     tensor_row_strides.append(row_stride)
     offsets.append(peer_offset)
     lengths.append(nbytes)
+    tensor_lengths.append(nbytes // wire_item_bytes * tensor_element_bytes)
+    wire_dtypes.append(wire_dtype_code)
+    wire_element_bytes.append(wire_item_bytes)
     peers.append(peer)
     ordinals.append(ordinal)
     region_indices.append(region_index)
@@ -260,9 +324,12 @@ def _build_send_batch(
     tensors: list[torch.Tensor] = []
     offsets: list[int] = []
     lengths: list[int] = []
+    tensor_lengths: list[int] = []
     tensor_offsets: list[int] = []
     tensor_row_bytes: list[int] = []
     tensor_row_strides: list[int] = []
+    wire_dtypes: list[int] = []
+    wire_element_bytes: list[int] = []
     peers: list[int] = []
     ordinals: list[int] = []
     region_indices: list[int] = []
@@ -294,7 +361,11 @@ def _build_send_batch(
                 fragments = [tensor]
             for fragment in fragments:
                 _ensure_cuda_tensor(fragment, op.send_shard_meta.name)
-                length = int(fragment.numel()) * int(fragment.element_size())
+                target_dtype = _wire_dtype(op, fragment.dtype)
+                _, _, wire_item_bytes = _dtype_descriptor(
+                    target_dtype, op.recv_shard_meta.name
+                )
+                length = int(fragment.numel()) * wire_item_bytes
                 row_bytes, row_stride = _tensor_copy_layout(
                     fragment, op.send_shard_meta.name
                 )
@@ -305,10 +376,14 @@ def _build_send_batch(
                     tensor_row_strides=tensor_row_strides,
                     offsets=offsets,
                     lengths=lengths,
+                    tensor_lengths=tensor_lengths,
+                    wire_dtypes=wire_dtypes,
+                    wire_element_bytes=wire_element_bytes,
                     peers=peers,
                     ordinals=ordinals,
                     region_indices=region_indices,
                     tensor=fragment,
+                    wire_dtype=target_dtype,
                     tensor_offset=0,
                     nbytes=length,
                     row_bytes=row_bytes,
@@ -325,9 +400,12 @@ def _build_send_batch(
         tensors=tensors,
         offsets=offsets,
         lengths=lengths,
+        tensor_lengths=tensor_lengths,
         tensor_offsets=tensor_offsets,
         tensor_row_bytes=tensor_row_bytes,
         tensor_row_strides=tensor_row_strides,
+        wire_dtypes=wire_dtypes,
+        wire_element_bytes=wire_element_bytes,
         peers=peers,
         ordinals=ordinals,
         region_indices=region_indices,
@@ -349,9 +427,12 @@ def _build_recv_batch(
     tensors: list[torch.Tensor] = []
     offsets: list[int] = []
     lengths: list[int] = []
+    tensor_lengths: list[int] = []
     tensor_offsets: list[int] = []
     tensor_row_bytes: list[int] = []
     tensor_row_strides: list[int] = []
+    wire_dtypes: list[int] = []
+    wire_element_bytes: list[int] = []
     peers: list[int] = []
     ordinals: list[int] = []
     region_indices: list[int] = []
@@ -378,6 +459,13 @@ def _build_recv_batch(
                     target, op.recv_shard_meta.name
                 )
             _ensure_cuda_tensor(target, op.recv_shard_meta.name)
+            target_wire_dtype = _wire_dtype(op, target.dtype)
+            if target.dtype != target_wire_dtype:
+                raise NCCLDeviceV2UnavailableError(
+                    "nccl_device_v2 receive tensor dtype does not match the wire "
+                    f"format for {op.recv_shard_meta.name}: "
+                    f"tensor={target.dtype}, wire={target_wire_dtype}"
+                )
             fragment_numels = [int(target.numel())]
             if op.send_tensor_span_numels:
                 layout_fragments = slice_layout_fragments(
@@ -402,10 +490,14 @@ def _build_recv_batch(
                     tensor_row_strides=tensor_row_strides,
                     offsets=offsets,
                     lengths=lengths,
+                    tensor_lengths=tensor_lengths,
+                    wire_dtypes=wire_dtypes,
+                    wire_element_bytes=wire_element_bytes,
                     peers=peers,
                     ordinals=ordinals,
                     region_indices=region_indices,
                     tensor=target,
+                    wire_dtype=target_wire_dtype,
                     tensor_offset=target_offset,
                     nbytes=length,
                     row_bytes=row_bytes,
@@ -423,9 +515,12 @@ def _build_recv_batch(
         tensors=tensors,
         offsets=offsets,
         lengths=lengths,
+        tensor_lengths=tensor_lengths,
         tensor_offsets=tensor_offsets,
         tensor_row_bytes=tensor_row_bytes,
         tensor_row_strides=tensor_row_strides,
+        wire_dtypes=wire_dtypes,
+        wire_element_bytes=wire_element_bytes,
         peers=peers,
         ordinals=ordinals,
         region_indices=region_indices,
@@ -642,10 +737,11 @@ class NCCLDeviceV2Transport:
         if not self._logged_batch_shape:
             logger.info(
                 "Lowered nccl_device_v2 plan rank=%s sender=%s spans=%s "
-                "payload_bytes=%s chunk_bytes=%s expected_counts=%s",
+                "tensor_bytes=%s wire_bytes=%s chunk_bytes=%s expected_counts=%s",
                 self.rank,
                 sender,
                 len(batch.tensors),
+                sum(batch.tensor_lengths),
                 sum(batch.lengths),
                 self.chunk_bytes,
                 batch.expected_counts,
@@ -661,6 +757,8 @@ class NCCLDeviceV2Transport:
                 batch.tensor_offsets,
                 batch.tensor_row_bytes,
                 batch.tensor_row_strides,
+                batch.wire_dtypes,
+                batch.wire_element_bytes,
                 batch.peers,
                 batch.ordinals,
                 batch.expected_counts,
@@ -678,6 +776,12 @@ class NCCLDeviceV2Transport:
         extension_metrics.update(
             {
                 "payload_bytes": float(sum(batch.lengths)),
+                "tensor_bytes": float(sum(batch.tensor_lengths)),
+                "wire_compression_ratio": (
+                    float(sum(batch.tensor_lengths)) / float(sum(batch.lengths))
+                    if batch.lengths and sum(batch.lengths)
+                    else 1.0
+                ),
                 "transport_init_time_ms": init_time_ms,
                 "python_copyback_time_ms": copyback_time_ms,
                 "transport_total_time_ms": (time.perf_counter() - run_start) * 1000.0,

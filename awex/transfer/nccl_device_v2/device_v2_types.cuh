@@ -47,6 +47,17 @@ enum class V2Direction : std::uint32_t {
   kRecv,
 };
 
+// Numeric formats understood by the streaming cast path. kOpaque keeps the
+// existing byte-copy behavior for dtypes that do not need conversion.
+enum class V2DataType : std::uint32_t {
+  kOpaque = 0,
+  kFloat16 = 1,
+  kBFloat16 = 2,
+  kFloat32 = 3,
+  kFloat8E4M3 = 4,
+  kFloat8E5M2 = 5,
+};
+
 // This is the fixed-plan task shape consumed by the v2 lowering layer. The
 // fields intentionally mirror the existing device task without adding a new
 // logical operation or changing its ordering.
@@ -69,7 +80,12 @@ struct alignas(16) V2Fragment {
   std::uint64_t tensor_offset;
   std::uint64_t tensor_row_bytes;
   std::uint64_t tensor_row_stride;
+  std::uint64_t wire_offset;
   std::uint64_t work_offset;
+  V2DataType tensor_dtype;
+  V2DataType wire_dtype;
+  std::uint32_t tensor_element_bytes;
+  std::uint32_t wire_element_bytes;
 };
 
 struct alignas(16) V2Work {

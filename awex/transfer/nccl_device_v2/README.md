@@ -9,6 +9,17 @@ virtual, discontinuous byte stream. It partitions that whole stream across
 channels before creating `V2Work` chunks, so a chunk may contain fragments
 from multiple tensors. Python does not perform transport chunking.
 
+The stream uses the receiver tensor dtype as its wire format. When a sender
+tensor has a different supported floating-point dtype, worker warps cast each
+element while filling the current FIFO step. No full-size converted tensor is
+materialized. The receiver writes the encoded bytes directly into its target
+tensor, so BF16-to-FP8 uses half the payload bytes. FP16, BF16, FP32, FP8 E4M3,
+and FP8 E5M2 participate in streaming casts; equal-dtype and other opaque
+equal-size transfers retain the vectorized byte-copy path. Scale computation
+is deliberately outside this primitive: scaled quantization formats expose
+their scale tensors as ordinary plan entries and select the desired wire dtype
+for the associated weight tensor.
+
 The CUDA execution hierarchy follows the useful NCCL P2P shape:
 
 ```text
@@ -20,7 +31,7 @@ fixed TransferPlan spans for one peer
   -> one 640-thread CUDA CTA per channel
   -> 20 warps divided across the active works in a batch
   -> explicit WaitSend/WaitRecv, worker, and PostSend/PostRecv roles
-  -> volatile 16-byte vector loads, unrolled across 8 instructions
+  -> volatile 16-byte vector copy or per-element streaming cast
   -> FIFO slot = absolute step % 8
 ```
 

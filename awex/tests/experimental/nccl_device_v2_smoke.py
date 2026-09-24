@@ -84,6 +84,8 @@ def main() -> None:
                 [0] * len(tensors),
                 list(_TENSOR_BYTES),
                 list(_TENSOR_BYTES),
+                [0] * len(tensors),
+                [1] * len(tensors),
                 [peer] * len(tensors),
                 list(range(len(tensors))),
                 [len(tensors), 0] if rank == 1 else [0, len(tensors)],
@@ -126,13 +128,17 @@ def main() -> None:
         if metrics["registered_window_bytes"] >= metrics["dense_window_bytes"]:
             raise AssertionError(f"expected a sparse window, got {dict(metrics)}")
         if launch_metrics[0]["plan_cache_hit"]:
-            raise AssertionError(f"first launch unexpectedly hit cache: {dict(metrics)}")
+            raise AssertionError(
+                f"first launch unexpectedly hit cache: {dict(metrics)}"
+            )
         if not launch_metrics[1]["plan_cache_hit"]:
             raise AssertionError(f"second launch missed cache: {dict(metrics)}")
         if launch_metrics[1]["host_lowering_time_ms"] != 0.0:
             raise AssertionError(f"cached launch repeated lowering: {dict(metrics)}")
         if launch_metrics[1]["metadata_upload_time_ms"] != 0.0:
-            raise AssertionError(f"cached launch repeated metadata upload: {dict(metrics)}")
+            raise AssertionError(
+                f"cached launch repeated metadata upload: {dict(metrics)}"
+            )
         if metrics["fragment_count"] <= metrics["work_count"]:
             raise AssertionError(
                 f"expected a chunk crossing tensor spans, got {dict(metrics)}"

@@ -45,10 +45,16 @@ struct V2LoweringConfig {
 
 struct V2LoweringTask {
   std::uintptr_t tensor_ptr = 0;
+  // nbytes is the encoded wire length. Tensor offsets and row dimensions are
+  // expressed in local tensor bytes.
   std::uint64_t nbytes = 0;
   std::uint64_t tensor_offset = 0;
   std::uint64_t tensor_row_bytes = 0;
   std::uint64_t tensor_row_stride = 0;
+  V2DataType tensor_dtype = V2DataType::kOpaque;
+  V2DataType wire_dtype = V2DataType::kOpaque;
+  std::uint32_t tensor_element_bytes = 0;
+  std::uint32_t wire_element_bytes = 0;
   std::uint32_t peer = 0;
   std::uint32_t ordinal = 0;
 };
@@ -168,10 +174,15 @@ inline void v2AppendFragments(const std::vector<V2StreamSpan>& spans, std::uint6
     schedule->fragments.push_back(V2Fragment{
       task.tensor_ptr,
       end - begin,
-      task.tensor_offset + begin - span.begin,
+      task.tensor_offset,
       task.tensor_row_bytes,
       task.tensor_row_stride,
+      begin - span.begin,
       begin - work_begin,
+      task.tensor_dtype,
+      task.wire_dtype,
+      task.tensor_element_bytes,
+      task.wire_element_bytes,
     });
   }
   const std::size_t fragment_count = schedule->fragments.size() - work->fragment_begin;
@@ -227,7 +238,10 @@ inline V2Schedule lowerFixedTasks(const std::vector<V2LoweringTask>& tasks,
     if (task.peer >= config.world_size || peer_index[task.peer] < 0) {
       throw std::invalid_argument("v2 task peer is not active");
     }
-    if (task.tensor_row_bytes == 0 || task.tensor_row_stride < task.tensor_row_bytes) {
+    if (task.tensor_element_bytes == 0 || task.wire_element_bytes == 0 ||
+        task.tensor_row_bytes == 0 || task.tensor_row_stride < task.tensor_row_bytes ||
+        task.tensor_row_bytes % task.tensor_element_bytes != 0 ||
+        task.tensor_row_stride % task.tensor_element_bytes != 0 || task.nbytes % task.wire_element_bytes != 0) {
       throw std::invalid_argument("invalid v2 tensor row layout");
     }
     if (task.ordinal != peer_tasks[task.peer].size()) {

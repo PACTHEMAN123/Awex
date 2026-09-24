@@ -310,12 +310,55 @@ bool same_tasks(const std::vector<v2::V2LoweringTask>& left, const std::vector<v
     const auto& a = left[index];
     const auto& b = right[index];
     if (a.tensor_ptr != b.tensor_ptr || a.nbytes != b.nbytes || a.tensor_offset != b.tensor_offset ||
-        a.tensor_row_bytes != b.tensor_row_bytes || a.tensor_row_stride != b.tensor_row_stride || a.peer != b.peer ||
-        a.ordinal != b.ordinal) {
+        a.tensor_row_bytes != b.tensor_row_bytes || a.tensor_row_stride != b.tensor_row_stride ||
+        a.tensor_dtype != b.tensor_dtype || a.wire_dtype != b.wire_dtype ||
+        a.tensor_element_bytes != b.tensor_element_bytes || a.wire_element_bytes != b.wire_element_bytes ||
+        a.peer != b.peer || a.ordinal != b.ordinal) {
       return false;
     }
   }
   return true;
+}
+
+v2::V2DataType tensor_dtype(const torch::Tensor& tensor) {
+  switch (tensor.scalar_type()) {
+    case at::ScalarType::Half:
+      return v2::V2DataType::kFloat16;
+    case at::ScalarType::BFloat16:
+      return v2::V2DataType::kBFloat16;
+    case at::ScalarType::Float:
+      return v2::V2DataType::kFloat32;
+    case at::ScalarType::Float8_e4m3fn:
+      return v2::V2DataType::kFloat8E4M3;
+    case at::ScalarType::Float8_e5m2:
+      return v2::V2DataType::kFloat8E5M2;
+    default:
+      return v2::V2DataType::kOpaque;
+  }
+}
+
+v2::V2DataType parse_wire_dtype(int64_t value) {
+  if (value < static_cast<int64_t>(v2::V2DataType::kOpaque) ||
+      value > static_cast<int64_t>(v2::V2DataType::kFloat8E5M2)) {
+    throw std::runtime_error("nccl_device_v2 wire dtype code is invalid");
+  }
+  return static_cast<v2::V2DataType>(value);
+}
+
+std::uint32_t dtype_bytes(v2::V2DataType dtype) {
+  switch (dtype) {
+    case v2::V2DataType::kFloat16:
+    case v2::V2DataType::kBFloat16:
+      return 2;
+    case v2::V2DataType::kFloat32:
+      return 4;
+    case v2::V2DataType::kFloat8E4M3:
+    case v2::V2DataType::kFloat8E5M2:
+      return 1;
+    case v2::V2DataType::kOpaque:
+      return 0;
+  }
+  return 0;
 }
 
 void initialize_sparse_window(DeviceState* state, const std::vector<std::uint32_t>& active_peers,
@@ -397,11 +440,13 @@ void initialize_sparse_window(DeviceState* state, const std::vector<std::uint32_
 std::vector<v2::V2LoweringTask> build_tasks(
   const DeviceState& state, const py::list& tensors, const std::vector<int64_t>& lengths,
   const std::vector<int64_t>& tensor_offsets, const std::vector<int64_t>& tensor_row_bytes,
-  const std::vector<int64_t>& tensor_row_strides, const std::vector<int64_t>& peers,
-  const std::vector<int64_t>& ordinals, const std::vector<int64_t>& expected_counts,
+  const std::vector<int64_t>& tensor_row_strides, const std::vector<int64_t>& wire_dtypes,
+  const std::vector<int64_t>& wire_element_bytes, const std::vector<int64_t>& peers,
+  const std::vector<int64_t>& ordinals, const std::vector<int64_t>& expected_counts, bool sender,
   std::vector<std::uint32_t>* active_peers) {
   if (tensors.size() != lengths.size() || tensors.size() != tensor_offsets.size() ||
       tensors.size() != tensor_row_bytes.size() || tensors.size() != tensor_row_strides.size() ||
+      tensors.size() != wire_dtypes.size() || tensors.size() != wire_element_bytes.size() ||
       tensors.size() != peers.size() || tensors.size() != ordinals.size()) {
     throw std::runtime_error("nccl_device_v2 tensor/task descriptor lengths do not match");
   }
@@ -426,6 +471,24 @@ std::vector<v2::V2LoweringTask> build_tasks(
     if (!tensor.is_cuda() || tensor.get_device() != state.device) {
       throw std::runtime_error("nccl_device_v2 tensors must be on the transport CUDA device");
     }
+    const auto local_dtype = tensor_dtype(tensor);
+    const auto wire_dtype = parse_wire_dtype(wire_dtypes[index]);
+    const auto local_element_bytes = static_cast<std::uint32_t>(tensor.element_size());
+    if (wire_element_bytes[index] <= 0 || static_cast<std::uint64_t>(wire_element_bytes[index]) > UINT32_MAX) {
+      throw std::runtime_error("nccl_device_v2 wire element size is invalid");
+    }
+    const auto wire_item_bytes = static_cast<std::uint32_t>(wire_element_bytes[index]);
+    const std::uint32_t expected_wire_bytes = dtype_bytes(wire_dtype);
+    if (expected_wire_bytes != 0 && expected_wire_bytes != wire_item_bytes) {
+      throw std::runtime_error("nccl_device_v2 wire dtype and element size disagree");
+    }
+    const bool requires_cast = local_dtype != wire_dtype || local_element_bytes != wire_item_bytes;
+    if (requires_cast && (local_dtype == v2::V2DataType::kOpaque || wire_dtype == v2::V2DataType::kOpaque)) {
+      throw std::runtime_error("nccl_device_v2 streaming cast dtype is unsupported");
+    }
+    if (!sender && requires_cast) {
+      throw std::runtime_error("nccl_device_v2 receiver tensor must use the wire dtype");
+    }
     const int64_t peer = peers[index];
     const int64_t ordinal = ordinals[index];
     if (peer < 0 || peer >= state.world_size || peer == state.rank) {
@@ -435,7 +498,10 @@ std::vector<v2::V2LoweringTask> build_tasks(
       throw std::runtime_error("nccl_device_v2 task ordinal is invalid");
     }
     if (lengths[index] < 0 || tensor_offsets[index] < 0 || tensor_row_bytes[index] <= 0 ||
-        tensor_row_strides[index] < tensor_row_bytes[index]) {
+        tensor_row_strides[index] < tensor_row_bytes[index] ||
+        lengths[index] % wire_item_bytes != 0 || tensor_offsets[index] % local_element_bytes != 0 ||
+        tensor_row_bytes[index] % local_element_bytes != 0 ||
+        tensor_row_strides[index] % local_element_bytes != 0) {
       throw std::runtime_error("nccl_device_v2 task byte range is invalid");
     }
     if (!peer_seen[peer]) {
@@ -448,6 +514,10 @@ std::vector<v2::V2LoweringTask> build_tasks(
       static_cast<std::uint64_t>(tensor_offsets[index]),
       static_cast<std::uint64_t>(tensor_row_bytes[index]),
       static_cast<std::uint64_t>(tensor_row_strides[index]),
+      local_dtype,
+      wire_dtype,
+      local_element_bytes,
+      wire_item_bytes,
       static_cast<std::uint32_t>(peer),
       static_cast<std::uint32_t>(ordinal),
     });
@@ -461,7 +531,8 @@ std::vector<v2::V2LoweringTask> build_tasks(
 
 py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64_t>& lengths,
                 const std::vector<int64_t>& tensor_offsets, const std::vector<int64_t>& tensor_row_bytes,
-                const std::vector<int64_t>& tensor_row_strides, const std::vector<int64_t>& peers,
+                const std::vector<int64_t>& tensor_row_strides, const std::vector<int64_t>& wire_dtypes,
+                const std::vector<int64_t>& wire_element_bytes, const std::vector<int64_t>& peers,
                 const std::vector<int64_t>& ordinals, const std::vector<int64_t>& expected_counts, bool sender,
                 int64_t sequence) {
   using Clock = std::chrono::steady_clock;
@@ -475,8 +546,9 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
   }
 
   std::vector<std::uint32_t> active_peers;
-  const auto tasks = build_tasks(*state, tensors, lengths, tensor_offsets, tensor_row_bytes, tensor_row_strides, peers,
-                                 ordinals, expected_counts, &active_peers);
+  const auto tasks = build_tasks(*state, tensors, lengths, tensor_offsets, tensor_row_bytes, tensor_row_strides,
+                                 wire_dtypes, wire_element_bytes, peers, ordinals, expected_counts, sender,
+                                 &active_peers);
   const v2::V2Direction direction = sender ? v2::V2Direction::kSend : v2::V2Direction::kRecv;
   AWEX_CUDA_V2_CHECK(cudaSetDevice(state->device));
   auto stream = at::cuda::getCurrentCUDAStream(state->device).stream();
@@ -537,6 +609,19 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
   metrics["warps_per_channel"] = py::int_(v2::kWarpsPerBlock);
   metrics["vector_bytes"] = py::int_(v2::kCopyPackBytes);
   metrics["copy_unroll"] = py::int_(v2::kCopyUnroll);
+  std::uint64_t tensor_bytes = 0;
+  std::uint64_t wire_bytes = 0;
+  std::uint64_t streaming_cast_tasks = 0;
+  for (const auto& task : tasks) {
+    wire_bytes += task.nbytes;
+    tensor_bytes += task.nbytes / task.wire_element_bytes * task.tensor_element_bytes;
+    if (task.tensor_dtype != task.wire_dtype || task.tensor_element_bytes != task.wire_element_bytes) {
+      ++streaming_cast_tasks;
+    }
+  }
+  metrics["tensor_bytes"] = py::int_(tensor_bytes);
+  metrics["wire_bytes"] = py::int_(wire_bytes);
+  metrics["streaming_cast_tasks"] = py::int_(streaming_cast_tasks);
   metrics["channel_limit"] = py::int_(state->total_channels);
   metrics["topology_requested_channels_per_peer"] = py::int_(state->topology.requested_channels_per_peer);
   metrics["topology_channels_per_peer"] = py::int_(state->topology.channels_per_peer);

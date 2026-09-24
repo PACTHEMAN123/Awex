@@ -19,6 +19,10 @@
 
 #include "device_v2_types.cuh"
 
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cuda_fp8.h>
+
 namespace awex {
 namespace nccl_device_v2 {
 
@@ -245,6 +249,87 @@ __device__ __forceinline__ void v2CopyContiguousToTensor(std::uint8_t* tensor, c
   }
 }
 
+struct alignas(4) V2ScalarBytes {
+  std::uint8_t bytes[4];
+};
+
+__device__ __forceinline__ const std::uint8_t* v2TensorAddress(const std::uint8_t* tensor,
+                                                              std::uint64_t logical_offset,
+                                                              std::uint64_t row_bytes,
+                                                              std::uint64_t row_stride) {
+  if (row_bytes == row_stride) return tensor + logical_offset;
+  const std::uint64_t row = logical_offset / row_bytes;
+  const std::uint64_t column = logical_offset % row_bytes;
+  return tensor + row * row_stride + column;
+}
+
+__device__ __forceinline__ float v2LoadNumeric(const std::uint8_t* address, V2DataType dtype) {
+  switch (dtype) {
+    case V2DataType::kFloat16:
+      return __half2float(*reinterpret_cast<const __half*>(address));
+    case V2DataType::kBFloat16:
+      return __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(address));
+    case V2DataType::kFloat32:
+      return *reinterpret_cast<const float*>(address);
+    case V2DataType::kFloat8E4M3:
+      return static_cast<float>(*reinterpret_cast<const __nv_fp8_e4m3*>(address));
+    case V2DataType::kFloat8E5M2:
+      return static_cast<float>(*reinterpret_cast<const __nv_fp8_e5m2*>(address));
+    case V2DataType::kOpaque:
+      break;
+  }
+  return 0.0F;
+}
+
+__device__ __forceinline__ V2ScalarBytes v2EncodeNumeric(float value, V2DataType dtype) {
+  V2ScalarBytes encoded{};
+  switch (dtype) {
+    case V2DataType::kFloat16:
+      *reinterpret_cast<__half*>(encoded.bytes) = __float2half_rn(value);
+      break;
+    case V2DataType::kBFloat16:
+      *reinterpret_cast<__nv_bfloat16*>(encoded.bytes) = __float2bfloat16_rn(value);
+      break;
+    case V2DataType::kFloat32:
+      *reinterpret_cast<float*>(encoded.bytes) = value;
+      break;
+    case V2DataType::kFloat8E4M3:
+      *reinterpret_cast<__nv_fp8_e4m3*>(encoded.bytes) = __nv_fp8_e4m3(value);
+      break;
+    case V2DataType::kFloat8E5M2:
+      *reinterpret_cast<__nv_fp8_e5m2*>(encoded.bytes) = __nv_fp8_e5m2(value);
+      break;
+    case V2DataType::kOpaque:
+      break;
+  }
+  return encoded;
+}
+
+// Encode directly into a FIFO slice. The slice may begin or end inside one
+// wire element, so an element at a step boundary is encoded by both adjacent
+// steps and each step publishes only its own bytes.
+__device__ __forceinline__ void v2CastTensorToContiguous(
+  std::uint8_t* destination, const std::uint8_t* tensor, std::uint64_t tensor_offset,
+  std::uint64_t wire_offset, std::uint64_t nbytes, std::uint64_t row_bytes, std::uint64_t row_stride,
+  V2DataType tensor_dtype, V2DataType wire_dtype, std::uint32_t tensor_element_bytes,
+  std::uint32_t wire_element_bytes, int tid, int nthreads) {
+  const std::uint64_t wire_end = wire_offset + nbytes;
+  const std::uint64_t first_element = wire_offset / wire_element_bytes;
+  const std::uint64_t element_end = (wire_end + wire_element_bytes - 1) / wire_element_bytes;
+  for (std::uint64_t element = first_element + tid; element < element_end; element += nthreads) {
+    const std::uint64_t logical_offset = tensor_offset + element * tensor_element_bytes;
+    const auto* source = v2TensorAddress(tensor, logical_offset, row_bytes, row_stride);
+    const V2ScalarBytes encoded = v2EncodeNumeric(v2LoadNumeric(source, tensor_dtype), wire_dtype);
+    const std::uint64_t element_wire_begin = element * wire_element_bytes;
+    const std::uint64_t begin = element_wire_begin < wire_offset ? wire_offset : element_wire_begin;
+    const std::uint64_t element_wire_end = element_wire_begin + wire_element_bytes;
+    const std::uint64_t end = element_wire_end < wire_end ? element_wire_end : wire_end;
+    for (std::uint64_t byte = begin; byte < end; ++byte) {
+      v2Store8(destination + byte - wire_offset, encoded.bytes[byte - element_wire_begin]);
+    }
+  }
+}
+
 __device__ __forceinline__ void v2CopyFragmentsToContiguous(const V2KernelArgs& args, const V2Work& work,
                                                             std::uint8_t* destination, std::uint64_t work_offset,
                                                             std::uint64_t nbytes, int tid, int nthreads) {
@@ -256,9 +341,17 @@ __device__ __forceinline__ void v2CopyFragmentsToContiguous(const V2KernelArgs& 
     const std::uint64_t begin = fragment.work_offset < work_offset ? work_offset : fragment.work_offset;
     const std::uint64_t end = fragment_end < copy_end ? fragment_end : copy_end;
     const auto* tensor = reinterpret_cast<const std::uint8_t*>(fragment.tensor_ptr);
-    v2CopyTensorToContiguous(destination + begin - work_offset, tensor,
-                             fragment.tensor_offset + begin - fragment.work_offset, end - begin,
-                             fragment.tensor_row_bytes, fragment.tensor_row_stride, tid, nthreads);
+    const std::uint64_t wire_offset = fragment.wire_offset + begin - fragment.work_offset;
+    if (fragment.tensor_dtype == fragment.wire_dtype &&
+        fragment.tensor_element_bytes == fragment.wire_element_bytes) {
+      v2CopyTensorToContiguous(destination + begin - work_offset, tensor, fragment.tensor_offset + wire_offset,
+                               end - begin, fragment.tensor_row_bytes, fragment.tensor_row_stride, tid, nthreads);
+    } else {
+      v2CastTensorToContiguous(destination + begin - work_offset, tensor, fragment.tensor_offset, wire_offset,
+                               end - begin, fragment.tensor_row_bytes, fragment.tensor_row_stride,
+                               fragment.tensor_dtype, fragment.wire_dtype, fragment.tensor_element_bytes,
+                               fragment.wire_element_bytes, tid, nthreads);
+    }
   }
 }
 
@@ -273,9 +366,10 @@ __device__ __forceinline__ void v2CopyContiguousToFragments(const V2KernelArgs& 
     const std::uint64_t begin = fragment.work_offset < work_offset ? work_offset : fragment.work_offset;
     const std::uint64_t end = fragment_end < copy_end ? fragment_end : copy_end;
     auto* tensor = reinterpret_cast<std::uint8_t*>(fragment.tensor_ptr);
+    const std::uint64_t wire_offset = fragment.wire_offset + begin - fragment.work_offset;
     v2CopyContiguousToTensor(tensor, source + begin - work_offset,
-                             fragment.tensor_offset + begin - fragment.work_offset, end - begin,
-                             fragment.tensor_row_bytes, fragment.tensor_row_stride, tid, nthreads);
+                             fragment.tensor_offset + wire_offset, end - begin, fragment.tensor_row_bytes,
+                             fragment.tensor_row_stride, tid, nthreads);
   }
 }
 
