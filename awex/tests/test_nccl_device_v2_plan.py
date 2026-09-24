@@ -210,6 +210,7 @@ def test_blockwise_fp8_row_layouts_share_state_and_translate_offsets(monkeypatch
     assert batch.quant_scale_tensors[0] is second_weight.state.scale
     assert batch.quant_row_offsets == [128, 0]
     assert batch.quant_cols == [256, 0]
+    assert batch.quant_group_ids == [0, 0]
 
 
 @pytest.mark.skipif(
@@ -261,11 +262,54 @@ def test_blockwise_fp8_send_batch_uses_source_and_shared_scale(monkeypatch):
     assert batch.quant_scale_row_strides == [3, 0]
     assert batch.quant_block_rows == [128, 0]
     assert batch.quant_block_cols == [128, 0]
+    assert batch.quant_group_ids == [0, 0]
     assert batch.tensor_row_bytes == [384 * source.element_size(), scale.numel() * 4]
     assert batch.tensor_row_strides == [
         384 * source.element_size(),
         scale.numel() * 4,
     ]
+
+
+@pytest.mark.skipif(
+    not hasattr(torch, "float8_e4m3fn"), reason="PyTorch has no FP8 dtype"
+)
+def test_blockwise_fp8_group_survives_interleaved_plan_tasks(monkeypatch):
+    source = torch.empty((128, 256), dtype=torch.bfloat16)
+    weight, scale = make_blockwise_fp8_layouts(source)
+    operations = [
+        _matrix_operation(
+            "weight", torch.bfloat16, torch.float8_e4m3fn, tuple(source.shape)
+        ),
+        _matrix_operation("bias", torch.float32, torch.float32, (16,)),
+        _matrix_operation(
+            "weight_scale_inv", torch.float32, torch.float32, tuple(scale.shape)
+        ),
+    ]
+    monkeypatch.setattr(nccl_device_v2, "_ensure_cuda_tensor", lambda *_: None)
+
+    send_batch = _build_send_batch(
+        {"weight": weight, "bias": torch.empty(16), "weight_scale_inv": scale},
+        TransferPlan(operations={0: operations}),
+        rank=1,
+        world_size=2,
+        chunk_bytes=16,
+        allow_staging=False,
+    )
+    recv_batch = _build_recv_batch(
+        {
+            "weight": torch.empty(source.shape, dtype=torch.float8_e4m3fn),
+            "bias": torch.empty(16),
+            "weight_scale_inv": torch.empty(scale.shape),
+        },
+        TransferPlan(operations={1: operations}),
+        rank=0,
+        world_size=2,
+        chunk_bytes=16,
+        allow_staging=False,
+    )
+
+    assert send_batch.quant_group_ids == [0, -1, 0]
+    assert recv_batch.quant_group_ids == [0, -1, 0]
 
 
 def test_blockwise_fp8_rejects_unaligned_transfer_slice():

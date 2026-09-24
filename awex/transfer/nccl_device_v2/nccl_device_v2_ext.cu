@@ -43,6 +43,7 @@
 #include <stdexcept>
 #include <string>
 #include <tuple>
+#include <unordered_map>
 #include <vector>
 
 namespace py = pybind11;
@@ -409,7 +410,7 @@ bool same_tasks(const std::vector<v2::V2LoweringTask>& left, const std::vector<v
         a.quant_row_offset != b.quant_row_offset || a.quant_col_offset != b.quant_col_offset ||
         a.quant_scale_row_stride != b.quant_scale_row_stride || a.quant_mode != b.quant_mode ||
         a.quant_block_rows != b.quant_block_rows || a.quant_block_cols != b.quant_block_cols ||
-        a.peer != b.peer || a.ordinal != b.ordinal) {
+        a.quant_group != b.quant_group || a.peer != b.peer || a.ordinal != b.ordinal) {
       return false;
     }
   }
@@ -550,14 +551,12 @@ bool tma_send_weight(const v2::V2LoweringTask& weight) {
   return true;
 }
 
-bool tma_recv_pair(const v2::V2LoweringTask& weight, const v2::V2LoweringTask& scale,
-                   std::uint64_t* rows, std::uint64_t* cols) {
-  if (!tma_scale_task(scale, weight.peer) || scale.ordinal != weight.ordinal + 1 ||
-      weight.quant_mode != v2::V2QuantMode::kNone ||
+bool tma_recv_weight(const v2::V2LoweringTask& weight, std::uint64_t* rows, std::uint64_t* cols) {
+  if (weight.quant_mode != v2::V2QuantMode::kNone ||
       weight.tensor_dtype != v2::V2DataType::kFloat8E4M3 ||
       weight.wire_dtype != v2::V2DataType::kFloat8E4M3 || weight.tensor_element_bytes != 1 ||
       weight.wire_element_bytes != 1 || weight.tensor_row_bytes == 0 ||
-      weight.nbytes % weight.tensor_row_bytes != 0) {
+      weight.tensor_offset % weight.tensor_row_bytes != 0 || weight.nbytes % weight.tensor_row_bytes != 0) {
     return false;
   }
   *rows = weight.nbytes / weight.tensor_row_bytes;
@@ -567,10 +566,7 @@ bool tma_recv_pair(const v2::V2LoweringTask& weight, const v2::V2LoweringTask& s
       task_base_address(weight) % 16 != 0 || weight.tensor_row_stride % 16 != 0) {
     return false;
   }
-  const std::uint64_t scale_rows = *rows / v2::kTmaQuantBlockRows;
-  const std::uint64_t scale_cols = *cols / v2::kTmaQuantBlockCols;
-  return scale.nbytes == scale_rows * scale_cols * sizeof(float) &&
-         scale.tensor_row_bytes == scale_cols * sizeof(float) && scale.tensor_row_stride % 16 == 0;
+  return true;
 }
 
 CUtensorMap make_tma_tensor_map(const v2::V2LoweringTask& task, std::uint64_t rows, std::uint64_t cols) {
@@ -601,38 +597,50 @@ TmaSchedule build_tma_schedule(const std::vector<v2::V2LoweringTask>& tasks, v2:
                           : config.initial_steps;
   handled->assign(tasks.size(), false);
   std::vector<std::vector<v2::V2TmaQuantTile>> peer_tiles(config.world_size);
-  for (std::size_t index = 0; index < tasks.size();) {
+  constexpr std::uint32_t kNoQuantGroup = std::numeric_limits<std::uint32_t>::max();
+  std::unordered_map<std::uint64_t, std::vector<std::size_t>> grouped_tasks;
+  std::vector<std::uint64_t> group_order;
+  for (std::size_t index = 0; index < tasks.size(); ++index) {
+    const auto& task = tasks[index];
+    if (task.quant_group == kNoQuantGroup) continue;
+    const std::uint64_t key = (static_cast<std::uint64_t>(task.peer) << 32) | task.quant_group;
+    auto [entry, inserted] = grouped_tasks.emplace(key, std::vector<std::size_t>{});
+    if (inserted) group_order.push_back(key);
+    entry->second.push_back(index);
+  }
+
+  for (const std::uint64_t key : group_order) {
+    const auto& group = grouped_tasks.at(key);
+    const std::uint32_t peer = static_cast<std::uint32_t>(key >> 32);
     if (direction == v2::V2Direction::kSend) {
-      if (!tma_send_weight(tasks[index])) {
-        ++index;
-        continue;
+      std::vector<std::size_t> weight_indices;
+      std::size_t scale_index = tasks.size();
+      bool eligible = true;
+      for (const std::size_t index : group) {
+        if (tma_send_weight(tasks[index])) {
+          weight_indices.push_back(index);
+        } else if (tma_scale_task(tasks[index], peer) && scale_index == tasks.size()) {
+          scale_index = index;
+        } else {
+          eligible = false;
+          break;
+        }
       }
-      const std::uint32_t peer = tasks[index].peer;
-      std::size_t scale_index = index;
+      if (!eligible || weight_indices.empty() || scale_index == tasks.size()) continue;
       std::uint64_t tile_count = 0;
-      while (scale_index < tasks.size()) {
-        const auto& weight = tasks[scale_index];
-        if (weight.peer != peer || !tma_send_weight(weight)) break;
+      for (const std::size_t weight_index : weight_indices) {
+        const auto& weight = tasks[weight_index];
         tile_count += weight.quant_rows / v2::kTmaQuantBlockRows *
                       (weight.quant_cols / v2::kTmaQuantBlockCols);
-        ++scale_index;
       }
-      if (scale_index >= tasks.size() || !tma_scale_task(tasks[scale_index], peer) ||
-          tasks[scale_index].ordinal != tasks[scale_index - 1].ordinal + 1 ||
-          tasks[scale_index].nbytes != tile_count * sizeof(float)) {
-        ++index;
-        continue;
-      }
-      const auto& first_weight = tasks[index];
+      if (tasks[scale_index].nbytes != tile_count * sizeof(float)) continue;
+      const auto& first_weight = tasks[weight_indices.front()];
       const std::uintptr_t first_scale_ptr =
         first_weight.quant_scale_ptr +
         (first_weight.quant_row_offset / v2::kTmaQuantBlockRows * first_weight.quant_scale_row_stride +
          first_weight.quant_col_offset / v2::kTmaQuantBlockCols) * sizeof(float);
-      if (task_base_address(tasks[scale_index]) != first_scale_ptr) {
-        ++index;
-        continue;
-      }
-      for (std::size_t weight_index = index; weight_index < scale_index; ++weight_index) {
+      if (task_base_address(tasks[scale_index]) != first_scale_ptr) continue;
+      for (const std::size_t weight_index : weight_indices) {
         const auto& weight = tasks[weight_index];
         const std::uint64_t rows = weight.quant_rows;
         const std::uint64_t cols = weight.quant_cols;
@@ -661,38 +669,65 @@ TmaSchedule build_tma_schedule(const std::vector<v2::V2LoweringTask>& tasks, v2:
       }
       (*handled)[scale_index] = true;
       ++schedule.matrix_count;
-      index = scale_index + 1;
       continue;
     }
 
-    if (index + 1 >= tasks.size()) break;
-    std::uint64_t rows = 0;
-    std::uint64_t cols = 0;
-    if (!tma_recv_pair(tasks[index], tasks[index + 1], &rows, &cols)) {
-      ++index;
-      continue;
-    }
-    const auto& weight = tasks[index];
-    const auto& scale = tasks[index + 1];
-    for (std::uint32_t tile_row = 0; tile_row < rows / v2::kTmaQuantBlockRows; ++tile_row) {
-      for (std::uint32_t tile_col = 0; tile_col < cols / v2::kTmaQuantBlockCols; ++tile_col) {
-        peer_tiles[weight.peer].push_back(v2::V2TmaQuantTile{
-          task_base_address(weight),
-          task_base_address(scale),
-          weight.tensor_row_stride,
-          scale.tensor_row_stride,
-          0,
-          0,
-          tile_row,
-          tile_col,
-          0,
-        });
+    std::vector<std::size_t> weight_indices;
+    std::size_t scale_index = tasks.size();
+    bool eligible = true;
+    std::uint64_t tile_count = 0;
+    std::uint64_t matrix_cols = 0;
+    for (const std::size_t index : group) {
+      std::uint64_t rows = 0;
+      std::uint64_t cols = 0;
+      if (tma_recv_weight(tasks[index], &rows, &cols)) {
+        if (matrix_cols != 0 && matrix_cols != cols) {
+          eligible = false;
+          break;
+        }
+        matrix_cols = cols;
+        tile_count += rows / v2::kTmaQuantBlockRows * (cols / v2::kTmaQuantBlockCols);
+        weight_indices.push_back(index);
+      } else if (tma_scale_task(tasks[index], peer) && scale_index == tasks.size()) {
+        scale_index = index;
+      } else {
+        eligible = false;
+        break;
       }
     }
-    (*handled)[index] = true;
-    (*handled)[index + 1] = true;
+    if (!eligible || weight_indices.empty() || scale_index == tasks.size()) continue;
+    const auto& scale = tasks[scale_index];
+    const std::uint64_t scale_cols = matrix_cols / v2::kTmaQuantBlockCols;
+    if (scale.nbytes != tile_count * sizeof(float) || scale.tensor_row_bytes != scale_cols * sizeof(float) ||
+        scale.tensor_row_stride % 16 != 0) {
+      continue;
+    }
+    for (const std::size_t weight_index : weight_indices) {
+      const auto& weight = tasks[weight_index];
+      const std::uint64_t rows = weight.nbytes / weight.tensor_row_bytes;
+      const std::uint64_t cols = weight.tensor_row_bytes;
+      const std::uint64_t destination_row = weight.tensor_offset / weight.tensor_row_bytes;
+      const std::uintptr_t scale_ptr =
+        task_base_address(scale) + destination_row / v2::kTmaQuantBlockRows * scale.tensor_row_stride;
+      for (std::uint32_t tile_row = 0; tile_row < rows / v2::kTmaQuantBlockRows; ++tile_row) {
+        for (std::uint32_t tile_col = 0; tile_col < cols / v2::kTmaQuantBlockCols; ++tile_col) {
+          peer_tiles[peer].push_back(v2::V2TmaQuantTile{
+            task_base_address(weight),
+            scale_ptr,
+            weight.tensor_row_stride,
+            scale.tensor_row_stride,
+            0,
+            0,
+            tile_row,
+            tile_col,
+            0,
+          });
+        }
+      }
+      (*handled)[weight_index] = true;
+    }
+    (*handled)[scale_index] = true;
     ++schedule.matrix_count;
-    index += 2;
   }
 
   for (std::uint32_t peer = 0; peer < config.world_size; ++peer) {
@@ -832,7 +867,7 @@ std::vector<v2::V2LoweringTask> build_tasks(
   const std::vector<int64_t>& quant_cols, const std::vector<int64_t>& quant_row_offsets,
   const std::vector<int64_t>& quant_col_offsets, const std::vector<int64_t>& quant_scale_row_strides,
   const std::vector<int64_t>& quant_block_rows, const std::vector<int64_t>& quant_block_cols,
-  const std::vector<int64_t>& peers, const std::vector<int64_t>& ordinals,
+  const std::vector<int64_t>& quant_group_ids, const std::vector<int64_t>& peers, const std::vector<int64_t>& ordinals,
   const std::vector<int64_t>& expected_counts, bool sender, std::vector<std::uint32_t>* active_peers) {
   if (tensors.size() != lengths.size() || tensors.size() != tensor_offsets.size() ||
       tensors.size() != tensor_row_bytes.size() || tensors.size() != tensor_row_strides.size() ||
@@ -841,7 +876,7 @@ std::vector<v2::V2LoweringTask> build_tasks(
       tensors.size() != quant_rows.size() || tensors.size() != quant_cols.size() ||
       tensors.size() != quant_row_offsets.size() || tensors.size() != quant_col_offsets.size() ||
       tensors.size() != quant_scale_row_strides.size() || tensors.size() != quant_block_rows.size() ||
-      tensors.size() != quant_block_cols.size() ||
+      tensors.size() != quant_block_cols.size() || tensors.size() != quant_group_ids.size() ||
       tensors.size() != peers.size() || tensors.size() != ordinals.size()) {
     throw std::runtime_error("nccl_device_v2 tensor/task descriptor lengths do not match");
   }
@@ -921,11 +956,16 @@ std::vector<v2::V2LoweringTask> build_tasks(
     }
     const int64_t peer = peers[index];
     const int64_t ordinal = ordinals[index];
+    const int64_t quant_group_id = quant_group_ids[index];
     if (peer < 0 || peer >= state.world_size || peer == state.rank) {
       throw std::runtime_error("nccl_device_v2 task peer is invalid");
     }
     if (ordinal < 0 || static_cast<std::uint64_t>(ordinal) >= expected[peer]) {
       throw std::runtime_error("nccl_device_v2 task ordinal is invalid");
+    }
+    if (quant_group_id < -1 ||
+        (quant_group_id >= 0 && static_cast<std::uint64_t>(quant_group_id) >= UINT32_MAX)) {
+      throw std::runtime_error("nccl_device_v2 quantization group is invalid");
     }
     if (lengths[index] < 0 || tensor_offsets[index] < 0 || tensor_row_bytes[index] <= 0 ||
         tensor_row_strides[index] < tensor_row_bytes[index] ||
@@ -957,6 +997,7 @@ std::vector<v2::V2LoweringTask> build_tasks(
       quant_mode,
       static_cast<std::uint32_t>(quant_block_rows[index]),
       static_cast<std::uint32_t>(quant_block_cols[index]),
+      quant_group_id < 0 ? UINT32_MAX : static_cast<std::uint32_t>(quant_group_id),
       static_cast<std::uint32_t>(peer),
       static_cast<std::uint32_t>(ordinal),
     });
@@ -976,7 +1017,8 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
                 const std::vector<int64_t>& quant_cols, const std::vector<int64_t>& quant_row_offsets,
                 const std::vector<int64_t>& quant_col_offsets, const std::vector<int64_t>& quant_scale_row_strides,
                 const std::vector<int64_t>& quant_block_rows, const std::vector<int64_t>& quant_block_cols,
-                const std::vector<int64_t>& peers, const std::vector<int64_t>& ordinals,
+                const std::vector<int64_t>& quant_group_ids, const std::vector<int64_t>& peers,
+                const std::vector<int64_t>& ordinals,
                 const std::vector<int64_t>& expected_counts, bool sender, int64_t sequence) {
   using Clock = std::chrono::steady_clock;
   const auto launch_start = Clock::now();
@@ -992,8 +1034,8 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
   const auto tasks = build_tasks(*state, tensors, lengths, tensor_offsets, tensor_row_bytes, tensor_row_strides,
                                  wire_dtypes, wire_element_bytes, quant_scale_tensors, quant_modes, quant_rows,
                                  quant_cols, quant_row_offsets, quant_col_offsets, quant_scale_row_strides,
-                                 quant_block_rows, quant_block_cols, peers, ordinals, expected_counts, sender,
-                                 &active_peers);
+                                 quant_block_rows, quant_block_cols, quant_group_ids, peers, ordinals,
+                                 expected_counts, sender, &active_peers);
   const v2::V2Direction direction = sender ? v2::V2Direction::kSend : v2::V2Direction::kRecv;
   AWEX_CUDA_V2_CHECK(cudaSetDevice(state->device));
   auto stream = at::cuda::getCurrentCUDAStream(state->device).stream();

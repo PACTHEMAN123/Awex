@@ -103,6 +103,7 @@ class _V2Batch:
     quant_scale_row_strides: list[int]
     quant_block_rows: list[int]
     quant_block_cols: list[int]
+    quant_group_ids: list[int]
     peers: list[int]
     ordinals: list[int]
     region_indices: list[int]
@@ -158,6 +159,37 @@ def _operation_groups(
             "nccl_device_v2 does not support self-transfer operations"
         )
     return [(peer, list(plan.operations[peer])) for peer in peers]
+
+
+def _blockwise_quant_group_ids(
+    operations: list[CommunicationOperation],
+) -> list[int]:
+    """Pair logical destination weights with their scale tensors.
+
+    A physical source layout can split one weight operation into several task
+    descriptors. Keeping the group on the operation makes that fragmentation
+    explicit instead of asking the CUDA lowering code to infer matrix bounds
+    from descriptor adjacency.
+    """
+
+    suffix = "_scale_inv"
+    weights: dict[str, list[int]] = {}
+    scales: dict[str, list[int]] = {}
+    for index, op in enumerate(operations):
+        name = op.recv_shard_meta.name
+        if name.endswith(suffix):
+            scales.setdefault(name[: -len(suffix)], []).append(index)
+        else:
+            weights.setdefault(name, []).append(index)
+
+    group_ids = [-1] * len(operations)
+    group_id = 0
+    for name in sorted(weights.keys() & scales.keys()):
+        for weight_index, scale_index in zip(weights[name], scales[name]):
+            group_ids[weight_index] = group_id
+            group_ids[scale_index] = group_id
+            group_id += 1
+    return group_ids
 
 
 def _resolve_chunk_bytes(chunk_bytes: int | None) -> int:
@@ -299,6 +331,7 @@ def _append_tensor_range(
     quant_scale_row_strides: list[int],
     quant_block_rows: list[int],
     quant_block_cols: list[int],
+    quant_group_ids: list[int],
     peers: list[int],
     ordinals: list[int],
     region_indices: list[int],
@@ -319,6 +352,7 @@ def _append_tensor_range(
     quant_col_offset: int = 0,
     quant_scale_row_stride: int = 0,
     quant_block_shape: tuple[int, int] = (0, 0),
+    quant_group_id: int = -1,
 ) -> int:
     # Preserve one descriptor per physical TransferPlan span. C++ concatenates
     # these descriptors into a virtual peer stream before selecting channels
@@ -389,6 +423,7 @@ def _append_tensor_range(
     quant_scale_row_strides.append(int(quant_scale_row_stride))
     quant_block_rows.append(int(quant_block_shape[0]))
     quant_block_cols.append(int(quant_block_shape[1]))
+    quant_group_ids.append(int(quant_group_id))
     peers.append(peer)
     ordinals.append(ordinal)
     region_indices.append(region_index)
@@ -422,6 +457,7 @@ def _build_send_batch(
     quant_scale_row_strides: list[int] = []
     quant_block_rows: list[int] = []
     quant_block_cols: list[int] = []
+    quant_group_ids: list[int] = []
     peers: list[int] = []
     ordinals: list[int] = []
     region_indices: list[int] = []
@@ -431,7 +467,8 @@ def _build_send_batch(
     for peer, operations in _operation_groups(plan, rank, world_size):
         peer_offset = 0
         ordinal = 0
-        for op in operations:
+        operation_group_ids = _blockwise_quant_group_ids(operations)
+        for operation_index, op in enumerate(operations):
             parameter = parameters[op.send_shard_meta.name]
             blockwise_state = None
             source_fragments = None
@@ -513,6 +550,7 @@ def _build_send_batch(
                     quant_scale_row_strides=quant_scale_row_strides,
                     quant_block_rows=quant_block_rows,
                     quant_block_cols=quant_block_cols,
+                    quant_group_ids=quant_group_ids,
                     peers=peers,
                     ordinals=ordinals,
                     region_indices=region_indices,
@@ -551,6 +589,11 @@ def _build_send_batch(
                         if quant_fragment is not None
                         else (0, 0)
                     ),
+                    quant_group_id=(
+                        operation_group_ids[operation_index]
+                        if isinstance(parameter, BlockwiseFp8Layout)
+                        else -1
+                    ),
                 )
                 peer_offset += length
         expected_counts[peer] = ordinal
@@ -574,6 +617,7 @@ def _build_send_batch(
         quant_scale_row_strides=quant_scale_row_strides,
         quant_block_rows=quant_block_rows,
         quant_block_cols=quant_block_cols,
+        quant_group_ids=quant_group_ids,
         peers=peers,
         ordinals=ordinals,
         region_indices=region_indices,
@@ -610,6 +654,7 @@ def _build_recv_batch(
     quant_scale_row_strides: list[int] = []
     quant_block_rows: list[int] = []
     quant_block_cols: list[int] = []
+    quant_group_ids: list[int] = []
     peers: list[int] = []
     ordinals: list[int] = []
     region_indices: list[int] = []
@@ -619,7 +664,8 @@ def _build_recv_batch(
     for peer, operations in _operation_groups(plan, rank, world_size):
         peer_offset = 0
         ordinal = 0
-        for op in operations:
+        operation_group_ids = _blockwise_quant_group_ids(operations)
+        for operation_index, op in enumerate(operations):
             parameter = parameters[op.recv_shard_meta.name]
             view = parameter[op.inf_slices]
             target = view
@@ -679,6 +725,7 @@ def _build_recv_batch(
                     quant_scale_row_strides=quant_scale_row_strides,
                     quant_block_rows=quant_block_rows,
                     quant_block_cols=quant_block_cols,
+                    quant_group_ids=quant_group_ids,
                     peers=peers,
                     ordinals=ordinals,
                     region_indices=region_indices,
@@ -692,6 +739,7 @@ def _build_recv_batch(
                     peer_offset=peer_offset,
                     ordinal=ordinal,
                     region_index=peer,
+                    quant_group_id=operation_group_ids[operation_index],
                 )
                 target_offset += length
                 peer_offset += length
@@ -716,6 +764,7 @@ def _build_recv_batch(
         quant_scale_row_strides=quant_scale_row_strides,
         quant_block_rows=quant_block_rows,
         quant_block_cols=quant_block_cols,
+        quant_group_ids=quant_group_ids,
         peers=peers,
         ordinals=ordinals,
         region_indices=region_indices,
@@ -964,6 +1013,7 @@ class NCCLDeviceV2Transport:
                 batch.quant_scale_row_strides,
                 batch.quant_block_rows,
                 batch.quant_block_cols,
+                batch.quant_group_ids,
                 batch.peers,
                 batch.ordinals,
                 batch.expected_counts,

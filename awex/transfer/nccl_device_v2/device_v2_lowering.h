@@ -64,6 +64,7 @@ struct V2LoweringTask {
   V2QuantMode quant_mode = V2QuantMode::kNone;
   std::uint32_t quant_block_rows = 0;
   std::uint32_t quant_block_cols = 0;
+  std::uint32_t quant_group = std::numeric_limits<std::uint32_t>::max();
   std::uint32_t peer = 0;
   std::uint32_t ordinal = 0;
 };

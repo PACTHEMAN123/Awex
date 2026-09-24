@@ -115,6 +115,7 @@ def main() -> None:
         quant_scale_row_strides = [scale.stride(0), scale.stride(0), 0]
         quant_block_rows = [128, 128, 0]
         quant_block_cols = [128, 128, 0]
+        quant_group_ids = [0, 0, 0]
         ordinals = [0, 1, 2]
         expected_counts = [0, 3]
     else:
@@ -132,6 +133,7 @@ def main() -> None:
         quant_scale_row_strides = [0, 0]
         quant_block_rows = [0, 0]
         quant_block_cols = [0, 0]
+        quant_group_ids = [0, 0]
         ordinals = [0, 1]
         expected_counts = [2, 0]
     handle = extension.create(
@@ -172,6 +174,7 @@ def main() -> None:
                         quant_scale_row_strides,
                         quant_block_rows,
                         quant_block_cols,
+                        quant_group_ids,
                         [peer] * len(tensors),
                         ordinals,
                         expected_counts,
