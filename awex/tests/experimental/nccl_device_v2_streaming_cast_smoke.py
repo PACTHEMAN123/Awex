@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""Two-rank BF16-to-FP8 streaming-cast smoke test for device v2."""
+"""Two-rank mixed-format streaming-cast smoke test for device v2."""
 
 from __future__ import annotations  # noqa: I001
 
@@ -25,8 +25,9 @@ from awex.transfer.nccl_device_v2 import _load_extension
 import torch
 import torch.distributed as dist
 
-_NUMEL = 5 * 1024 * 1024 + 257
-_FP8_E4M3_CODE = 4
+_NUMELS = (5 * 1024 * 1024 + 257, 1024 * 1024 + 129)
+_WIRE_DTYPES = (4, 1)  # FP8 E4M3 and FP16.
+_WIRE_ELEMENT_BYTES = (1, 2)
 
 
 def _broadcast_unique_id(extension: object, rank: int) -> bytes:
@@ -35,9 +36,13 @@ def _broadcast_unique_id(extension: object, rank: int) -> bytes:
     return values[0]
 
 
-def _values(sequence: int) -> torch.Tensor:
-    indices = torch.arange(_NUMEL, dtype=torch.int32, device="cuda")
-    return (((indices + sequence * 37) % 4096) - 2048).to(torch.bfloat16) / 16
+def _values(sequence: int) -> list[torch.Tensor]:
+    first = torch.arange(_NUMELS[0], dtype=torch.int32, device="cuda")
+    second = torch.arange(_NUMELS[1], dtype=torch.int32, device="cuda")
+    return [
+        (((first + sequence * 37) % 4096) - 2048).to(torch.bfloat16) / 16,
+        (((second + sequence * 19) % 8192) - 4096).float() / 32,
+    ]
 
 
 def main() -> None:
@@ -54,10 +59,16 @@ def main() -> None:
     extension = _load_extension()
     unique_id = _broadcast_unique_id(extension, rank)
     peer = 1 - rank
-    tensor = (
-        torch.empty(_NUMEL, dtype=torch.bfloat16, device="cuda")
+    tensors = (
+        [
+            torch.empty(_NUMELS[0], dtype=torch.bfloat16, device="cuda"),
+            torch.empty(_NUMELS[1], dtype=torch.float32, device="cuda"),
+        ]
         if rank == 0
-        else torch.empty(_NUMEL, dtype=torch.float8_e4m3fn, device="cuda")
+        else [
+            torch.empty(_NUMELS[0], dtype=torch.float8_e4m3fn, device="cuda"),
+            torch.empty(_NUMELS[1], dtype=torch.float16, device="cuda"),
+        ]
     )
     handle = extension.create(
         unique_id,
@@ -65,51 +76,75 @@ def main() -> None:
         rank,
         local_rank,
         60_000,
-        64,
+        1,
         8,
-        512 * 1024,
-        4 * 1024 * 1024,
+        513,
+        4096,
     )
     try:
         launches = []
         for sequence in (1, 2):
             values = _values(sequence)
             if rank == 0:
-                tensor.copy_(values)
+                for tensor, value in zip(tensors, values):
+                    tensor.copy_(value)
             else:
-                tensor.zero_()
+                for tensor in tensors:
+                    tensor.zero_()
             dist.barrier()
             metrics = extension.launch(
                 handle,
-                [tensor],
-                [_NUMEL],
-                [0],
-                [_NUMEL * tensor.element_size()],
-                [_NUMEL * tensor.element_size()],
-                [_FP8_E4M3_CODE],
-                [1],
-                [peer],
-                [0],
-                [1, 0] if rank == 1 else [0, 1],
+                tensors,
+                [
+                    numel * wire_element_bytes
+                    for numel, wire_element_bytes in zip(_NUMELS, _WIRE_ELEMENT_BYTES)
+                ],
+                [0, 0],
+                [
+                    numel * tensor.element_size()
+                    for numel, tensor in zip(_NUMELS, tensors)
+                ],
+                [
+                    numel * tensor.element_size()
+                    for numel, tensor in zip(_NUMELS, tensors)
+                ],
+                list(_WIRE_DTYPES),
+                list(_WIRE_ELEMENT_BYTES),
+                [peer, peer],
+                [0, 1],
+                [2, 0] if rank == 1 else [0, 2],
                 rank == 0,
                 sequence,
             )
             launches.append(dict(metrics))
             dist.barrier()
             if rank == 1:
-                expected = values.to(torch.float8_e4m3fn).float()
-                if not torch.equal(tensor.float(), expected):
-                    difference = (tensor.float() - expected).abs().max().item()
-                    raise AssertionError(f"BF16-to-FP8 mismatch: max_abs={difference}")
+                expected = [
+                    values[0].to(torch.float8_e4m3fn).float(),
+                    values[1].to(torch.float16).float(),
+                ]
+                for index, (tensor, reference) in enumerate(zip(tensors, expected)):
+                    if not torch.equal(tensor.float(), reference):
+                        difference = (tensor.float() - reference).abs().max().item()
+                        raise AssertionError(
+                            f"streaming-cast tensor {index} mismatch: max_abs={difference}"
+                        )
 
         metrics = launches[-1]
-        expected_tensor_bytes = _NUMEL * (2 if rank == 0 else 1)
+        expected_wire_bytes = sum(
+            numel * itemsize for numel, itemsize in zip(_NUMELS, _WIRE_ELEMENT_BYTES)
+        )
+        expected_tensor_bytes = sum(
+            numel * tensor.element_size() for numel, tensor in zip(_NUMELS, tensors)
+        )
         if metrics["tensor_bytes"] != expected_tensor_bytes:
             raise AssertionError(f"unexpected tensor byte count: {metrics}")
-        if metrics["wire_bytes"] != _NUMEL:
+        if metrics["wire_bytes"] != expected_wire_bytes:
             raise AssertionError(f"unexpected wire byte count: {metrics}")
-        if metrics["streaming_cast_tasks"] != (1 if rank == 0 else 0):
+        if metrics["streaming_cast_tasks"] != (2 if rank == 0 else 0):
             raise AssertionError(f"unexpected streaming-cast task count: {metrics}")
+        if metrics["fragment_count"] <= metrics["work_count"]:
+            raise AssertionError(f"no work crossed the tensor boundary: {metrics}")
         if not launches[1]["plan_cache_hit"]:
             raise AssertionError(f"second launch missed the plan cache: {metrics}")
         dist.barrier()
