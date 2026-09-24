@@ -75,7 +75,7 @@ def _configure_gin_hca_policy() -> None:
     """Optionally spread local ranks evenly across active RDMA devices."""
 
     policy = os.environ.get(
-        "AWEX_NCCL_DEVICE_V2_HCA_POLICY", "topology"
+        "AWEX_NCCL_DEVICE_V2_HCA_POLICY", "balanced"
     ).strip().lower()
     if policy == "topology" or "NCCL_IB_HCA" in os.environ:
         return
@@ -86,10 +86,8 @@ def _configure_gin_hca_policy() -> None:
     try:
         local_rank = int(os.environ["LOCAL_RANK"])
         local_world_size = int(os.environ["LOCAL_WORLD_SIZE"])
-    except (KeyError, ValueError) as exc:
-        raise NCCLDeviceV2UnavailableError(
-            "balanced HCA policy requires LOCAL_RANK and LOCAL_WORLD_SIZE"
-        ) from exc
+    except (KeyError, ValueError):
+        return
     devices = _active_rdma_devices()
     if not devices or local_world_size <= 0 or not 0 <= local_rank < local_world_size:
         return
@@ -831,7 +829,7 @@ class NCCLDeviceV2Transport:
             "fifo_depth=%s step_bytes=%s network_step_bytes=%s "
             "requested_network_channels_per_peer=%s gin_connections=%s "
             "gin_context_count=%s gin_doorbell_batch=%s "
-            "gin_reliable_doorbell=%s",
+            "gin_reliable_doorbell=%s hca_policy=%s selected_hca=%s",
             self.rank,
             self.chunk_bytes,
             self.max_channels,
@@ -843,6 +841,8 @@ class NCCLDeviceV2Transport:
             self.gin_context_count,
             self.gin_doorbell_batch,
             self.gin_reliable_doorbell,
+            os.environ.get("AWEX_NCCL_DEVICE_V2_HCA_POLICY", "balanced"),
+            os.environ.get("NCCL_IB_HCA", "topology"),
         )
 
     def _ensure_initialized(self) -> float:
@@ -932,6 +932,12 @@ class NCCLDeviceV2Transport:
                 bool(sender),
                 int(sequence),
             )
+        )
+        extension_metrics["hca_policy"] = os.environ.get(
+            "AWEX_NCCL_DEVICE_V2_HCA_POLICY", "balanced"
+        )
+        extension_metrics["selected_hca"] = os.environ.get(
+            "NCCL_IB_HCA", "topology"
         )
         copyback_start = time.perf_counter()
         if batch.copybacks:

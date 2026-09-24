@@ -16,7 +16,7 @@
 | --- | --- | --- | --- |
 | 2. 跨机 channel 分片公式 | GIN 已改为多节点公式：`step / 2` 到 `step` | 多节点使用 `step / 2` 到 `step` | 已对齐 |
 | 3. 默认流水线粒度 | LSA 512 KiB；GIN 128 KiB；8 层 FIFO；4 MiB work chunk | 跨机 P2P 默认 128 KiB，并按消息大小和协议调节 | GIN step 和 SIMPLE 小消息调节已对齐；work chunk 仍是 Awex lowering 层概念 |
-| 5. 网络执行上下文 | connection 由 active RDMA netdev 探测；context 和 channel 根据实际 connection 数、peer 数及负荷自动确定 | 常规 NET 按 NIC、带宽、channel 和 flow 调度 | 默认路径无需手工指定并行度 |
+| 5. 网络执行上下文 | active RDMA HCA 按 PCI 顺序在 local rank 间均衡；context 和 channel 根据实际 connection 数、peer 数及负荷自动确定 | 常规 NET 按 NIC、带宽、channel 和 flow 调度 | 默认路径无需手工指定并行度 |
 
 ## 2. 跨机使用多节点 SIMPLE 分片公式
 

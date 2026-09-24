@@ -196,9 +196,11 @@ def main() -> None:
                 "gin_connection_count",
                 "gin_context_count",
                 "gin_credit_batch",
+                "hca_policy",
                 "network_channel_budget",
                 "network_channels_per_peer",
                 "network_step_bytes",
+                "selected_hca",
             ):
                 if name in last_metrics:
                     result[name] = last_metrics[name]
