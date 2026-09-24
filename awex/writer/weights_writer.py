@@ -210,6 +210,7 @@ class WeightsExchangeShardingWriter(WeightExchangeWriter):
             self.parameters_meta,
             self.infer_params_meta,
             raise_exception=not self.enable_debug_mode,
+            allow_dtype_mismatch=self.comm_backend == "nccl_device_v2",
         )
         self.weight_converter = get_train_weights_converter(
             self.train_engine.engine_name,

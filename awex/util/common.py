@@ -173,6 +173,7 @@ def check_train_infer_params_meta(
     infer_parameters_meta: List,
     raise_exception: bool = False,
     strict_key_match: bool = False,
+    allow_dtype_mismatch: bool = False,
 ):
     infer_meta = {param_meta.name: param_meta for param_meta in infer_parameters_meta}
     train_meta = {param_meta.name: param_meta for param_meta in training_params_meta}
@@ -240,7 +241,12 @@ def check_train_infer_params_meta(
                 logger.error(error_msg)
         if infer_param_meta.dtype != train_param_meta.dtype:
             error_msg = f"Inconsistent dtype for parameter {param_name}: {infer_param_meta.dtype} != {train_param_meta.dtype}"
-            if raise_exception:
+            if allow_dtype_mismatch:
+                logger.info(
+                    "%s; the selected transport will convert to the inference dtype",
+                    error_msg,
+                )
+            elif raise_exception:
                 raise ValueError(error_msg)
             else:
                 logger.error(error_msg)

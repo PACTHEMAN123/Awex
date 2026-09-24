@@ -27,7 +27,12 @@ from awex.sharding.param_sharding import ShardingType
 from awex.util.common import check_train_infer_params_meta
 
 
-def _make_param_meta(name: str, shape=(4, 4), global_rank: int = 0) -> ParameterMeta:
+def _make_param_meta(
+    name: str,
+    shape=(4, 4),
+    global_rank: int = 0,
+    dtype: torch.dtype = torch.float32,
+) -> ParameterMeta:
     numel = int(shape[0] * shape[1])
     shard = ParameterShardMeta(
         tp_rank=0,
@@ -41,7 +46,7 @@ def _make_param_meta(name: str, shape=(4, 4), global_rank: int = 0) -> Parameter
         name=name,
         shape=shape,
         numel=numel,
-        dtype=torch.float32,
+        dtype=dtype,
         global_offset=(0, 0),
         sharding_type=ShardingType.NO_SHARDING,
         num_shards=1,
@@ -51,7 +56,7 @@ def _make_param_meta(name: str, shape=(4, 4), global_rank: int = 0) -> Parameter
         name=name,
         global_numel=numel,
         global_shape=shape,
-        dtype=torch.float32,
+        dtype=dtype,
         shards=[shard],
         replicas=[ParameterReplicaMeta(shards=[shard])],
     )
@@ -91,3 +96,23 @@ def test_meta_alignment_strict_mode_rejects_infer_extra():
             raise_exception=True,
             strict_key_match=True,
         )
+
+
+def test_meta_alignment_rejects_dtype_mismatch_by_default():
+    train = [_make_param_meta("weight", dtype=torch.bfloat16)]
+    infer = [_make_param_meta("weight", dtype=torch.float16)]
+
+    with pytest.raises(ValueError, match="Inconsistent dtype"):
+        check_train_infer_params_meta(train, infer, raise_exception=True)
+
+
+def test_meta_alignment_can_delegate_dtype_conversion_to_transport():
+    train = [_make_param_meta("weight", dtype=torch.bfloat16)]
+    infer = [_make_param_meta("weight", dtype=torch.float16)]
+
+    check_train_infer_params_meta(
+        train,
+        infer,
+        raise_exception=True,
+        allow_dtype_mismatch=True,
+    )

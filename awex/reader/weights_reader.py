@@ -218,6 +218,7 @@ class WeightsReader(WeightExchangeReader):
             self.training_params_meta,
             self.parameters_meta,
             raise_exception=not config.enable_debug_mode,
+            allow_dtype_mismatch=config.comm_backend == "nccl_device_v2",
         )
         logger.info("Start to send parameters meta to tp workers")
         infer_parameters_meta_bytes = pickle.dumps(self.parameters_meta)
