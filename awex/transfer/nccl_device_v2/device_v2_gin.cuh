@@ -24,7 +24,7 @@ namespace nccl_device_v2 {
 
 #if AWEX_NCCL_DEVICE_V2_HAS_GIN
 
-#if AWEX_NCCL_DEVICE_V2_HAS_EXPLICIT_SIGNAL_STRENGTH
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 30, 7)
 using V2GinReadySignalInc = ncclGin_StrongSignalInc;
 using V2GinCreditSignalAdd = ncclGin_WeakSignalAdd;
 #else
@@ -121,14 +121,10 @@ __device__ __forceinline__ void v2GinRunSend(const V2KernelArgs& args, const V2W
     if ((roles & kRolePostSend) && v2LoadError(error) == 0) {
       // The cumulative ready counter requires ordered completion so a later
       // put cannot satisfy the wait for an earlier FIFO step.
-      const bool aggregate_request = args.gin_doorbell_batch > 1 && cursor + slice_bytes < work.nbytes &&
-        (step - work.step_begin + 1) % args.gin_doorbell_batch != 0;
-      const std::uint32_t gin_opt_flags =
-        aggregate_request ? ncclGinOptFlagsAggregateRequests : ncclGinOptFlagsDefault;
       gin.put(world, work.peer, args.window, v2GinPayloadOffset(args, work.peer, args.local_rank, channel, step),
               args.window, v2GinPayloadOffset(args, args.local_rank, work.peer, channel, step), slice_bytes,
               V2GinReadySignalInc{ready_signal}, ncclGin_None{}, ncclCoopThread{}, ncclGin_None{},
-              cuda::thread_scope_thread, cuda::thread_scope_device, gin_opt_flags);
+              cuda::thread_scope_thread, cuda::thread_scope_device, ncclGinOptFlagsDefault);
     }
     if (v2LoadError(error) != 0) return;
     cursor += slice_bytes;

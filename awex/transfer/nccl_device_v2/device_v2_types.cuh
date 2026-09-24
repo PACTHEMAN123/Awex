@@ -22,23 +22,14 @@
 
 #if __has_include(<nccl_device.h>)
 #include <nccl_device.h>
-#define AWEX_NCCL_DEVICE_V2_AGGREGATE_HEADER 1
-#else
-#include <nccl_device/core.h>
-#define AWEX_NCCL_DEVICE_V2_AGGREGATE_HEADER 0
-#endif
-
-#if AWEX_NCCL_DEVICE_V2_AGGREGATE_HEADER && defined(NCCL_OS_LINUX) && \
-  NCCL_VERSION_CODE >= NCCL_VERSION(2, 30, 4)
+#if defined(NCCL_OS_LINUX) && NCCL_VERSION_CODE >= NCCL_VERSION(2, 30, 4)
 #define AWEX_NCCL_DEVICE_V2_HAS_GIN 1
 #else
 #define AWEX_NCCL_DEVICE_V2_HAS_GIN 0
 #endif
-
-#if AWEX_NCCL_DEVICE_V2_HAS_GIN && NCCL_VERSION_CODE >= NCCL_VERSION(2, 30, 7)
-#define AWEX_NCCL_DEVICE_V2_HAS_EXPLICIT_SIGNAL_STRENGTH 1
 #else
-#define AWEX_NCCL_DEVICE_V2_HAS_EXPLICIT_SIGNAL_STRENGTH 0
+#include <nccl_device/core.h>
+#define AWEX_NCCL_DEVICE_V2_HAS_GIN 0
 #endif
 
 #include <cstddef>
@@ -168,7 +159,6 @@ struct V2KernelArgs {
   std::uint32_t gin_enabled;
   std::uint32_t gin_credit_batch;
   std::uint32_t gin_signal_count;
-  std::uint32_t gin_doorbell_batch;
 #if AWEX_NCCL_DEVICE_V2_HAS_GIN
   ncclWindow_t window;
   ncclDevComm dev_comm;

@@ -36,8 +36,8 @@ fallback.
 The topology layer mirrors NCCL's NVLink path formula,
 `2 * max(1, pathBandwidth / linkBandwidth)`. Once GIN is initialized, remote
 peer channel demand is raised to two channels per negotiated GIN connection,
-rounded up to a power of two. By default NCCL discovers the available GIN
-connections and creates one context per connection. Network channel limits are
+rounded up to a power of two. Awex detects the active RDMA devices and requests
+one GIN context per connection. Network channel limits are
 then computed from the negotiated connection count and each active peer's byte
 share. Each peer first receives enough power-of-two channels to keep one FIFO
 window in flight, capped at two channels per connection. Remaining channels
@@ -51,12 +51,10 @@ is derived from half the FIFO depth and capped at four; every work tail returns
 its remainder. Multiple network peers return each credit immediately so their
 shared contexts do not phase-block one another. This reduces reverse-path WQEs
 for a single heavy stream without weakening FIFO reuse or completion guarantees.
-Both paths remain capped by the configured channel ceiling and the
-device's SM capacity. The raw, requested, effective, and network-specific
-values are exposed in launch metrics.
-`AWEX_NCCL_DEVICE_V2_NET_CHANNELS_PER_PEER` can override the automatic channel
-choice; `NCCL_NCHANNELS_PER_NET_PEER` is used as a fallback so the regular and
-device paths can share an explicit channel setting.
+Both paths remain capped by the configured channel ceiling and the device's SM
+capacity. Effective values are exposed in launch metrics. Per-peer channel
+counts are always derived from the negotiated connection count, FIFO window,
+and actual payload bytes; there is no separate manual channel override.
 `AWEX_NCCL_DEVICE_V2_GIN_CONNECTIONS` controls the requested connection count
 and falls back to `NCCL_GIN_NCONNECTIONS` when set. If both are absent, Awex
 counts active RDMA devices with visible netdevs in sysfs and caps the result at
@@ -75,14 +73,13 @@ Within a rank, the device scheduler measures the actual bytes for every peer
 and weights channel promotion against that byte share. `NCCL_IB_HCA` remains
 the highest-priority explicit selection. Set `AWEX_NCCL_DEVICE_V2_HCA_POLICY`
 to `topology` to retain NCCL's native per-GPU selection.
-`AWEX_NCCL_DEVICE_V2_GIN_CONTEXTS` controls the requested context count. If it
-is absent, Awex requests one context per detected connection. This explicit
-mapping is required for NCCL 2.30.4, which does not round a one-context request
-up to the connection count.
+Awex always requests one context per detected connection. This explicit mapping
+is required for NCCL 2.30.4, which does not round a one-context request up to
+the connection count.
 `AWEX_NCCL_DEVICE_V2_FIFO_DEPTH` controls the number of reusable payload slots
 per peer and channel, from 1 through 64; the default is 16.
-`AWEX_NCCL_DEVICE_V2_GIN_DOORBELL_BATCH` can aggregate up to eight consecutive
-puts before ringing the GDAKI doorbell; its conservative default is one.
+Every GIN put uses the regular doorbell path. Doorbell aggregation was removed
+after the two-node sweep showed that batching reduced throughput.
 `AWEX_NCCL_DEVICE_V2_GIN_RELIABLE_DB` controls NCCL's GDAKI reliable doorbell
 mode and falls back to `NCCL_GIN_GDAKI_USE_RELIABLE_DB`. Its default is mode
 two: try the no-DBR hardware path, then software emulation, and finally the
@@ -109,15 +106,16 @@ path requires Linux, CUDA 12.2 or newer, NCCL 2.30.4 or newer with aggregate
 `nccl_device.h` headers, a GIN-capable communicator, and a fully connected
 supported RDMA fabric. The launch metrics expose `lsa_peer_count`,
 `gin_peer_count`, `gin_type`, `gin_connection_count`, `gin_context_count`,
-`requested_gin_context_count`,
-`requested_network_channels_per_peer`, `network_channels_per_peer`, and the
+`network_channels_per_peer`, and the
 effective work step sizes so a deployment can confirm which path and
 parallelism were selected. GIN contexts are distinct from physical GIN
 connections. Indexed GIN signals are reset behind a world barrier before each
 cached-plan launch.
 
-The Python transport entry point lives next to this directory in
-`awex/transfer/nccl_device_v2.py`. It has its own task binding and extension
-loader; the existing v1 transport is not used as a compatibility layer. The
-top-level writer/reader route to this backend only when
+The Python transport and batch binding live in `awex/transfer/nccl_device_v2.py`.
+RDMA discovery and HCA placement live in `awex/transfer/nccl_device_v2_gin.py`.
+On the C++ side, `device_v2_gin_config.h` owns GIN capability checks, device
+communicator lifetime, and channel planning; `device_v2_gin.cuh` contains only
+the device protocol. The existing v1 transport is not used as a compatibility
+layer. The top-level writer/reader route to this backend only when
 `comm_backend=nccl_device_v2`.

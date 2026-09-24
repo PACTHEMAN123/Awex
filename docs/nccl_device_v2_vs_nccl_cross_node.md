@@ -15,7 +15,7 @@
 | 对比项 | Awex `nccl_device_v2` | 标准 NCCL | 主要影响 |
 | --- | --- | --- | --- |
 | 2. 跨机 channel 分片公式 | GIN 已改为多节点公式：`step / 2` 到 `step` | 多节点使用 `step / 2` 到 `step` | 已对齐 |
-| 3. 默认流水线粒度 | LSA 512 KiB；GIN 128 KiB；8 层 FIFO；4 MiB work chunk | 跨机 P2P 默认 128 KiB，并按消息大小和协议调节 | GIN step 和 SIMPLE 小消息调节已对齐；work chunk 仍是 Awex lowering 层概念 |
+| 3. 默认流水线粒度 | LSA 512 KiB；GIN 128 KiB；16 层 FIFO；4 MiB work chunk | 跨机 P2P 默认 128 KiB，并按消息大小和协议调节 | GIN step 和 SIMPLE 小消息调节已对齐；work chunk 仍是 Awex lowering 层概念 |
 | 5. 网络执行上下文 | active RDMA HCA 按 PCI 顺序在 local rank 间均衡；context 和 channel 根据实际 connection 数、peer 数及负荷自动确定 | 常规 NET 按 NIC、带宽、channel 和 flow 调度 | 默认路径无需手工指定并行度 |
 
 ## 2. 跨机使用多节点 SIMPLE 分片公式
@@ -79,10 +79,8 @@ GIN 与标准 NCCL 现在使用相同的默认 `minPartSize=64 KiB`、`maxPartSi
 预算。只有 payload 占比足以覆盖下一档 2 次幂且共享预算仍有余量的 peer 才会升级；单 peer
 可以独占向上取整后的预算。这样小控制流不会和 GB 级权重流占用相同资源，多 peer 也不会因
 各自向上取整而超出总预算。由于公开 Device API 没有直接暴露标准 NCCL 内部的 NIC 总带宽，
-`ceil(netBw / 14 GB/s)` 这一项仍无法直接复刻。
-如需使用标准 NCCL 计算出的更大值，可以设置 `NCCL_NCHANNELS_PER_NET_PEER`；v2 会继承它，
-`AWEX_NCCL_DEVICE_V2_NET_CHANNELS_PER_PEER` 则提供优先级更高的单后端覆盖。显式值同样会向上取
-2 次幂并受总 channel 上限约束。
+`ceil(netBw / 14 GB/s)` 这一项仍无法直接复刻。v2 不再提供手工 per-peer channel
+覆盖；运行时始终使用同一套按 connection、FIFO window 和实际 payload 计算的规则。
 
 ## 3. 默认 step、FIFO 与 work chunk 不同
 
@@ -92,7 +90,7 @@ GIN 与标准 NCCL 现在使用相同的默认 `minPartSize=64 KiB`、`maxPartSi
 
 ```text
 max_channels = 64
-fifo_depth   = 8
+fifo_depth   = 16
 local_step_bytes   = 512 KiB
 network_step_bytes = 128 KiB
 chunk_bytes  = 4 MiB
@@ -103,14 +101,14 @@ chunk_bytes  = 4 MiB
 - `max_channels` 是总 channel 上限，不代表跨机 peer 实际会得到 64 个 channel；
 - `local_step_bytes` 是 LSA/NVLink 的传输 step；
 - `network_step_bytes` 是 GIN 的规划 step，也是大消息单次 GIN put 的最大 slice；
-- `fifo_depth` 表示每个 `(peer, channel)` 有 8 个循环使用的 slot；
+- `fifo_depth` 表示每个 `(peer, channel)` 有 16 个循环使用的 slot；
 - `chunk_bytes` 是 lowering 生成一个 `V2Work` 的默认上限。一个 4 MiB work 在 LSA 路径包含
   8 个 512 KiB step，在 GIN 大消息路径包含 32 个 128 KiB step。
 
 window 的 slot 按两种 step 的较大值分配，因此默认每个 `(peer, channel)` 的 payload window 仍为：
 
 ```text
-8 * 512 KiB = 4 MiB
+16 * 512 KiB = 8 MiB
 ```
 
 源码：
@@ -171,13 +169,14 @@ context = channel % ginContextCount
 默认结果是每个 connection 一个 context。这里由 Awex 显式传入数量，因为 NCCL 2.30.4 不会把单个
 context 请求向上取整到 connection 数；新版 NCCL 即使支持 round-up，也得到相同结果。
 connection 数由 Awex 在 communicator 创建前统计 sysfs 中 active 且带 netdev 的 RDMA 设备，最多使用
-4 个 GIN connection slot；sysfs 不可见时回退到 4。显式设置为 0 才使用 NCCL 的原生 local-device
-discovery。kernel 始终使用返回的 `dev_comm.ginContextCount` 做 channel 取模。两个请求值都可由环境变量覆盖。
+4 个 GIN connection slot；sysfs 不可见时回退到 4。显式设置 connection 为 0 才使用 NCCL 的原生
+local-device discovery。context 数始终自动跟随 connection 数，kernel 使用返回的
+`dev_comm.ginContextCount` 做 channel 取模。
 
 源码：
 
-- [`nccl_device_v2_ext.cu`](../awex/transfer/nccl_device_v2/nccl_device_v2_ext.cu)：
-  `ncclDevCommRequirements.ginContextCount`；
+- [`device_v2_gin_config.h`](../awex/transfer/nccl_device_v2/device_v2_gin_config.h)：
+  GIN capability、device communicator 生命周期和 channel 规划；
 - [`device_v2_gin.cuh`](../awex/transfer/nccl_device_v2/device_v2_gin.cuh)：send/recv channel 到
   GIN context 的取模映射。
 
@@ -205,17 +204,14 @@ topology、per-peer flow、net device 和 plugin/proxy 共同决定，仍比 v2 
 
 需要注意，GIN context、NCCL channel、network flow 和 RDMA QP 不是一一等价的对象。v2 默认从 active
 RDMA netdev 推导 connection 数，并让 NCCL 为每个 connection 创建一个 context；NCCL 返回的实际数量仍可能因
-connection 数向上取整。可通过 `AWEX_NCCL_DEVICE_V2_GIN_CONNECTIONS` 和
-`AWEX_NCCL_DEVICE_V2_GIN_CONTEXTS` 分别覆盖这两个请求值，并结合以下指标做 sweep：
+connection 数向上取整。只保留 `AWEX_NCCL_DEVICE_V2_GIN_CONNECTIONS` 作为硬件发现异常时的诊断覆盖，
+日常路径无需手工调节 context、channel 或 doorbell batch。关键指标为：
 
 ```text
 channel_count
 network_channels_per_peer
-requested_network_channels_per_peer
 gin_connection_count
 gin_context_count
-requested_gin_context_count
-gin_doorbell_batch
 gin_reliable_doorbell_mode
 gin_type
 network_step_bytes
@@ -231,8 +227,8 @@ backend_execute_time_ms
 
 本轮已经对齐跨机分片公式、128 KiB 网络 step、SIMPLE 小消息调节，并把默认 GIN 并行度改为
 运行时自动规划：active RDMA netdev 决定 connection，每个 connection 一个 context，channel 按 connection 与 peer
-payload 负荷分配。GDAKI reliable doorbell 默认使用带普通 DBR 回退的 mode 2。connection、context、
-channel、doorbell batch 以及 reliable doorbell mode 都保留独立覆盖项用于诊断。
+payload 负荷分配。GDAKI reliable doorbell 默认使用带普通 DBR 回退的 mode 2。已删除实测无收益的
+doorbell batching、手工 context 和手工 per-peer channel 覆盖，避免配置分叉。
 
 仍未完全对齐的部分是标准 NCCL 内部基于 NIC 总带宽的 channel 增量、LL protocol 选择，以及
 NET plugin/proxy 的动态 flow 调度。因此这次修改需要通过真实双机吞吐测试确认收益，不能仅根据

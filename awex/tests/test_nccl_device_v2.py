@@ -22,17 +22,16 @@ import pytest
 from awex.transfer.nccl_device_v2 import (
     NCCLDeviceV2Transport,
     NCCLDeviceV2UnavailableError,
+    _resolve_fifo_depth,
+    _resolve_network_step_bytes,
+)
+from awex.transfer.nccl_device_v2_gin import (
     _active_rdma_endpoints,
     _configure_gin_hca_policy,
     _parse_nvidia_topology,
     _RdmaEndpoint,
-    _resolve_fifo_depth,
     _resolve_gin_connections,
-    _resolve_gin_context_count,
-    _resolve_gin_doorbell_batch,
     _resolve_gin_reliable_doorbell,
-    _resolve_network_channels_per_peer,
-    _resolve_network_step_bytes,
     _weighted_hca_assignments,
 )
 
@@ -58,7 +57,7 @@ def test_balanced_hca_policy_groups_ranks_across_devices(monkeypatch):
     monkeypatch.setenv("LOCAL_WORLD_SIZE", "8")
     monkeypatch.delenv("NCCL_IB_HCA", raising=False)
     monkeypatch.setattr(
-        "awex.transfer.nccl_device_v2._active_rdma_endpoints",
+        "awex.transfer.nccl_device_v2_gin._active_rdma_endpoints",
         lambda: [
             _RdmaEndpoint(name, 1, 200.0, f"/pci/{index}")
             for index, name in enumerate(["mlx5_3", "mlx5_8", "mlx5_19", "mlx5_30"])
@@ -78,7 +77,7 @@ def test_balanced_hca_policy_applies_node_rank_offset(monkeypatch):
     monkeypatch.setenv("AWEX_NODE_LOCAL_WORLD_SIZE", "8")
     monkeypatch.delenv("NCCL_IB_HCA", raising=False)
     monkeypatch.setattr(
-        "awex.transfer.nccl_device_v2._active_rdma_endpoints",
+        "awex.transfer.nccl_device_v2_gin._active_rdma_endpoints",
         lambda: [
             _RdmaEndpoint(name, 1, 200.0, f"/pci/{index}")
             for index, name in enumerate(["mlx5_3", "mlx5_8", "mlx5_19", "mlx5_30"])
@@ -213,31 +212,12 @@ def test_network_step_must_be_vector_aligned():
         _resolve_network_step_bytes(127)
 
 
-def test_network_channels_default_to_auto(monkeypatch):
-    monkeypatch.delenv("AWEX_NCCL_DEVICE_V2_NET_CHANNELS_PER_PEER", raising=False)
-    monkeypatch.delenv("NCCL_NCHANNELS_PER_NET_PEER", raising=False)
-
-    assert _resolve_network_channels_per_peer(None) == 0
-
-
-def test_network_channels_honor_nccl_configuration(monkeypatch):
-    monkeypatch.delenv("AWEX_NCCL_DEVICE_V2_NET_CHANNELS_PER_PEER", raising=False)
-    monkeypatch.setenv("NCCL_NCHANNELS_PER_NET_PEER", "8")
-
-    assert _resolve_network_channels_per_peer(None) == 8
-
-
-@pytest.mark.parametrize("value", [-1, 65])
-def test_network_channels_reject_out_of_range_values(value):
-    with pytest.raises(NCCLDeviceV2UnavailableError, match=r"must be in \[0, 64\]"):
-        _resolve_network_channels_per_peer(value)
-
-
 def test_gin_connections_default_to_active_rdma_devices(monkeypatch):
     monkeypatch.delenv("AWEX_NCCL_DEVICE_V2_GIN_CONNECTIONS", raising=False)
     monkeypatch.delenv("NCCL_GIN_NCONNECTIONS", raising=False)
     monkeypatch.setattr(
-        "awex.transfer.nccl_device_v2._detect_active_rdma_device_count", lambda: 3
+        "awex.transfer.nccl_device_v2_gin._detect_active_rdma_device_count",
+        lambda: 3,
     )
 
     assert _resolve_gin_connections(None) == 3
@@ -247,7 +227,8 @@ def test_gin_connections_fall_back_to_available_slots(monkeypatch):
     monkeypatch.delenv("AWEX_NCCL_DEVICE_V2_GIN_CONNECTIONS", raising=False)
     monkeypatch.delenv("NCCL_GIN_NCONNECTIONS", raising=False)
     monkeypatch.setattr(
-        "awex.transfer.nccl_device_v2._detect_active_rdma_device_count", lambda: 0
+        "awex.transfer.nccl_device_v2_gin._detect_active_rdma_device_count",
+        lambda: 0,
     )
 
     assert _resolve_gin_connections(None) == 4
@@ -273,44 +254,13 @@ def test_gin_connections_reject_out_of_range_values(value):
         _resolve_gin_connections(value)
 
 
-def test_gin_contexts_default_to_one_per_connection(monkeypatch):
-    monkeypatch.delenv("AWEX_NCCL_DEVICE_V2_GIN_CONTEXTS", raising=False)
-
-    assert _resolve_gin_context_count(None) == 0
-
-
 def test_transport_maps_auto_contexts_to_detected_connections(monkeypatch):
-    monkeypatch.delenv("AWEX_NCCL_DEVICE_V2_GIN_CONTEXTS", raising=False)
     monkeypatch.setenv("NCCL_GIN_NCONNECTIONS", "3")
     monkeypatch.setenv("NCCL_GIN_GDAKI_USE_RELIABLE_DB", "2")
 
     transport = NCCLDeviceV2Transport(None, 0, 2, gin_connections=3)
 
     assert transport.gin_context_count == 3
-
-
-@pytest.mark.parametrize("value", [-1, 65])
-def test_gin_contexts_reject_out_of_range_values(value):
-    with pytest.raises(NCCLDeviceV2UnavailableError, match=r"must be in \[0, 64\]"):
-        _resolve_gin_context_count(value)
-
-
-def test_gin_doorbell_batch_defaults_to_disabled(monkeypatch):
-    monkeypatch.delenv("AWEX_NCCL_DEVICE_V2_GIN_DOORBELL_BATCH", raising=False)
-
-    assert _resolve_gin_doorbell_batch(None) == 1
-
-
-def test_gin_doorbell_batch_honors_environment(monkeypatch):
-    monkeypatch.setenv("AWEX_NCCL_DEVICE_V2_GIN_DOORBELL_BATCH", "8")
-
-    assert _resolve_gin_doorbell_batch(None) == 8
-
-
-@pytest.mark.parametrize("value", [0, 9])
-def test_gin_doorbell_batch_rejects_values_beyond_fifo(value):
-    with pytest.raises(NCCLDeviceV2UnavailableError, match=r"must be in \[1, 8\]"):
-        _resolve_gin_doorbell_batch(value)
 
 
 def test_gin_reliable_doorbell_defaults_to_fallback_mode(monkeypatch):

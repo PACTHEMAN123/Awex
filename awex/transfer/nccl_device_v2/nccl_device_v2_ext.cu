@@ -17,11 +17,6 @@
 
 #include <cuda_runtime.h>
 #include <nccl.h>
-#if __has_include(<nccl_device.h>)
-#include <nccl_device.h>
-#else
-#include <nccl_device/core.h>
-#endif
 
 #include <ATen/cuda/CUDAContext.h>
 #include <pybind11/pybind11.h>
@@ -29,6 +24,7 @@
 #include <torch/extension.h>
 
 #include "device_v2_launch.cuh"
+#include "device_v2_gin_config.h"
 #include "device_v2_lowering.h"
 #include "device_v2_topology.h"
 
@@ -62,10 +58,7 @@ struct LaunchBuffers {
 struct DeviceState {
   ncclComm_t comm = nullptr;
   ncclWindow_t window = nullptr;
-#if AWEX_NCCL_DEVICE_V2_HAS_GIN
-  ncclDevComm dev_comm{};
-  ncclGinType_t gin_type = NCCL_GIN_TYPE_NONE;
-#endif
+  v2::V2GinState gin;
   void* local_base = nullptr;
   std::vector<void*> remote_bases;
   uintptr_t* device_peer_windows = nullptr;
@@ -83,13 +76,6 @@ struct DeviceState {
   std::size_t chunk_bytes = v2::kDefaultChunkBytes;
   std::size_t step_bytes = v2::kDefaultStepBytes;
   std::size_t network_step_bytes = v2::kDefaultNetworkStepBytes;
-  std::uint32_t requested_network_channels_per_peer = 0;
-  std::uint32_t network_channels_per_peer = 1;
-  std::uint32_t network_channel_budget = 0;
-  std::uint32_t requested_gin_context_count = 0;
-  std::uint32_t gin_doorbell_batch = 1;
-  std::uint32_t gin_connection_count = 0;
-  std::vector<std::uint64_t> peer_payload_bytes;
   bool plan_initialized = false;
   bool window_initialized = false;
   v2::V2Direction direction = v2::V2Direction::kSend;
@@ -101,13 +87,10 @@ struct DeviceState {
   LaunchBuffers buffers;
   ncclTeam_t world_team{};
   ncclTeam_t lsa_team{};
-  std::uint32_t gin_signal_count = 0;
   int nccl_version = 0;
   int rank = 0;
   int world_size = 0;
   int device = 0;
-  bool gin_enabled = false;
-  bool dev_comm_created = false;
 };
 
 void release_buffers(LaunchBuffers* buffers);
@@ -144,17 +127,10 @@ std::uint32_t power_of_two_down(std::uint32_t value) {
   return result;
 }
 
-std::uint32_t power_of_two_up(std::uint32_t value) {
-  std::uint32_t result = 1;
-  while (result < value && result < v2::kMaxChannels) result *= 2;
-  return result;
-}
-
 std::unique_ptr<DeviceState> make_state(const std::string& unique_id_bytes, int world_size, int rank, int device,
                                         int timeout_ms, std::uint32_t max_channels, std::uint32_t fifo_depth,
                                         std::size_t step_bytes, std::size_t network_step_bytes,
-                                        std::size_t chunk_bytes, std::uint32_t network_channels_per_peer,
-                                        std::uint32_t gin_context_count, std::uint32_t gin_doorbell_batch) {
+                                        std::size_t chunk_bytes, std::uint32_t gin_context_count) {
   if (world_size < 2 || world_size > kMaxRanks) {
     throw std::runtime_error("nccl_device_v2 world_size must be in [2, 256]");
   }
@@ -167,14 +143,8 @@ std::unique_ptr<DeviceState> make_state(const std::string& unique_id_bytes, int 
   if (max_channels == 0 || max_channels > v2::kMaxChannels) {
     throw std::runtime_error("invalid nccl_device_v2 max_channels");
   }
-  if (network_channels_per_peer > v2::kMaxChannels) {
-    throw std::runtime_error("invalid nccl_device_v2 network_channels_per_peer");
-  }
-  if (gin_context_count > v2::kMaxChannels) {
+  if (gin_context_count == 0 || gin_context_count > v2::kMaxChannels) {
     throw std::runtime_error("invalid nccl_device_v2 GIN context count");
-  }
-  if (gin_doorbell_batch == 0 || gin_doorbell_batch > fifo_depth) {
-    throw std::runtime_error("invalid nccl_device_v2 GIN doorbell batch");
   }
   if (fifo_depth == 0 || step_bytes == 0 || network_step_bytes == 0 ||
       step_bytes > std::numeric_limits<std::uint32_t>::max() ||
@@ -191,9 +161,7 @@ std::unique_ptr<DeviceState> make_state(const std::string& unique_id_bytes, int 
   state->fifo_depth = fifo_depth;
   state->step_bytes = step_bytes;
   state->network_step_bytes = network_step_bytes;
-  state->requested_network_channels_per_peer = network_channels_per_peer;
-  state->requested_gin_context_count = gin_context_count;
-  state->gin_doorbell_batch = gin_doorbell_batch;
+  state->gin.context_count = gin_context_count;
   state->chunk_bytes = chunk_bytes;
   AWEX_CUDA_V2_CHECK(cudaSetDevice(device));
   int multiprocessor_count = 0;
@@ -224,9 +192,7 @@ std::unique_ptr<DeviceState> make_state(const std::string& unique_id_bytes, int 
         state->peer_transports[peer] = static_cast<std::uint8_t>(v2::V2Transport::kLsa);
       }
     }
-#if AWEX_NCCL_DEVICE_V2_HAS_GIN
-    state->gin_type = properties.ginType;
-#endif
+    v2::v2SetGinType(&state->gin, properties);
 
     state->topology = v2::discoverV2Topology(state->comm, world_size, rank, device, channel_limit);
     state->total_channels = state->topology.total_channels;
@@ -258,12 +224,7 @@ void destroy_state(DeviceState* state) {
     AWEX_CUDA_V2_CHECK(cudaFree(state->device_peer_windows));
     state->device_peer_windows = nullptr;
   }
-#if AWEX_NCCL_DEVICE_V2_HAS_GIN
-  if (state->dev_comm_created) {
-    AWEX_NCCL_V2_CHECK(ncclDevCommDestroy(state->comm, &state->dev_comm));
-    state->dev_comm_created = false;
-  }
-#endif
+  AWEX_NCCL_V2_CHECK(v2::v2DestroyGin(&state->gin, state->comm));
   if (state->window != nullptr) {
     AWEX_NCCL_V2_CHECK(ncclCommWindowDeregister(state->comm, state->window));
     state->window = nullptr;
@@ -414,26 +375,13 @@ void initialize_sparse_window(DeviceState* state, const std::vector<std::uint32_
     payload_peer_count = std::max(payload_peer_count, source_peer_count);
   }
 
-  const bool local_gin = std::any_of(active_peers.begin(), active_peers.end(), [&](std::uint32_t peer) {
-    return state->peer_transports[peer] == static_cast<std::uint8_t>(v2::V2Transport::kGin);
-  });
+  const bool local_gin = v2::v2HasGinPeer(active_peers, state->peer_transports);
   const std::uint32_t local_gin_flag = local_gin ? 1U : 0U;
   const auto gin_flags =
     v2::topology_detail::allGather(state->comm, &local_gin_flag, 1, state->world_size, stream);
-  state->gin_enabled = std::any_of(gin_flags.begin(), gin_flags.end(), [](std::uint32_t value) { return value != 0; });
-  if (state->gin_enabled) {
-#if AWEX_NCCL_DEVICE_V2_HAS_GIN
-    if (state->nccl_version < NCCL_VERSION(2, 30, 4)) {
-      throw std::runtime_error("nccl_device_v2 GIN transport requires NCCL 2.30.4 or newer at runtime");
-    }
-    if (state->gin_type == NCCL_GIN_TYPE_NONE) {
-      throw std::runtime_error("nccl_device_v2 found non-LSA peers, but the NCCL communicator has no GIN support");
-    }
-#else
-    throw std::runtime_error(
-      "nccl_device_v2 found non-LSA peers, but this extension was not built with NCCL 2.30.4+ GIN headers");
-#endif
-  }
+  state->gin.enabled =
+    std::any_of(gin_flags.begin(), gin_flags.end(), [](std::uint32_t value) { return value != 0; });
+  v2::v2ValidateGinSupport(state->gin, state->nccl_version);
 
   const std::size_t slot_bytes = std::max(state->step_bytes, state->network_step_bytes);
   state->layout = v2::makeV2WindowLayout(state->world_size, state->total_channels, state->fifo_depth, slot_bytes,
@@ -482,116 +430,24 @@ void initialize_sparse_window(DeviceState* state, const std::vector<std::uint32_
                                        state->peer_transports.size() * sizeof(std::uint8_t), cudaMemcpyHostToDevice,
                                        stream));
 
-#if AWEX_NCCL_DEVICE_V2_HAS_GIN
-    if (state->gin_enabled) {
-      state->peer_payload_bytes.assign(state->world_size, 0);
+    if (state->gin.enabled) {
+      std::vector<std::uint64_t> peer_payload_bytes(state->world_size, 0);
       for (const auto& task : tasks) {
-        auto& peer_bytes = state->peer_payload_bytes[task.peer];
+        auto& peer_bytes = peer_payload_bytes[task.peer];
         if (task.nbytes > std::numeric_limits<std::uint64_t>::max() - peer_bytes) {
           throw std::runtime_error("nccl_device_v2 peer payload size overflows");
         }
         peer_bytes += task.nbytes;
       }
-      state->gin_signal_count = 2U * static_cast<std::uint32_t>(state->world_size) * state->total_channels;
-      ncclDevCommRequirements requirements = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
-      // A request of one is rounded up by NCCL to one context per negotiated
-      // connection. Explicit values remain available for diagnostics.
-      requirements.ginContextCount = static_cast<int>(state->requested_gin_context_count == 0
-          ? 1
-          : std::min(state->requested_gin_context_count, state->total_channels));
-      requirements.ginSignalCount = static_cast<int>(state->gin_signal_count);
-      requirements.ginConnectionType = NCCL_GIN_CONNECTION_FULL;
-      requirements.worldGinBarrierCount = 1;
-#if AWEX_NCCL_DEVICE_V2_HAS_EXPLICIT_SIGNAL_STRENGTH
-      requirements.ginStrongSignalsRequired = true;
-      requirements.ginVaSignalsRequired = false;
-#endif
-      AWEX_NCCL_V2_CHECK(ncclDevCommCreate(state->comm, &requirements, &state->dev_comm));
-      state->dev_comm_created = true;
-      if (state->dev_comm.ginContextCount == 0) {
-        throw std::runtime_error("nccl_device_v2 GIN initialization returned no device contexts");
-      }
-      state->gin_connection_count = static_cast<std::uint32_t>(state->dev_comm.ginConnectionCount);
-      if (state->gin_connection_count == 0) {
-        throw std::runtime_error("nccl_device_v2 GIN initialization returned no network connections");
-      }
-      const std::uint32_t base_channels =
-        std::min(state->total_channels, power_of_two_up(2 * state->gin_connection_count));
-      state->network_channel_budget =
-        std::min(state->total_channels, 6 * state->gin_connection_count);
-      std::uint64_t total_gin_bytes = 0;
-      std::vector<std::uint32_t> gin_peers;
-      for (const std::uint32_t peer : active_peers) {
-        if (state->peer_transports[peer] == static_cast<std::uint8_t>(v2::V2Transport::kGin)) {
-          total_gin_bytes += state->peer_payload_bytes[peer];
-          gin_peers.push_back(peer);
-        }
-      }
-      state->network_channels_per_peer = 1;
-      if (state->requested_network_channels_per_peer != 0) {
-        const std::uint32_t channels = std::min(
-          state->total_channels, power_of_two_up(state->requested_network_channels_per_peer));
-        for (const std::uint32_t peer : gin_peers) state->peer_channels[peer] = channels;
-      } else if (gin_peers.size() == 1) {
-        // A single stream can use the whole issue budget without contending
-        // with another peer. Round up so all negotiated connections remain
-        // evenly striped.
-        state->peer_channels[gin_peers.front()] =
-          std::min(state->total_channels, power_of_two_up(state->network_channel_budget));
-      } else {
-        // First reserve only enough channels to keep one FIFO window in flight
-        // for each peer. Small control peers should not consume the same eight
-        // channels as multi-gigabyte weight streams.
-        const std::uint64_t fifo_window_bytes =
-          static_cast<std::uint64_t>(state->network_step_bytes) * state->fifo_depth;
-        std::uint32_t assigned_channels = 0;
-        for (const std::uint32_t peer : gin_peers) {
-          const std::uint64_t window_demand =
-            std::max<std::uint64_t>(1, v2::v2DivUp(state->peer_payload_bytes[peer], fifo_window_bytes));
-          const std::uint32_t capped_demand =
-            static_cast<std::uint32_t>(std::min<std::uint64_t>(base_channels, window_demand));
-          const std::uint32_t channels = power_of_two_up(capped_demand);
-          state->peer_channels[peer] = channels;
-          assigned_channels += channels;
-        }
-
-        // Promote only peers whose byte share justifies the next power of two,
-        // and charge every promotion against the shared per-rank budget.
-        std::sort(gin_peers.begin(), gin_peers.end(), [&](std::uint32_t left, std::uint32_t right) {
-          return state->peer_payload_bytes[left] > state->peer_payload_bytes[right];
-        });
-        std::uint32_t remaining_channels = assigned_channels < state->network_channel_budget
-          ? state->network_channel_budget - assigned_channels
-          : 0;
-        for (const std::uint32_t peer : gin_peers) {
-          const std::uint64_t weighted_demand = total_gin_bytes == 0
-            ? 1
-            : v2::v2DivUp(static_cast<std::uint64_t>(state->network_channel_budget) *
-                            state->peer_payload_bytes[peer],
-                          total_gin_bytes);
-          while (state->peer_channels[peer] <= remaining_channels &&
-                 2 * state->peer_channels[peer] <= weighted_demand &&
-                 state->peer_channels[peer] <= state->total_channels / 2) {
-            remaining_channels -= state->peer_channels[peer];
-            state->peer_channels[peer] *= 2;
-          }
-        }
-      }
-      for (const std::uint32_t peer : gin_peers) {
-        state->network_channels_per_peer =
-          std::max(state->network_channels_per_peer, state->peer_channels[peer]);
-      }
+      v2::v2InitializeGin(&state->gin, state->comm, state->world_size, state->total_channels,
+                          state->fifo_depth, state->network_step_bytes, state->gin.context_count,
+                          active_peers, state->peer_transports, std::move(peer_payload_bytes),
+                          &state->peer_channels);
     }
-#endif
     state->window_active_peers = active_peers;
     state->window_initialized = true;
   } catch (...) {
-#if AWEX_NCCL_DEVICE_V2_HAS_GIN
-    if (state->dev_comm_created) {
-      ncclDevCommDestroy(state->comm, &state->dev_comm);
-      state->dev_comm_created = false;
-    }
-#endif
+    (void)v2::v2DestroyGin(&state->gin, state->comm);
     if (state->device_peer_transports != nullptr) {
       cudaFree(state->device_peer_transports);
       state->device_peer_transports = nullptr;
@@ -612,8 +468,6 @@ void initialize_sparse_window(DeviceState* state, const std::vector<std::uint32_
       ncclMemFree(state->local_base);
       state->local_base = nullptr;
     }
-    state->gin_connection_count = 0;
-    state->network_channels_per_peer = 1;
     state->window_active_peers.clear();
     state->window_initialized = false;
     throw;
@@ -798,34 +652,24 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
   metrics["topology_path_bandwidth_gbps"] = py::float_(active_path_bandwidth_gbps);
   metrics["lsa_peer_count"] = py::int_(active_lsa_peers);
   metrics["gin_peer_count"] = py::int_(active_gin_peers);
-  metrics["gin_enabled"] = py::bool_(state->gin_enabled);
-  metrics["gin_signal_count"] = py::int_(state->gin_signal_count);
-  metrics["gin_connection_count"] = py::int_(state->gin_connection_count);
-  metrics["requested_gin_context_count"] = py::int_(state->requested_gin_context_count);
-  metrics["gin_doorbell_batch"] = py::int_(state->gin_doorbell_batch);
-  const std::uint32_t gin_credit_batch = active_gin_peers > 1
-    ? 1
-    : std::min<std::uint32_t>(4, std::max<std::uint32_t>(1, state->fifo_depth / 2));
+  metrics["gin_enabled"] = py::bool_(state->gin.enabled);
+  metrics["gin_signal_count"] = py::int_(state->gin.signal_count);
+  metrics["gin_connection_count"] = py::int_(state->gin.connection_count);
+  const std::uint32_t gin_credit_batch = v2::v2GinCreditBatch(active_gin_peers, state->fifo_depth);
   metrics["gin_credit_batch"] = py::int_(gin_credit_batch);
-  metrics["requested_network_channels_per_peer"] = py::int_(state->requested_network_channels_per_peer);
-  metrics["network_channels_per_peer"] = py::int_(state->network_channels_per_peer);
-  metrics["network_channel_budget"] = py::int_(state->network_channel_budget);
+  metrics["network_channels_per_peer"] = py::int_(state->gin.channels_per_peer);
+  metrics["network_channel_budget"] = py::int_(state->gin.channel_budget);
   py::list peer_channel_counts;
   py::list peer_payload_bytes;
   for (const std::uint32_t peer : cached_peers) {
     peer_channel_counts.append(py::int_(state->peer_channels[peer]));
-    peer_payload_bytes.append(py::int_(state->peer_payload_bytes.empty() ? 0 : state->peer_payload_bytes[peer]));
+    peer_payload_bytes.append(
+      py::int_(state->gin.peer_payload_bytes.empty() ? 0 : state->gin.peer_payload_bytes[peer]));
   }
   metrics["active_peer_channel_limits"] = std::move(peer_channel_counts);
   metrics["active_peer_payload_bytes"] = std::move(peer_payload_bytes);
-#if AWEX_NCCL_DEVICE_V2_HAS_GIN
-  metrics["gin_type"] = py::int_(static_cast<int>(state->gin_type));
-  metrics["gin_context_count"] =
-    py::int_(state->dev_comm_created ? static_cast<int>(state->dev_comm.ginContextCount) : 0);
-#else
-  metrics["gin_type"] = py::int_(0);
-  metrics["gin_context_count"] = py::int_(0);
-#endif
+  metrics["gin_type"] = py::int_(v2::v2GinType(state->gin));
+  metrics["gin_context_count"] = py::int_(v2::v2GinContextCount(state->gin));
   metrics["local_step_bytes"] = py::int_(state->step_bytes);
   metrics["network_step_bytes"] = py::int_(state->network_step_bytes);
   metrics["slot_bytes"] = py::int_(state->layout.slot_bytes);
@@ -860,14 +704,7 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
   args.local_window = reinterpret_cast<std::uint8_t*>(state->local_base);
   args.peer_windows = state->device_peer_windows;
   args.payload_peer_slots = state->device_payload_peer_slots;
-  args.gin_enabled = state->gin_enabled ? 1U : 0U;
-  args.gin_credit_batch = gin_credit_batch;
-  args.gin_signal_count = state->gin_signal_count;
-  args.gin_doorbell_batch = state->gin_doorbell_batch;
-#if AWEX_NCCL_DEVICE_V2_HAS_GIN
-  args.window = state->window;
-  if (state->dev_comm_created) args.dev_comm = state->dev_comm;
-#endif
+  v2::v2SetGinKernelArgs(state->gin, state->window, active_gin_peers, state->fifo_depth, &args);
   args.epoch = static_cast<unsigned long long>(sequence);
   args.timeout_cycles = state->timeout_cycles;
   const auto kernel_start = Clock::now();
@@ -899,20 +736,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   });
   module.def("create", [](const py::bytes& id, int world_size, int rank, int device, int timeout_ms, int max_channels,
                           int fifo_depth, int64_t step_bytes, int64_t network_step_bytes, int64_t chunk_bytes,
-                          int network_channels_per_peer, int gin_context_count, int gin_doorbell_batch) {
+                          int gin_context_count) {
     if (step_bytes <= 0 || network_step_bytes <= 0 || chunk_bytes < 0) {
       throw std::runtime_error("invalid nccl_device_v2 step/chunk bytes");
     }
-    if (network_channels_per_peer < 0 || gin_context_count < 0 || gin_doorbell_batch <= 0) {
+    if (gin_context_count <= 0) {
       throw std::runtime_error("invalid nccl_device_v2 network parallelism");
     }
     const std::string unique_id = id;
     auto state = make_state(unique_id, world_size, rank, device, timeout_ms, static_cast<std::uint32_t>(max_channels),
                             static_cast<std::uint32_t>(fifo_depth), static_cast<std::size_t>(step_bytes),
                             static_cast<std::size_t>(network_step_bytes), static_cast<std::size_t>(chunk_bytes),
-                            static_cast<std::uint32_t>(network_channels_per_peer),
-                            static_cast<std::uint32_t>(gin_context_count),
-                            static_cast<std::uint32_t>(gin_doorbell_batch));
+                            static_cast<std::uint32_t>(gin_context_count));
     return reinterpret_cast<int64_t>(state.release());
   });
   module.def("launch", &launch);
