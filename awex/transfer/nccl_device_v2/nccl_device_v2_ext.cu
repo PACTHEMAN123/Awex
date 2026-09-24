@@ -803,10 +803,8 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
   metrics["gin_connection_count"] = py::int_(state->gin_connection_count);
   metrics["requested_gin_context_count"] = py::int_(state->requested_gin_context_count);
   metrics["gin_doorbell_batch"] = py::int_(state->gin_doorbell_batch);
-  const std::uint32_t gin_credit_batch = active_gin_peers > 1
-    ? 1
-    : std::min<std::uint32_t>(4, std::max<std::uint32_t>(1, state->fifo_depth / 2));
-  metrics["gin_credit_batch"] = py::int_(gin_credit_batch);
+  metrics["gin_credit_batch"] =
+    py::int_(std::min<std::uint32_t>(4, std::max<std::uint32_t>(1, state->fifo_depth / 2)));
   metrics["requested_network_channels_per_peer"] = py::int_(state->requested_network_channels_per_peer);
   metrics["network_channels_per_peer"] = py::int_(state->network_channels_per_peer);
   metrics["network_channel_budget"] = py::int_(state->network_channel_budget);
@@ -861,7 +859,6 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
   args.peer_windows = state->device_peer_windows;
   args.payload_peer_slots = state->device_payload_peer_slots;
   args.gin_enabled = state->gin_enabled ? 1U : 0U;
-  args.gin_peer_count = active_gin_peers;
   args.gin_signal_count = state->gin_signal_count;
   args.gin_doorbell_batch = state->gin_doorbell_batch;
 #if AWEX_NCCL_DEVICE_V2_HAS_GIN
