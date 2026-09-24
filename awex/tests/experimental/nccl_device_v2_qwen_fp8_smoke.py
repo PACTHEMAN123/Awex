@@ -163,11 +163,8 @@ def main() -> None:
             raise AssertionError(f"Unexpected block-wise task count: {metrics}")
         if metrics["blockwise_fp8_matrix_count"] != 0:
             raise AssertionError(f"TMA path unexpectedly used fallback matrices: {metrics}")
-        expected_quant_blocks = (
-            ((source.shape[0] + 127) // 128)
-            * ((source.shape[1] + 127) // 128)
-            if rank == 0
-            else 0
+        expected_quant_blocks = ((source.shape[0] + 127) // 128) * (
+            (source.shape[1] + 127) // 128
         )
         if metrics["blockwise_fp8_block_count"] != 0:
             raise AssertionError(f"TMA path unexpectedly used fallback blocks: {metrics}")
