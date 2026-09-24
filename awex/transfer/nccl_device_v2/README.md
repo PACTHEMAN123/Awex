@@ -62,12 +62,17 @@ and falls back to `NCCL_GIN_NCONNECTIONS` when set. If both are absent, Awex
 counts active RDMA devices with visible netdevs in sysfs and caps the result at
 the four GIN connection slots. It falls back to four when sysfs is unavailable;
 an explicit zero requests NCCL's native local-device discovery.
-Before NCCL initialization, the default `balanced` HCA policy orders active
-RDMA devices by PCI address and assigns contiguous local-rank groups evenly
-across them. This avoids topology-local selection concentrating several busy
-GPU ranks on one NIC while leaving another idle. `NCCL_IB_HCA` remains the
-highest-priority explicit selection. Set `AWEX_NCCL_DEVICE_V2_HCA_POLICY` to
-`topology` to retain NCCL's native per-GPU selection.
+Before NCCL initialization, the default `balanced` HCA policy discovers every
+active RDMA port, reads its link rate from sysfs, and assigns local-rank loads
+with deterministic capacity-weighted scheduling. Uniform rank loads preserve
+contiguous PCI-local groups, while heterogeneous ports receive work in
+proportion to their capacity and skewed rank loads use longest-processing-time
+placement. Multi-engine vLLM launchers provide node-level
+rank offsets so each engine does not restart allocation at the first HCA.
+Within a rank, the device scheduler measures the actual bytes for every peer
+and weights channel promotion against that byte share. `NCCL_IB_HCA` remains
+the highest-priority explicit selection. Set `AWEX_NCCL_DEVICE_V2_HCA_POLICY`
+to `topology` to retain NCCL's native per-GPU selection.
 `AWEX_NCCL_DEVICE_V2_GIN_CONTEXTS` controls the requested context count. If it
 is absent, Awex requests one context per detected connection. This explicit
 mapping is required for NCCL 2.30.4, which does not round a one-context request

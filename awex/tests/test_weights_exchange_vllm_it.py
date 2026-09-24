@@ -328,6 +328,10 @@ def test_inference_only_vllm_children_split_visible_devices(monkeypatch):
     assert launched[1][0][launched[1][0].index("--port") + 1] == "8001"
     assert launched[0][1]["CUDA_VISIBLE_DEVICES"] == "2,3"
     assert launched[1][1]["CUDA_VISIBLE_DEVICES"] == "5,7"
+    assert launched[0][1]["AWEX_NODE_LOCAL_RANK_OFFSET"] == "0"
+    assert launched[1][1]["AWEX_NODE_LOCAL_RANK_OFFSET"] == "2"
+    assert launched[0][1]["AWEX_NODE_LOCAL_WORLD_SIZE"] == "4"
+    assert launched[1][1]["AWEX_NODE_LOCAL_WORLD_SIZE"] == "4"
 
 
 def test_inference_only_vllm_children_require_enough_devices(monkeypatch):

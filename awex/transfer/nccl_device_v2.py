@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -38,16 +39,24 @@ class NCCLDeviceV2UnavailableError(RuntimeError):
     """Raised when the isolated NCCL Device v2 path cannot be initialized."""
 
 
-def _active_rdma_devices(
+@dataclass(frozen=True, slots=True)
+class _RdmaEndpoint:
+    name: str
+    port: int
+    bandwidth_gbps: float
+    pci_path: str
+
+
+def _active_rdma_endpoints(
     sysfs_root: str = "/sys/class/infiniband",
-) -> list[str]:
-    """Return active RDMA devices in stable PCI order."""
+) -> list[_RdmaEndpoint]:
+    """Return active RDMA ports and their link capacities in stable PCI order."""
 
     try:
         devices = list(os.scandir(sysfs_root))
     except OSError:
         return []
-    active_devices: list[tuple[str, str]] = []
+    active_endpoints: list[_RdmaEndpoint] = []
     for device in devices:
         net_path = os.path.join(device.path, "device", "net")
         try:
@@ -66,13 +75,107 @@ def _active_rdma_devices(
                 continue
             if "ACTIVE" in state:
                 pci_path = os.path.realpath(os.path.join(device.path, "device"))
-                active_devices.append((pci_path, device.name))
-                break
-    return [name for _, name in sorted(active_devices)]
+                try:
+                    port_number = int(port.name)
+                except ValueError:
+                    continue
+                try:
+                    with open(
+                        os.path.join(port.path, "rate"), encoding="ascii"
+                    ) as rate_file:
+                        rate_match = re.search(
+                            r"([0-9]+(?:\.[0-9]+)?)\s*Gb/sec", rate_file.read()
+                        )
+                except OSError:
+                    rate_match = None
+                bandwidth_gbps = float(rate_match.group(1)) if rate_match else 1.0
+                active_endpoints.append(
+                    _RdmaEndpoint(
+                        name=device.name,
+                        port=port_number,
+                        bandwidth_gbps=max(1.0, bandwidth_gbps),
+                        pci_path=pci_path,
+                    )
+                )
+    return sorted(
+        active_endpoints,
+        key=lambda endpoint: (endpoint.pci_path, endpoint.port, endpoint.name),
+    )
+
+
+def _active_rdma_devices(
+    sysfs_root: str = "/sys/class/infiniband",
+) -> list[str]:
+    """Return active RDMA device names in stable PCI order."""
+
+    return list(
+        dict.fromkeys(endpoint.name for endpoint in _active_rdma_endpoints(sysfs_root))
+    )
+
+
+def _weighted_hca_assignments(
+    endpoints: list[_RdmaEndpoint], rank_payload_bytes: list[int]
+) -> list[_RdmaEndpoint]:
+    """Assign rank loads to HCA capacity with locality-preserving weighted bins."""
+
+    if not endpoints or not rank_payload_bytes:
+        return []
+    normalized_payloads = [max(1, int(payload)) for payload in rank_payload_bytes]
+    if len(set(normalized_payloads)) == 1:
+        total_capacity = sum(endpoint.bandwidth_gbps for endpoint in endpoints)
+        assignments = []
+        for rank in range(len(normalized_payloads)):
+            target_capacity = (
+                (rank + 0.5) * total_capacity / len(normalized_payloads)
+            )
+            cumulative_capacity = 0.0
+            for endpoint in endpoints:
+                cumulative_capacity += endpoint.bandwidth_gbps
+                if target_capacity <= cumulative_capacity:
+                    assignments.append(endpoint)
+                    break
+        return assignments
+    assigned_bytes = [0] * len(endpoints)
+    assignments: list[_RdmaEndpoint | None] = [None] * len(normalized_payloads)
+    for rank in sorted(
+        range(len(normalized_payloads)),
+        key=lambda candidate: (-normalized_payloads[candidate], candidate),
+    ):
+        payload = normalized_payloads[rank]
+        endpoint_index = min(
+            range(len(endpoints)),
+            key=lambda candidate: (
+                (assigned_bytes[candidate] + payload)
+                / endpoints[candidate].bandwidth_gbps,
+                assigned_bytes[candidate] / endpoints[candidate].bandwidth_gbps,
+                candidate,
+            ),
+        )
+        assignments[rank] = endpoints[endpoint_index]
+        assigned_bytes[endpoint_index] += payload
+    return [assignment for assignment in assignments if assignment is not None]
+
+
+def _rank_payload_bytes_from_environment(local_world_size: int) -> list[int]:
+    configured = os.environ.get("AWEX_NCCL_DEVICE_V2_RANK_PAYLOAD_BYTES", "")
+    if not configured:
+        return [1] * local_world_size
+    try:
+        payloads = [int(value.strip()) for value in configured.split(",")]
+    except ValueError as exc:
+        raise NCCLDeviceV2UnavailableError(
+            "AWEX_NCCL_DEVICE_V2_RANK_PAYLOAD_BYTES must be comma-separated integers"
+        ) from exc
+    if len(payloads) != local_world_size or any(payload < 0 for payload in payloads):
+        raise NCCLDeviceV2UnavailableError(
+            "AWEX_NCCL_DEVICE_V2_RANK_PAYLOAD_BYTES must contain one non-negative "
+            "value per local rank"
+        )
+    return payloads
 
 
 def _configure_gin_hca_policy() -> None:
-    """Optionally spread local ranks evenly across active RDMA devices."""
+    """Spread local rank load across active RDMA capacity before NCCL starts."""
 
     policy = os.environ.get(
         "AWEX_NCCL_DEVICE_V2_HCA_POLICY", "balanced"
@@ -84,17 +187,28 @@ def _configure_gin_hca_policy() -> None:
             "AWEX_NCCL_DEVICE_V2_HCA_POLICY must be topology or balanced"
         )
     try:
-        local_rank = int(os.environ["LOCAL_RANK"])
-        local_world_size = int(os.environ["LOCAL_WORLD_SIZE"])
+        local_rank = int(os.environ["LOCAL_RANK"]) + int(
+            os.environ.get("AWEX_NODE_LOCAL_RANK_OFFSET", "0")
+        )
+        local_world_size = int(
+            os.environ.get(
+                "AWEX_NODE_LOCAL_WORLD_SIZE",
+                os.environ.get("LOCAL_WORLD_SIZE", ""),
+            )
+        )
     except (KeyError, ValueError):
         return
-    devices = _active_rdma_devices()
-    if not devices or local_world_size <= 0 or not 0 <= local_rank < local_world_size:
+    endpoints = _active_rdma_endpoints()
+    if not endpoints or local_world_size <= 0 or not 0 <= local_rank < local_world_size:
         return
-    device_index = min(
-        len(devices) - 1, local_rank * len(devices) // local_world_size
+    assignments = _weighted_hca_assignments(
+        endpoints, _rank_payload_bytes_from_environment(local_world_size)
     )
-    os.environ["NCCL_IB_HCA"] = f"={devices[device_index]}:1"
+    endpoint = assignments[local_rank]
+    os.environ["NCCL_IB_HCA"] = f"={endpoint.name}:{endpoint.port}"
+    os.environ["AWEX_NCCL_DEVICE_V2_SELECTED_HCA_BANDWIDTH_GBPS"] = str(
+        endpoint.bandwidth_gbps
+    )
 
 
 def _preload_configured_nccl() -> None:
@@ -939,6 +1053,13 @@ class NCCLDeviceV2Transport:
         extension_metrics["selected_hca"] = os.environ.get(
             "NCCL_IB_HCA", "topology"
         )
+        selected_hca_bandwidth = os.environ.get(
+            "AWEX_NCCL_DEVICE_V2_SELECTED_HCA_BANDWIDTH_GBPS"
+        )
+        if selected_hca_bandwidth is not None:
+            extension_metrics["selected_hca_bandwidth_gbps"] = float(
+                selected_hca_bandwidth
+            )
         copyback_start = time.perf_counter()
         if batch.copybacks:
             with torch.no_grad():
