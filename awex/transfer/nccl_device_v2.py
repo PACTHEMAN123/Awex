@@ -265,6 +265,25 @@ def _resolve_gin_doorbell_batch(gin_doorbell_batch: int | None) -> int:
     return gin_doorbell_batch
 
 
+def _resolve_gin_reliable_doorbell(gin_reliable_doorbell: int | None) -> int:
+    if gin_reliable_doorbell is None:
+        configured = os.environ.get("AWEX_NCCL_DEVICE_V2_GIN_RELIABLE_DB")
+        if configured is None:
+            configured = os.environ.get("NCCL_GIN_GDAKI_USE_RELIABLE_DB")
+        try:
+            gin_reliable_doorbell = 2 if configured is None else int(configured)
+        except ValueError as exc:
+            raise NCCLDeviceV2UnavailableError(
+                "AWEX_NCCL_DEVICE_V2_GIN_RELIABLE_DB must be an integer"
+            ) from exc
+    gin_reliable_doorbell = int(gin_reliable_doorbell)
+    if gin_reliable_doorbell < 0 or gin_reliable_doorbell > 2:
+        raise NCCLDeviceV2UnavailableError(
+            "nccl_device_v2 GIN reliable doorbell mode must be in [0, 2]"
+        )
+    return gin_reliable_doorbell
+
+
 def _sequence_from_step(step_id: int) -> int:
     sequence = int(step_id) + 2
     if sequence <= 0:
@@ -658,6 +677,7 @@ class NCCLDeviceV2Transport:
         gin_connections: int | None = None,
         gin_context_count: int | None = None,
         gin_doorbell_batch: int | None = None,
+        gin_reliable_doorbell: int | None = None,
     ):
         if world_size < 2 or world_size > 256:
             raise NCCLDeviceV2UnavailableError(
@@ -686,7 +706,13 @@ class NCCLDeviceV2Transport:
         self.gin_connections = _resolve_gin_connections(gin_connections)
         self.gin_context_count = _resolve_gin_context_count(gin_context_count)
         self.gin_doorbell_batch = _resolve_gin_doorbell_batch(gin_doorbell_batch)
+        self.gin_reliable_doorbell = _resolve_gin_reliable_doorbell(
+            gin_reliable_doorbell
+        )
         os.environ["NCCL_GIN_NCONNECTIONS"] = str(self.gin_connections)
+        os.environ["NCCL_GIN_GDAKI_USE_RELIABLE_DB"] = str(
+            self.gin_reliable_doorbell
+        )
         if self.chunk_bytes and self.chunk_bytes < max(
             self.step_bytes, self.network_step_bytes
         ):
@@ -706,7 +732,8 @@ class NCCLDeviceV2Transport:
             "Configured nccl_device_v2 rank=%s chunk_bytes=%s max_channels=%s "
             "fifo_depth=%s step_bytes=%s network_step_bytes=%s "
             "requested_network_channels_per_peer=%s gin_connections=%s "
-            "gin_context_count=%s gin_doorbell_batch=%s",
+            "gin_context_count=%s gin_doorbell_batch=%s "
+            "gin_reliable_doorbell=%s",
             self.rank,
             self.chunk_bytes,
             self.max_channels,
@@ -717,6 +744,7 @@ class NCCLDeviceV2Transport:
             self.gin_connections,
             self.gin_context_count,
             self.gin_doorbell_batch,
+            self.gin_reliable_doorbell,
         )
 
     def _ensure_initialized(self) -> float:
@@ -760,7 +788,8 @@ class NCCLDeviceV2Transport:
             "Initialized nccl_device_v2 rank=%s world_size=%s window_config="
             "channels:%s fifo:%s step_bytes:%s network_step_bytes:%s "
             "requested_network_channels_per_peer:%s gin_connections:%s "
-            "gin_context_count:%s gin_doorbell_batch:%s",
+            "gin_context_count:%s gin_doorbell_batch:%s "
+            "gin_reliable_doorbell:%s",
             self.rank,
             self.world_size,
             self.max_channels,
@@ -771,6 +800,7 @@ class NCCLDeviceV2Transport:
             self.gin_connections,
             self.gin_context_count,
             self.gin_doorbell_batch,
+            self.gin_reliable_doorbell,
         )
         return (time.perf_counter() - start_time) * 1000.0
 
@@ -818,6 +848,7 @@ class NCCLDeviceV2Transport:
                 "transport_init_time_ms": init_time_ms,
                 "python_copyback_time_ms": copyback_time_ms,
                 "transport_total_time_ms": (time.perf_counter() - run_start) * 1000.0,
+                "gin_reliable_doorbell_mode": self.gin_reliable_doorbell,
             }
         )
         extension_metrics["reader_copyback_total_time_ms"] = (

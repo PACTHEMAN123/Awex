@@ -22,6 +22,7 @@ from awex.transfer.nccl_device_v2 import (
     _resolve_gin_connections,
     _resolve_gin_context_count,
     _resolve_gin_doorbell_batch,
+    _resolve_gin_reliable_doorbell,
     _resolve_network_channels_per_peer,
     _resolve_network_step_bytes,
 )
@@ -134,3 +135,30 @@ def test_gin_doorbell_batch_honors_environment(monkeypatch):
 def test_gin_doorbell_batch_rejects_values_beyond_fifo(value):
     with pytest.raises(NCCLDeviceV2UnavailableError, match=r"must be in \[1, 8\]"):
         _resolve_gin_doorbell_batch(value)
+
+
+def test_gin_reliable_doorbell_defaults_to_fallback_mode(monkeypatch):
+    monkeypatch.delenv("AWEX_NCCL_DEVICE_V2_GIN_RELIABLE_DB", raising=False)
+    monkeypatch.delenv("NCCL_GIN_GDAKI_USE_RELIABLE_DB", raising=False)
+
+    assert _resolve_gin_reliable_doorbell(None) == 2
+
+
+def test_gin_reliable_doorbell_honors_nccl_configuration(monkeypatch):
+    monkeypatch.delenv("AWEX_NCCL_DEVICE_V2_GIN_RELIABLE_DB", raising=False)
+    monkeypatch.setenv("NCCL_GIN_GDAKI_USE_RELIABLE_DB", "1")
+
+    assert _resolve_gin_reliable_doorbell(None) == 1
+
+
+def test_gin_reliable_doorbell_prefers_awex_override(monkeypatch):
+    monkeypatch.setenv("AWEX_NCCL_DEVICE_V2_GIN_RELIABLE_DB", "0")
+    monkeypatch.setenv("NCCL_GIN_GDAKI_USE_RELIABLE_DB", "1")
+
+    assert _resolve_gin_reliable_doorbell(None) == 0
+
+
+@pytest.mark.parametrize("value", [-1, 3])
+def test_gin_reliable_doorbell_rejects_out_of_range_values(value):
+    with pytest.raises(NCCLDeviceV2UnavailableError, match=r"must be in \[0, 2\]"):
+        _resolve_gin_reliable_doorbell(value)

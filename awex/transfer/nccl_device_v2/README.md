@@ -49,6 +49,10 @@ and falls back to `NCCL_GIN_NCONNECTIONS` when unset.
 `AWEX_NCCL_DEVICE_V2_GIN_CONTEXTS` controls the requested context count.
 `AWEX_NCCL_DEVICE_V2_GIN_DOORBELL_BATCH` can aggregate up to eight consecutive
 puts before ringing the GDAKI doorbell; its conservative default is one.
+`AWEX_NCCL_DEVICE_V2_GIN_RELIABLE_DB` controls NCCL's GDAKI reliable doorbell
+mode and falls back to `NCCL_GIN_GDAKI_USE_RELIABLE_DB`. Its default is mode
+two: try the no-DBR hardware path, then software emulation, and finally the
+regular valid-DBR path when the faster modes are unavailable.
 NCCL's internal
 collective-graph channel count is not used as a v2 execution cap because this
 backend has a different CTA shape. Work groups use CUDA named barriers,
