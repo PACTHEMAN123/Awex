@@ -25,13 +25,13 @@ namespace nccl_device_v2 {
 #if AWEX_NCCL_DEVICE_V2_HAS_GIN
 
 #if AWEX_NCCL_DEVICE_V2_HAS_EXPLICIT_SIGNAL_STRENGTH
-using V2GinReadySignalAdd = ncclGin_StrongSignalAdd;
+using V2GinReadySignalInc = ncclGin_StrongSignalInc;
 using V2GinCreditSignalAdd = ncclGin_WeakSignalAdd;
 #else
-// NCCL 2.30.4 SignalAdd has the strong ordering semantics later made
-// explicit by StrongSignalAdd: the signal follows all earlier puts to the
+// NCCL 2.30.4 SignalInc has the strong ordering semantics later made
+// explicit by StrongSignalInc: the signal follows all earlier puts to the
 // same peer on the same context.
-using V2GinReadySignalAdd = ncclGin_SignalAdd;
+using V2GinReadySignalInc = ncclGin_SignalInc;
 using V2GinCreditSignalAdd = ncclGin_SignalAdd;
 #endif
 
@@ -101,8 +101,6 @@ __device__ __forceinline__ void v2GinRunSend(const V2KernelArgs& args, const V2W
   const ncclTeam world = ncclTeamWorld(args.dev_comm);
   const ncclGinSignal_t ready_signal = v2GinReadySignal(args, args.local_rank, channel);
   const ncclGinSignal_t credit_signal = v2GinCreditSignal(args, work.peer, channel);
-  const std::uint32_t ready_batch =
-    std::min<std::uint32_t>(4, std::max<std::uint32_t>(1, args.layout.fifo_depth / 2));
   std::uint64_t cursor = 0;
   std::uint64_t step = work.step_begin;
   while (cursor < work.nbytes) {
@@ -127,21 +125,10 @@ __device__ __forceinline__ void v2GinRunSend(const V2KernelArgs& args, const V2W
         (step - work.step_begin + 1) % args.gin_doorbell_batch != 0;
       const std::uint32_t gin_opt_flags =
         aggregate_request ? ncclGinOptFlagsAggregateRequests : ncclGinOptFlagsDefault;
-      const std::uint64_t work_step = step - work.step_begin + 1;
-      const bool work_complete = cursor + slice_bytes == work.nbytes;
-      if (work_complete || work_step % ready_batch == 0) {
-        const std::uint32_t ready_steps = static_cast<std::uint32_t>(
-          work_complete && work_step % ready_batch != 0 ? work_step % ready_batch : ready_batch);
-        gin.put(world, work.peer, args.window, v2GinPayloadOffset(args, work.peer, args.local_rank, channel, step),
-                args.window, v2GinPayloadOffset(args, args.local_rank, work.peer, channel, step), slice_bytes,
-                V2GinReadySignalAdd{ready_signal, ready_steps}, ncclGin_None{}, ncclCoopThread{}, ncclGin_None{},
-                cuda::thread_scope_thread, cuda::thread_scope_device, gin_opt_flags);
-      } else {
-        gin.put(world, work.peer, args.window, v2GinPayloadOffset(args, work.peer, args.local_rank, channel, step),
-                args.window, v2GinPayloadOffset(args, args.local_rank, work.peer, channel, step), slice_bytes,
-                ncclGin_None{}, ncclGin_None{}, ncclCoopThread{}, ncclGin_None{}, cuda::thread_scope_thread,
-                cuda::thread_scope_device, gin_opt_flags);
-      }
+      gin.put(world, work.peer, args.window, v2GinPayloadOffset(args, work.peer, args.local_rank, channel, step),
+              args.window, v2GinPayloadOffset(args, args.local_rank, work.peer, channel, step), slice_bytes,
+              V2GinReadySignalInc{ready_signal}, ncclGin_None{}, ncclCoopThread{}, ncclGin_None{},
+              cuda::thread_scope_thread, cuda::thread_scope_device, gin_opt_flags);
     }
     if (v2LoadError(error) != 0) return;
     cursor += slice_bytes;

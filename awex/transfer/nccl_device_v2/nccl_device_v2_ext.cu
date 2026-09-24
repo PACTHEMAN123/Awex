@@ -763,8 +763,6 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
   metrics["gin_connection_count"] = py::int_(state->gin_connection_count);
   metrics["requested_gin_context_count"] = py::int_(state->requested_gin_context_count);
   metrics["gin_doorbell_batch"] = py::int_(state->gin_doorbell_batch);
-  metrics["gin_ready_batch"] =
-    py::int_(std::min<std::uint32_t>(4, std::max<std::uint32_t>(1, state->fifo_depth / 2)));
   metrics["gin_credit_batch"] =
     py::int_(std::min<std::uint32_t>(4, std::max<std::uint32_t>(1, state->fifo_depth / 2)));
   metrics["requested_network_channels_per_peer"] = py::int_(state->requested_network_channels_per_peer);
