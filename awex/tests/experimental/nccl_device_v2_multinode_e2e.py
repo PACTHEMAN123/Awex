@@ -172,9 +172,7 @@ def main() -> None:
                     "gin_context_count": metrics["gin_context_count"],
                     "gin_connection_count": metrics["gin_connection_count"],
                     "channel_count": metrics["channel_count"],
-                    "network_channels_per_peer": metrics[
-                        "network_channels_per_peer"
-                    ],
+                    "network_channels_per_peer": metrics["network_channels_per_peer"],
                     "network_step_bytes": metrics["network_step_bytes"],
                     "registered_window_bytes": metrics["registered_window_bytes"],
                     "kernel_transfer_time_ms": metrics["kernel_transfer_time_ms"],
