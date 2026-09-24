@@ -181,6 +181,118 @@ def test_qkv_split_is_gqa_aware():
     assert torch.equal(result["model.layers.0.self_attn.v_proj.weight"], v)
 
 
+def test_block_fp8_qkv_scales_are_split_and_oriented():
+    config = SimpleNamespace(
+        num_attention_heads=32,
+        num_key_value_heads=4,
+        head_dim=128,
+        hidden_size=2048,
+        intermediate_size=6144,
+        moe_intermediate_size=768,
+        num_experts=128,
+        architectures=["Qwen3MoeForCausalLM"],
+    )
+    converter = SGlangToHFWeightConverterQwen3Moe(
+        config, _infer_engine_config(), _rank_info()
+    )
+    input_major = torch.arange(16 * 40, dtype=torch.float32).reshape(16, 40)
+
+    result = dict(
+        converter.convert_param(
+            "model.layers.0.self_attn.qkv_proj.weight_scale_inv", input_major
+        )
+    )
+
+    assert result["model.layers.0.self_attn.q_proj.weight_scale_inv"].shape == (
+        32,
+        16,
+    )
+    assert result["model.layers.0.self_attn.k_proj.weight_scale_inv"].shape == (
+        4,
+        16,
+    )
+    assert result["model.layers.0.self_attn.v_proj.weight_scale_inv"].shape == (
+        4,
+        16,
+    )
+    assert torch.equal(
+        result["model.layers.0.self_attn.q_proj.weight_scale_inv"],
+        input_major[:, :32].transpose(0, 1),
+    )
+
+
+def test_block_fp8_expert_scales_are_split_and_oriented():
+    config = SimpleNamespace(
+        num_attention_heads=32,
+        num_key_value_heads=4,
+        head_dim=128,
+        hidden_size=2048,
+        intermediate_size=6144,
+        moe_intermediate_size=768,
+        num_experts=128,
+        architectures=["Qwen3MoeForCausalLM"],
+    )
+    converter = SGlangToHFWeightConverterQwen3Moe(
+        config, _infer_engine_config(), _rank_info()
+    )
+    w13_scale = torch.arange(2 * 16 * 12, dtype=torch.float32).reshape(2, 16, 12)
+    w2_scale = torch.arange(2 * 6 * 16, dtype=torch.float32).reshape(2, 6, 16)
+
+    gate_up = dict(
+        converter.convert_param(
+            "model.layers.0.mlp.experts.w13_weight_scale_inv", w13_scale
+        )
+    )
+    down = dict(
+        converter.convert_param(
+            "model.layers.0.mlp.experts.w2_weight_scale_inv", w2_scale
+        )
+    )
+
+    assert gate_up[
+        "model.layers.0.mlp.experts.0.gate_proj.weight_scale_inv"
+    ].shape == (6, 16)
+    assert gate_up[
+        "model.layers.0.mlp.experts.0.up_proj.weight_scale_inv"
+    ].shape == (6, 16)
+    assert down[
+        "model.layers.0.mlp.experts.0.down_proj.weight_scale_inv"
+    ].shape == (16, 6)
+    assert torch.equal(
+        gate_up["model.layers.0.mlp.experts.0.gate_proj.weight_scale_inv"],
+        w13_scale[0, :, :6].transpose(0, 1),
+    )
+    assert torch.equal(
+        down["model.layers.0.mlp.experts.0.down_proj.weight_scale_inv"],
+        w2_scale[0].transpose(0, 1),
+    )
+
+
+def test_block_fp8_router_scale_is_oriented():
+    config = SimpleNamespace(
+        num_attention_heads=32,
+        num_key_value_heads=4,
+        head_dim=128,
+        hidden_size=2048,
+        intermediate_size=6144,
+        moe_intermediate_size=768,
+        num_experts=128,
+        architectures=["Qwen3MoeForCausalLM"],
+    )
+    converter = SGlangToHFWeightConverterQwen3Moe(
+        config, _infer_engine_config(), _rank_info()
+    )
+    input_major = torch.arange(16, dtype=torch.float32).reshape(16, 1)
+
+    [(name, scale)] = converter.convert_param(
+        "model.layers.0.mlp.gate.weight_scale_inv", input_major
+    )
+
+    assert name == "model.layers.0.mlp.gate.weight_scale_inv"
+    assert scale.shape == (1, 16)
+    assert torch.equal(scale, input_major.transpose(0, 1))
+
+
 def test_mcore_qkv_device_layout_uses_stable_source_spans():
     converter_class = CONFIG["mcore_converter"]()
     converter = converter_class.__new__(converter_class)

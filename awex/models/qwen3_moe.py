@@ -44,6 +44,175 @@ class SGlangToHFWeightConverterQwen3Moe(SGlangToHFWeightConverter):
         # inference side must unfuse qkv_proj for transfer-plan matching.
         return False
 
+    @staticmethod
+    def _block_count(size: int) -> int:
+        return (int(size) + 127) // 128
+
+    def _config_int(self, name: str, default=None) -> int:
+        value = getattr(self.model_config, name, default)
+        if value is None:
+            raise ValueError(f"Qwen config is missing {name}")
+        return int(value)
+
+    def _head_dim(self) -> int:
+        head_dim = getattr(self.model_config, "head_dim", None)
+        if head_dim:
+            return int(head_dim)
+        return self._config_int("hidden_size") // self._config_int(
+            "num_attention_heads"
+        )
+
+    @staticmethod
+    def _orient_block_scale(
+        name: str,
+        parameter: torch.Tensor,
+        output_blocks: int,
+        input_blocks: int,
+    ) -> torch.Tensor:
+        """Expose vLLM input-major FP8 scales in HF output-major order."""
+
+        expected = (int(output_blocks), int(input_blocks))
+        transposed = (expected[1], expected[0])
+        shape = tuple(int(dim) for dim in parameter.shape)
+        if shape == expected:
+            return parameter
+        if shape == transposed:
+            return parameter.transpose(0, 1)
+        raise ValueError(
+            f"Unexpected 128x128 block scale shape for {name}: got {shape}, "
+            f"expected {expected} or input-major {transposed}"
+        )
+
+    def _local_attention_rows(self) -> Tuple[int, int]:
+        num_heads = self._config_int("num_attention_heads")
+        num_kv_heads = self._config_int("num_key_value_heads", num_heads)
+        if num_heads % self.tp_size or num_kv_heads % self.tp_size:
+            raise ValueError(
+                "Qwen attention heads must be divisible by inference TP size: "
+                f"heads={num_heads}, kv_heads={num_kv_heads}, tp={self.tp_size}"
+            )
+        head_dim = self._head_dim()
+        return (
+            num_heads // self.tp_size * head_dim,
+            num_kv_heads // self.tp_size * head_dim,
+        )
+
+    def _mlp_intermediate_size(self, name: str) -> int:
+        if ".experts" in name:
+            return self._config_int("moe_intermediate_size")
+        if "shared_expert" in name:
+            shared_size = getattr(
+                self.model_config, "shared_expert_intermediate_size", None
+            )
+            if shared_size:
+                return int(shared_size)
+        return self._config_int("intermediate_size")
+
+    def _local_mlp_intermediate_size(self, name: str) -> int:
+        intermediate_size = self._mlp_intermediate_size(name)
+        if intermediate_size % self.tp_size:
+            raise ValueError(
+                f"Qwen intermediate size {intermediate_size} for {name} must be "
+                f"divisible by inference TP size {self.tp_size}"
+            )
+        return intermediate_size // self.tp_size
+
+    def _convert_attention_param(
+        self, name: str, parameter: torch.Tensor, layer_number: str
+    ) -> List[Tuple[str, torch.Tensor]]:
+        if not name.endswith("_scale_inv"):
+            return super()._convert_attention_param(name, parameter, layer_number)
+
+        base_name = name[: -len("_scale_inv")]
+        hidden_blocks = self._block_count(self._config_int("hidden_size"))
+        q_rows, kv_rows = self._local_attention_rows()
+        if "qkv_proj" in base_name or "query_key_value" in base_name:
+            q_blocks = self._block_count(q_rows)
+            kv_blocks = self._block_count(kv_rows)
+            scale = self._orient_block_scale(
+                name, parameter, q_blocks + 2 * kv_blocks, hidden_blocks
+            )
+            q_name = base_name.replace("qkv_proj", "q_proj").replace(
+                "query_key_value", "q_proj"
+            )
+            k_name = base_name.replace("qkv_proj", "k_proj").replace(
+                "query_key_value", "k_proj"
+            )
+            v_name = base_name.replace("qkv_proj", "v_proj").replace(
+                "query_key_value", "v_proj"
+            )
+            return [
+                (
+                    f"{q_name}_scale_inv",
+                    scale.narrow(0, 0, q_blocks),
+                ),
+                (
+                    f"{k_name}_scale_inv",
+                    scale.narrow(0, q_blocks, kv_blocks),
+                ),
+                (
+                    f"{v_name}_scale_inv",
+                    scale.narrow(0, q_blocks + kv_blocks, kv_blocks),
+                ),
+            ]
+        if "o_proj" in base_name or "dense" in base_name:
+            scale = self._orient_block_scale(
+                name,
+                parameter,
+                hidden_blocks,
+                self._block_count(q_rows),
+            )
+            return [(name, scale)]
+        return super()._convert_attention_param(name, parameter, layer_number)
+
+    def _convert_mlp_param(
+        self, name: str, parameter: torch.Tensor, layer_number: str
+    ) -> List[Tuple[str, torch.Tensor]]:
+        if not name.endswith("_scale_inv"):
+            return super()._convert_mlp_param(name, parameter, layer_number)
+
+        base_name = name[: -len("_scale_inv")]
+        hidden_blocks = self._block_count(self._config_int("hidden_size"))
+        intermediate_blocks = self._block_count(
+            self._local_mlp_intermediate_size(base_name)
+        )
+        if "gate_up_proj" in base_name or "w13_weight" in base_name:
+            scale = self._orient_block_scale(
+                name, parameter, 2 * intermediate_blocks, hidden_blocks
+            )
+            gate_name = base_name.replace("gate_up_proj", "gate_proj").replace(
+                "w13_weight", "gate_proj.weight"
+            )
+            up_name = base_name.replace("gate_up_proj", "up_proj").replace(
+                "w13_weight", "up_proj.weight"
+            )
+            return [
+                (f"{gate_name}_scale_inv", scale.narrow(0, 0, intermediate_blocks)),
+                (
+                    f"{up_name}_scale_inv",
+                    scale.narrow(0, intermediate_blocks, intermediate_blocks),
+                ),
+            ]
+        if "down_proj" in base_name or "w2_weight" in base_name:
+            scale = self._orient_block_scale(
+                name, parameter, hidden_blocks, intermediate_blocks
+            )
+            converted_name = base_name.replace("w2_weight", "down_proj.weight")
+            return [(f"{converted_name}_scale_inv", scale)]
+        return super()._convert_mlp_param(name, parameter, layer_number)
+
+    def convert_param(
+        self, name: str, parameter: torch.Tensor
+    ) -> List[Tuple[str, torch.Tensor]]:
+        if name.endswith(".mlp.gate.weight_scale_inv"):
+            parameter = self._orient_block_scale(
+                name,
+                parameter,
+                self._block_count(self._config_int("num_experts")),
+                self._block_count(self._config_int("hidden_size")),
+            )
+        return super().convert_param(name, parameter)
+
     def _convert_layer_norm_param(
         self, name: str, parameter: torch.Tensor, layer_number: str
     ) -> List[Tuple[str, torch.Tensor]]:
