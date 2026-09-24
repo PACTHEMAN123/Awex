@@ -29,10 +29,10 @@ from awex.transfer.nccl_device_v2 import (
 )
 
 
-def test_fifo_depth_defaults_to_eight(monkeypatch):
+def test_fifo_depth_defaults_to_sixteen(monkeypatch):
     monkeypatch.delenv("AWEX_NCCL_DEVICE_V2_FIFO_DEPTH", raising=False)
 
-    assert _resolve_fifo_depth() == 8
+    assert _resolve_fifo_depth() == 16
 
 
 def test_fifo_depth_honors_environment(monkeypatch):

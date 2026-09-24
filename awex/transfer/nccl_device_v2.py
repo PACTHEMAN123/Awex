@@ -195,7 +195,7 @@ def _resolve_fifo_depth(fifo_depth: int | None = None) -> int:
     if fifo_depth is None:
         configured = os.environ.get("AWEX_NCCL_DEVICE_V2_FIFO_DEPTH")
         try:
-            fifo_depth = 8 if configured is None else int(configured)
+            fifo_depth = 16 if configured is None else int(configured)
         except ValueError as exc:
             raise NCCLDeviceV2UnavailableError(
                 "AWEX_NCCL_DEVICE_V2_FIFO_DEPTH must be an integer"

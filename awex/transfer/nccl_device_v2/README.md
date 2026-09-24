@@ -50,7 +50,7 @@ device paths can share an explicit channel setting.
 and falls back to `NCCL_GIN_NCONNECTIONS` when unset.
 `AWEX_NCCL_DEVICE_V2_GIN_CONTEXTS` controls the requested context count.
 `AWEX_NCCL_DEVICE_V2_FIFO_DEPTH` controls the number of reusable payload slots
-per peer and channel, from 1 through 64; the default remains eight.
+per peer and channel, from 1 through 64; the default is 16.
 `AWEX_NCCL_DEVICE_V2_GIN_DOORBELL_BATCH` can aggregate up to eight consecutive
 puts before ringing the GDAKI doorbell; its conservative default is one.
 `AWEX_NCCL_DEVICE_V2_GIN_RELIABLE_DB` controls NCCL's GDAKI reliable doorbell
