@@ -324,15 +324,28 @@ def _configure_gin_hca_policy() -> None:
     endpoints = _active_rdma_endpoints()
     if not endpoints or local_world_size <= 0 or not 0 <= local_rank < local_world_size:
         return
+    topology = _gpu_hca_topology(endpoints, local_world_size)
     assignments = _weighted_hca_assignments(
         endpoints,
         _rank_payload_bytes_from_environment(local_world_size),
-        _gpu_hca_topology(endpoints, local_world_size),
+        topology,
     )
-    endpoint = assignments[local_rank]
-    os.environ["NCCL_IB_HCA"] = f"={endpoint.name}:{endpoint.port}"
+    selected_endpoints = [assignments[local_rank]]
+    if topology is not None:
+        local_endpoints = [
+            endpoint
+            for endpoint, distance in zip(endpoints, topology[local_rank])
+            if distance < _HCA_DISTANCE_SCORES["SYS"]
+        ]
+        if local_endpoints:
+            selected_endpoints = local_endpoints
+    os.environ["NCCL_IB_HCA"] = "=" + ",".join(
+        f"{endpoint.name}:{endpoint.port}" for endpoint in selected_endpoints
+    )
+    if len(selected_endpoints) > 1:
+        os.environ.setdefault("NCCL_NETDEVS_POLICY", "ALL")
     os.environ["AWEX_NCCL_DEVICE_V2_SELECTED_HCA_BANDWIDTH_GBPS"] = str(
-        endpoint.bandwidth_gbps
+        sum(endpoint.bandwidth_gbps for endpoint in selected_endpoints)
     )
 
 

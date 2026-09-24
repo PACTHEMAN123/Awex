@@ -90,6 +90,39 @@ def test_balanced_hca_policy_applies_node_rank_offset(monkeypatch):
     assert os.environ["NCCL_IB_HCA"] == "=mlx5_19:1"
 
 
+def test_balanced_hca_policy_exposes_only_local_numa_rails(monkeypatch):
+    monkeypatch.setenv("AWEX_NCCL_DEVICE_V2_HCA_POLICY", "balanced")
+    monkeypatch.setenv("LOCAL_RANK", "2")
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "4")
+    monkeypatch.delenv("NCCL_IB_HCA", raising=False)
+    monkeypatch.delenv("NCCL_NETDEVS_POLICY", raising=False)
+    endpoints = [
+        _RdmaEndpoint(f"mlx5_{index}", 1, 200.0, f"/pci/{index}")
+        for index in range(4)
+    ]
+    monkeypatch.setattr(
+        "awex.transfer.nccl_device_v2._active_rdma_endpoints", lambda: endpoints
+    )
+    monkeypatch.setattr(
+        "awex.transfer.nccl_device_v2._gpu_hca_topology",
+        lambda _endpoints, _world_size: [
+            [3, 3, 4, 4],
+            [0, 3, 4, 4],
+            [3, 3, 4, 4],
+            [3, 0, 4, 4],
+        ],
+    )
+
+    _configure_gin_hca_policy()
+
+    assert os.environ["NCCL_IB_HCA"] == "=mlx5_0:1,mlx5_1:1"
+    assert os.environ["NCCL_NETDEVS_POLICY"] == "ALL"
+    assert (
+        os.environ["AWEX_NCCL_DEVICE_V2_SELECTED_HCA_BANDWIDTH_GBPS"]
+        == "400.0"
+    )
+
+
 def test_weighted_hca_assignments_follow_capacity_and_payload():
     endpoints = [
         _RdmaEndpoint("fast", 1, 400.0, "/pci/0"),

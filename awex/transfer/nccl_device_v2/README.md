@@ -67,7 +67,9 @@ active RDMA port, reads its link rate from sysfs, and combines it with the
 GPU-to-NIC distances reported by `nvidia-smi topo -m`. A rank uses a remote
 NUMA rail only when no local rail is active. Within the local set, PIX/NODE
 affinity is preserved and equal-affinity choices minimize assigned bytes per
-Gbps. Uniform rank loads therefore preserve contiguous PCI-local groups, while
+Gbps. All local rails are exposed to GIN, whose channel-to-context mapping
+stripes each peer's byte-weighted channel allocation across those rails.
+Uniform rank loads therefore preserve contiguous PCI-local groups, while
 heterogeneous ports receive work in proportion to their capacity and skewed
 rank loads use longest-processing-time placement. Multi-engine vLLM launchers provide node-level
 rank offsets so each engine does not restart allocation at the first HCA.
