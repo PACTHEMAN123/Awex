@@ -152,8 +152,7 @@ __device__ __forceinline__ void v2GinRunRecv(const V2KernelArgs& args, const V2W
   const ncclTeam world = ncclTeamWorld(args.dev_comm);
   const ncclGinSignal_t ready_signal = v2GinReadySignal(args, work.peer, channel);
   const ncclGinSignal_t credit_signal = v2GinCreditSignal(args, args.local_rank, channel);
-  const std::uint32_t half_fifo = args.layout.fifo_depth / 2;
-  const std::uint32_t credit_batch = half_fifo == 0 ? 1 : (half_fifo < 4 ? half_fifo : 4);
+  const std::uint32_t credit_batch = args.layout.fifo_depth < 2 ? 1 : args.layout.fifo_depth / 2;
   std::uint64_t cursor = 0;
   std::uint64_t step = work.step_begin;
   while (cursor < work.nbytes) {
