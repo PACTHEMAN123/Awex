@@ -201,9 +201,7 @@ def test_gin_chunk_is_independent_from_lsa_chunk(monkeypatch):
     transport = NCCLDeviceV2Transport(None, 0, 2, gin_connections=1)
 
     assert transport.chunk_bytes == 8 * 1024 * 1024
-    assert transport.gin_chunk_bytes == _gin_chunk_bytes(
-        transport.network_step_bytes
-    )
+    assert transport.gin_chunk_bytes == _gin_chunk_bytes(transport.network_step_bytes)
 
 
 def test_network_step_defaults_to_nccl_cross_node_chunk(monkeypatch):
