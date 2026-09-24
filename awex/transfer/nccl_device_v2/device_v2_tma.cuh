@@ -47,20 +47,30 @@ __device__ __forceinline__ float v2TmaScaleForFp8(float value, float scale, floa
   const std::uint32_t magnitude_bits = __float_as_uint(fabsf(approximate));
   if (magnitude_bits == 0) return approximate;
 
-  constexpr std::uint32_t kFp8MinNormalBits = 121U << 23U;  // 2^-6
+  constexpr std::uint32_t kFp8MinNormalExponent = 121U;  // 2^-6
   constexpr std::uint32_t kFloatInfinityBits = 0x7f800000U;
-  if (magnitude_bits < kFp8MinNormalBits || magnitude_bits >= kFloatInfinityBits) {
-    return value / scale;
-  }
+  if (magnitude_bits >= kFloatInfinityBits) return value / scale;
 
   // E4M3 keeps three of the float mantissa bits. Reciprocal multiplication can
   // differ from division by a few float ulps, so refine only near a rounding tie.
-  constexpr std::uint32_t kDiscardedMask = (1U << 20U) - 1U;
-  constexpr std::uint32_t kRoundingTie = 1U << 19U;
   constexpr std::uint32_t kRefineUlps = 16U;
-  const std::uint32_t discarded = magnitude_bits & kDiscardedMask;
+  const std::uint32_t exponent = (magnitude_bits >> 23U) & 0xffU;
+  const std::uint32_t mantissa = magnitude_bits & 0x7fffffU;
+  if (exponent < 116U) return approximate;
+  if (exponent == 116U) {
+    return mantissa >= 0x7fffffU - kRefineUlps ? value / scale : approximate;
+  }
+  if (exponent == 117U) {
+    return mantissa <= kRefineUlps ? value / scale : approximate;
+  }
+
+  const std::uint32_t discarded_bits =
+    exponent < kFp8MinNormalExponent ? 20U + kFp8MinNormalExponent - exponent : 20U;
+  const std::uint32_t discarded_mask = (1U << discarded_bits) - 1U;
+  const std::uint32_t rounding_tie = 1U << (discarded_bits - 1U);
+  const std::uint32_t discarded = mantissa & discarded_mask;
   const std::uint32_t tie_distance =
-    discarded > kRoundingTie ? discarded - kRoundingTie : kRoundingTie - discarded;
+    discarded > rounding_tie ? discarded - rounding_tie : rounding_tie - discarded;
   return tie_distance <= kRefineUlps ? value / scale : approximate;
 }
 
