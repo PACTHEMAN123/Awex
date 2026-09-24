@@ -109,10 +109,11 @@ def _build_mcore_converter_qwen3_moe():
             is_mlp_weight = ".mlp." in name and name.endswith(
                 (".gate_proj.weight", ".up_proj.weight", ".down_proj.weight")
             )
+            is_router_weight = name.endswith(".mlp.gate.weight")
             return (
                 self.blockwise_fp8
                 and len(shape) == 2
-                and (is_attention_weight or is_mlp_weight)
+                and (is_attention_weight or is_mlp_weight or is_router_weight)
             )
 
         def _apply_blockwise_fp8(self, converted):

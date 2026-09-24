@@ -101,6 +101,7 @@ class VLLMWeightsExchangeIT:
         train_tp_size=1,
         train_ep_size=1,
         train_expert_tp_size=None,
+        train_model_path=None,
         use_mbridge=False,
         host="127.0.0.1",
         port=8000,
@@ -129,6 +130,7 @@ class VLLMWeightsExchangeIT:
         self.meta_server_addr = None
         self.inference_config = inference_config or copy.deepcopy(vllm_inference_config)
         self.inference_config["comm_backend"] = comm_backend
+        self.train_model_path = train_model_path or self.inference_config["model_path"]
         self.train_config = {
             "comm_backend": comm_backend,
             "enable_debug_mode": enable_debug_mode,
@@ -403,7 +405,7 @@ class VLLMWeightsExchangeIT:
                 torch.npu.manual_seed(0)
 
         model, hf_config = megatron_model_from_hf(
-            model_path=self.inference_config["model_path"],
+            model_path=self.train_model_path,
             use_mbridge=self.use_mbridge,
         )
         return model[0], hf_config
@@ -493,6 +495,7 @@ def main(args):
         train_tp_size=args.train_tp_size,
         train_ep_size=args.train_ep_size,
         train_expert_tp_size=args.train_expert_tp_size,
+        train_model_path=args.train_model_path,
         use_mbridge=args.use_mbridge,
         host=args.host,
         port=args.port,
@@ -550,7 +553,15 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model-path",
         default=vllm_inference_config["model_path"],
-        help="HF model path used by Megatron and the vLLM server.",
+        help="HF model path used by the vLLM server.",
+    )
+    parser.add_argument(
+        "--train-model-path",
+        default=None,
+        help=(
+            "Optional HF model path used by Megatron; defaults to --model-path. "
+            "Use this with an FP8 inference checkpoint and a BF16 training model."
+        ),
     )
     parser.add_argument(
         "--train-tp-size",

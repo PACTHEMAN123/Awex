@@ -50,6 +50,23 @@ from awex.util.tensor_util import check_and_log_nan_values
 logger = logging.getLogger(__name__)
 
 
+def _config_value(config, name, default=None):
+    if isinstance(config, dict):
+        return config.get(name, default)
+    return getattr(config, name, default)
+
+
+def _infer_uses_blockwise_fp8(infer_conf) -> bool:
+    hf_config = infer_conf.get("hf_config", {})
+    quantization_config = _config_value(hf_config, "quantization_config", {}) or {}
+    quant_method = _config_value(quantization_config, "quant_method", "")
+    block_size = _config_value(quantization_config, "weight_block_size", None)
+    return "fp8" in str(quant_method).lower() and tuple(block_size or ()) == (
+        128,
+        128,
+    )
+
+
 class WeightExchangeWriter(ABC):
     def __init__(self, train_engine):
         self.train_engine = train_engine
@@ -210,7 +227,10 @@ class WeightsExchangeShardingWriter(WeightExchangeWriter):
             self.parameters_meta,
             self.infer_params_meta,
             raise_exception=not self.enable_debug_mode,
-            allow_dtype_mismatch=self.comm_backend == "nccl_device_v2",
+            allow_dtype_mismatch=(
+                self.comm_backend == "nccl_device_v2"
+                or _infer_uses_blockwise_fp8(self.infer_conf)
+            ),
         )
         self.weight_converter = get_train_weights_converter(
             self.train_engine.engine_name,
