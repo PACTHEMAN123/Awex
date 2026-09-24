@@ -41,12 +41,6 @@ constexpr ncclGinFenceLevel kV2GinNoFence = ncclGinFenceLevel::None;
 constexpr ncclGinFenceLevel kV2GinNoFence = ncclGinFenceLevel::Relaxed;
 #endif
 
-__device__ __forceinline__ std::uint32_t v2GinContext(const V2KernelArgs& args, std::uint32_t peer,
-                                                       std::uint32_t channel) {
-  if (args.gin_peer_contexts == nullptr) return channel % args.dev_comm.ginContextCount;
-  return args.gin_peer_contexts[static_cast<std::size_t>(peer) * args.layout.channel_count + channel];
-}
-
 __device__ __forceinline__ ncclGinSignal_t v2GinReadySignal(const V2KernelArgs& args, std::uint32_t peer,
                                                             std::uint32_t channel) {
   return static_cast<ncclGinSignal_t>(static_cast<std::size_t>(peer) * args.layout.channel_count + channel);
@@ -103,7 +97,7 @@ __device__ __forceinline__ void v2GinRunSend(const V2KernelArgs& args, const V2W
   int nworkers = 0;
   const std::uint32_t roles = v2GinRoles(V2Direction::kSend, tid, nthreads, &nworkers);
   auto* error = &reinterpret_cast<V2WindowHeader*>(args.local_window)->error;
-  ncclGin gin{args.dev_comm, static_cast<int>(v2GinContext(args, work.peer, channel))};
+  ncclGin gin{args.dev_comm, static_cast<int>(channel % args.dev_comm.ginContextCount)};
   const ncclTeam world = ncclTeamWorld(args.dev_comm);
   const ncclGinSignal_t ready_signal = v2GinReadySignal(args, args.local_rank, channel);
   const ncclGinSignal_t credit_signal = v2GinCreditSignal(args, work.peer, channel);
@@ -154,7 +148,7 @@ __device__ __forceinline__ void v2GinRunRecv(const V2KernelArgs& args, const V2W
   int nworkers = 0;
   const std::uint32_t roles = v2GinRoles(V2Direction::kRecv, tid, nthreads, &nworkers);
   auto* error = &reinterpret_cast<V2WindowHeader*>(args.local_window)->error;
-  ncclGin gin{args.dev_comm, static_cast<int>(v2GinContext(args, work.peer, channel))};
+  ncclGin gin{args.dev_comm, static_cast<int>(channel % args.dev_comm.ginContextCount)};
   const ncclTeam world = ncclTeamWorld(args.dev_comm);
   const ncclGinSignal_t ready_signal = v2GinReadySignal(args, work.peer, channel);
   const ncclGinSignal_t credit_signal = v2GinCreditSignal(args, args.local_rank, channel);

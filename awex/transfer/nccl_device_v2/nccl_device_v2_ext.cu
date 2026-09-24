@@ -33,19 +33,14 @@
 #include "device_v2_topology.h"
 
 #include <algorithm>
-#include <array>
 #include <chrono>
-#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
-#include <map>
 #include <memory>
-#include <sstream>
 #include <stdexcept>
 #include <string>
-#include <tuple>
 #include <vector>
 
 namespace py = pybind11;
@@ -54,7 +49,6 @@ namespace v2 = awex::nccl_device_v2;
 namespace {
 
 constexpr int kMaxRanks = 256;
-constexpr int kMaxGinConnections = 4;
 
 struct LaunchBuffers {
   v2::V2Work* works = nullptr;
@@ -77,8 +71,6 @@ struct DeviceState {
   uintptr_t* device_peer_windows = nullptr;
   std::uint32_t* device_payload_peer_slots = nullptr;
   std::uint8_t* device_peer_transports = nullptr;
-  std::uint8_t* device_gin_peer_contexts = nullptr;
-  std::uint64_t* device_gin_channel_context_masks = nullptr;
   v2::V2WindowLayout layout{};
   std::size_t window_bytes = 0;
   std::size_t dense_window_bytes = 0;
@@ -98,12 +90,6 @@ struct DeviceState {
   std::uint32_t gin_doorbell_batch = 1;
   std::uint32_t gin_connection_count = 0;
   std::vector<std::uint64_t> peer_payload_bytes;
-  std::vector<float> hca_effective_bandwidths_gbps;
-  std::vector<std::uint8_t> hca_pci_distances;
-  std::uint64_t numa_group_id = 0;
-  std::vector<std::uint8_t> gin_peer_contexts;
-  std::vector<std::uint64_t> gin_channel_context_masks;
-  std::vector<std::uint64_t> gin_rail_scheduled_bytes;
   bool plan_initialized = false;
   bool window_initialized = false;
   v2::V2Direction direction = v2::V2Direction::kSend;
@@ -150,58 +136,6 @@ std::size_t checked_multiply(std::size_t left, std::size_t right, const char* de
     throw std::runtime_error(std::string(description) + " size overflows");
   }
   return left * right;
-}
-
-std::vector<float> parse_float_list_environment(const char* name) {
-  const char* value = std::getenv(name);
-  if (value == nullptr || value[0] == '\0') return {};
-  std::vector<float> parsed;
-  std::stringstream stream(value);
-  std::string field;
-  while (std::getline(stream, field, ',')) {
-    try {
-      const float number = std::stof(field);
-      if (!std::isfinite(number) || number <= 0.0F) throw std::invalid_argument("non-positive");
-      parsed.push_back(number);
-    } catch (const std::exception&) {
-      throw std::runtime_error(std::string(name) + " must contain positive comma-separated numbers");
-    }
-  }
-  if (parsed.empty() || parsed.size() > kMaxGinConnections) {
-    throw std::runtime_error(std::string(name) + " must contain between one and four values");
-  }
-  return parsed;
-}
-
-std::vector<std::uint8_t> parse_distance_list_environment(const char* name) {
-  const char* value = std::getenv(name);
-  if (value == nullptr || value[0] == '\0') return {};
-  std::vector<std::uint8_t> parsed;
-  std::stringstream stream(value);
-  std::string field;
-  while (std::getline(stream, field, ',')) {
-    try {
-      const int number = std::stoi(field);
-      if (number < 0 || number > 255) throw std::out_of_range("distance");
-      parsed.push_back(static_cast<std::uint8_t>(number));
-    } catch (const std::exception&) {
-      throw std::runtime_error(std::string(name) + " must contain comma-separated byte values");
-    }
-  }
-  return parsed;
-}
-
-std::uint64_t parse_uint64_environment(const char* name) {
-  const char* value = std::getenv(name);
-  if (value == nullptr || value[0] == '\0') return 0;
-  try {
-    std::size_t consumed = 0;
-    const std::uint64_t parsed = std::stoull(value, &consumed);
-    if (value[consumed] != '\0') throw std::invalid_argument("trailing characters");
-    return parsed;
-  } catch (const std::exception&) {
-    throw std::runtime_error(std::string(name) + " must be an unsigned integer");
-  }
 }
 
 std::uint32_t power_of_two_down(std::uint32_t value) {
@@ -261,16 +195,6 @@ std::unique_ptr<DeviceState> make_state(const std::string& unique_id_bytes, int 
   state->requested_gin_context_count = gin_context_count;
   state->gin_doorbell_batch = gin_doorbell_batch;
   state->chunk_bytes = chunk_bytes;
-  state->hca_effective_bandwidths_gbps =
-    parse_float_list_environment("AWEX_NCCL_DEVICE_V2_HCA_EFFECTIVE_BANDWIDTHS_GBPS");
-  state->hca_pci_distances = parse_distance_list_environment("AWEX_NCCL_DEVICE_V2_HCA_PCI_DISTANCES");
-  state->numa_group_id = parse_uint64_environment("AWEX_NCCL_DEVICE_V2_NUMA_GROUP_ID");
-  if (!state->hca_effective_bandwidths_gbps.empty() && state->hca_pci_distances.empty()) {
-    state->hca_pci_distances.assign(state->hca_effective_bandwidths_gbps.size(), 3);
-  }
-  if (state->hca_effective_bandwidths_gbps.size() != state->hca_pci_distances.size()) {
-    throw std::runtime_error("nccl_device_v2 HCA bandwidth and PCI-distance tables differ in size");
-  }
   AWEX_CUDA_V2_CHECK(cudaSetDevice(device));
   int multiprocessor_count = 0;
   AWEX_CUDA_V2_CHECK(cudaDeviceGetAttribute(&multiprocessor_count, cudaDevAttrMultiProcessorCount, device));
@@ -325,14 +249,6 @@ void destroy_state(DeviceState* state) {
   if (state->device_peer_transports != nullptr) {
     AWEX_CUDA_V2_CHECK(cudaFree(state->device_peer_transports));
     state->device_peer_transports = nullptr;
-  }
-  if (state->device_gin_peer_contexts != nullptr) {
-    AWEX_CUDA_V2_CHECK(cudaFree(state->device_gin_peer_contexts));
-    state->device_gin_peer_contexts = nullptr;
-  }
-  if (state->device_gin_channel_context_masks != nullptr) {
-    AWEX_CUDA_V2_CHECK(cudaFree(state->device_gin_channel_context_masks));
-    state->device_gin_channel_context_masks = nullptr;
   }
   if (state->device_payload_peer_slots != nullptr) {
     AWEX_CUDA_V2_CHECK(cudaFree(state->device_payload_peer_slots));
@@ -467,219 +383,8 @@ bool same_tasks(const std::vector<v2::V2LoweringTask>& left, const std::vector<v
   return true;
 }
 
-#if AWEX_NCCL_DEVICE_V2_HAS_GIN
-struct GinRankLoadRecord {
-  std::uint64_t numa_group_id = 0;
-  std::array<std::uint64_t, kMaxRanks> peer_payload_bytes{};
-  std::array<float, kMaxGinConnections> rail_bandwidths_gbps{};
-  std::array<std::uint8_t, kMaxRanks> peer_channels{};
-  std::array<std::uint8_t, kMaxRanks> peer_is_gin{};
-  std::array<std::uint8_t, kMaxGinConnections> rail_pci_distances{};
-  std::uint8_t rail_count = 0;
-  std::uint8_t sender = 0;
-};
-
-struct GinFlowPart {
-  std::uint32_t source = 0;
-  std::uint32_t destination = 0;
-  std::uint32_t part = 0;
-  std::uint32_t part_count = 0;
-  std::uint64_t bytes = 0;
-};
-
-using GinPartKey = std::tuple<std::uint32_t, std::uint32_t, std::uint32_t>;
-using GinRailKey = std::pair<std::uint64_t, std::uint32_t>;
-
-std::uint32_t gin_channels_for_record(const DeviceState& state, const GinRankLoadRecord& record,
-                                      std::uint32_t peer) {
-  const std::uint32_t max_channels =
-    std::max<std::uint32_t>(1, std::min<std::uint32_t>(record.peer_channels[peer], state.total_channels));
-  std::uint32_t min_channels = max_channels;
-  while (static_cast<std::uint64_t>(min_channels) * state.world_size > state.total_channels && min_channels > 1) {
-    min_channels /= 2;
-  }
-  return v2::v2ChannelsForBytes(record.peer_payload_bytes[peer], min_channels, max_channels,
-                                state.network_step_bytes, true);
-}
-
-void configure_gin_peer_contexts(DeviceState* state, const std::vector<std::uint32_t>& gin_peers,
-                                 v2::V2Direction direction, cudaStream_t stream) {
-  const std::uint32_t context_count = static_cast<std::uint32_t>(state->dev_comm.ginContextCount);
-  const std::uint32_t connection_count = state->gin_connection_count;
-  const std::size_t table_size = static_cast<std::size_t>(state->world_size) * state->total_channels;
-  state->gin_peer_contexts.resize(table_size);
-  for (int peer = 0; peer < state->world_size; ++peer) {
-    for (std::uint32_t channel = 0; channel < state->total_channels; ++channel) {
-      state->gin_peer_contexts[static_cast<std::size_t>(peer) * state->total_channels + channel] =
-        static_cast<std::uint8_t>(channel % context_count);
-    }
-  }
-  state->gin_channel_context_masks.assign(state->total_channels, 0);
-  state->gin_rail_scheduled_bytes.assign(state->hca_effective_bandwidths_gbps.size(), 0);
-
-  GinRankLoadRecord local{};
-  local.numa_group_id = state->numa_group_id;
-  local.sender = direction == v2::V2Direction::kSend ? 1 : 0;
-  local.rail_count = static_cast<std::uint8_t>(state->hca_effective_bandwidths_gbps.size());
-  for (int peer = 0; peer < state->world_size; ++peer) {
-    local.peer_payload_bytes[peer] = state->peer_payload_bytes[peer];
-    local.peer_channels[peer] = static_cast<std::uint8_t>(state->peer_channels[peer]);
-    local.peer_is_gin[peer] =
-      state->peer_transports[peer] == static_cast<std::uint8_t>(v2::V2Transport::kGin) ? 1 : 0;
-  }
-  for (std::size_t rail = 0; rail < state->hca_effective_bandwidths_gbps.size(); ++rail) {
-    local.rail_bandwidths_gbps[rail] = state->hca_effective_bandwidths_gbps[rail];
-    local.rail_pci_distances[rail] = state->hca_pci_distances[rail];
-  }
-  auto records = v2::topology_detail::allGather(state->comm, &local, 1, state->world_size, stream);
-
-  for (int source = 0; source < state->world_size; ++source) {
-    if (records[source].sender == 0) continue;
-    for (int destination = 0; destination < state->world_size; ++destination) {
-      if (records[source].peer_payload_bytes[destination] == 0 ||
-          records[source].peer_is_gin[destination] == 0) {
-        continue;
-      }
-      const std::uint8_t shared_channels =
-        std::max<std::uint8_t>(1, std::min(records[source].peer_channels[destination],
-                                           records[destination].peer_channels[source]));
-      records[source].peer_channels[destination] = shared_channels;
-      records[destination].peer_channels[source] = shared_channels;
-    }
-  }
-  state->network_channels_per_peer = 1;
-  for (const std::uint32_t peer : gin_peers) {
-    const std::uint32_t source = direction == v2::V2Direction::kSend ? state->rank : peer;
-    const std::uint32_t destination = direction == v2::V2Direction::kSend ? peer : state->rank;
-    state->peer_channels[peer] = records[source].peer_channels[destination];
-    state->network_channels_per_peer =
-      std::max(state->network_channels_per_peer, state->peer_channels[peer]);
-  }
-
-  std::vector<GinFlowPart> parts;
-  for (int source = 0; source < state->world_size; ++source) {
-    const auto& source_record = records[source];
-    if (source_record.sender == 0 || source_record.rail_count == 0 || source_record.numa_group_id == 0) continue;
-    for (int destination = 0; destination < state->world_size; ++destination) {
-      const std::uint64_t bytes = source_record.peer_payload_bytes[destination];
-      if (bytes == 0 || source_record.peer_is_gin[destination] == 0) continue;
-      const auto& destination_record = records[destination];
-      if (destination_record.rail_count == 0 || destination_record.numa_group_id == 0) continue;
-      if (destination_record.sender == 0 && destination_record.peer_payload_bytes[source] != bytes) {
-        throw std::runtime_error("nccl_device_v2 sender/receiver byte totals differ during GIN rail scheduling");
-      }
-      const std::uint32_t part_count = gin_channels_for_record(*state, source_record, destination);
-      for (std::uint32_t part = 0; part < part_count; ++part) {
-        const auto bounds = v2::v2PartBounds(part_count, part, bytes);
-        if (bounds.first != bounds.second) {
-          parts.push_back(GinFlowPart{static_cast<std::uint32_t>(source),
-                                      static_cast<std::uint32_t>(destination), part, part_count,
-                                      bounds.second - bounds.first});
-        }
-      }
-    }
-  }
-  std::sort(parts.begin(), parts.end(), [](const GinFlowPart& left, const GinFlowPart& right) {
-    if (left.bytes != right.bytes) return left.bytes > right.bytes;
-    return std::tie(left.source, left.destination, left.part) <
-           std::tie(right.source, right.destination, right.part);
-  });
-
-  std::map<GinRailKey, long double> rail_load;
-  std::map<std::pair<std::uint32_t, std::uint32_t>, std::array<std::uint32_t, kMaxGinConnections>>
-    connection_uses;
-  std::map<GinPartKey, std::uint8_t> part_contexts;
-  const std::uint32_t contexts_per_connection = std::max<std::uint32_t>(1, context_count / connection_count);
-  for (const GinFlowPart& part : parts) {
-    const auto& source = records[part.source];
-    const auto& destination = records[part.destination];
-    const auto edge = std::make_pair(part.source, part.destination);
-    auto& uses = connection_uses[edge];
-    std::uint32_t selected_connection = 0;
-    auto selected_key = std::tuple<long double, unsigned int, std::uint32_t, std::uint32_t>{
-      std::numeric_limits<long double>::infinity(), std::numeric_limits<unsigned int>::max(),
-      std::numeric_limits<std::uint32_t>::max(), std::numeric_limits<std::uint32_t>::max()};
-    for (std::uint32_t connection = 0; connection < connection_count; ++connection) {
-      const std::uint32_t source_rail = connection % source.rail_count;
-      const std::uint32_t destination_rail = connection % destination.rail_count;
-      const long double bandwidth = std::max<long double>(
-        1.0L, std::min(source.rail_bandwidths_gbps[source_rail],
-                       destination.rail_bandwidths_gbps[destination_rail]));
-      const long double work = static_cast<long double>(part.bytes) / bandwidth;
-      const GinRailKey source_key{source.numa_group_id, source_rail};
-      const GinRailKey destination_key{destination.numa_group_id, destination_rail};
-      const long double projected = std::max(rail_load[source_key] + work, rail_load[destination_key] + work);
-      const unsigned int distance = static_cast<unsigned int>(source.rail_pci_distances[source_rail]) +
-                                    destination.rail_pci_distances[destination_rail];
-      const std::uint32_t rotated = (connection + connection_count -
-                                     ((part.source + part.destination) % connection_count)) %
-                                    connection_count;
-      const auto key = std::make_tuple(projected, distance, uses[connection], rotated);
-      if (key < selected_key) {
-        selected_key = key;
-        selected_connection = connection;
-      }
-    }
-    const std::uint32_t source_rail = selected_connection % source.rail_count;
-    const std::uint32_t destination_rail = selected_connection % destination.rail_count;
-    const long double bandwidth = std::max<long double>(
-      1.0L, std::min(source.rail_bandwidths_gbps[source_rail],
-                     destination.rail_bandwidths_gbps[destination_rail]));
-    const long double work = static_cast<long double>(part.bytes) / bandwidth;
-    rail_load[{source.numa_group_id, source_rail}] += work;
-    rail_load[{destination.numa_group_id, destination_rail}] += work;
-    const std::uint32_t use = uses[selected_connection]++;
-    const std::uint32_t context =
-      selected_connection + (use % contexts_per_connection) * connection_count;
-    part_contexts[{part.source, part.destination, part.part}] = static_cast<std::uint8_t>(context);
-  }
-
-  for (const std::uint32_t peer : gin_peers) {
-    const std::uint32_t source = direction == v2::V2Direction::kSend ? state->rank : peer;
-    const std::uint32_t destination = direction == v2::V2Direction::kSend ? peer : state->rank;
-    const auto& source_record = records[source];
-    const std::uint32_t part_count = gin_channels_for_record(*state, source_record, destination);
-    const std::uint32_t channel_base =
-      v2::v2ChannelBase(source, destination, state->total_channels, part_count);
-    for (std::uint32_t part = 0; part < part_count; ++part) {
-      const std::uint32_t channel = (channel_base + part) & (state->total_channels - 1);
-      const auto found = part_contexts.find({source, destination, part});
-      const std::uint8_t context = found == part_contexts.end()
-        ? static_cast<std::uint8_t>(channel % context_count)
-        : found->second;
-      state->gin_peer_contexts[static_cast<std::size_t>(peer) * state->total_channels + channel] = context;
-      state->gin_channel_context_masks[channel] |= std::uint64_t{1} << context;
-      if (!state->gin_rail_scheduled_bytes.empty()) {
-        const auto bounds = v2::v2PartBounds(part_count, part, source_record.peer_payload_bytes[destination]);
-        const std::uint32_t connection = context % connection_count;
-        const std::uint32_t local_rail = connection % state->gin_rail_scheduled_bytes.size();
-        state->gin_rail_scheduled_bytes[local_rail] += bounds.second - bounds.first;
-      }
-    }
-  }
-  for (std::uint32_t channel = 0; channel < state->total_channels; ++channel) {
-    if (state->gin_channel_context_masks[channel] == 0) {
-      state->gin_channel_context_masks[channel] = std::uint64_t{1} << (channel % context_count);
-    }
-  }
-
-  AWEX_CUDA_V2_CHECK(cudaMalloc(reinterpret_cast<void**>(&state->device_gin_peer_contexts),
-                                state->gin_peer_contexts.size() * sizeof(std::uint8_t)));
-  AWEX_CUDA_V2_CHECK(cudaMemcpyAsync(state->device_gin_peer_contexts, state->gin_peer_contexts.data(),
-                                     state->gin_peer_contexts.size() * sizeof(std::uint8_t),
-                                     cudaMemcpyHostToDevice, stream));
-  AWEX_CUDA_V2_CHECK(cudaMalloc(reinterpret_cast<void**>(&state->device_gin_channel_context_masks),
-                                state->gin_channel_context_masks.size() * sizeof(std::uint64_t)));
-  AWEX_CUDA_V2_CHECK(cudaMemcpyAsync(state->device_gin_channel_context_masks,
-                                     state->gin_channel_context_masks.data(),
-                                     state->gin_channel_context_masks.size() * sizeof(std::uint64_t),
-                                     cudaMemcpyHostToDevice, stream));
-}
-#endif
-
 void initialize_sparse_window(DeviceState* state, const std::vector<std::uint32_t>& active_peers,
-                              const std::vector<v2::V2LoweringTask>& tasks, v2::V2Direction direction,
-                              cudaStream_t stream) {
+                              const std::vector<v2::V2LoweringTask>& tasks, cudaStream_t stream) {
   if (state->window_initialized) {
     if (active_peers != state->window_active_peers) {
       throw std::runtime_error("nccl_device_v2 active peers changed after window initialization");
@@ -876,7 +581,6 @@ void initialize_sparse_window(DeviceState* state, const std::vector<std::uint32_
         state->network_channels_per_peer =
           std::max(state->network_channels_per_peer, state->peer_channels[peer]);
       }
-      configure_gin_peer_contexts(state, gin_peers, direction, stream);
     }
 #endif
     state->window_active_peers = active_peers;
@@ -891,14 +595,6 @@ void initialize_sparse_window(DeviceState* state, const std::vector<std::uint32_
     if (state->device_peer_transports != nullptr) {
       cudaFree(state->device_peer_transports);
       state->device_peer_transports = nullptr;
-    }
-    if (state->device_gin_peer_contexts != nullptr) {
-      cudaFree(state->device_gin_peer_contexts);
-      state->device_gin_peer_contexts = nullptr;
-    }
-    if (state->device_gin_channel_context_masks != nullptr) {
-      cudaFree(state->device_gin_channel_context_masks);
-      state->device_gin_channel_context_masks = nullptr;
     }
     if (state->device_payload_peer_slots != nullptr) {
       cudaFree(state->device_payload_peer_slots);
@@ -1017,7 +713,7 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
   const bool plan_cache_hit = state->plan_initialized;
   if (!state->plan_initialized) {
     const auto initialization_start = Clock::now();
-    initialize_sparse_window(state, active_peers, tasks, direction, stream);
+    initialize_sparse_window(state, active_peers, tasks, stream);
     v2::V2LoweringConfig config;
     config.local_rank = static_cast<std::uint32_t>(state->rank);
     config.world_size = static_cast<std::uint32_t>(state->world_size);
@@ -1122,21 +818,6 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
   }
   metrics["active_peer_channel_limits"] = std::move(peer_channel_counts);
   metrics["active_peer_payload_bytes"] = std::move(peer_payload_bytes);
-  py::list hca_bandwidths;
-  for (const float bandwidth : state->hca_effective_bandwidths_gbps) {
-    hca_bandwidths.append(py::float_(bandwidth));
-  }
-  metrics["gin_hca_effective_bandwidths_gbps"] = std::move(hca_bandwidths);
-  py::list hca_distances;
-  for (const std::uint8_t distance : state->hca_pci_distances) {
-    hca_distances.append(py::int_(distance));
-  }
-  metrics["gin_hca_pci_distances"] = std::move(hca_distances);
-  py::list rail_scheduled_bytes;
-  for (const std::uint64_t bytes : state->gin_rail_scheduled_bytes) {
-    rail_scheduled_bytes.append(py::int_(bytes));
-  }
-  metrics["gin_rail_scheduled_bytes"] = std::move(rail_scheduled_bytes);
 #if AWEX_NCCL_DEVICE_V2_HAS_GIN
   metrics["gin_type"] = py::int_(static_cast<int>(state->gin_type));
   metrics["gin_context_count"] =
@@ -1179,8 +860,6 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
   args.local_window = reinterpret_cast<std::uint8_t*>(state->local_base);
   args.peer_windows = state->device_peer_windows;
   args.payload_peer_slots = state->device_payload_peer_slots;
-  args.gin_peer_contexts = state->device_gin_peer_contexts;
-  args.gin_channel_context_masks = state->device_gin_channel_context_masks;
   args.gin_enabled = state->gin_enabled ? 1U : 0U;
   args.gin_credit_batch = gin_credit_batch;
   args.gin_signal_count = state->gin_signal_count;

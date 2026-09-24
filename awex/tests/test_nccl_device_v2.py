@@ -16,7 +16,6 @@
 # under the License.
 
 import os
-from types import SimpleNamespace
 
 import pytest
 
@@ -25,9 +24,7 @@ from awex.transfer.nccl_device_v2 import (
     NCCLDeviceV2UnavailableError,
     _active_rdma_endpoints,
     _configure_gin_hca_policy,
-    _gpu_numa_nodes,
     _parse_nvidia_topology,
-    _pcie_bandwidth_gbps,
     _RdmaEndpoint,
     _resolve_fifo_depth,
     _resolve_gin_connections,
@@ -55,64 +52,22 @@ def test_active_rdma_endpoints_read_active_port_capacity(tmp_path):
     ]
 
 
-def test_pcie_bandwidth_uses_current_speed_width_and_encoding(tmp_path):
-    (tmp_path / "current_link_speed").write_text("16.0 GT/s PCIe\n", encoding="ascii")
-    (tmp_path / "current_link_width").write_text("16\n", encoding="ascii")
-
-    assert _pcie_bandwidth_gbps(str(tmp_path)) == pytest.approx(
-        16.0 * 16 * 128 / 130
-    )
-
-
-def test_gpu_numa_nodes_resolve_index_and_uuid(monkeypatch, tmp_path):
-    for bus_id, numa_node in (("0000:18:00.0", 0), ("0000:98:00.0", 1)):
-        device = tmp_path / bus_id
-        device.mkdir()
-        (device / "numa_node").write_text(f"{numa_node}\n", encoding="ascii")
-    monkeypatch.setenv("AWEX_NODE_LOCAL_GPU_IDS", "GPU-first,1")
-    monkeypatch.setattr(
-        "awex.transfer.nccl_device_v2.subprocess.run",
-        lambda *args, **kwargs: SimpleNamespace(
-            stdout=(
-                "0, GPU-first, 00000000:18:00.0\n"
-                "1, GPU-second, 00000000:98:00.0\n"
-            )
-        ),
-    )
-
-    assert _gpu_numa_nodes(2, str(tmp_path)) == [0, 1]
-
-
-def test_balanced_hca_policy_exposes_only_rank_numa_domain(monkeypatch):
+def test_balanced_hca_policy_groups_ranks_across_devices(monkeypatch):
     monkeypatch.setenv("AWEX_NCCL_DEVICE_V2_HCA_POLICY", "balanced")
     monkeypatch.setenv("LOCAL_RANK", "5")
     monkeypatch.setenv("LOCAL_WORLD_SIZE", "8")
     monkeypatch.delenv("NCCL_IB_HCA", raising=False)
-    monkeypatch.delenv("NCCL_NETDEVS_POLICY", raising=False)
     monkeypatch.setattr(
         "awex.transfer.nccl_device_v2._active_rdma_endpoints",
         lambda: [
-            _RdmaEndpoint(name, 1, 200.0, f"/pci/{index}", index // 2)
+            _RdmaEndpoint(name, 1, 200.0, f"/pci/{index}")
             for index, name in enumerate(["mlx5_3", "mlx5_8", "mlx5_19", "mlx5_30"])
         ],
-    )
-    monkeypatch.setattr(
-        "awex.transfer.nccl_device_v2._gpu_numa_nodes",
-        lambda size: [0, 0, 0, 0, 1, 1, 1, 1],
-    )
-    monkeypatch.setattr(
-        "awex.transfer.nccl_device_v2._gpu_hca_topology",
-        lambda endpoints, size: [[3, 3, 4, 4]] * 4 + [[4, 4, 3, 0]] * 4,
     )
 
     _configure_gin_hca_policy()
 
-    assert os.environ["NCCL_IB_HCA"] == "=mlx5_19:1,mlx5_30:1"
-    assert os.environ["NCCL_NETDEVS_POLICY"] == "ALL"
-    assert os.environ["AWEX_NCCL_DEVICE_V2_HCA_EFFECTIVE_BANDWIDTHS_GBPS"] == (
-        "200.0,200.0"
-    )
-    assert os.environ["AWEX_NCCL_DEVICE_V2_HCA_PCI_DISTANCES"] == "3,0"
+    assert os.environ["NCCL_IB_HCA"] == "=mlx5_19:1"
 
 
 def test_balanced_hca_policy_applies_node_rank_offset(monkeypatch):
@@ -125,43 +80,14 @@ def test_balanced_hca_policy_applies_node_rank_offset(monkeypatch):
     monkeypatch.setattr(
         "awex.transfer.nccl_device_v2._active_rdma_endpoints",
         lambda: [
-            _RdmaEndpoint(name, 1, 200.0, f"/pci/{index}", index // 2)
+            _RdmaEndpoint(name, 1, 200.0, f"/pci/{index}")
             for index, name in enumerate(["mlx5_3", "mlx5_8", "mlx5_19", "mlx5_30"])
         ],
-    )
-    monkeypatch.setattr(
-        "awex.transfer.nccl_device_v2._gpu_numa_nodes",
-        lambda size: [0, 0, 0, 0, 1, 1, 1, 1],
-    )
-    monkeypatch.setattr(
-        "awex.transfer.nccl_device_v2._gpu_hca_topology",
-        lambda endpoints, size: [[3, 3, 4, 4]] * 4 + [[4, 4, 3, 3]] * 4,
     )
 
     _configure_gin_hca_policy()
 
-    assert os.environ["NCCL_IB_HCA"] == "=mlx5_19:1,mlx5_30:1"
-
-
-def test_balanced_hca_policy_rejects_cross_numa_fallback(monkeypatch):
-    monkeypatch.setenv("AWEX_NCCL_DEVICE_V2_HCA_POLICY", "balanced")
-    monkeypatch.setenv("LOCAL_RANK", "0")
-    monkeypatch.setenv("LOCAL_WORLD_SIZE", "1")
-    monkeypatch.delenv("NCCL_IB_HCA", raising=False)
-    monkeypatch.setattr(
-        "awex.transfer.nccl_device_v2._active_rdma_endpoints",
-        lambda: [_RdmaEndpoint("mlx5_0", 1, 400.0, "/pci/0", 1)],
-    )
-    monkeypatch.setattr(
-        "awex.transfer.nccl_device_v2._gpu_numa_nodes", lambda size: [0]
-    )
-    monkeypatch.setattr(
-        "awex.transfer.nccl_device_v2._gpu_hca_topology",
-        lambda endpoints, size: [[4]],
-    )
-
-    with pytest.raises(NCCLDeviceV2UnavailableError, match="no active RDMA endpoint"):
-        _configure_gin_hca_policy()
+    assert os.environ["NCCL_IB_HCA"] == "=mlx5_19:1"
 
 
 def test_weighted_hca_assignments_follow_capacity_and_payload():
