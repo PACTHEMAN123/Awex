@@ -55,18 +55,19 @@ __device__ __forceinline__ ncclGinSignal_t v2GinCreditSignal(const V2KernelArgs&
 
 __device__ __forceinline__ std::size_t v2GinPayloadOffset(const V2KernelArgs& args, std::uint32_t window_rank,
                                                           std::uint32_t peer, std::uint32_t channel,
-                                                          unsigned long long step) {
+                                                          unsigned long long step, std::uint32_t fifo_depth) {
   const std::uint32_t payload_slot =
     args.payload_peer_slots[static_cast<std::size_t>(window_rank) * args.world_size + peer];
   const std::size_t connection = static_cast<std::size_t>(payload_slot) * args.layout.channel_count + channel;
   const std::size_t slot =
-    connection * args.layout.fifo_depth + static_cast<std::size_t>(step % args.layout.fifo_depth);
+    connection * args.layout.fifo_depth + static_cast<std::size_t>(step % fifo_depth);
   return args.layout.payload_offset + slot * args.layout.slot_bytes;
 }
 
 __device__ __forceinline__ std::uint8_t* v2GinLocalPayload(const V2KernelArgs& args, std::uint32_t peer,
-                                                           std::uint32_t channel, unsigned long long step) {
-  return args.local_window + v2GinPayloadOffset(args, args.local_rank, peer, channel, step);
+                                                           std::uint32_t channel, unsigned long long step,
+                                                           std::uint32_t fifo_depth) {
+  return args.local_window + v2GinPayloadOffset(args, args.local_rank, peer, channel, step, fifo_depth);
 }
 
 __device__ __forceinline__ bool v2GinWaitSignal(const V2KernelArgs& args, const ncclGin& gin, ncclGinSignal_t signal,
@@ -106,14 +107,15 @@ __device__ __forceinline__ void v2GinRunSend(const V2KernelArgs& args, const V2W
   while (cursor < work.nbytes) {
     const std::uint64_t slice_bytes =
       work.step_bytes < work.nbytes - cursor ? work.step_bytes : work.nbytes - cursor;
-    if ((roles & kRoleWaitSend) && step > args.layout.fifo_depth) {
-      *ready = v2GinWaitSignal(args, gin, credit_signal, step - args.layout.fifo_depth, 3U);
+    if ((roles & kRoleWaitSend) && step > work.fifo_depth) {
+      *ready = v2GinWaitSignal(args, gin, credit_signal, step - work.fifo_depth, 3U);
     }
     if (roles & kRoleWorker) {
       v2GroupBarrier(wait_barrier, nworkers);
       if (*ready) {
-        v2CopyFragmentsToContiguous(args, work, v2GinLocalPayload(args, work.peer, channel, step), cursor, slice_bytes,
-                                    tid, nworkers);
+        v2CopyFragmentsToContiguous(
+          args, work, v2GinLocalPayload(args, work.peer, channel, step, work.fifo_depth), cursor, slice_bytes, tid,
+          nworkers);
       }
     }
 
@@ -121,8 +123,9 @@ __device__ __forceinline__ void v2GinRunSend(const V2KernelArgs& args, const V2W
     if ((roles & kRolePostSend) && v2LoadError(error) == 0) {
       // The cumulative ready counter requires ordered completion so a later
       // put cannot satisfy the wait for an earlier FIFO step.
-      gin.put(world, work.peer, args.window, v2GinPayloadOffset(args, work.peer, args.local_rank, channel, step),
-              args.window, v2GinPayloadOffset(args, args.local_rank, work.peer, channel, step), slice_bytes,
+      gin.put(world, work.peer, args.window,
+              v2GinPayloadOffset(args, work.peer, args.local_rank, channel, step, work.fifo_depth), args.window,
+              v2GinPayloadOffset(args, args.local_rank, work.peer, channel, step, work.fifo_depth), slice_bytes,
               V2GinReadySignalInc{ready_signal}, ncclGin_None{}, ncclCoopThread{}, ncclGin_None{},
               cuda::thread_scope_thread, cuda::thread_scope_device, ncclGinOptFlagsDefault);
     }
@@ -159,8 +162,9 @@ __device__ __forceinline__ void v2GinRunRecv(const V2KernelArgs& args, const V2W
     }
     v2GroupBarrier(barrier, nthreads);
     if (*ready && (roles & kRoleWorker)) {
-      v2CopyContiguousToFragments(args, work, v2GinLocalPayload(args, work.peer, channel, step), cursor, slice_bytes,
-                                  tid, nworkers);
+      v2CopyContiguousToFragments(
+        args, work, v2GinLocalPayload(args, work.peer, channel, step, work.fifo_depth), cursor, slice_bytes, tid,
+        nworkers);
     }
 
     v2GroupBarrier(barrier, nthreads);

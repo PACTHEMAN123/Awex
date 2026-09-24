@@ -144,23 +144,25 @@ __device__ __forceinline__ void v2Store8(void* address, std::uint8_t value) {
 
 __device__ __forceinline__ V2FifoSlot* v2FifoSlot(const V2KernelArgs& args, std::uint32_t window_rank,
                                                   std::uint32_t connection_rank, std::uint32_t channel,
-                                                  unsigned long long step, bool local_window) {
+                                                  unsigned long long step, std::uint32_t fifo_depth,
+                                                  bool local_window) {
   auto* window = local_window ? args.local_window : reinterpret_cast<std::uint8_t*>(args.peer_windows[window_rank]);
   const std::size_t connection = (static_cast<std::size_t>(connection_rank) * args.layout.channel_count) + channel;
   const std::size_t slot =
-    connection * args.layout.fifo_depth + static_cast<std::size_t>(step % args.layout.fifo_depth);
+    connection * args.layout.fifo_depth + static_cast<std::size_t>(step % fifo_depth);
   return reinterpret_cast<V2FifoSlot*>(window + args.layout.state_offset + slot * sizeof(V2FifoSlot));
 }
 
 __device__ __forceinline__ std::uint8_t* v2FifoPayload(const V2KernelArgs& args, std::uint32_t window_rank,
                                                        std::uint32_t connection_rank, std::uint32_t channel,
-                                                       unsigned long long step, bool local_window) {
+                                                       unsigned long long step, std::uint32_t fifo_depth,
+                                                       bool local_window) {
   auto* window = local_window ? args.local_window : reinterpret_cast<std::uint8_t*>(args.peer_windows[window_rank]);
   const std::uint32_t payload_peer =
     args.payload_peer_slots[static_cast<std::size_t>(window_rank) * args.world_size + connection_rank];
   const std::size_t connection = (static_cast<std::size_t>(payload_peer) * args.layout.channel_count) + channel;
   const std::size_t slot =
-    connection * args.layout.fifo_depth + static_cast<std::size_t>(step % args.layout.fifo_depth);
+    connection * args.layout.fifo_depth + static_cast<std::size_t>(step % fifo_depth);
   return window + args.layout.payload_offset + slot * args.layout.slot_bytes;
 }
 

@@ -75,6 +75,8 @@ struct DeviceState {
   std::uint32_t fifo_depth = v2::kDefaultFifoDepth;
   std::size_t chunk_bytes = v2::kDefaultChunkBytes;
   std::size_t step_bytes = v2::kDefaultStepBytes;
+  std::uint32_t gin_fifo_depth = v2::kDefaultFifoDepth;
+  std::size_t gin_chunk_bytes = v2::kDefaultChunkBytes;
   std::size_t network_step_bytes = v2::kDefaultNetworkStepBytes;
   bool plan_initialized = false;
   bool window_initialized = false;
@@ -129,8 +131,9 @@ std::uint32_t power_of_two_down(std::uint32_t value) {
 
 std::unique_ptr<DeviceState> make_state(const std::string& unique_id_bytes, int world_size, int rank, int device,
                                         int timeout_ms, std::uint32_t max_channels, std::uint32_t fifo_depth,
-                                        std::size_t step_bytes, std::size_t network_step_bytes,
-                                        std::size_t chunk_bytes, std::uint32_t gin_context_count) {
+                                        std::size_t step_bytes, std::size_t chunk_bytes,
+                                        std::uint32_t gin_fifo_depth, std::size_t network_step_bytes,
+                                        std::size_t gin_chunk_bytes, std::uint32_t gin_context_count) {
   if (world_size < 2 || world_size > kMaxRanks) {
     throw std::runtime_error("nccl_device_v2 world_size must be in [2, 256]");
   }
@@ -146,13 +149,14 @@ std::unique_ptr<DeviceState> make_state(const std::string& unique_id_bytes, int 
   if (gin_context_count == 0 || gin_context_count > v2::kMaxChannels) {
     throw std::runtime_error("invalid nccl_device_v2 GIN context count");
   }
-  if (fifo_depth == 0 || step_bytes == 0 || network_step_bytes == 0 ||
+  if (fifo_depth == 0 || gin_fifo_depth == 0 || step_bytes == 0 || network_step_bytes == 0 ||
       step_bytes > std::numeric_limits<std::uint32_t>::max() ||
       network_step_bytes > std::numeric_limits<std::uint32_t>::max()) {
     throw std::runtime_error("nccl_device_v2 FIFO depth and step sizes must be positive and fit in V2Work");
   }
-  if (chunk_bytes != 0 && chunk_bytes < std::max(step_bytes, network_step_bytes)) {
-    throw std::runtime_error("nccl_device_v2 chunk_bytes must be zero or at least step_bytes");
+  if ((chunk_bytes != 0 && chunk_bytes < step_bytes) ||
+      (gin_chunk_bytes != 0 && gin_chunk_bytes < network_step_bytes)) {
+    throw std::runtime_error("nccl_device_v2 transport chunk_bytes must be zero or at least its step_bytes");
   }
   auto state = std::make_unique<DeviceState>();
   state->rank = rank;
@@ -160,9 +164,11 @@ std::unique_ptr<DeviceState> make_state(const std::string& unique_id_bytes, int 
   state->device = device;
   state->fifo_depth = fifo_depth;
   state->step_bytes = step_bytes;
-  state->network_step_bytes = network_step_bytes;
-  state->gin.context_count = gin_context_count;
   state->chunk_bytes = chunk_bytes;
+  state->gin_fifo_depth = gin_fifo_depth;
+  state->network_step_bytes = network_step_bytes;
+  state->gin_chunk_bytes = gin_chunk_bytes;
+  state->gin.context_count = gin_context_count;
   AWEX_CUDA_V2_CHECK(cudaSetDevice(device));
   int multiprocessor_count = 0;
   AWEX_CUDA_V2_CHECK(cudaDeviceGetAttribute(&multiprocessor_count, cudaDevAttrMultiProcessorCount, device));
@@ -383,11 +389,14 @@ void initialize_sparse_window(DeviceState* state, const std::vector<std::uint32_
     std::any_of(gin_flags.begin(), gin_flags.end(), [](std::uint32_t value) { return value != 0; });
   v2::v2ValidateGinSupport(state->gin, state->nccl_version);
 
-  const std::size_t slot_bytes = std::max(state->step_bytes, state->network_step_bytes);
-  state->layout = v2::makeV2WindowLayout(state->world_size, state->total_channels, state->fifo_depth, slot_bytes,
+  const std::uint32_t layout_fifo_depth =
+    state->gin.enabled ? std::max(state->fifo_depth, state->gin_fifo_depth) : state->fifo_depth;
+  const std::size_t slot_bytes =
+    state->gin.enabled ? std::max(state->step_bytes, state->network_step_bytes) : state->step_bytes;
+  state->layout = v2::makeV2WindowLayout(state->world_size, state->total_channels, layout_fifo_depth, slot_bytes,
                                          payload_peer_count);
   state->window_bytes = state->layout.window_bytes;
-  state->dense_window_bytes = v2::makeV2WindowLayout(state->world_size, state->total_channels, state->fifo_depth,
+  state->dense_window_bytes = v2::makeV2WindowLayout(state->world_size, state->total_channels, layout_fifo_depth,
                                                       slot_bytes, state->world_size)
                                 .window_bytes;
   try {
@@ -440,7 +449,7 @@ void initialize_sparse_window(DeviceState* state, const std::vector<std::uint32_
         peer_bytes += task.nbytes;
       }
       v2::v2InitializeGin(&state->gin, state->comm, state->world_size, state->total_channels,
-                          state->fifo_depth, state->network_step_bytes, state->gin.context_count,
+                          state->gin_fifo_depth, state->network_step_bytes, state->gin.context_count,
                           active_peers, state->peer_transports, std::move(peer_payload_bytes),
                           &state->peer_channels);
     }
@@ -575,6 +584,8 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
     config.fifo_depth = state->fifo_depth;
     config.chunk_bytes = state->chunk_bytes;
     config.step_bytes = state->step_bytes;
+    config.gin_fifo_depth = state->gin_fifo_depth;
+    config.gin_chunk_bytes = state->gin_chunk_bytes;
     config.network_step_bytes = state->network_step_bytes;
     config.peer_channels = state->peer_channels;
     config.peer_transports = state->peer_transports;
@@ -624,6 +635,9 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
   metrics["max_work_step_bytes"] = py::int_(max_work_step_bytes);
   metrics["active_peer_count"] = py::int_(cached_peers.size());
   metrics["fifo_depth"] = py::int_(state->fifo_depth);
+  metrics["gin_fifo_depth"] = py::int_(state->gin_fifo_depth);
+  metrics["chunk_bytes"] = py::int_(state->chunk_bytes);
+  metrics["gin_chunk_bytes"] = py::int_(state->gin_chunk_bytes);
   metrics["threads_per_channel"] = py::int_(v2::kThreadsPerBlock);
   metrics["warps_per_channel"] = py::int_(v2::kWarpsPerBlock);
   metrics["vector_bytes"] = py::int_(v2::kCopyPackBytes);
@@ -655,7 +669,7 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
   metrics["gin_enabled"] = py::bool_(state->gin.enabled);
   metrics["gin_signal_count"] = py::int_(state->gin.signal_count);
   metrics["gin_connection_count"] = py::int_(state->gin.connection_count);
-  const std::uint32_t gin_credit_batch = v2::v2GinCreditBatch(active_gin_peers, state->fifo_depth);
+  const std::uint32_t gin_credit_batch = v2::v2GinCreditBatch(active_gin_peers, state->gin_fifo_depth);
   metrics["gin_credit_batch"] = py::int_(gin_credit_batch);
   metrics["network_channels_per_peer"] = py::int_(state->gin.channels_per_peer);
   metrics["network_channel_budget"] = py::int_(state->gin.channel_budget);
@@ -676,7 +690,7 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
   metrics["payload_peer_count"] = py::int_(state->layout.payload_peer_count);
   metrics["control_window_bytes"] = py::int_(state->layout.payload_offset);
   metrics["payload_buffer_bytes"] = py::int_(
-    static_cast<std::size_t>(state->layout.payload_peer_count) * state->total_channels * state->fifo_depth *
+    static_cast<std::size_t>(state->layout.payload_peer_count) * state->total_channels * state->layout.fifo_depth *
     state->layout.slot_bytes);
   metrics["registered_window_bytes"] = py::int_(state->window_bytes);
   metrics["dense_window_bytes"] = py::int_(state->dense_window_bytes);
@@ -704,7 +718,7 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
   args.local_window = reinterpret_cast<std::uint8_t*>(state->local_base);
   args.peer_windows = state->device_peer_windows;
   args.payload_peer_slots = state->device_payload_peer_slots;
-  v2::v2SetGinKernelArgs(state->gin, state->window, active_gin_peers, state->fifo_depth, &args);
+  v2::v2SetGinKernelArgs(state->gin, state->window, active_gin_peers, state->gin_fifo_depth, &args);
   args.epoch = static_cast<unsigned long long>(sequence);
   args.timeout_cycles = state->timeout_cycles;
   const auto kernel_start = Clock::now();
@@ -735,9 +749,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
     return py::bytes(reinterpret_cast<const char*>(&unique_id), sizeof(unique_id));
   });
   module.def("create", [](const py::bytes& id, int world_size, int rank, int device, int timeout_ms, int max_channels,
-                          int fifo_depth, int64_t step_bytes, int64_t network_step_bytes, int64_t chunk_bytes,
-                          int gin_context_count) {
-    if (step_bytes <= 0 || network_step_bytes <= 0 || chunk_bytes < 0) {
+                          int fifo_depth, int64_t step_bytes, int64_t chunk_bytes, int gin_fifo_depth,
+                          int64_t network_step_bytes, int64_t gin_chunk_bytes, int gin_context_count) {
+    if (fifo_depth <= 0 || gin_fifo_depth <= 0 || step_bytes <= 0 || network_step_bytes <= 0 || chunk_bytes < 0 ||
+        gin_chunk_bytes < 0) {
       throw std::runtime_error("invalid nccl_device_v2 step/chunk bytes");
     }
     if (gin_context_count <= 0) {
@@ -746,7 +761,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
     const std::string unique_id = id;
     auto state = make_state(unique_id, world_size, rank, device, timeout_ms, static_cast<std::uint32_t>(max_channels),
                             static_cast<std::uint32_t>(fifo_depth), static_cast<std::size_t>(step_bytes),
-                            static_cast<std::size_t>(network_step_bytes), static_cast<std::size_t>(chunk_bytes),
+                            static_cast<std::size_t>(chunk_bytes), static_cast<std::uint32_t>(gin_fifo_depth),
+                            static_cast<std::size_t>(network_step_bytes), static_cast<std::size_t>(gin_chunk_bytes),
                             static_cast<std::uint32_t>(gin_context_count));
     return reinterpret_cast<int64_t>(state.release());
   });

@@ -50,14 +50,15 @@ __device__ __forceinline__ void v2RunSend(const V2KernelArgs& args, const V2Work
   while (cursor < work.nbytes) {
     const std::uint64_t slice_bytes =
       work.step_bytes < work.nbytes - cursor ? work.step_bytes : work.nbytes - cursor;
-    V2FifoSlot* slot = v2FifoSlot(args, args.local_rank, work.peer, channel, step, true);
+    V2FifoSlot* slot = v2FifoSlot(args, args.local_rank, work.peer, channel, step, work.fifo_depth, true);
     if (roles & kRoleWaitSend) {
-      *ready = v2WaitFree(slot, step, args.layout.fifo_depth, step_cache, error, args.timeout_cycles);
+      *ready = v2WaitFree(slot, step, work.fifo_depth, step_cache, error, args.timeout_cycles);
     }
     if (roles & kRoleWorker) {
       v2GroupBarrier(wait_barrier, nworkers);
       if (*ready) {
-        std::uint8_t* payload = v2FifoPayload(args, args.local_rank, work.peer, channel, step, true);
+        std::uint8_t* payload =
+          v2FifoPayload(args, args.local_rank, work.peer, channel, step, work.fifo_depth, true);
         v2CopyFragmentsToContiguous(args, work, payload, cursor, slice_bytes, tid, nworkers);
       }
     }
@@ -75,7 +76,8 @@ __device__ __forceinline__ void v2RunSend(const V2KernelArgs& args, const V2Work
   }
 
   if (work.final && work.nbytes != 0) {
-    V2FifoSlot* slot = v2FifoSlot(args, args.local_rank, work.peer, channel, step - 1, true);
+    V2FifoSlot* slot =
+      v2FifoSlot(args, args.local_rank, work.peer, channel, step - 1, work.fifo_depth, true);
     if (roles & kRoleWaitSend) {
       *ready = v2WaitConsumed(slot, step - 1, step_cache, error, args.timeout_cycles);
     }
@@ -94,13 +96,14 @@ __device__ __forceinline__ void v2RunRecv(const V2KernelArgs& args, const V2Work
   while (cursor < work.nbytes) {
     const std::uint64_t slice_bytes =
       work.step_bytes < work.nbytes - cursor ? work.step_bytes : work.nbytes - cursor;
-    V2FifoSlot* slot = v2FifoSlot(args, work.peer, args.local_rank, channel, step, false);
+    V2FifoSlot* slot = v2FifoSlot(args, work.peer, args.local_rank, channel, step, work.fifo_depth, false);
     if (roles & kRoleWaitRecv) {
       *ready = v2WaitReady(&slot->ready_step, step, step_cache, error, args.timeout_cycles);
     }
     v2GroupBarrier(barrier, nthreads);
     if (*ready && (roles & kRoleWorker)) {
-      const std::uint8_t* payload = v2FifoPayload(args, work.peer, args.local_rank, channel, step, false);
+      const std::uint8_t* payload =
+        v2FifoPayload(args, work.peer, args.local_rank, channel, step, work.fifo_depth, false);
       v2CopyContiguousToFragments(args, work, payload, cursor, slice_bytes, tid, nworkers);
     }
 

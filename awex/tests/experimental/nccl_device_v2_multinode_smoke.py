@@ -110,6 +110,12 @@ def main() -> None:
             raise AssertionError(f"expected NCCL network step size, got {dict(metrics)}")
         if metrics["min_work_step_bytes"] != 128 * 1024:
             raise AssertionError(f"expected 128 KiB GIN steps, got {dict(metrics)}")
+        if metrics["fifo_depth"] != 8 or metrics["gin_fifo_depth"] != 16:
+            raise AssertionError(f"LSA and GIN FIFO settings were not isolated: {dict(metrics)}")
+        if metrics["chunk_bytes"] != 4 * 1024 * 1024:
+            raise AssertionError(f"main's LSA chunk size changed: {dict(metrics)}")
+        if metrics["gin_chunk_bytes"] != 4 * 1024 * 1024:
+            raise AssertionError(f"unexpected GIN chunk size: {dict(metrics)}")
         if metrics["channel_count"] != metrics["network_channels_per_peer"]:
             raise AssertionError(f"GIN did not use its network channels: {dict(metrics)}")
         if metrics["payload_peer_count"] != 1:

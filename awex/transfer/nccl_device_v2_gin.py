@@ -332,6 +332,32 @@ def _resolve_gin_connections(gin_connections: int | None) -> int:
     return gin_connections
 
 
+def _resolve_gin_fifo_depth(gin_fifo_depth: int | None = None) -> int:
+    if gin_fifo_depth is None:
+        configured = os.environ.get("AWEX_NCCL_DEVICE_V2_GIN_FIFO_DEPTH")
+        if configured is None:
+            # The old branch-wide name is now a GIN-only compatibility alias.
+            configured = os.environ.get("AWEX_NCCL_DEVICE_V2_FIFO_DEPTH")
+        try:
+            gin_fifo_depth = 16 if configured is None else int(configured)
+        except ValueError as exc:
+            raise NCCLDeviceV2UnavailableError(
+                "AWEX_NCCL_DEVICE_V2_GIN_FIFO_DEPTH must be an integer"
+            ) from exc
+    gin_fifo_depth = int(gin_fifo_depth)
+    if gin_fifo_depth < 1 or gin_fifo_depth > 64:
+        raise NCCLDeviceV2UnavailableError(
+            "nccl_device_v2 GIN FIFO depth must be in [1, 64]"
+        )
+    return gin_fifo_depth
+
+
+def _gin_chunk_bytes(network_step_bytes: int) -> int:
+    """Keep GIN chunking independent from the public LSA chunk setting."""
+
+    return max(4 * 1024 * 1024, int(network_step_bytes))
+
+
 def _resolve_gin_reliable_doorbell(gin_reliable_doorbell: int | None) -> int:
     if gin_reliable_doorbell is None:
         configured = os.environ.get("AWEX_NCCL_DEVICE_V2_GIN_RELIABLE_DB")

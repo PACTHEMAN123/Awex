@@ -148,6 +148,8 @@ def main() -> None:
             raise AssertionError(f"GIN has no network connections: {metrics}")
         if metrics["network_step_bytes"] != transport.network_step_bytes:
             raise AssertionError(f"expected NCCL network step size: {metrics}")
+        if metrics["fifo_depth"] != 8 or metrics["gin_fifo_depth"] != 16:
+            raise AssertionError(f"LSA and GIN FIFO settings were not isolated: {metrics}")
         if metrics["channel_count"] != metrics["network_channels_per_peer"]:
             raise AssertionError(f"GIN did not use its network channels: {metrics}")
         if launch_metrics[0]["plan_cache_hit"]:

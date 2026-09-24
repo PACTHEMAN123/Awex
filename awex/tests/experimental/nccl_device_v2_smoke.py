@@ -118,6 +118,10 @@ def main() -> None:
             raise AssertionError(f"expected 32 active channels, got {dict(metrics)}")
         if metrics["min_work_step_bytes"] != 512 * 1024:
             raise AssertionError(f"expected 512 KiB LSA steps, got {dict(metrics)}")
+        if metrics["fifo_depth"] != 8:
+            raise AssertionError(f"expected main's LSA FIFO depth, got {dict(metrics)}")
+        if metrics["chunk_bytes"] != 4 * 1024 * 1024:
+            raise AssertionError(f"expected main's LSA chunk size, got {dict(metrics)}")
         if metrics["threads_per_channel"] != 640:
             raise AssertionError(f"expected 640 channel threads, got {dict(metrics)}")
         if metrics["warps_per_channel"] != 20:
@@ -133,6 +137,8 @@ def main() -> None:
             raise AssertionError(f"expected the LSA path, got {dict(metrics)}")
         if metrics["gin_enabled"]:
             raise AssertionError(f"GIN unexpectedly enabled: {dict(metrics)}")
+        if metrics["slot_bytes"] != 512 * 1024:
+            raise AssertionError(f"GIN changed the LSA window layout: {dict(metrics)}")
         if launch_metrics[0]["plan_cache_hit"]:
             raise AssertionError(
                 f"first launch unexpectedly hit cache: {dict(metrics)}"

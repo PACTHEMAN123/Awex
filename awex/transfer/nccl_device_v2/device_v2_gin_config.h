@@ -89,7 +89,7 @@ inline void v2ValidateGinSupport(const V2GinState& state, int nccl_version) {
 }
 
 inline void v2ConfigureGinChannels(V2GinState* state, std::uint32_t total_channels,
-                                   std::uint32_t fifo_depth, std::size_t network_step_bytes,
+                                   std::uint32_t gin_fifo_depth, std::size_t network_step_bytes,
                                    const std::vector<std::uint32_t>& active_peers,
                                    const std::vector<std::uint8_t>& transports,
                                    std::vector<std::uint32_t>* peer_channels) {
@@ -111,7 +111,8 @@ inline void v2ConfigureGinChannels(V2GinState* state, std::uint32_t total_channe
     (*peer_channels)[gin_peers.front()] =
       std::min(total_channels, v2PowerOfTwoUp(state->channel_budget));
   } else {
-    const std::uint64_t fifo_window_bytes = static_cast<std::uint64_t>(network_step_bytes) * fifo_depth;
+    const std::uint64_t fifo_window_bytes =
+      static_cast<std::uint64_t>(network_step_bytes) * gin_fifo_depth;
     std::uint32_t assigned_channels = 0;
     for (const std::uint32_t peer : gin_peers) {
       const std::uint64_t window_demand =
@@ -148,7 +149,7 @@ inline void v2ConfigureGinChannels(V2GinState* state, std::uint32_t total_channe
 }
 
 inline void v2InitializeGin(V2GinState* state, ncclComm_t comm, int world_size,
-                            std::uint32_t total_channels, std::uint32_t fifo_depth,
+                            std::uint32_t total_channels, std::uint32_t gin_fifo_depth,
                             std::size_t network_step_bytes, std::uint32_t context_count,
                             const std::vector<std::uint32_t>& active_peers,
                             const std::vector<std::uint8_t>& transports,
@@ -177,13 +178,13 @@ inline void v2InitializeGin(V2GinState* state, ncclComm_t comm, int world_size,
     throw std::runtime_error("nccl_device_v2 GIN initialization returned no contexts or connections");
   }
   state->peer_payload_bytes = std::move(peer_payload_bytes);
-  v2ConfigureGinChannels(state, total_channels, fifo_depth, network_step_bytes, active_peers,
+  v2ConfigureGinChannels(state, total_channels, gin_fifo_depth, network_step_bytes, active_peers,
                          transports, peer_channels);
 #else
   (void)comm;
   (void)world_size;
   (void)total_channels;
-  (void)fifo_depth;
+  (void)gin_fifo_depth;
   (void)network_step_bytes;
   (void)context_count;
   (void)active_peers;

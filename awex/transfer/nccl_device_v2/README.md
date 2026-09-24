@@ -21,15 +21,17 @@ fixed TransferPlan spans for one peer
   -> 20 warps divided across the active works in a batch
   -> explicit WaitSend/WaitRecv, worker, and PostSend/PostRecv roles
   -> volatile 16-byte vector loads, unrolled across 8 instructions
-  -> FIFO slot = absolute step % 8
+  -> FIFO slot = absolute step % transport FIFO depth
 ```
 
-Channel sizing follows NCCL's `addP2pToPlan` policy for each transport.
-Intra-node SIMPLE traffic uses `minPartSize = stepSize / 8` and
+Channel sizing follows NCCL's `addP2pToPlan` policy for each transport without
+sharing transport configuration. Intra-node SIMPLE traffic retains main's
+FIFO depth 8, 512 KiB step, 4 MiB chunk, and symmetric bit-reversed channel
+placement. It uses `minPartSize = stepSize / 8` and
 `maxPartSize = stepSize * 32`; cross-node GIN traffic uses the multi-node
-range `stepSize / 2` through `stepSize`. LSA keeps the 512 KiB default step,
-while GIN defaults to NCCL's 128 KiB network P2P chunk and applies NCCL's
-small-message `/4` and `/2` tuning. The network step can be overridden with
+range `stepSize / 2` through `stepSize`, its own FIFO depth 16 and contiguous
+channel groups. GIN defaults to NCCL's 128 KiB network P2P chunk and applies
+NCCL's small-message `/4` and `/2` tuning. The network step can be overridden with
 `AWEX_NCCL_DEVICE_V2_NET_STEP_BYTES`, with `NCCL_P2P_NET_CHUNKSIZE` used as a
 fallback.
 
@@ -76,8 +78,12 @@ to `topology` to retain NCCL's native per-GPU selection.
 Awex always requests one context per detected connection. This explicit mapping
 is required for NCCL 2.30.4, which does not round a one-context request up to
 the connection count.
-`AWEX_NCCL_DEVICE_V2_FIFO_DEPTH` controls the number of reusable payload slots
-per peer and channel, from 1 through 64; the default is 16.
+`AWEX_NCCL_DEVICE_V2_GIN_FIFO_DEPTH` controls only GIN's reusable payload slots
+per peer and channel, from 1 through 64; the default is 16. The former
+`AWEX_NCCL_DEVICE_V2_FIFO_DEPTH` name remains a GIN-only compatibility alias;
+neither setting changes the LSA FIFO. GIN chunking is derived independently
+from its network step and cannot overwrite `AWEX_NCCL_DEVICE_CHUNK_BYTES`,
+which retains its original LSA meaning.
 Every GIN put uses the regular doorbell path. Doorbell aggregation was removed
 after the two-node sweep showed that batching reduced throughput.
 `AWEX_NCCL_DEVICE_V2_GIN_RELIABLE_DB` controls NCCL's GDAKI reliable doorbell
@@ -98,8 +104,9 @@ that window, and `ready_step`/`consumed_step` carry ownership. Peers outside the
 LSA team use GIN puts into the receiver's FIFO. Strong ready signals order the
 put stream and weak credit signals release reusable sender slots. Every
 `(peer, channel)` still owns an independent monotonically increasing step
-stream, and both paths share the same work/channel lowering and symmetric
-registered window.
+stream. Both paths share one symmetric registered allocation sized for the
+larger transport requirements, but each work carries its own FIFO depth, step
+size, chunk size, and channel placement policy.
 
 GIN is initialized only when the cached plan contains a non-LSA edge. That
 path requires Linux, CUDA 12.2 or newer, NCCL 2.30.4 or newer with aggregate

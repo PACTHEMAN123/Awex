@@ -36,7 +36,9 @@ from typing import Any
 from awex.transfer.nccl_device_v2_gin import (
     NCCLDeviceV2UnavailableError,
     _configure_gin_hca_policy,
+    _gin_chunk_bytes,
     _resolve_gin_connections,
+    _resolve_gin_fifo_depth,
     _resolve_gin_reliable_doorbell,
 )
 
@@ -193,23 +195,6 @@ def _resolve_network_step_bytes(network_step_bytes: int | None) -> int:
             "nccl_device_v2 network_step_bytes must be a multiple of 16"
         )
     return network_step_bytes
-
-
-def _resolve_fifo_depth(fifo_depth: int | None = None) -> int:
-    if fifo_depth is None:
-        configured = os.environ.get("AWEX_NCCL_DEVICE_V2_FIFO_DEPTH")
-        try:
-            fifo_depth = 16 if configured is None else int(configured)
-        except ValueError as exc:
-            raise NCCLDeviceV2UnavailableError(
-                "AWEX_NCCL_DEVICE_V2_FIFO_DEPTH must be an integer"
-            ) from exc
-    fifo_depth = int(fifo_depth)
-    if fifo_depth < 1 or fifo_depth > 64:
-        raise NCCLDeviceV2UnavailableError(
-            "nccl_device_v2 FIFO depth must be in [1, 64]"
-        )
-    return fifo_depth
 
 
 def _sequence_from_step(step_id: int) -> int:
@@ -620,11 +605,15 @@ class NCCLDeviceV2Transport:
             raise NCCLDeviceV2UnavailableError(
                 "nccl_device_v2 max_channels must be at most 64"
             )
-        self.fifo_depth = _resolve_fifo_depth()
+        # Preserve main's LSA protocol. Remote peers use independent GIN
+        # settings below and cannot retune local FIFO/chunk behavior.
+        self.fifo_depth = 8
         self.step_bytes = _env_int(
             "AWEX_NCCL_DEVICE_V2_STEP_BYTES", 512 * 1024, minimum=1
         )
         self.network_step_bytes = _resolve_network_step_bytes(network_step_bytes)
+        self.gin_fifo_depth = _resolve_gin_fifo_depth()
+        self.gin_chunk_bytes = _gin_chunk_bytes(self.network_step_bytes)
         self.gin_connections = _resolve_gin_connections(gin_connections)
         # NCCL 2.30.4 needs one explicit context per requested connection.
         self.gin_context_count = self.gin_connections or 1
@@ -636,12 +625,9 @@ class NCCLDeviceV2Transport:
         else:
             os.environ.pop("NCCL_GIN_NCONNECTIONS", None)
         os.environ["NCCL_GIN_GDAKI_USE_RELIABLE_DB"] = str(self.gin_reliable_doorbell)
-        if self.chunk_bytes and self.chunk_bytes < max(
-            self.step_bytes, self.network_step_bytes
-        ):
+        if self.chunk_bytes and self.chunk_bytes < self.step_bytes:
             raise NCCLDeviceV2UnavailableError(
-                "nccl_device_v2 chunk_bytes must be at least both local and network "
-                "step_bytes"
+                "nccl_device_v2 chunk_bytes must be at least the LSA step_bytes"
             )
         self.infer_instance_world_size = int(infer_instance_world_size)
         self.num_infer_engines = int(num_infer_engines)
@@ -653,7 +639,8 @@ class NCCLDeviceV2Transport:
         self._prepared_recv = None
         logger.info(
             "Configured nccl_device_v2 rank=%s chunk_bytes=%s max_channels=%s "
-            "fifo_depth=%s step_bytes=%s network_step_bytes=%s "
+            "fifo_depth=%s step_bytes=%s gin_fifo_depth=%s "
+            "network_step_bytes=%s gin_chunk_bytes=%s "
             "gin_connections=%s gin_context_count=%s "
             "gin_reliable_doorbell=%s hca_policy=%s selected_hca=%s",
             self.rank,
@@ -661,7 +648,9 @@ class NCCLDeviceV2Transport:
             self.max_channels,
             self.fifo_depth,
             self.step_bytes,
+            self.gin_fifo_depth,
             self.network_step_bytes,
+            self.gin_chunk_bytes,
             self.gin_connections,
             self.gin_context_count,
             self.gin_reliable_doorbell,
@@ -698,15 +687,18 @@ class NCCLDeviceV2Transport:
                 self.max_channels,
                 self.fifo_depth,
                 self.step_bytes,
-                self.network_step_bytes,
                 self.chunk_bytes,
+                self.gin_fifo_depth,
+                self.network_step_bytes,
+                self.gin_chunk_bytes,
                 self.gin_context_count,
             )
         )
         self._initialized = True
         logger.info(
             "Initialized nccl_device_v2 rank=%s world_size=%s window_config="
-            "channels:%s fifo:%s step_bytes:%s network_step_bytes:%s "
+            "channels:%s lsa_fifo:%s lsa_step_bytes:%s gin_fifo:%s "
+            "network_step_bytes:%s "
             "gin_connections:%s gin_context_count:%s "
             "gin_reliable_doorbell:%s",
             self.rank,
@@ -714,6 +706,7 @@ class NCCLDeviceV2Transport:
             self.max_channels,
             self.fifo_depth,
             self.step_bytes,
+            self.gin_fifo_depth,
             self.network_step_bytes,
             self.gin_connections,
             self.gin_context_count,

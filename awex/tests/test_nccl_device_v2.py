@@ -22,15 +22,16 @@ import pytest
 from awex.transfer.nccl_device_v2 import (
     NCCLDeviceV2Transport,
     NCCLDeviceV2UnavailableError,
-    _resolve_fifo_depth,
     _resolve_network_step_bytes,
 )
 from awex.transfer.nccl_device_v2_gin import (
     _active_rdma_endpoints,
     _configure_gin_hca_policy,
+    _gin_chunk_bytes,
     _parse_nvidia_topology,
     _RdmaEndpoint,
     _resolve_gin_connections,
+    _resolve_gin_fifo_depth,
     _resolve_gin_reliable_doorbell,
     _weighted_hca_assignments,
 )
@@ -161,22 +162,48 @@ def test_balanced_hca_policy_preserves_explicit_nccl_selection(monkeypatch):
     assert os.environ["NCCL_IB_HCA"] == "=mlx5_8:1"
 
 
-def test_fifo_depth_defaults_to_sixteen(monkeypatch):
+def test_gin_fifo_depth_defaults_to_sixteen(monkeypatch):
+    monkeypatch.delenv("AWEX_NCCL_DEVICE_V2_GIN_FIFO_DEPTH", raising=False)
     monkeypatch.delenv("AWEX_NCCL_DEVICE_V2_FIFO_DEPTH", raising=False)
 
-    assert _resolve_fifo_depth() == 16
+    assert _resolve_gin_fifo_depth() == 16
 
 
-def test_fifo_depth_honors_environment(monkeypatch):
+def test_gin_fifo_depth_honors_gin_environment(monkeypatch):
+    monkeypatch.setenv("AWEX_NCCL_DEVICE_V2_GIN_FIFO_DEPTH", "24")
     monkeypatch.setenv("AWEX_NCCL_DEVICE_V2_FIFO_DEPTH", "16")
 
-    assert _resolve_fifo_depth() == 16
+    assert _resolve_gin_fifo_depth() == 24
 
 
 @pytest.mark.parametrize("value", [0, 65])
-def test_fifo_depth_rejects_out_of_range_values(value):
+def test_gin_fifo_depth_rejects_out_of_range_values(value):
     with pytest.raises(NCCLDeviceV2UnavailableError, match=r"must be in \[1, 64\]"):
-        _resolve_fifo_depth(value)
+        _resolve_gin_fifo_depth(value)
+
+
+def test_gin_config_cannot_override_main_lsa_defaults(monkeypatch):
+    monkeypatch.setenv("AWEX_NCCL_DEVICE_V2_GIN_FIFO_DEPTH", "24")
+    monkeypatch.setenv("AWEX_NCCL_DEVICE_V2_FIFO_DEPTH", "32")
+
+    transport = NCCLDeviceV2Transport(None, 0, 2, gin_connections=1)
+
+    assert transport.fifo_depth == 8
+    assert transport.step_bytes == 512 * 1024
+    assert transport.chunk_bytes == 4 * 1024 * 1024
+    assert transport.gin_fifo_depth == 24
+    assert transport.gin_chunk_bytes == 4 * 1024 * 1024
+
+
+def test_gin_chunk_is_independent_from_lsa_chunk(monkeypatch):
+    monkeypatch.setenv("AWEX_NCCL_DEVICE_CHUNK_BYTES", str(8 * 1024 * 1024))
+
+    transport = NCCLDeviceV2Transport(None, 0, 2, gin_connections=1)
+
+    assert transport.chunk_bytes == 8 * 1024 * 1024
+    assert transport.gin_chunk_bytes == _gin_chunk_bytes(
+        transport.network_step_bytes
+    )
 
 
 def test_network_step_defaults_to_nccl_cross_node_chunk(monkeypatch):

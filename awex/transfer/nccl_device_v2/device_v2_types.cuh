@@ -99,6 +99,7 @@ struct alignas(16) V2Work {
   std::uint32_t chunk_count;
   std::uint32_t final;
   std::uint32_t step_bytes;
+  std::uint32_t fifo_depth;
   std::uint64_t stream_offset;
   std::uint64_t nbytes;
   std::uint64_t step_begin;
