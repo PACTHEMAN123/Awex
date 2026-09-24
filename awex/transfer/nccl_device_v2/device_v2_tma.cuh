@@ -42,6 +42,12 @@ __device__ __forceinline__ bool v2TmaElected(bool control) {
   return control && ptx::elect_sync(0xffffffffU);
 }
 
+__device__ __forceinline__ float v2TmaDivideByScale(float value, float scale, float inverse_scale) {
+  const float quotient = value * inverse_scale;
+  const float remainder = fmaf(-quotient, scale, value);
+  return fmaf(remainder, inverse_scale, quotient);
+}
+
 __device__ __forceinline__ bool v2TmaWaitForPeers(const V2KernelArgs& args, bool control_lane) {
   auto* local_header = reinterpret_cast<V2WindowHeader*>(args.local_window);
   __shared__ int peers_ready;
@@ -90,6 +96,7 @@ __global__ void __launch_bounds__(kTmaQuantThreads, 1) tma_quant_send_kernel(V2T
   __shared__ V2TmaBarrier barriers[2];
   __shared__ float warp_max[kTmaWorkerGroups][kTmaMaxGroupWarps];
   __shared__ float block_scale[kTmaWorkerGroups];
+  __shared__ float block_inv_scale[kTmaWorkerGroups];
   __shared__ int fifo_ready;
   __shared__ unsigned long long fifo_cache;
 
@@ -150,7 +157,11 @@ __global__ void __launch_bounds__(kTmaQuantThreads, 1) tma_quant_send_kernel(V2T
         for (int offset = kWarpSize / 2; offset > 0; offset /= 2) {
           local_max = fmaxf(local_max, __shfl_down_sync(0xffffffffU, local_max, offset));
         }
-        if (lane == 0) block_scale[worker_group] = fmaxf(local_max, 1.0e-4F) / 448.0F;
+        if (lane == 0) {
+          const float scale = fmaxf(local_max, 1.0e-4F) / 448.0F;
+          block_scale[worker_group] = scale;
+          block_inv_scale[worker_group] = 1.0F / scale;
+        }
       }
       v2GroupBarrier(kTmaHandoffBarrierBase + worker_group, group_threads + kWarpSize);
       if (!fifo_ready) return;
@@ -161,8 +172,8 @@ __global__ void __launch_bounds__(kTmaQuantThreads, 1) tma_quant_send_kernel(V2T
       for (std::uint32_t pair = group_tid; pair < pair_count; pair += group_threads) {
         const float2 values = __bfloat1622float2(reinterpret_cast<const __nv_bfloat162*>(shared_tile)[pair]);
         const float2 scaled = {
-          values.x / block_scale[worker_group],
-          values.y / block_scale[worker_group],
+          v2TmaDivideByScale(values.x, block_scale[worker_group], block_inv_scale[worker_group]),
+          v2TmaDivideByScale(values.y, block_scale[worker_group], block_inv_scale[worker_group]),
         };
         const __nv_fp8x2_e4m3 encoded(scaled);
         reinterpret_cast<std::uint16_t*>(shared_output)[pair] = encoded.__x;
