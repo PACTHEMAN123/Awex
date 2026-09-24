@@ -699,8 +699,7 @@ TmaSchedule build_tma_schedule(const std::vector<v2::V2LoweringTask>& tasks, v2:
     if (!eligible || weight_indices.empty() || scale_index == tasks.size()) continue;
     const auto& scale = tasks[scale_index];
     const std::uint64_t scale_cols = matrix_cols / v2::kTmaQuantBlockCols;
-    if (scale.nbytes != tile_count * sizeof(float) || scale.tensor_row_bytes != scale_cols * sizeof(float) ||
-        scale.tensor_row_stride % 16 != 0) {
+    if (scale.nbytes != tile_count * sizeof(float) || scale.tensor_row_bytes != scale_cols * sizeof(float)) {
       continue;
     }
     for (const std::size_t weight_index : weight_indices) {
