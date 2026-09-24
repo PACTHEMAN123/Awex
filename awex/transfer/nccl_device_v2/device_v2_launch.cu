@@ -29,13 +29,12 @@ cudaError_t launchDeviceV2(const V2KernelArgs& args, cudaStream_t stream) {
   return cudaGetLastError();
 }
 
-cudaError_t launchBlockwiseFp8Scales(const V2QuantMatrix* matrices, std::uint32_t matrix_count,
-                                     std::uint32_t max_blocks, cudaStream_t stream) {
-  if (matrix_count == 0 || max_blocks == 0) {
+cudaError_t launchBlockwiseFp8Scales(const V2QuantMatrix* matrices, const V2QuantBlock* blocks,
+                                     std::uint32_t block_count, cudaStream_t stream) {
+  if (block_count == 0) {
     return cudaSuccess;
   }
-  const dim3 grid(max_blocks, matrix_count);
-  blockwise_fp8_scale_kernel<<<grid, 256, 0, stream>>>(matrices, matrix_count, max_blocks);
+  blockwise_fp8_scale_kernel<<<block_count, 256, 0, stream>>>(matrices, blocks, block_count);
   return cudaGetLastError();
 }
 

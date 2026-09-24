@@ -60,6 +60,7 @@ struct LaunchBuffers {
   std::uint32_t* channel_ids = nullptr;
   std::uint32_t* active_peers = nullptr;
   v2::V2QuantMatrix* quant_matrices = nullptr;
+  v2::V2QuantBlock* quant_blocks = nullptr;
 };
 
 struct DeviceState {
@@ -84,7 +85,7 @@ struct DeviceState {
   std::vector<v2::V2LoweringTask> tasks;
   std::vector<std::uint32_t> active_peers;
   std::vector<v2::V2QuantMatrix> quant_matrices;
-  std::uint32_t max_quant_blocks = 0;
+  std::vector<v2::V2QuantBlock> quant_blocks;
   v2::V2Schedule schedule;
   LaunchBuffers buffers;
   int rank = 0;
@@ -247,10 +248,15 @@ void release_buffers(LaunchBuffers* buffers) {
     AWEX_CUDA_V2_CHECK(cudaFree(buffers->quant_matrices));
     buffers->quant_matrices = nullptr;
   }
+  if (buffers->quant_blocks != nullptr) {
+    AWEX_CUDA_V2_CHECK(cudaFree(buffers->quant_blocks));
+    buffers->quant_blocks = nullptr;
+  }
 }
 
 void allocate_buffers(const v2::V2Schedule& schedule, std::size_t active_peer_count,
-                      std::size_t quant_matrix_count, LaunchBuffers* buffers) {
+                      std::size_t quant_matrix_count, std::size_t quant_block_count,
+                      LaunchBuffers* buffers) {
   try {
     if (!schedule.works.empty()) {
       AWEX_CUDA_V2_CHECK(cudaMalloc(reinterpret_cast<void**>(&buffers->works),
@@ -280,6 +286,10 @@ void allocate_buffers(const v2::V2Schedule& schedule, std::size_t active_peer_co
       AWEX_CUDA_V2_CHECK(cudaMalloc(reinterpret_cast<void**>(&buffers->quant_matrices),
                                     quant_matrix_count * sizeof(v2::V2QuantMatrix)));
     }
+    if (quant_block_count != 0) {
+      AWEX_CUDA_V2_CHECK(cudaMalloc(reinterpret_cast<void**>(&buffers->quant_blocks),
+                                    quant_block_count * sizeof(v2::V2QuantBlock)));
+    }
   } catch (...) {
     release_buffers(buffers);
     throw;
@@ -287,8 +297,9 @@ void allocate_buffers(const v2::V2Schedule& schedule, std::size_t active_peer_co
 }
 
 void upload_buffers(const v2::V2Schedule& schedule, const std::vector<std::uint32_t>& active_peers,
-                    const std::vector<v2::V2QuantMatrix>& quant_matrices, LaunchBuffers* buffers,
-                    cudaStream_t stream) {
+                    const std::vector<v2::V2QuantMatrix>& quant_matrices,
+                    const std::vector<v2::V2QuantBlock>& quant_blocks,
+                    LaunchBuffers* buffers, cudaStream_t stream) {
   if (!schedule.works.empty()) {
     AWEX_CUDA_V2_CHECK(cudaMemcpyAsync(buffers->works, schedule.works.data(),
                                        schedule.works.size() * sizeof(v2::V2Work), cudaMemcpyHostToDevice, stream));
@@ -320,6 +331,11 @@ void upload_buffers(const v2::V2Schedule& schedule, const std::vector<std::uint3
   if (!quant_matrices.empty()) {
     AWEX_CUDA_V2_CHECK(cudaMemcpyAsync(buffers->quant_matrices, quant_matrices.data(),
                                        quant_matrices.size() * sizeof(v2::V2QuantMatrix), cudaMemcpyHostToDevice,
+                                       stream));
+  }
+  if (!quant_blocks.empty()) {
+    AWEX_CUDA_V2_CHECK(cudaMemcpyAsync(buffers->quant_blocks, quant_blocks.data(),
+                                       quant_blocks.size() * sizeof(v2::V2QuantBlock), cudaMemcpyHostToDevice,
                                        stream));
   }
 }
@@ -385,14 +401,17 @@ std::uint32_t dtype_bytes(v2::V2DataType dtype) {
   return 0;
 }
 
-std::vector<v2::V2QuantMatrix> build_quant_matrices(
-  const std::vector<v2::V2LoweringTask>& tasks, std::uint32_t* max_blocks) {
+struct QuantPlan {
+  std::vector<v2::V2QuantMatrix> matrices;
+  std::vector<v2::V2QuantBlock> blocks;
+};
+
+QuantPlan build_quant_plan(const std::vector<v2::V2LoweringTask>& tasks) {
   using Key = std::tuple<std::uintptr_t, std::uintptr_t, std::uint64_t, std::uint64_t, std::uint64_t,
                          std::uint64_t, std::uint64_t, std::uint64_t, std::uint32_t, std::uint32_t,
                          std::uint32_t, std::uint32_t>;
   std::set<Key> seen;
-  std::vector<v2::V2QuantMatrix> matrices;
-  *max_blocks = 0;
+  QuantPlan plan;
   for (const auto& task : tasks) {
     if (task.quant_mode == v2::V2QuantMode::kNone) continue;
     const Key key{
@@ -410,7 +429,8 @@ std::vector<v2::V2QuantMatrix> build_quant_matrices(
       task.quant_block_cols,
     };
     if (!seen.insert(key).second) continue;
-    matrices.push_back(v2::V2QuantMatrix{
+    const std::size_t matrix_index = plan.matrices.size();
+    plan.matrices.push_back(v2::V2QuantMatrix{
       task.tensor_ptr,
       task.quant_scale_ptr,
       task.tensor_row_stride,
@@ -429,15 +449,19 @@ std::vector<v2::V2QuantMatrix> build_quant_matrices(
     const std::uint64_t col_blocks =
       (task.quant_cols + task.quant_block_cols - 1) / task.quant_block_cols;
     const std::uint64_t blocks = row_blocks * col_blocks;
-    if (blocks > std::numeric_limits<std::uint32_t>::max()) {
+    if (blocks > std::numeric_limits<std::uint32_t>::max() ||
+        matrix_index > std::numeric_limits<std::uint32_t>::max() ||
+        plan.blocks.size() > std::numeric_limits<std::uint32_t>::max() - blocks) {
       throw std::runtime_error("nccl_device_v2 block-wise FP8 matrix is too large");
     }
-    *max_blocks = std::max(*max_blocks, static_cast<std::uint32_t>(blocks));
+    for (std::uint32_t block = 0; block < blocks; ++block) {
+      plan.blocks.push_back(v2::V2QuantBlock{
+        static_cast<std::uint32_t>(matrix_index),
+        block,
+      });
+    }
   }
-  if (matrices.size() > 65535) {
-    throw std::runtime_error("nccl_device_v2 has too many block-wise FP8 matrix fragments");
-  }
-  return matrices;
+  return plan;
 }
 
 void initialize_sparse_window(DeviceState* state, const std::vector<std::uint32_t>& active_peers,
@@ -708,20 +732,19 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
     const auto lowering_start = Clock::now();
     auto schedule = v2::lowerFixedTasks(tasks, active_peers, direction, config);
     host_lowering_time_ms = std::chrono::duration<double, std::milli>(Clock::now() - lowering_start).count();
-    std::uint32_t max_quant_blocks = 0;
-    auto quant_matrices = build_quant_matrices(tasks, &max_quant_blocks);
+    auto quant_plan = build_quant_plan(tasks);
 
     initialize_sparse_window(state, active_peers, direction, stream);
     LaunchBuffers buffers;
     try {
       const auto metadata_start = Clock::now();
-      allocate_buffers(schedule, active_peers.size(), quant_matrices.size(), &buffers);
-      upload_buffers(schedule, active_peers, quant_matrices, &buffers, stream);
+      allocate_buffers(schedule, active_peers.size(), quant_plan.matrices.size(), quant_plan.blocks.size(), &buffers);
+      upload_buffers(schedule, active_peers, quant_plan.matrices, quant_plan.blocks, &buffers, stream);
       metadata_upload_time_ms = std::chrono::duration<double, std::milli>(Clock::now() - metadata_start).count();
       state->tasks = tasks;
       state->active_peers = active_peers;
-      state->quant_matrices = std::move(quant_matrices);
-      state->max_quant_blocks = max_quant_blocks;
+      state->quant_matrices = std::move(quant_plan.matrices);
+      state->quant_blocks = std::move(quant_plan.blocks);
       state->schedule = std::move(schedule);
       state->buffers = buffers;
       state->direction = direction;
@@ -770,6 +793,7 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
   metrics["streaming_cast_tasks"] = py::int_(streaming_cast_tasks);
   metrics["blockwise_fp8_tasks"] = py::int_(blockwise_fp8_tasks);
   metrics["blockwise_fp8_matrix_count"] = py::int_(state->quant_matrices.size());
+  metrics["blockwise_fp8_block_count"] = py::int_(state->quant_blocks.size());
   metrics["channel_limit"] = py::int_(state->total_channels);
   metrics["topology_requested_channels_per_peer"] = py::int_(state->topology.requested_channels_per_peer);
   metrics["topology_channels_per_peer"] = py::int_(state->topology.channels_per_peer);
@@ -827,8 +851,8 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
     AWEX_CUDA_V2_CHECK(cudaEventCreate(&quant_end));
     AWEX_CUDA_V2_CHECK(cudaEventRecord(quant_start, stream));
     AWEX_CUDA_V2_CHECK(v2::launchBlockwiseFp8Scales(state->buffers.quant_matrices,
-                                                    static_cast<std::uint32_t>(state->quant_matrices.size()),
-                                                    state->max_quant_blocks, stream));
+                                                    state->buffers.quant_blocks,
+                                                    static_cast<std::uint32_t>(state->quant_blocks.size()), stream));
     AWEX_CUDA_V2_CHECK(cudaEventRecord(quant_end, stream));
   }
   AWEX_CUDA_V2_CHECK(v2::launchDeviceV2(args, stream));

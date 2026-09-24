@@ -117,6 +117,11 @@ struct alignas(16) V2QuantMatrix {
   std::uint32_t block_cols;
 };
 
+struct V2QuantBlock {
+  std::uint32_t matrix_index;
+  std::uint32_t block_index;
+};
+
 struct alignas(16) V2Work {
   std::uint32_t peer;
   std::uint32_t fragment_begin;

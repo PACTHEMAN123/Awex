@@ -27,16 +27,15 @@ struct V2BatchShared {
   unsigned long long step_cache[kMaxWorksPerBatch];
 };
 
-__global__ void blockwise_fp8_scale_kernel(const V2QuantMatrix* matrices, std::uint32_t matrix_count,
-                                           std::uint32_t max_blocks) {
-  const std::uint32_t matrix_index = blockIdx.y;
-  const std::uint32_t block_index = blockIdx.x;
-  if (matrix_index >= matrix_count || block_index >= max_blocks) return;
+__global__ void blockwise_fp8_scale_kernel(const V2QuantMatrix* matrices, const V2QuantBlock* blocks,
+                                           std::uint32_t block_count) {
+  const std::uint32_t global_block_index = blockIdx.x;
+  if (global_block_index >= block_count) return;
 
-  const V2QuantMatrix matrix = matrices[matrix_index];
+  const V2QuantBlock block = blocks[global_block_index];
+  const V2QuantMatrix matrix = matrices[block.matrix_index];
+  const std::uint32_t block_index = block.block_index;
   const std::uint64_t block_cols = (matrix.cols + matrix.block_cols - 1) / matrix.block_cols;
-  const std::uint64_t block_rows = (matrix.rows + matrix.block_rows - 1) / matrix.block_rows;
-  if (block_index >= block_rows * block_cols) return;
 
   const std::uint64_t local_block_row = block_index / block_cols;
   const std::uint64_t local_block_col = block_index % block_cols;

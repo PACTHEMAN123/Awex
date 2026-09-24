@@ -163,6 +163,14 @@ def main() -> None:
             raise AssertionError(f"Unexpected block-wise task count: {metrics}")
         if metrics["blockwise_fp8_matrix_count"] != expected_quant_tasks:
             raise AssertionError(f"Unexpected block-wise matrix count: {metrics}")
+        expected_quant_blocks = (
+            ((source.shape[0] + 127) // 128)
+            * ((source.shape[1] + 127) // 128)
+            if rank == 0
+            else 0
+        )
+        if metrics["blockwise_fp8_block_count"] != expected_quant_blocks:
+            raise AssertionError(f"Unexpected block-wise block count: {metrics}")
         if not metrics["plan_cache_hit"]:
             raise AssertionError(f"Second launch missed the plan cache: {metrics}")
         dist.barrier()
