@@ -17,6 +17,7 @@
 
 #include "device_v2_kernel.cuh"
 #include "device_v2_launch.cuh"
+#include "device_v2_tma.cuh"
 
 namespace awex {
 namespace nccl_device_v2 {
@@ -26,6 +27,22 @@ cudaError_t launchDeviceV2(const V2KernelArgs& args, cudaStream_t stream) {
     return cudaSuccess;
   }
   device_v2_kernel<<<args.channel_count, kThreadsPerBlock, 0, stream>>>(args);
+  return cudaGetLastError();
+}
+
+cudaError_t launchDeviceV2Tma(const V2TmaKernelArgs& args, V2Direction direction, cudaStream_t stream) {
+  if (args.queue_count == 0) {
+    return cudaSuccess;
+  }
+  if (direction == V2Direction::kSend) {
+    constexpr int shared_bytes = 2 * kTmaQuantElements * sizeof(__nv_bfloat16);
+    cudaError_t result = cudaFuncSetAttribute(tma_quant_send_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                             shared_bytes);
+    if (result != cudaSuccess) return result;
+    tma_quant_send_kernel<<<args.queue_count, kTmaQuantThreads, shared_bytes, stream>>>(args);
+  } else {
+    tma_quant_recv_kernel<<<args.queue_count, kTmaQuantThreads, 0, stream>>>(args);
+  }
   return cudaGetLastError();
 }
 

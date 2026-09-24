@@ -23,6 +23,7 @@ namespace awex {
 namespace nccl_device_v2 {
 
 cudaError_t launchDeviceV2(const V2KernelArgs& args, cudaStream_t stream);
+cudaError_t launchDeviceV2Tma(const V2TmaKernelArgs& args, V2Direction direction, cudaStream_t stream);
 cudaError_t launchBlockwiseFp8Scales(const V2QuantMatrix* matrices, const V2QuantBlock* blocks,
                                      std::uint32_t block_count, cudaStream_t stream);
 

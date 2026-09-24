@@ -150,7 +150,8 @@ __device__ __forceinline__ void v2Store16(void* address, std::uint16_t value) {
   asm volatile("st.global.u16 [%0], %1;" : : "l"(address), "h"(value) : "memory");
 }
 
-__device__ __forceinline__ V2FifoSlot* v2FifoSlot(const V2KernelArgs& args, std::uint32_t window_rank,
+template <typename Args>
+__device__ __forceinline__ V2FifoSlot* v2FifoSlot(const Args& args, std::uint32_t window_rank,
                                                   std::uint32_t connection_rank, std::uint32_t channel,
                                                   unsigned long long step, bool local_window) {
   auto* window = local_window ? args.local_window : reinterpret_cast<std::uint8_t*>(args.peer_windows[window_rank]);
@@ -160,7 +161,8 @@ __device__ __forceinline__ V2FifoSlot* v2FifoSlot(const V2KernelArgs& args, std:
   return reinterpret_cast<V2FifoSlot*>(window + args.layout.state_offset + slot * sizeof(V2FifoSlot));
 }
 
-__device__ __forceinline__ std::uint8_t* v2FifoPayload(const V2KernelArgs& args, std::uint32_t window_rank,
+template <typename Args>
+__device__ __forceinline__ std::uint8_t* v2FifoPayload(const Args& args, std::uint32_t window_rank,
                                                        std::uint32_t connection_rank, std::uint32_t channel,
                                                        unsigned long long step, bool local_window) {
   auto* window = local_window ? args.local_window : reinterpret_cast<std::uint8_t*>(args.peer_windows[window_rank]);

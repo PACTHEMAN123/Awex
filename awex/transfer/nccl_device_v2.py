@@ -815,6 +815,7 @@ def _load_extension() -> Any:
                         for path in library_paths
                     ),
                     "-lnccl",
+                    "-lcuda",
                     "-ldl",
                 ],
                 with_cuda=True,

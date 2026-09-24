@@ -116,8 +116,8 @@ def main() -> None:
                         tensors,
                         [weight_numel, scale_numel * 4],
                         [0, 0],
-                        [cols * weight.element_size(), scale_numel * 4],
-                        [cols * weight.element_size(), scale_numel * 4],
+                        [cols * weight.element_size(), scale.shape[1] * 4],
+                        [cols * weight.element_size(), scale.stride(0) * 4],
                         [_FP8_E4M3_CODE, _FLOAT32_CODE],
                         [1, 4],
                         [scale, scale],
@@ -161,16 +161,24 @@ def main() -> None:
         expected_quant_tasks = 1 if rank == 0 else 0
         if metrics["blockwise_fp8_tasks"] != expected_quant_tasks:
             raise AssertionError(f"Unexpected block-wise task count: {metrics}")
-        if metrics["blockwise_fp8_matrix_count"] != expected_quant_tasks:
-            raise AssertionError(f"Unexpected block-wise matrix count: {metrics}")
+        if metrics["blockwise_fp8_matrix_count"] != 0:
+            raise AssertionError(f"TMA path unexpectedly used fallback matrices: {metrics}")
         expected_quant_blocks = (
             ((source.shape[0] + 127) // 128)
             * ((source.shape[1] + 127) // 128)
             if rank == 0
             else 0
         )
-        if metrics["blockwise_fp8_block_count"] != expected_quant_blocks:
-            raise AssertionError(f"Unexpected block-wise block count: {metrics}")
+        if metrics["blockwise_fp8_block_count"] != 0:
+            raise AssertionError(f"TMA path unexpectedly used fallback blocks: {metrics}")
+        if not metrics["fused_tma_supported"]:
+            raise AssertionError(f"TMA is not supported on the smoke-test GPU: {metrics}")
+        if metrics["fused_tma_matrix_count"] != 1:
+            raise AssertionError(f"Unexpected fused TMA matrix count: {metrics}")
+        if metrics["fused_tma_tile_count"] != expected_quant_blocks:
+            raise AssertionError(f"Unexpected fused TMA tile count: {metrics}")
+        if metrics["fused_tma_queue_count"] <= 0:
+            raise AssertionError(f"Fused TMA did not create a channel queue: {metrics}")
         if not metrics["plan_cache_hit"]:
             raise AssertionError(f"Second launch missed the plan cache: {metrics}")
         dist.barrier()

@@ -61,6 +61,17 @@ struct LaunchBuffers {
   std::uint32_t* active_peers = nullptr;
   v2::V2QuantMatrix* quant_matrices = nullptr;
   v2::V2QuantBlock* quant_blocks = nullptr;
+  CUtensorMap* tma_tensor_maps = nullptr;
+  v2::V2TmaQuantTile* tma_tiles = nullptr;
+  v2::V2TmaChannelQueue* tma_queues = nullptr;
+};
+
+struct TmaSchedule {
+  std::vector<CUtensorMap> tensor_maps;
+  std::vector<v2::V2TmaQuantTile> tiles;
+  std::vector<v2::V2TmaChannelQueue> queues;
+  std::vector<std::uint64_t> next_steps;
+  std::uint32_t matrix_count = 0;
 };
 
 struct DeviceState {
@@ -80,12 +91,14 @@ struct DeviceState {
   std::uint32_t fifo_depth = v2::kDefaultFifoDepth;
   std::size_t chunk_bytes = v2::kDefaultChunkBytes;
   std::size_t step_bytes = v2::kDefaultStepBytes;
+  bool tma_supported = false;
   bool plan_initialized = false;
   v2::V2Direction direction = v2::V2Direction::kSend;
   std::vector<v2::V2LoweringTask> tasks;
   std::vector<std::uint32_t> active_peers;
   std::vector<v2::V2QuantMatrix> quant_matrices;
   std::vector<v2::V2QuantBlock> quant_blocks;
+  TmaSchedule tma_schedule;
   v2::V2Schedule schedule;
   LaunchBuffers buffers;
   int rank = 0;
@@ -156,6 +169,10 @@ std::unique_ptr<DeviceState> make_state(const std::string& unique_id_bytes, int 
   state->step_bytes = step_bytes;
   state->chunk_bytes = chunk_bytes;
   AWEX_CUDA_V2_CHECK(cudaSetDevice(device));
+  int compute_capability_major = 0;
+  AWEX_CUDA_V2_CHECK(
+    cudaDeviceGetAttribute(&compute_capability_major, cudaDevAttrComputeCapabilityMajor, device));
+  state->tma_supported = compute_capability_major >= 9;
   int multiprocessor_count = 0;
   AWEX_CUDA_V2_CHECK(cudaDeviceGetAttribute(&multiprocessor_count, cudaDevAttrMultiProcessorCount, device));
   const std::uint32_t channel_limit = power_of_two_down(std::min<std::uint32_t>(max_channels, multiprocessor_count));
@@ -252,11 +269,23 @@ void release_buffers(LaunchBuffers* buffers) {
     AWEX_CUDA_V2_CHECK(cudaFree(buffers->quant_blocks));
     buffers->quant_blocks = nullptr;
   }
+  if (buffers->tma_tensor_maps != nullptr) {
+    AWEX_CUDA_V2_CHECK(cudaFree(buffers->tma_tensor_maps));
+    buffers->tma_tensor_maps = nullptr;
+  }
+  if (buffers->tma_tiles != nullptr) {
+    AWEX_CUDA_V2_CHECK(cudaFree(buffers->tma_tiles));
+    buffers->tma_tiles = nullptr;
+  }
+  if (buffers->tma_queues != nullptr) {
+    AWEX_CUDA_V2_CHECK(cudaFree(buffers->tma_queues));
+    buffers->tma_queues = nullptr;
+  }
 }
 
 void allocate_buffers(const v2::V2Schedule& schedule, std::size_t active_peer_count,
                       std::size_t quant_matrix_count, std::size_t quant_block_count,
-                      LaunchBuffers* buffers) {
+                      const TmaSchedule& tma_schedule, LaunchBuffers* buffers) {
   try {
     if (!schedule.works.empty()) {
       AWEX_CUDA_V2_CHECK(cudaMalloc(reinterpret_cast<void**>(&buffers->works),
@@ -290,6 +319,18 @@ void allocate_buffers(const v2::V2Schedule& schedule, std::size_t active_peer_co
       AWEX_CUDA_V2_CHECK(cudaMalloc(reinterpret_cast<void**>(&buffers->quant_blocks),
                                     quant_block_count * sizeof(v2::V2QuantBlock)));
     }
+    if (!tma_schedule.tensor_maps.empty()) {
+      AWEX_CUDA_V2_CHECK(cudaMalloc(reinterpret_cast<void**>(&buffers->tma_tensor_maps),
+                                    tma_schedule.tensor_maps.size() * sizeof(CUtensorMap)));
+    }
+    if (!tma_schedule.tiles.empty()) {
+      AWEX_CUDA_V2_CHECK(cudaMalloc(reinterpret_cast<void**>(&buffers->tma_tiles),
+                                    tma_schedule.tiles.size() * sizeof(v2::V2TmaQuantTile)));
+    }
+    if (!tma_schedule.queues.empty()) {
+      AWEX_CUDA_V2_CHECK(cudaMalloc(reinterpret_cast<void**>(&buffers->tma_queues),
+                                    tma_schedule.queues.size() * sizeof(v2::V2TmaChannelQueue)));
+    }
   } catch (...) {
     release_buffers(buffers);
     throw;
@@ -299,7 +340,7 @@ void allocate_buffers(const v2::V2Schedule& schedule, std::size_t active_peer_co
 void upload_buffers(const v2::V2Schedule& schedule, const std::vector<std::uint32_t>& active_peers,
                     const std::vector<v2::V2QuantMatrix>& quant_matrices,
                     const std::vector<v2::V2QuantBlock>& quant_blocks,
-                    LaunchBuffers* buffers, cudaStream_t stream) {
+                    const TmaSchedule& tma_schedule, LaunchBuffers* buffers, cudaStream_t stream) {
   if (!schedule.works.empty()) {
     AWEX_CUDA_V2_CHECK(cudaMemcpyAsync(buffers->works, schedule.works.data(),
                                        schedule.works.size() * sizeof(v2::V2Work), cudaMemcpyHostToDevice, stream));
@@ -337,6 +378,21 @@ void upload_buffers(const v2::V2Schedule& schedule, const std::vector<std::uint3
     AWEX_CUDA_V2_CHECK(cudaMemcpyAsync(buffers->quant_blocks, quant_blocks.data(),
                                        quant_blocks.size() * sizeof(v2::V2QuantBlock), cudaMemcpyHostToDevice,
                                        stream));
+  }
+  if (!tma_schedule.tensor_maps.empty()) {
+    AWEX_CUDA_V2_CHECK(cudaMemcpyAsync(buffers->tma_tensor_maps, tma_schedule.tensor_maps.data(),
+                                       tma_schedule.tensor_maps.size() * sizeof(CUtensorMap),
+                                       cudaMemcpyHostToDevice, stream));
+  }
+  if (!tma_schedule.tiles.empty()) {
+    AWEX_CUDA_V2_CHECK(cudaMemcpyAsync(buffers->tma_tiles, tma_schedule.tiles.data(),
+                                       tma_schedule.tiles.size() * sizeof(v2::V2TmaQuantTile),
+                                       cudaMemcpyHostToDevice, stream));
+  }
+  if (!tma_schedule.queues.empty()) {
+    AWEX_CUDA_V2_CHECK(cudaMemcpyAsync(buffers->tma_queues, tma_schedule.queues.data(),
+                                       tma_schedule.queues.size() * sizeof(v2::V2TmaChannelQueue),
+                                       cudaMemcpyHostToDevice, stream));
   }
 }
 
@@ -462,6 +518,170 @@ QuantPlan build_quant_plan(const std::vector<v2::V2LoweringTask>& tasks) {
     }
   }
   return plan;
+}
+
+std::uintptr_t task_base_address(const v2::V2LoweringTask& task) {
+  const std::uint64_t row = task.tensor_offset / task.tensor_row_bytes;
+  const std::uint64_t col = task.tensor_offset - row * task.tensor_row_bytes;
+  return task.tensor_ptr + row * task.tensor_row_stride + col;
+}
+
+bool tma_quant_pair(const v2::V2LoweringTask& weight, const v2::V2LoweringTask& scale,
+                    v2::V2Direction direction, std::uint64_t* rows, std::uint64_t* cols) {
+  if (weight.peer != scale.peer || scale.ordinal != weight.ordinal + 1 ||
+      scale.tensor_dtype != v2::V2DataType::kFloat32 || scale.wire_dtype != v2::V2DataType::kFloat32 ||
+      scale.tensor_element_bytes != sizeof(float) || scale.wire_element_bytes != sizeof(float)) {
+    return false;
+  }
+  if (direction == v2::V2Direction::kSend) {
+    if (weight.quant_mode != v2::V2QuantMode::kBlockwiseFloat8E4M3 ||
+        weight.tensor_dtype != v2::V2DataType::kBFloat16 ||
+        weight.wire_dtype != v2::V2DataType::kFloat8E4M3 || weight.tensor_element_bytes != 2 ||
+        weight.wire_element_bytes != 1 || weight.quant_block_rows != v2::kTmaQuantBlockRows ||
+        weight.quant_block_cols != v2::kTmaQuantBlockCols) {
+      return false;
+    }
+    *rows = weight.quant_rows;
+    *cols = weight.quant_cols;
+    const std::uintptr_t expected_scale =
+      weight.quant_scale_ptr +
+      (weight.quant_row_offset / v2::kTmaQuantBlockRows * weight.quant_scale_row_stride +
+       weight.quant_col_offset / v2::kTmaQuantBlockCols) * sizeof(float);
+    if (task_base_address(scale) != expected_scale) return false;
+  } else {
+    if (weight.quant_mode != v2::V2QuantMode::kNone ||
+        weight.tensor_dtype != v2::V2DataType::kFloat8E4M3 ||
+        weight.wire_dtype != v2::V2DataType::kFloat8E4M3 || weight.tensor_element_bytes != 1 ||
+        weight.wire_element_bytes != 1 || weight.tensor_row_bytes == 0 ||
+        weight.nbytes % weight.tensor_row_bytes != 0) {
+      return false;
+    }
+    *rows = weight.nbytes / weight.tensor_row_bytes;
+    *cols = weight.tensor_row_bytes;
+  }
+  if (*rows == 0 || *cols == 0 || *rows % v2::kTmaQuantBlockRows != 0 ||
+      *cols % v2::kTmaQuantBlockCols != 0 || weight.nbytes != *rows * *cols ||
+      task_base_address(weight) % 16 != 0 || weight.tensor_row_stride % 16 != 0) {
+    return false;
+  }
+  const std::uint64_t scale_rows = *rows / v2::kTmaQuantBlockRows;
+  const std::uint64_t scale_cols = *cols / v2::kTmaQuantBlockCols;
+  return scale.nbytes == scale_rows * scale_cols * sizeof(float) &&
+         scale.tensor_row_bytes == scale_cols * sizeof(float) && scale.tensor_row_stride % 16 == 0;
+}
+
+CUtensorMap make_tma_tensor_map(const v2::V2LoweringTask& task, std::uint64_t rows, std::uint64_t cols) {
+  CUtensorMap tensor_map{};
+  const cuuint64_t global_dims[2] = {cols, rows};
+  const cuuint64_t global_strides[1] = {task.tensor_row_stride};
+  const cuuint32_t box_dims[2] = {v2::kTmaQuantBlockCols, v2::kTmaQuantBlockRows};
+  const cuuint32_t element_strides[2] = {1, 1};
+  const CUresult result = cuTensorMapEncodeTiled(
+    &tensor_map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, reinterpret_cast<void*>(task_base_address(task)),
+    global_dims, global_strides, box_dims, element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
+    CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  if (result != CUDA_SUCCESS) {
+    const char* message = nullptr;
+    cuGetErrorString(result, &message);
+    throw std::runtime_error(std::string("cuTensorMapEncodeTiled failed: ") +
+                             (message == nullptr ? "unknown CUDA driver error" : message));
+  }
+  return tensor_map;
+}
+
+TmaSchedule build_tma_schedule(const std::vector<v2::V2LoweringTask>& tasks, v2::V2Direction direction,
+                               const v2::V2LoweringConfig& config, std::vector<bool>* handled) {
+  TmaSchedule schedule;
+  schedule.next_steps = config.initial_steps.empty()
+                          ? std::vector<std::uint64_t>(static_cast<std::size_t>(config.world_size) *
+                                                        config.total_channels, 1)
+                          : config.initial_steps;
+  handled->assign(tasks.size(), false);
+  std::vector<std::vector<v2::V2TmaQuantTile>> peer_tiles(config.world_size);
+  for (std::size_t index = 0; index + 1 < tasks.size(); ++index) {
+    std::uint64_t rows = 0;
+    std::uint64_t cols = 0;
+    if (!tma_quant_pair(tasks[index], tasks[index + 1], direction, &rows, &cols)) continue;
+
+    const auto& weight = tasks[index];
+    const auto& scale = tasks[index + 1];
+    const std::uint32_t map_index = static_cast<std::uint32_t>(schedule.tensor_maps.size());
+    if (direction == v2::V2Direction::kSend) {
+      schedule.tensor_maps.push_back(make_tma_tensor_map(weight, rows, cols));
+    }
+    const std::uintptr_t tensor_ptr = task_base_address(weight);
+    const std::uintptr_t scale_ptr = task_base_address(scale);
+    for (std::uint32_t tile_row = 0; tile_row < rows / v2::kTmaQuantBlockRows; ++tile_row) {
+      for (std::uint32_t tile_col = 0; tile_col < cols / v2::kTmaQuantBlockCols; ++tile_col) {
+        peer_tiles[weight.peer].push_back(v2::V2TmaQuantTile{
+          tensor_ptr,
+          scale_ptr,
+          weight.tensor_row_stride,
+          scale.tensor_row_stride,
+          0,
+          map_index,
+          tile_row,
+          tile_col,
+          0,
+        });
+      }
+    }
+    (*handled)[index] = true;
+    (*handled)[index + 1] = true;
+    ++schedule.matrix_count;
+    ++index;
+  }
+
+  for (std::uint32_t peer = 0; peer < config.world_size; ++peer) {
+    if (peer_tiles[peer].empty()) continue;
+    const std::uint32_t max_channels =
+      std::max<std::uint32_t>(1, std::min(config.peer_channels[peer], config.total_channels));
+    std::uint32_t min_channels = max_channels;
+    while (static_cast<std::uint64_t>(min_channels) * config.world_size > config.total_channels && min_channels > 1) {
+      min_channels /= 2;
+    }
+    const std::uint64_t stream_bytes = peer_tiles[peer].size() * v2::kTmaQuantPacketBytes;
+    const std::uint32_t channel_count =
+      v2::v2ChannelsForBytes(stream_bytes, min_channels, max_channels, config.step_bytes);
+    const std::uint32_t channel_base =
+      v2::v2ChannelBase(config.local_rank, peer, config.world_size, config.total_channels);
+    std::vector<std::vector<v2::V2TmaQuantTile>> channel_tiles(channel_count);
+    for (std::size_t tile = 0; tile < peer_tiles[peer].size(); ++tile) {
+      channel_tiles[tile % channel_count].push_back(peer_tiles[peer][tile]);
+    }
+    for (std::uint32_t part = 0; part < channel_count; ++part) {
+      if (channel_tiles[part].empty()) continue;
+      const std::uint32_t channel = (channel_base + part) & (config.total_channels - 1);
+      v2::V2TmaChannelQueue queue{
+        peer,
+        channel,
+        static_cast<std::uint32_t>(schedule.tiles.size()),
+        static_cast<std::uint32_t>(channel_tiles[part].size()),
+      };
+      const std::size_t connection = static_cast<std::size_t>(peer) * config.total_channels + channel;
+      for (auto tile : channel_tiles[part]) {
+        tile.step = schedule.next_steps[connection]++;
+        schedule.tiles.push_back(tile);
+      }
+      schedule.queues.push_back(queue);
+    }
+  }
+  return schedule;
+}
+
+std::vector<v2::V2LoweringTask> remove_tma_tasks(const std::vector<v2::V2LoweringTask>& tasks,
+                                                  const std::vector<bool>& handled,
+                                                  std::uint32_t world_size) {
+  std::vector<std::uint32_t> ordinals(world_size, 0);
+  std::vector<v2::V2LoweringTask> generic;
+  generic.reserve(tasks.size());
+  for (std::size_t index = 0; index < tasks.size(); ++index) {
+    if (handled[index]) continue;
+    auto task = tasks[index];
+    task.ordinal = ordinals[task.peer]++;
+    generic.push_back(task);
+  }
+  return generic;
 }
 
 void initialize_sparse_window(DeviceState* state, const std::vector<std::uint32_t>& active_peers,
@@ -730,21 +950,31 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
     config.step_bytes = state->step_bytes;
     config.peer_channels = state->topology.peer_channels;
     const auto lowering_start = Clock::now();
-    auto schedule = v2::lowerFixedTasks(tasks, active_peers, direction, config);
+    TmaSchedule tma_schedule;
+    std::vector<v2::V2LoweringTask> generic_tasks = tasks;
+    if (state->tma_supported && state->step_bytes >= v2::kTmaQuantPacketBytes) {
+      std::vector<bool> tma_handled;
+      tma_schedule = build_tma_schedule(tasks, direction, config, &tma_handled);
+      generic_tasks = remove_tma_tasks(tasks, tma_handled, static_cast<std::uint32_t>(state->world_size));
+      config.initial_steps = tma_schedule.next_steps;
+    }
+    auto schedule = v2::lowerFixedTasks(generic_tasks, active_peers, direction, config);
     host_lowering_time_ms = std::chrono::duration<double, std::milli>(Clock::now() - lowering_start).count();
-    auto quant_plan = build_quant_plan(tasks);
+    auto quant_plan = build_quant_plan(generic_tasks);
 
     initialize_sparse_window(state, active_peers, direction, stream);
     LaunchBuffers buffers;
     try {
       const auto metadata_start = Clock::now();
-      allocate_buffers(schedule, active_peers.size(), quant_plan.matrices.size(), quant_plan.blocks.size(), &buffers);
-      upload_buffers(schedule, active_peers, quant_plan.matrices, quant_plan.blocks, &buffers, stream);
+      allocate_buffers(schedule, active_peers.size(), quant_plan.matrices.size(), quant_plan.blocks.size(),
+                       tma_schedule, &buffers);
+      upload_buffers(schedule, active_peers, quant_plan.matrices, quant_plan.blocks, tma_schedule, &buffers, stream);
       metadata_upload_time_ms = std::chrono::duration<double, std::milli>(Clock::now() - metadata_start).count();
       state->tasks = tasks;
       state->active_peers = active_peers;
       state->quant_matrices = std::move(quant_plan.matrices);
       state->quant_blocks = std::move(quant_plan.blocks);
+      state->tma_schedule = std::move(tma_schedule);
       state->schedule = std::move(schedule);
       state->buffers = buffers;
       state->direction = direction;
@@ -794,6 +1024,13 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
   metrics["blockwise_fp8_tasks"] = py::int_(blockwise_fp8_tasks);
   metrics["blockwise_fp8_matrix_count"] = py::int_(state->quant_matrices.size());
   metrics["blockwise_fp8_block_count"] = py::int_(state->quant_blocks.size());
+  metrics["fused_tma_supported"] = py::bool_(state->tma_supported);
+  metrics["fused_tma_matrix_count"] = py::int_(state->tma_schedule.matrix_count);
+  metrics["fused_tma_tile_count"] = py::int_(state->tma_schedule.tiles.size());
+  metrics["fused_tma_queue_count"] = py::int_(state->tma_schedule.queues.size());
+  metrics["fused_tma_packet_bytes"] = py::int_(v2::kTmaQuantPacketBytes);
+  metrics["fused_tma_wire_bytes"] =
+    py::int_(state->tma_schedule.tiles.size() * v2::kTmaQuantPacketBytes);
   metrics["channel_limit"] = py::int_(state->total_channels);
   metrics["topology_requested_channels_per_peer"] = py::int_(state->topology.requested_channels_per_peer);
   metrics["topology_channels_per_peer"] = py::int_(state->topology.channels_per_peer);
@@ -843,9 +1080,18 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
       static_cast<unsigned long long>(sequence),
       state->timeout_cycles,
   };
+  const v2::V2TmaKernelArgs tma_args{
+      args,
+      state->buffers.tma_tensor_maps,
+      state->buffers.tma_tiles,
+      state->buffers.tma_queues,
+      static_cast<std::uint32_t>(state->tma_schedule.queues.size()),
+  };
   const auto kernel_start = Clock::now();
   cudaEvent_t quant_start = nullptr;
   cudaEvent_t quant_end = nullptr;
+  cudaEvent_t tma_start = nullptr;
+  cudaEvent_t tma_end = nullptr;
   if (!state->quant_matrices.empty()) {
     AWEX_CUDA_V2_CHECK(cudaEventCreate(&quant_start));
     AWEX_CUDA_V2_CHECK(cudaEventCreate(&quant_end));
@@ -854,6 +1100,13 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
                                                     state->buffers.quant_blocks,
                                                     static_cast<std::uint32_t>(state->quant_blocks.size()), stream));
     AWEX_CUDA_V2_CHECK(cudaEventRecord(quant_end, stream));
+  }
+  if (!state->tma_schedule.queues.empty()) {
+    AWEX_CUDA_V2_CHECK(cudaEventCreate(&tma_start));
+    AWEX_CUDA_V2_CHECK(cudaEventCreate(&tma_end));
+    AWEX_CUDA_V2_CHECK(cudaEventRecord(tma_start, stream));
+    AWEX_CUDA_V2_CHECK(v2::launchDeviceV2Tma(tma_args, direction, stream));
+    AWEX_CUDA_V2_CHECK(cudaEventRecord(tma_end, stream));
   }
   AWEX_CUDA_V2_CHECK(v2::launchDeviceV2(args, stream));
   AWEX_CUDA_V2_CHECK(cudaStreamSynchronize(stream));
@@ -865,6 +1118,13 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
     AWEX_CUDA_V2_CHECK(cudaEventDestroy(quant_end));
   }
   metrics["quant_scale_kernel_time_ms"] = py::float_(quant_scale_kernel_time_ms);
+  float fused_tma_kernel_time_ms = 0.0F;
+  if (tma_start != nullptr) {
+    AWEX_CUDA_V2_CHECK(cudaEventElapsedTime(&fused_tma_kernel_time_ms, tma_start, tma_end));
+    AWEX_CUDA_V2_CHECK(cudaEventDestroy(tma_start));
+    AWEX_CUDA_V2_CHECK(cudaEventDestroy(tma_end));
+  }
+  metrics["fused_tma_kernel_time_ms"] = py::float_(fused_tma_kernel_time_ms);
 
   v2::V2WindowHeader header{};
   AWEX_CUDA_V2_CHECK(cudaMemcpy(&header, state->local_base, sizeof(header), cudaMemcpyDeviceToHost));

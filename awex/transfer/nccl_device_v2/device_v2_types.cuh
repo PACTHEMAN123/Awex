@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <cuda.h>
 #include <cuda_runtime.h>
 
 #include <cstddef>
@@ -37,6 +38,14 @@ constexpr std::size_t kDefaultChunkBytes = 4 * 1024 * 1024;
 constexpr std::size_t kDefaultStepBytes = 512 * 1024;
 constexpr std::size_t kWindowAlignment = 4096;
 constexpr std::size_t kFifoAlignment = 256;
+constexpr std::uint32_t kTmaQuantThreads = 256;
+constexpr std::uint32_t kTmaQuantBlockRows = 128;
+constexpr std::uint32_t kTmaQuantBlockCols = 128;
+constexpr std::size_t kTmaQuantElements =
+  static_cast<std::size_t>(kTmaQuantBlockRows) * kTmaQuantBlockCols;
+constexpr std::size_t kTmaQuantPayloadBytes = kTmaQuantElements;
+constexpr std::size_t kTmaQuantHeaderBytes = 16;
+constexpr std::size_t kTmaQuantPacketBytes = kTmaQuantHeaderBytes + kTmaQuantPayloadBytes;
 
 static_assert(kThreadsPerBlock % kWarpSize == 0, "block must contain full warps");
 static_assert(kMaxWorksPerBatch <= 15, "work groups use CUDA named barriers 1-15");
@@ -122,6 +131,30 @@ struct V2QuantBlock {
   std::uint32_t block_index;
 };
 
+struct alignas(16) V2TmaQuantTile {
+  std::uintptr_t tensor_ptr;
+  std::uintptr_t scale_ptr;
+  std::uint64_t tensor_row_stride;
+  std::uint64_t scale_row_stride;
+  std::uint64_t step;
+  std::uint32_t tensor_map_index;
+  std::uint32_t tile_row;
+  std::uint32_t tile_col;
+  std::uint32_t reserved;
+};
+
+struct V2TmaChannelQueue {
+  std::uint32_t peer;
+  std::uint32_t channel;
+  std::uint32_t tile_begin;
+  std::uint32_t tile_count;
+};
+
+struct alignas(16) V2TmaPacketHeader {
+  float scale;
+  std::uint32_t reserved[3];
+};
+
 struct alignas(16) V2Work {
   std::uint32_t peer;
   std::uint32_t fragment_begin;
@@ -188,6 +221,14 @@ struct V2KernelArgs {
   const std::uint32_t* payload_peer_slots;
   unsigned long long epoch;
   unsigned long long timeout_cycles;
+};
+
+struct V2TmaKernelArgs {
+  V2KernelArgs transport;
+  const CUtensorMap* tensor_maps;
+  const V2TmaQuantTile* tiles;
+  const V2TmaChannelQueue* queues;
+  std::uint32_t queue_count;
 };
 
 }  // namespace nccl_device_v2
