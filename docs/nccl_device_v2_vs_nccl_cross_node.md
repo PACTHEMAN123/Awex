@@ -75,7 +75,7 @@ maxPartSize = 128 KiB
 GIN 与标准 NCCL 现在使用相同的默认 `minPartSize=64 KiB`、`maxPartSize=128 KiB`。
 实际 channel 数仍受 per-peer channel 上限约束。v2 在 GIN 初始化完成后读取
 `ginConnectionCount`，先为每个 peer 保留每个 connection 两个 channel，再以
-`6 * ginConnectionCount` 作为 issue channel 预算，按各 peer 的 payload 字节占比分配额外 channel，
+`10 * ginConnectionCount` 作为 issue channel 预算，按各 peer 的 payload 字节占比分配额外 channel，
 向上取 2 次幂并受总 channel 上限约束。这样单个重载 peer 能获得更多独立 issue CTA，而多 peer
 拓扑会自然回落到基础并行度。由于公开 Device API 没有直接暴露标准 NCCL 内部的 NIC 总带宽，
 `ceil(netBw / 14 GB/s)` 这一项仍无法直接复刻。

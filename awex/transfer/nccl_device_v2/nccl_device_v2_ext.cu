@@ -518,7 +518,7 @@ void initialize_sparse_window(DeviceState* state, const std::vector<std::uint32_
       const std::uint32_t base_channels =
         std::min(state->total_channels, power_of_two_up(2 * state->gin_connection_count));
       state->network_channel_budget =
-        std::min(state->total_channels, 6 * state->gin_connection_count);
+        std::min(state->total_channels, 10 * state->gin_connection_count);
       std::uint64_t total_gin_bytes = 0;
       for (const std::uint32_t peer : active_peers) {
         if (state->peer_transports[peer] == static_cast<std::uint8_t>(v2::V2Transport::kGin)) {
