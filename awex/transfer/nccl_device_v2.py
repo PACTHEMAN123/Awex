@@ -191,6 +191,23 @@ def _resolve_network_step_bytes(network_step_bytes: int | None) -> int:
     return network_step_bytes
 
 
+def _resolve_fifo_depth(fifo_depth: int | None = None) -> int:
+    if fifo_depth is None:
+        configured = os.environ.get("AWEX_NCCL_DEVICE_V2_FIFO_DEPTH")
+        try:
+            fifo_depth = 8 if configured is None else int(configured)
+        except ValueError as exc:
+            raise NCCLDeviceV2UnavailableError(
+                "AWEX_NCCL_DEVICE_V2_FIFO_DEPTH must be an integer"
+            ) from exc
+    fifo_depth = int(fifo_depth)
+    if fifo_depth < 1 or fifo_depth > 64:
+        raise NCCLDeviceV2UnavailableError(
+            "nccl_device_v2 FIFO depth must be in [1, 64]"
+        )
+    return fifo_depth
+
+
 def _resolve_network_channels_per_peer(
     network_channels_per_peer: int | None,
 ) -> int:
@@ -695,7 +712,7 @@ class NCCLDeviceV2Transport:
             raise NCCLDeviceV2UnavailableError(
                 "nccl_device_v2 max_channels must be at most 64"
             )
-        self.fifo_depth = 8
+        self.fifo_depth = _resolve_fifo_depth()
         self.step_bytes = _env_int(
             "AWEX_NCCL_DEVICE_V2_STEP_BYTES", 512 * 1024, minimum=1
         )

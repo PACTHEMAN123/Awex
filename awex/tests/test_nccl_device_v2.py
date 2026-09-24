@@ -19,6 +19,7 @@ import pytest
 
 from awex.transfer.nccl_device_v2 import (
     NCCLDeviceV2UnavailableError,
+    _resolve_fifo_depth,
     _resolve_gin_connections,
     _resolve_gin_context_count,
     _resolve_gin_doorbell_batch,
@@ -26,6 +27,24 @@ from awex.transfer.nccl_device_v2 import (
     _resolve_network_channels_per_peer,
     _resolve_network_step_bytes,
 )
+
+
+def test_fifo_depth_defaults_to_eight(monkeypatch):
+    monkeypatch.delenv("AWEX_NCCL_DEVICE_V2_FIFO_DEPTH", raising=False)
+
+    assert _resolve_fifo_depth() == 8
+
+
+def test_fifo_depth_honors_environment(monkeypatch):
+    monkeypatch.setenv("AWEX_NCCL_DEVICE_V2_FIFO_DEPTH", "16")
+
+    assert _resolve_fifo_depth() == 16
+
+
+@pytest.mark.parametrize("value", [0, 65])
+def test_fifo_depth_rejects_out_of_range_values(value):
+    with pytest.raises(NCCLDeviceV2UnavailableError, match=r"must be in \[1, 64\]"):
+        _resolve_fifo_depth(value)
 
 
 def test_network_step_defaults_to_nccl_cross_node_chunk(monkeypatch):
