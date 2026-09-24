@@ -29,6 +29,7 @@ from __future__ import annotations
 import ctypes
 import os
 import re
+import subprocess
 import threading
 import time
 from dataclasses import dataclass
@@ -114,13 +115,58 @@ def _active_rdma_devices(
 
 
 def _weighted_hca_assignments(
-    endpoints: list[_RdmaEndpoint], rank_payload_bytes: list[int]
+    endpoints: list[_RdmaEndpoint],
+    rank_payload_bytes: list[int],
+    topology_distances: list[list[int]] | None = None,
 ) -> list[_RdmaEndpoint]:
     """Assign rank loads to HCA capacity with locality-preserving weighted bins."""
 
     if not endpoints or not rank_payload_bytes:
         return []
     normalized_payloads = [max(1, int(payload)) for payload in rank_payload_bytes]
+    if topology_distances is not None:
+        if len(topology_distances) != len(normalized_payloads) or any(
+            len(distances) != len(endpoints) for distances in topology_distances
+        ):
+            raise NCCLDeviceV2UnavailableError(
+                "GPU/HCA topology dimensions do not match local ranks and RDMA ports"
+            )
+        assigned_bytes = [0] * len(endpoints)
+        assignments: list[_RdmaEndpoint | None] = [None] * len(normalized_payloads)
+
+        def affinity_key(rank: int) -> tuple[int, int, int, int]:
+            local_distances = sorted(
+                distance
+                for distance in topology_distances[rank]
+                if distance < _HCA_DISTANCE_SCORES["SYS"]
+            )
+            best = local_distances[0] if local_distances else _HCA_DISTANCE_SCORES["SYS"]
+            second = local_distances[1] if len(local_distances) > 1 else best + 1
+            return (-normalized_payloads[rank], -(second - best), best, rank)
+
+        for rank in sorted(range(len(normalized_payloads)), key=affinity_key):
+            payload = normalized_payloads[rank]
+            distances = topology_distances[rank]
+            local_candidates = [
+                index
+                for index, distance in enumerate(distances)
+                if distance < _HCA_DISTANCE_SCORES["SYS"]
+            ]
+            candidates = local_candidates or list(range(len(endpoints)))
+            endpoint_index = min(
+                candidates,
+                key=lambda candidate: (
+                    distances[candidate],
+                    (assigned_bytes[candidate] + payload)
+                    / endpoints[candidate].bandwidth_gbps,
+                    assigned_bytes[candidate] / endpoints[candidate].bandwidth_gbps,
+                    candidate,
+                ),
+            )
+            assignments[rank] = endpoints[endpoint_index]
+            assigned_bytes[endpoint_index] += payload
+        return [assignment for assignment in assignments if assignment is not None]
+
     if len(set(normalized_payloads)) == 1:
         total_capacity = sum(endpoint.bandwidth_gbps for endpoint in endpoints)
         assignments = []
@@ -154,6 +200,81 @@ def _weighted_hca_assignments(
         assignments[rank] = endpoints[endpoint_index]
         assigned_bytes[endpoint_index] += payload
     return [assignment for assignment in assignments if assignment is not None]
+
+
+_HCA_DISTANCE_SCORES = {
+    "PIX": 0,
+    "PXB": 1,
+    "PHB": 2,
+    "NODE": 3,
+    "SYS": 4,
+}
+
+
+def _parse_nvidia_topology(
+    output: str, endpoints: list[_RdmaEndpoint], gpu_ids: list[str]
+) -> list[list[int]] | None:
+    lines = [line.split() for line in output.splitlines() if line.strip()]
+    header = next((fields for fields in lines if fields[0] == "GPU0"), None)
+    if header is None:
+        return None
+    nic_names: dict[str, str] = {}
+    for line in output.splitlines():
+        match = re.match(r"\s*(NIC\d+):\s+(\S+)\s*$", line)
+        if match:
+            nic_names[match.group(2)] = match.group(1)
+    try:
+        nic_columns = [header.index(nic_names[endpoint.name]) for endpoint in endpoints]
+    except (KeyError, ValueError):
+        return None
+    rows = {fields[0]: fields for fields in lines if re.fullmatch(r"GPU\d+", fields[0])}
+    distances = []
+    for gpu_id in gpu_ids:
+        if not gpu_id.isdigit():
+            return None
+        row = rows.get(f"GPU{gpu_id}")
+        if row is None:
+            return None
+        try:
+            distances.append(
+                [
+                    _HCA_DISTANCE_SCORES.get(row[column + 1], 5)
+                    for column in nic_columns
+                ]
+            )
+        except IndexError:
+            return None
+    return distances
+
+
+def _node_local_gpu_ids(local_world_size: int) -> list[str]:
+    configured = os.environ.get("AWEX_NODE_LOCAL_GPU_IDS")
+    if configured:
+        gpu_ids = [value.strip() for value in configured.split(",")]
+    else:
+        visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+        gpu_ids = [value.strip() for value in visible.split(",") if value.strip()]
+    if len(gpu_ids) < local_world_size:
+        gpu_ids = [str(rank) for rank in range(local_world_size)]
+    return gpu_ids[:local_world_size]
+
+
+def _gpu_hca_topology(
+    endpoints: list[_RdmaEndpoint], local_world_size: int
+) -> list[list[int]] | None:
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "topo", "-m"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return _parse_nvidia_topology(
+        result.stdout, endpoints, _node_local_gpu_ids(local_world_size)
+    )
 
 
 def _rank_payload_bytes_from_environment(local_world_size: int) -> list[int]:
@@ -202,7 +323,9 @@ def _configure_gin_hca_policy() -> None:
     if not endpoints or local_world_size <= 0 or not 0 <= local_rank < local_world_size:
         return
     assignments = _weighted_hca_assignments(
-        endpoints, _rank_payload_bytes_from_environment(local_world_size)
+        endpoints,
+        _rank_payload_bytes_from_environment(local_world_size),
+        _gpu_hca_topology(endpoints, local_world_size),
     )
     endpoint = assignments[local_rank]
     os.environ["NCCL_IB_HCA"] = f"={endpoint.name}:{endpoint.port}"

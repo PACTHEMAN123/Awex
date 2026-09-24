@@ -63,11 +63,13 @@ counts active RDMA devices with visible netdevs in sysfs and caps the result at
 the four GIN connection slots. It falls back to four when sysfs is unavailable;
 an explicit zero requests NCCL's native local-device discovery.
 Before NCCL initialization, the default `balanced` HCA policy discovers every
-active RDMA port, reads its link rate from sysfs, and assigns local-rank loads
-with deterministic capacity-weighted scheduling. Uniform rank loads preserve
-contiguous PCI-local groups, while heterogeneous ports receive work in
-proportion to their capacity and skewed rank loads use longest-processing-time
-placement. Multi-engine vLLM launchers provide node-level
+active RDMA port, reads its link rate from sysfs, and combines it with the
+GPU-to-NIC distances reported by `nvidia-smi topo -m`. A rank uses a remote
+NUMA rail only when no local rail is active. Within the local set, PIX/NODE
+affinity is preserved and equal-affinity choices minimize assigned bytes per
+Gbps. Uniform rank loads therefore preserve contiguous PCI-local groups, while
+heterogeneous ports receive work in proportion to their capacity and skewed
+rank loads use longest-processing-time placement. Multi-engine vLLM launchers provide node-level
 rank offsets so each engine does not restart allocation at the first HCA.
 Within a rank, the device scheduler measures the actual bytes for every peer
 and weights channel promotion against that byte share. `NCCL_IB_HCA` remains

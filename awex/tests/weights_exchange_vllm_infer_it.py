@@ -107,11 +107,20 @@ def _start_vllm_server(
         "--gpu-memory-utilization",
         str(args.vllm_gpu_memory_utilization),
     ]
+    node_devices = [
+        device.strip()
+        for device in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
+        if device.strip()
+    ]
+    required = args.num_engines * args.vllm_tp_size
+    if len(node_devices) < required:
+        node_devices = [str(device) for device in range(required)]
     env = _server_environment()
     if devices is not None:
         env["CUDA_VISIBLE_DEVICES"] = ",".join(devices)
     env["AWEX_NODE_LOCAL_RANK_OFFSET"] = str(engine_rank * args.vllm_tp_size)
     env["AWEX_NODE_LOCAL_WORLD_SIZE"] = str(args.num_engines * args.vllm_tp_size)
+    env["AWEX_NODE_LOCAL_GPU_IDS"] = ",".join(node_devices[:required])
     logger.info(
         "Starting inference-node vLLM engine %s/%s on devices %s: %s",
         engine_rank,

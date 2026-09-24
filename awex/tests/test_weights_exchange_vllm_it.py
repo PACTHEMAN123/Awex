@@ -332,6 +332,8 @@ def test_inference_only_vllm_children_split_visible_devices(monkeypatch):
     assert launched[1][1]["AWEX_NODE_LOCAL_RANK_OFFSET"] == "2"
     assert launched[0][1]["AWEX_NODE_LOCAL_WORLD_SIZE"] == "4"
     assert launched[1][1]["AWEX_NODE_LOCAL_WORLD_SIZE"] == "4"
+    assert launched[0][1]["AWEX_NODE_LOCAL_GPU_IDS"] == "2,3,5,7"
+    assert launched[1][1]["AWEX_NODE_LOCAL_GPU_IDS"] == "2,3,5,7"
 
 
 def test_inference_only_vllm_children_require_enough_devices(monkeypatch):
