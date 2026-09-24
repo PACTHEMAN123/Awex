@@ -84,13 +84,56 @@ def main() -> None:
     else:
         weight = torch.empty_like(expected_weight)
         scale = torch.empty_like(expected_scale)
-    tensors = [weight, scale]
     extension = _load_extension()
     unique_id = _broadcast_unique_id(extension, rank)
     peer = 1 - rank
     rows, cols = source.shape
     weight_numel = source.numel()
     scale_numel = expected_scale.numel()
+    if rank == 0:
+        split_row = rows // 2
+        if split_row % 128 or (rows - split_row) % 128:
+            raise RuntimeError("Qwen smoke source cannot be split on a block boundary")
+        weight_fragments = [weight[:split_row], weight[split_row:]]
+        tensors = [*weight_fragments, scale]
+        lengths = [fragment.numel() for fragment in weight_fragments] + [
+            scale_numel * 4
+        ]
+        tensor_row_bytes = [cols * weight.element_size()] * 2 + [
+            scale.shape[1] * 4
+        ]
+        tensor_row_strides = [weight.stride(0) * weight.element_size()] * 2 + [
+            scale.stride(0) * 4
+        ]
+        wire_dtypes = [_FP8_E4M3_CODE, _FP8_E4M3_CODE, _FLOAT32_CODE]
+        wire_element_bytes = [1, 1, 4]
+        quant_scale_tensors = [scale, scale, scale]
+        quant_modes = [1, 1, 0]
+        quant_rows = [split_row, rows - split_row, 0]
+        quant_cols = [cols, cols, 0]
+        quant_row_offsets = [0, split_row, 0]
+        quant_scale_row_strides = [scale.stride(0), scale.stride(0), 0]
+        quant_block_rows = [128, 128, 0]
+        quant_block_cols = [128, 128, 0]
+        ordinals = [0, 1, 2]
+        expected_counts = [0, 3]
+    else:
+        tensors = [weight, scale]
+        lengths = [weight_numel, scale_numel * 4]
+        tensor_row_bytes = [cols, scale.shape[1] * 4]
+        tensor_row_strides = [cols, scale.stride(0) * 4]
+        wire_dtypes = [_FP8_E4M3_CODE, _FLOAT32_CODE]
+        wire_element_bytes = [1, 4]
+        quant_scale_tensors = [scale, scale]
+        quant_modes = [0, 0]
+        quant_rows = [0, 0]
+        quant_cols = [0, 0]
+        quant_row_offsets = [0, 0]
+        quant_scale_row_strides = [0, 0]
+        quant_block_rows = [0, 0]
+        quant_block_cols = [0, 0]
+        ordinals = [0, 1]
+        expected_counts = [2, 0]
     handle = extension.create(
         unique_id,
         world_size,
@@ -114,24 +157,24 @@ def main() -> None:
                     extension.launch(
                         handle,
                         tensors,
-                        [weight_numel, scale_numel * 4],
-                        [0, 0],
-                        [cols * weight.element_size(), scale.shape[1] * 4],
-                        [cols * weight.element_size(), scale.stride(0) * 4],
-                        [_FP8_E4M3_CODE, _FLOAT32_CODE],
-                        [1, 4],
-                        [scale, scale],
-                        [1, 0] if rank == 0 else [0, 0],
-                        [rows, 0] if rank == 0 else [0, 0],
-                        [cols, 0] if rank == 0 else [0, 0],
-                        [0, 0],
-                        [0, 0],
-                        [scale.stride(0), 0] if rank == 0 else [0, 0],
-                        [128, 0] if rank == 0 else [0, 0],
-                        [128, 0] if rank == 0 else [0, 0],
-                        [peer, peer],
-                        [0, 1],
-                        [2, 0] if rank == 1 else [0, 2],
+                        lengths,
+                        [0] * len(tensors),
+                        tensor_row_bytes,
+                        tensor_row_strides,
+                        wire_dtypes,
+                        wire_element_bytes,
+                        quant_scale_tensors,
+                        quant_modes,
+                        quant_rows,
+                        quant_cols,
+                        quant_row_offsets,
+                        [0] * len(tensors),
+                        quant_scale_row_strides,
+                        quant_block_rows,
+                        quant_block_cols,
+                        [peer] * len(tensors),
+                        ordinals,
+                        expected_counts,
                         rank == 0,
                         sequence,
                     )
@@ -158,7 +201,7 @@ def main() -> None:
             raise AssertionError(f"Unexpected block-wise wire bytes: {metrics}")
         if metrics["tensor_bytes"] != expected_tensor_bytes:
             raise AssertionError(f"Unexpected block-wise tensor bytes: {metrics}")
-        expected_quant_tasks = 1 if rank == 0 else 0
+        expected_quant_tasks = 2 if rank == 0 else 0
         if metrics["blockwise_fp8_tasks"] != expected_quant_tasks:
             raise AssertionError(f"Unexpected block-wise task count: {metrics}")
         if metrics["blockwise_fp8_matrix_count"] != 0:
@@ -170,6 +213,12 @@ def main() -> None:
             raise AssertionError(f"TMA path unexpectedly used fallback blocks: {metrics}")
         if not metrics["fused_tma_supported"]:
             raise AssertionError(f"TMA is not supported on the smoke-test GPU: {metrics}")
+        if metrics["fused_tma_threads"] != 640:
+            raise AssertionError(f"Unexpected fused TMA thread count: {metrics}")
+        if metrics["fused_tma_control_warps"] != 1:
+            raise AssertionError(f"Unexpected fused TMA control warp count: {metrics}")
+        if metrics["fused_tma_worker_warps"] != 19:
+            raise AssertionError(f"Unexpected fused TMA worker warp count: {metrics}")
         if metrics["fused_tma_matrix_count"] != 1:
             raise AssertionError(f"Unexpected fused TMA matrix count: {metrics}")
         if metrics["fused_tma_tile_count"] != expected_quant_blocks:

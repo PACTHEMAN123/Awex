@@ -526,39 +526,42 @@ std::uintptr_t task_base_address(const v2::V2LoweringTask& task) {
   return task.tensor_ptr + row * task.tensor_row_stride + col;
 }
 
-bool tma_quant_pair(const v2::V2LoweringTask& weight, const v2::V2LoweringTask& scale,
-                    v2::V2Direction direction, std::uint64_t* rows, std::uint64_t* cols) {
-  if (weight.peer != scale.peer || scale.ordinal != weight.ordinal + 1 ||
-      scale.tensor_dtype != v2::V2DataType::kFloat32 || scale.wire_dtype != v2::V2DataType::kFloat32 ||
-      scale.tensor_element_bytes != sizeof(float) || scale.wire_element_bytes != sizeof(float)) {
+bool tma_scale_task(const v2::V2LoweringTask& scale, std::uint32_t peer) {
+  return scale.peer == peer && scale.tensor_dtype == v2::V2DataType::kFloat32 &&
+         scale.wire_dtype == v2::V2DataType::kFloat32 && scale.tensor_element_bytes == sizeof(float) &&
+         scale.wire_element_bytes == sizeof(float);
+}
+
+bool tma_send_weight(const v2::V2LoweringTask& weight) {
+  if (weight.quant_mode != v2::V2QuantMode::kBlockwiseFloat8E4M3 ||
+      weight.tensor_dtype != v2::V2DataType::kBFloat16 ||
+      weight.wire_dtype != v2::V2DataType::kFloat8E4M3 || weight.tensor_element_bytes != 2 ||
+      weight.wire_element_bytes != 1 || weight.quant_block_rows != v2::kTmaQuantBlockRows ||
+      weight.quant_block_cols != v2::kTmaQuantBlockCols) {
     return false;
   }
-  if (direction == v2::V2Direction::kSend) {
-    if (weight.quant_mode != v2::V2QuantMode::kBlockwiseFloat8E4M3 ||
-        weight.tensor_dtype != v2::V2DataType::kBFloat16 ||
-        weight.wire_dtype != v2::V2DataType::kFloat8E4M3 || weight.tensor_element_bytes != 2 ||
-        weight.wire_element_bytes != 1 || weight.quant_block_rows != v2::kTmaQuantBlockRows ||
-        weight.quant_block_cols != v2::kTmaQuantBlockCols) {
-      return false;
-    }
-    *rows = weight.quant_rows;
-    *cols = weight.quant_cols;
-    const std::uintptr_t expected_scale =
-      weight.quant_scale_ptr +
-      (weight.quant_row_offset / v2::kTmaQuantBlockRows * weight.quant_scale_row_stride +
-       weight.quant_col_offset / v2::kTmaQuantBlockCols) * sizeof(float);
-    if (task_base_address(scale) != expected_scale) return false;
-  } else {
-    if (weight.quant_mode != v2::V2QuantMode::kNone ||
-        weight.tensor_dtype != v2::V2DataType::kFloat8E4M3 ||
-        weight.wire_dtype != v2::V2DataType::kFloat8E4M3 || weight.tensor_element_bytes != 1 ||
-        weight.wire_element_bytes != 1 || weight.tensor_row_bytes == 0 ||
-        weight.nbytes % weight.tensor_row_bytes != 0) {
-      return false;
-    }
-    *rows = weight.nbytes / weight.tensor_row_bytes;
-    *cols = weight.tensor_row_bytes;
+  if (weight.quant_rows == 0 || weight.quant_cols == 0 ||
+      weight.quant_rows % v2::kTmaQuantBlockRows != 0 ||
+      weight.quant_cols % v2::kTmaQuantBlockCols != 0 ||
+      weight.nbytes != weight.quant_rows * weight.quant_cols ||
+      task_base_address(weight) % 16 != 0 || weight.tensor_row_stride % 16 != 0) {
+    return false;
   }
+  return true;
+}
+
+bool tma_recv_pair(const v2::V2LoweringTask& weight, const v2::V2LoweringTask& scale,
+                   std::uint64_t* rows, std::uint64_t* cols) {
+  if (!tma_scale_task(scale, weight.peer) || scale.ordinal != weight.ordinal + 1 ||
+      weight.quant_mode != v2::V2QuantMode::kNone ||
+      weight.tensor_dtype != v2::V2DataType::kFloat8E4M3 ||
+      weight.wire_dtype != v2::V2DataType::kFloat8E4M3 || weight.tensor_element_bytes != 1 ||
+      weight.wire_element_bytes != 1 || weight.tensor_row_bytes == 0 ||
+      weight.nbytes % weight.tensor_row_bytes != 0) {
+    return false;
+  }
+  *rows = weight.nbytes / weight.tensor_row_bytes;
+  *cols = weight.tensor_row_bytes;
   if (*rows == 0 || *cols == 0 || *rows % v2::kTmaQuantBlockRows != 0 ||
       *cols % v2::kTmaQuantBlockCols != 0 || weight.nbytes != *rows * *cols ||
       task_base_address(weight) % 16 != 0 || weight.tensor_row_stride % 16 != 0) {
@@ -598,28 +601,88 @@ TmaSchedule build_tma_schedule(const std::vector<v2::V2LoweringTask>& tasks, v2:
                           : config.initial_steps;
   handled->assign(tasks.size(), false);
   std::vector<std::vector<v2::V2TmaQuantTile>> peer_tiles(config.world_size);
-  for (std::size_t index = 0; index + 1 < tasks.size(); ++index) {
+  for (std::size_t index = 0; index < tasks.size();) {
+    if (direction == v2::V2Direction::kSend) {
+      if (!tma_send_weight(tasks[index])) {
+        ++index;
+        continue;
+      }
+      const std::uint32_t peer = tasks[index].peer;
+      std::size_t scale_index = index;
+      std::uint64_t tile_count = 0;
+      while (scale_index < tasks.size()) {
+        const auto& weight = tasks[scale_index];
+        if (weight.peer != peer || !tma_send_weight(weight)) break;
+        tile_count += weight.quant_rows / v2::kTmaQuantBlockRows *
+                      (weight.quant_cols / v2::kTmaQuantBlockCols);
+        ++scale_index;
+      }
+      if (scale_index >= tasks.size() || !tma_scale_task(tasks[scale_index], peer) ||
+          tasks[scale_index].ordinal != tasks[scale_index - 1].ordinal + 1 ||
+          tasks[scale_index].nbytes != tile_count * sizeof(float)) {
+        ++index;
+        continue;
+      }
+      const auto& first_weight = tasks[index];
+      const std::uintptr_t first_scale_ptr =
+        first_weight.quant_scale_ptr +
+        (first_weight.quant_row_offset / v2::kTmaQuantBlockRows * first_weight.quant_scale_row_stride +
+         first_weight.quant_col_offset / v2::kTmaQuantBlockCols) * sizeof(float);
+      if (task_base_address(tasks[scale_index]) != first_scale_ptr) {
+        ++index;
+        continue;
+      }
+      for (std::size_t weight_index = index; weight_index < scale_index; ++weight_index) {
+        const auto& weight = tasks[weight_index];
+        const std::uint64_t rows = weight.quant_rows;
+        const std::uint64_t cols = weight.quant_cols;
+        const std::uint32_t map_index = static_cast<std::uint32_t>(schedule.tensor_maps.size());
+        schedule.tensor_maps.push_back(make_tma_tensor_map(weight, rows, cols));
+        const std::uintptr_t scale_ptr =
+          weight.quant_scale_ptr +
+          (weight.quant_row_offset / v2::kTmaQuantBlockRows * weight.quant_scale_row_stride +
+           weight.quant_col_offset / v2::kTmaQuantBlockCols) * sizeof(float);
+        for (std::uint32_t tile_row = 0; tile_row < rows / v2::kTmaQuantBlockRows; ++tile_row) {
+          for (std::uint32_t tile_col = 0; tile_col < cols / v2::kTmaQuantBlockCols; ++tile_col) {
+            peer_tiles[peer].push_back(v2::V2TmaQuantTile{
+              task_base_address(weight),
+              scale_ptr,
+              weight.tensor_row_stride,
+              weight.quant_scale_row_stride * sizeof(float),
+              0,
+              map_index,
+              tile_row,
+              tile_col,
+              0,
+            });
+          }
+        }
+        (*handled)[weight_index] = true;
+      }
+      (*handled)[scale_index] = true;
+      ++schedule.matrix_count;
+      index = scale_index + 1;
+      continue;
+    }
+
+    if (index + 1 >= tasks.size()) break;
     std::uint64_t rows = 0;
     std::uint64_t cols = 0;
-    if (!tma_quant_pair(tasks[index], tasks[index + 1], direction, &rows, &cols)) continue;
-
+    if (!tma_recv_pair(tasks[index], tasks[index + 1], &rows, &cols)) {
+      ++index;
+      continue;
+    }
     const auto& weight = tasks[index];
     const auto& scale = tasks[index + 1];
-    const std::uint32_t map_index = static_cast<std::uint32_t>(schedule.tensor_maps.size());
-    if (direction == v2::V2Direction::kSend) {
-      schedule.tensor_maps.push_back(make_tma_tensor_map(weight, rows, cols));
-    }
-    const std::uintptr_t tensor_ptr = task_base_address(weight);
-    const std::uintptr_t scale_ptr = task_base_address(scale);
     for (std::uint32_t tile_row = 0; tile_row < rows / v2::kTmaQuantBlockRows; ++tile_row) {
       for (std::uint32_t tile_col = 0; tile_col < cols / v2::kTmaQuantBlockCols; ++tile_col) {
         peer_tiles[weight.peer].push_back(v2::V2TmaQuantTile{
-          tensor_ptr,
-          scale_ptr,
+          task_base_address(weight),
+          task_base_address(scale),
           weight.tensor_row_stride,
           scale.tensor_row_stride,
           0,
-          map_index,
+          0,
           tile_row,
           tile_col,
           0,
@@ -629,7 +692,7 @@ TmaSchedule build_tma_schedule(const std::vector<v2::V2LoweringTask>& tasks, v2:
     (*handled)[index] = true;
     (*handled)[index + 1] = true;
     ++schedule.matrix_count;
-    ++index;
+    index += 2;
   }
 
   for (std::uint32_t peer = 0; peer < config.world_size; ++peer) {
@@ -1025,6 +1088,9 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
   metrics["blockwise_fp8_matrix_count"] = py::int_(state->quant_matrices.size());
   metrics["blockwise_fp8_block_count"] = py::int_(state->quant_blocks.size());
   metrics["fused_tma_supported"] = py::bool_(state->tma_supported);
+  metrics["fused_tma_threads"] = py::int_(v2::kTmaQuantThreads);
+  metrics["fused_tma_control_warps"] = py::int_(1);
+  metrics["fused_tma_worker_warps"] = py::int_(v2::kTmaQuantThreads / v2::kWarpSize - 1);
   metrics["fused_tma_matrix_count"] = py::int_(state->tma_schedule.matrix_count);
   metrics["fused_tma_tile_count"] = py::int_(state->tma_schedule.tiles.size());
   metrics["fused_tma_queue_count"] = py::int_(state->tma_schedule.queues.size());
