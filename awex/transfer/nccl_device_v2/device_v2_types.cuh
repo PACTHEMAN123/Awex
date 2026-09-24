@@ -165,6 +165,8 @@ struct V2KernelArgs {
   std::uint8_t* local_window;
   const std::uintptr_t* peer_windows;
   const std::uint32_t* payload_peer_slots;
+  const std::uint8_t* gin_peer_contexts;
+  const std::uint64_t* gin_channel_context_masks;
   std::uint32_t gin_enabled;
   std::uint32_t gin_credit_batch;
   std::uint32_t gin_signal_count;

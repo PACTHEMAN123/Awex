@@ -27,8 +27,10 @@ side while the draft is stabilized.
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import os
 import re
+import socket
 import subprocess
 import threading
 import time
@@ -46,6 +48,43 @@ class _RdmaEndpoint:
     port: int
     bandwidth_gbps: float
     pci_path: str
+    numa_node: int | None = None
+
+
+def _read_sysfs_int(path: str) -> int | None:
+    try:
+        with open(path, encoding="ascii") as value_file:
+            return int(value_file.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _pcie_bandwidth_gbps(device_path: str) -> float | None:
+    """Return the current one-way PCIe line-rate capacity for a device."""
+
+    try:
+        with open(
+            os.path.join(device_path, "current_link_speed"), encoding="ascii"
+        ) as speed_file:
+            speed_match = re.search(
+                r"([0-9]+(?:\.[0-9]+)?)\s*GT/s", speed_file.read()
+            )
+        with open(
+            os.path.join(device_path, "current_link_width"), encoding="ascii"
+        ) as width_file:
+            width = int(width_file.read().strip())
+    except (OSError, ValueError):
+        return None
+    if speed_match is None or width <= 0:
+        return None
+    transfers_per_second = float(speed_match.group(1))
+    if transfers_per_second < 8.0:
+        encoding_efficiency = 0.8
+    elif transfers_per_second < 64.0:
+        encoding_efficiency = 128.0 / 130.0
+    else:
+        encoding_efficiency = 242.0 / 256.0
+    return transfers_per_second * width * encoding_efficiency
 
 
 def _active_rdma_endpoints(
@@ -89,13 +128,27 @@ def _active_rdma_endpoints(
                         )
                 except OSError:
                     rate_match = None
-                bandwidth_gbps = float(rate_match.group(1)) if rate_match else 1.0
+                rdma_bandwidth_gbps = (
+                    float(rate_match.group(1)) if rate_match else 1.0
+                )
+                pcie_bandwidth_gbps = _pcie_bandwidth_gbps(pci_path)
+                bandwidth_gbps = (
+                    min(rdma_bandwidth_gbps, pcie_bandwidth_gbps)
+                    if pcie_bandwidth_gbps is not None
+                    else rdma_bandwidth_gbps
+                )
+                numa_node = _read_sysfs_int(os.path.join(pci_path, "numa_node"))
                 active_endpoints.append(
                     _RdmaEndpoint(
                         name=device.name,
                         port=port_number,
                         bandwidth_gbps=max(1.0, bandwidth_gbps),
                         pci_path=pci_path,
+                        numa_node=(
+                            numa_node
+                            if numa_node is not None and numa_node >= 0
+                            else None
+                        ),
                     )
                 )
     return sorted(
@@ -261,6 +314,56 @@ def _node_local_gpu_ids(local_world_size: int) -> list[str]:
     return gpu_ids[:local_world_size]
 
 
+def _normalize_pci_bus_id(bus_id: str) -> str | None:
+    match = re.fullmatch(
+        r"(?:[0-9a-fA-F]{4})?([0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7])",
+        bus_id.strip(),
+    )
+    return match.group(1).lower() if match else None
+
+
+def _gpu_numa_nodes(
+    local_world_size: int, pci_sysfs_root: str = "/sys/bus/pci/devices"
+) -> list[int | None]:
+    gpu_ids = _node_local_gpu_ids(local_world_size)
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,uuid,pci.bus_id",
+                "--format=csv,noheader,nounits",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return [None] * local_world_size
+    pci_by_gpu: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        fields = [field.strip() for field in line.split(",")]
+        if len(fields) != 3:
+            continue
+        pci_bus_id = _normalize_pci_bus_id(fields[2])
+        if pci_bus_id is None:
+            continue
+        pci_by_gpu[fields[0]] = pci_bus_id
+        pci_by_gpu[fields[1]] = pci_bus_id
+    numa_nodes: list[int | None] = []
+    for gpu_id in gpu_ids:
+        pci_bus_id = pci_by_gpu.get(gpu_id)
+        numa_node = (
+            _read_sysfs_int(os.path.join(pci_sysfs_root, pci_bus_id, "numa_node"))
+            if pci_bus_id is not None
+            else None
+        )
+        numa_nodes.append(
+            numa_node if numa_node is not None and numa_node >= 0 else None
+        )
+    return numa_nodes
+
+
 def _gpu_hca_topology(
     endpoints: list[_RdmaEndpoint], local_world_size: int
 ) -> list[list[int]] | None:
@@ -298,7 +401,7 @@ def _rank_payload_bytes_from_environment(local_world_size: int) -> list[int]:
 
 
 def _configure_gin_hca_policy() -> None:
-    """Spread local rank load across active RDMA capacity before NCCL starts."""
+    """Expose only the rank's NUMA-local HCA scheduling domain to NCCL."""
 
     policy = os.environ.get(
         "AWEX_NCCL_DEVICE_V2_HCA_POLICY", "balanced"
@@ -324,15 +427,58 @@ def _configure_gin_hca_policy() -> None:
     endpoints = _active_rdma_endpoints()
     if not endpoints or local_world_size <= 0 or not 0 <= local_rank < local_world_size:
         return
-    assignments = _weighted_hca_assignments(
-        endpoints,
-        _rank_payload_bytes_from_environment(local_world_size),
-        _gpu_hca_topology(endpoints, local_world_size),
+    topology = _gpu_hca_topology(endpoints, local_world_size)
+    gpu_numa_node = _gpu_numa_nodes(local_world_size)[local_rank]
+    if gpu_numa_node is not None and any(
+        endpoint.numa_node is not None for endpoint in endpoints
+    ):
+        selected_indices = [
+            index
+            for index, endpoint in enumerate(endpoints)
+            if endpoint.numa_node == gpu_numa_node
+        ]
+        if not selected_indices:
+            raise NCCLDeviceV2UnavailableError(
+                f"GPU local rank {local_rank} is on NUMA {gpu_numa_node}, but no "
+                "active RDMA endpoint is attached to that NUMA node"
+            )
+    elif topology is not None:
+        selected_indices = [
+            index
+            for index, distance in enumerate(topology[local_rank])
+            if distance < _HCA_DISTANCE_SCORES["SYS"]
+        ]
+        if not selected_indices:
+            selected_indices = list(range(len(endpoints)))
+    else:
+        selected_indices = list(range(len(endpoints)))
+    selected_endpoints = [endpoints[index] for index in selected_indices]
+    selected_distances = [
+        topology[local_rank][index]
+        if topology is not None
+        else _HCA_DISTANCE_SCORES["NODE"]
+        for index in selected_indices
+    ]
+    os.environ["NCCL_IB_HCA"] = "=" + ",".join(
+        f"{endpoint.name}:{endpoint.port}" for endpoint in selected_endpoints
     )
-    endpoint = assignments[local_rank]
-    os.environ["NCCL_IB_HCA"] = f"={endpoint.name}:{endpoint.port}"
+    if len(selected_endpoints) > 1:
+        os.environ.setdefault("NCCL_NETDEVS_POLICY", "ALL")
     os.environ["AWEX_NCCL_DEVICE_V2_SELECTED_HCA_BANDWIDTH_GBPS"] = str(
-        endpoint.bandwidth_gbps
+        sum(endpoint.bandwidth_gbps for endpoint in selected_endpoints)
+    )
+    os.environ["AWEX_NCCL_DEVICE_V2_HCA_EFFECTIVE_BANDWIDTHS_GBPS"] = ",".join(
+        str(endpoint.bandwidth_gbps) for endpoint in selected_endpoints
+    )
+    os.environ["AWEX_NCCL_DEVICE_V2_HCA_PCI_DISTANCES"] = ",".join(
+        str(distance) for distance in selected_distances
+    )
+    numa_group = f"{socket.gethostname()}:{gpu_numa_node}"
+    os.environ["AWEX_NCCL_DEVICE_V2_NUMA_GROUP_ID"] = str(
+        int.from_bytes(
+            hashlib.blake2b(numa_group.encode("utf-8"), digest_size=8).digest(),
+            "little",
+        )
     )
 
 

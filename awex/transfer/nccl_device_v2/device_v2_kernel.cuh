@@ -187,8 +187,14 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 1) device_v2_kernel(V2Kernel
   }
 #if AWEX_NCCL_DEVICE_V2_HAS_GIN
   if (args.gin_enabled != 0) {
-    ncclGin gin{args.dev_comm, static_cast<int>(channel % args.dev_comm.ginContextCount)};
-    gin.flush(ncclCoopCta());
+    const std::uint64_t context_mask = args.gin_channel_context_masks == nullptr
+      ? std::uint64_t{1} << (channel % args.dev_comm.ginContextCount)
+      : args.gin_channel_context_masks[channel];
+    for (std::uint32_t context = 0; context < args.dev_comm.ginContextCount; ++context) {
+      if ((context_mask & (std::uint64_t{1} << context)) == 0) continue;
+      ncclGin gin{args.dev_comm, static_cast<int>(context)};
+      gin.flush(ncclCoopCta());
+    }
   }
 #endif
 }
