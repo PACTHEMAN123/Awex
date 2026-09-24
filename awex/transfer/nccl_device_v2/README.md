@@ -37,8 +37,10 @@ The topology layer mirrors NCCL's NVLink path formula,
 `2 * max(1, pathBandwidth / linkBandwidth)`. Once GIN is initialized, remote
 peer channel demand is raised to two channels per negotiated GIN connection,
 rounded up to a power of two. Four connections and four contexts are requested
-by default; the eight network channels share one context per connection. Both
-paths remain capped by the configured channel ceiling and the
+by default; the eight network channels share one context per connection. Peer
+pairs are symmetrically striped across disjoint channel groups until a rank's
+channel budget is exhausted, avoiding serialization of independent peer flows.
+Both paths remain capped by the configured channel ceiling and the
 device's SM capacity. The raw, requested, effective, and network-specific
 values are exposed in launch metrics.
 `AWEX_NCCL_DEVICE_V2_NET_CHANNELS_PER_PEER` can override the automatic channel

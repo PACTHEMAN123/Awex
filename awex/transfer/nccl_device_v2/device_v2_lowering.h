@@ -142,26 +142,14 @@ inline std::size_t v2TransferStepBytes(std::uint64_t bytes, std::size_t step_byt
   return step_bytes;
 }
 
-inline std::uint32_t v2Log2(std::uint32_t value) {
-  std::uint32_t bits = 0;
-  while ((1U << bits) < value) ++bits;
-  return bits;
-}
-
-inline std::uint32_t v2ReverseBits(std::uint64_t value, std::uint32_t bits) {
-  std::uint32_t result = 0;
-  for (std::uint32_t bit = 0; bit < bits; ++bit) {
-    result = (result << 1) | static_cast<std::uint32_t>((value >> bit) & 1ULL);
-  }
-  return result;
-}
-
-inline std::uint32_t v2ChannelBase(std::uint32_t local_rank, std::uint32_t peer, std::uint32_t world_size,
-                                   std::uint32_t total_channels) {
-  const std::uint32_t low = std::min(local_rank, peer);
-  const std::uint32_t high = std::max(local_rank, peer);
-  const std::uint64_t pair = static_cast<std::uint64_t>(low) * world_size + high;
-  return v2ReverseBits(pair, v2Log2(total_channels));
+inline std::uint32_t v2ChannelBase(std::uint32_t local_rank, std::uint32_t peer, std::uint32_t total_channels,
+                                   std::uint32_t peer_channels) {
+  // This symmetric edge coloring gives consecutive peers disjoint channel
+  // groups until the per-rank channel budget is exhausted. Keeping a peer's
+  // channels contiguous also preserves the context/connection round robin.
+  const std::uint32_t group_count = std::max<std::uint32_t>(1, total_channels / peer_channels);
+  const std::uint32_t group = (local_rank + peer) % group_count;
+  return group * peer_channels;
 }
 
 struct V2StreamSpan {
@@ -284,7 +272,8 @@ inline V2Schedule lowerFixedTasks(const std::vector<V2LoweringTask>& tasks,
     const std::uint32_t channel_count =
       v2ChannelsForBytes(stream_bytes, min_channels, max_channels, planning_step_bytes, network);
     schedule.peer_channel_counts[peer] = channel_count;
-    const std::uint32_t channel_base = v2ChannelBase(config.local_rank, peer, config.world_size, config.total_channels);
+    const std::uint32_t channel_base =
+      v2ChannelBase(config.local_rank, peer, config.total_channels, channel_count);
 
     for (std::uint32_t part = 0; part < channel_count; ++part) {
       const auto bounds = v2PartBounds(channel_count, part, stream_bytes);
