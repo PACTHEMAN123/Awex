@@ -469,6 +469,23 @@ class TestCompareAndLogTensorDifferences:
         # Should log errors
         assert self.mock_logger.error.call_count >= 3
 
+    @pytest.mark.skipif(
+        not hasattr(torch, "float8_e4m3fn"), reason="PyTorch has no FP8 dtype"
+    )
+    def test_float8_mismatch_diagnostics_use_float32(self):
+        tensor1 = torch.tensor([1.0, 2.0], dtype=torch.float8_e4m3fn)
+        tensor2 = torch.tensor([1.0, 3.0], dtype=torch.float8_e4m3fn)
+
+        result = compare_and_log_tensor_differences(
+            tensor1, tensor2, "float8_tensors", exact_match=True
+        )
+
+        assert result is False
+        assert any(
+            "has 1 inconsistent elements" in call[0][0]
+            for call in self.mock_logger.error.call_args_list
+        )
+
 
 def _batch_isend_irecv_worker(rank, world_size, master_port, result_queue):
     try:

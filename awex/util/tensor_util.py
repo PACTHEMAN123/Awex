@@ -464,19 +464,32 @@ def compare_and_log_tensor_differences(
         )
         return False
 
+    # CPU comparison kernels do not implement all float8 arithmetic. Preserve
+    # exact equality on the original representation, then use fp32 only for
+    # tolerance checks and mismatch diagnostics.
+    comparison_tensor1 = tensor1
+    comparison_tensor2 = tensor2
+    if str(tensor1.dtype).startswith("torch.float8"):
+        comparison_tensor1 = tensor1.float()
+        comparison_tensor2 = tensor2.float()
+
     # Check if tensors are close using torch.allclose
     if exact_match:
         if torch.equal(tensor1, tensor2):
             return True
     else:
-        if torch.allclose(tensor1, tensor2, atol=atol, rtol=rtol):
+        if torch.allclose(
+            comparison_tensor1, comparison_tensor2, atol=atol, rtol=rtol
+        ):
             return True
     logger.error(
         f"Tensors are not close for {tensor_name}, get {tensor1.shape} \n{tensor1} expect {tensor2.shape} \n{tensor2}"
     )
 
     # Find elements that are not close
-    close_mask = torch.isclose(tensor1, tensor2, atol=atol, rtol=rtol)
+    close_mask = torch.isclose(
+        comparison_tensor1, comparison_tensor2, atol=atol, rtol=rtol
+    )
     inconsistent_mask = ~close_mask
 
     if inconsistent_mask.any():
@@ -489,14 +502,14 @@ def compare_and_log_tensor_differences(
         inconsistent_indices = torch.nonzero(inconsistent_mask, as_tuple=True)
 
         # Calculate absolute and relative differences
-        abs_diff = torch.abs(tensor1 - tensor2)
+        abs_diff = torch.abs(comparison_tensor1 - comparison_tensor2)
         rel_diff = abs_diff / (
-            torch.abs(tensor2) + 1e-8
+            torch.abs(comparison_tensor2) + 1e-8
         )  # Add small epsilon to avoid division by zero
 
         # Get the actual values at inconsistent positions
-        tensor1_values = tensor1[inconsistent_indices]
-        tensor2_values = tensor2[inconsistent_indices]
+        tensor1_values = comparison_tensor1[inconsistent_indices]
+        tensor2_values = comparison_tensor2[inconsistent_indices]
         abs_diff_values = abs_diff[inconsistent_indices]
         rel_diff_values = rel_diff[inconsistent_indices]
 
