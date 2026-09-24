@@ -312,6 +312,45 @@ def test_blockwise_fp8_group_survives_interleaved_plan_tasks(monkeypatch):
     assert recv_batch.quant_group_ids == [0, -1, 0]
 
 
+@pytest.mark.skipif(
+    not hasattr(torch, "float8_e4m3fn"), reason="PyTorch has no FP8 dtype"
+)
+def test_blockwise_fp8_recv_batch_preserves_matrix_rows(monkeypatch):
+    operations = [
+        _matrix_operation(
+            "down_proj.weight",
+            torch.bfloat16,
+            torch.float8_e4m3fn,
+            (2048, 768),
+        ),
+        _matrix_operation(
+            "down_proj.weight_scale_inv",
+            torch.float32,
+            torch.float32,
+            (16, 6),
+        ),
+    ]
+    monkeypatch.setattr(nccl_device_v2, "_ensure_cuda_tensor", lambda *_: None)
+
+    batch = _build_recv_batch(
+        {
+            "down_proj.weight": torch.empty(
+                (2048, 768), dtype=torch.float8_e4m3fn
+            ),
+            "down_proj.weight_scale_inv": torch.empty((16, 6)),
+        },
+        TransferPlan(operations={1: operations}),
+        rank=0,
+        world_size=2,
+        chunk_bytes=16,
+        allow_staging=False,
+    )
+
+    assert batch.quant_group_ids == [0, 0]
+    assert batch.tensor_row_bytes == [768, 6 * 4]
+    assert batch.tensor_row_strides == [768, 6 * 4]
+
+
 def test_blockwise_fp8_rejects_unaligned_transfer_slice():
     source = torch.empty((256, 256), dtype=torch.bfloat16)
     weight, _ = make_blockwise_fp8_layouts(source)

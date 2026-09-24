@@ -669,18 +669,20 @@ def _build_recv_batch(
             parameter = parameters[op.recv_shard_meta.name]
             view = parameter[op.inf_slices]
             target = view
+            quant_group_id = operation_group_ids[operation_index]
+            copy_layout = (
+                _quant_matrix_copy_layout
+                if quant_group_id >= 0 and target.dim() == 2
+                else _tensor_copy_layout
+            )
             try:
-                row_bytes, row_stride = _tensor_copy_layout(
-                    target, op.recv_shard_meta.name
-                )
+                row_bytes, row_stride = copy_layout(target, op.recv_shard_meta.name)
             except NCCLDeviceV2UnavailableError:
                 if not allow_staging:
                     raise
                 target = torch.empty_like(view, memory_format=torch.contiguous_format)
                 copybacks.append((view, target))
-                row_bytes, row_stride = _tensor_copy_layout(
-                    target, op.recv_shard_meta.name
-                )
+                row_bytes, row_stride = copy_layout(target, op.recv_shard_meta.name)
             _ensure_cuda_tensor(target, op.recv_shard_meta.name)
             target_wire_dtype = _wire_dtype(op, target.dtype)
             if target.dtype != target_wire_dtype:
@@ -739,7 +741,7 @@ def _build_recv_batch(
                     peer_offset=peer_offset,
                     ordinal=ordinal,
                     region_index=peer,
-                    quant_group_id=operation_group_ids[operation_index],
+                    quant_group_id=quant_group_id,
                 )
                 target_offset += length
                 peer_offset += length
