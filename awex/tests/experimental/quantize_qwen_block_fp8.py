@@ -32,15 +32,16 @@ from safetensors.torch import save_file
 
 from awex.converter.weights_converter import per_block_cast_to_fp8
 
-_QUANTIZED_SUFFIXES = (
+_ATTENTION_SUFFIXES = (
     ".self_attn.q_proj.weight",
     ".self_attn.k_proj.weight",
     ".self_attn.v_proj.weight",
     ".self_attn.o_proj.weight",
-    ".mlp.gate.weight",
-    ".mlp.gate_proj.weight",
-    ".mlp.up_proj.weight",
-    ".mlp.down_proj.weight",
+)
+_MLP_PROJECTION_SUFFIXES = (
+    ".gate_proj.weight",
+    ".up_proj.weight",
+    ".down_proj.weight",
 )
 _SAFETENSORS_DTYPES = {
     "BF16": torch.bfloat16,
@@ -71,7 +72,14 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _should_quantize(name: str, shape: tuple[int, ...]) -> bool:
-    return len(shape) == 2 and name.endswith(_QUANTIZED_SUFFIXES)
+    is_attention_weight = name.endswith(_ATTENTION_SUFFIXES)
+    is_mlp_projection = ".mlp." in name and name.endswith(
+        _MLP_PROJECTION_SUFFIXES
+    )
+    is_router_weight = name.endswith(".mlp.gate.weight")
+    return len(shape) == 2 and (
+        is_attention_weight or is_mlp_projection or is_router_weight
+    )
 
 
 def _torch_dtype(safetensors_dtype) -> torch.dtype:
