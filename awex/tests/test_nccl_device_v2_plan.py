@@ -26,6 +26,7 @@ from awex.transfer.nccl_device_v2 import (
     _build_recv_batch,
     _build_send_batch,
 )
+from awex.transfer.tensor_layout import make_blockwise_fp8_layouts
 from awex.transfer.transfer_plan import CommunicationOperation, TransferPlan
 
 
@@ -42,6 +43,29 @@ def _operation(source_dtype, destination_dtype, numel=32):
         overlap_shape=(numel,),
         train_slices=(slice(None),),
         inf_slices=(slice(None),),
+    )
+
+
+def _matrix_operation(
+    name,
+    source_dtype,
+    destination_dtype,
+    shape,
+    train_slices=None,
+):
+    train_slices = train_slices or tuple(slice(None) for _ in shape)
+    send_shard = SimpleNamespace(name=name, shape=shape, dtype=source_dtype)
+    recv_shard = SimpleNamespace(name=name, shape=shape, dtype=destination_dtype)
+    return CommunicationOperation(
+        send_rank=1,
+        send_shard_meta=send_shard,
+        send_offset=tuple(0 for _ in shape),
+        recv_rank=0,
+        recv_shard_meta=recv_shard,
+        recv_offset=tuple(0 for _ in shape),
+        overlap_shape=shape,
+        train_slices=train_slices,
+        inf_slices=tuple(slice(None) for _ in shape),
     )
 
 
@@ -110,3 +134,82 @@ def test_receive_tensor_must_match_wire_dtype(monkeypatch):
             chunk_bytes=16,
             allow_staging=False,
         )
+
+
+@pytest.mark.skipif(
+    not hasattr(torch, "float8_e4m3fn"), reason="PyTorch has no FP8 dtype"
+)
+def test_blockwise_fp8_layout_matches_eager_quantization():
+    from awex.converter.weights_converter import per_block_cast_to_fp8
+
+    source = (torch.arange(129 * 257, dtype=torch.float32).reshape(129, 257) % 2048).to(
+        torch.bfloat16
+    )
+    weight, scale = make_blockwise_fp8_layouts(source)
+
+    actual_weight = weight.materialize()
+    actual_scale = scale.materialize()
+    expected_weight, expected_scale = per_block_cast_to_fp8(source, False)
+
+    assert torch.equal(actual_weight.float(), expected_weight.float())
+    assert torch.equal(actual_scale, expected_scale)
+    assert tuple(actual_scale.shape) == (2, 3)
+
+
+@pytest.mark.skipif(
+    not hasattr(torch, "float8_e4m3fn"), reason="PyTorch has no FP8 dtype"
+)
+def test_blockwise_fp8_send_batch_uses_source_and_shared_scale(monkeypatch):
+    source = (
+        torch.arange(256 * 384, dtype=torch.float32)
+        .reshape(256, 384)
+        .to(torch.bfloat16)
+    )
+    weight, scale = make_blockwise_fp8_layouts(source)
+    operations = [
+        _matrix_operation(
+            "weight",
+            torch.bfloat16,
+            torch.float8_e4m3fn,
+            tuple(source.shape),
+        ),
+        _matrix_operation(
+            "weight_scale_inv",
+            torch.float32,
+            torch.float32,
+            tuple(scale.shape),
+        ),
+    ]
+    monkeypatch.setattr(nccl_device_v2, "_ensure_cuda_tensor", lambda *_: None)
+
+    batch = _build_send_batch(
+        {"weight": weight, "weight_scale_inv": scale},
+        TransferPlan(operations={0: operations}),
+        rank=1,
+        world_size=2,
+        chunk_bytes=16,
+        allow_staging=False,
+    )
+
+    assert weight.state._materialized is None
+    assert batch.tensors[0].data_ptr() == source.data_ptr()
+    assert batch.quant_scale_tensors[0] is weight.state.scale
+    assert batch.lengths == [source.numel(), scale.numel() * 4]
+    assert batch.tensor_lengths == [source.numel() * 2, scale.numel() * 4]
+    assert batch.wire_dtypes == [4, 3]
+    assert batch.quant_modes == [1, 0]
+    assert batch.quant_rows == [256, 0]
+    assert batch.quant_cols == [384, 0]
+    assert batch.quant_row_offsets == [0, 0]
+    assert batch.quant_col_offsets == [0, 0]
+    assert batch.quant_scale_row_strides == [3, 0]
+    assert batch.quant_block_rows == [128, 0]
+    assert batch.quant_block_cols == [128, 0]
+
+
+def test_blockwise_fp8_rejects_unaligned_transfer_slice():
+    source = torch.empty((256, 256), dtype=torch.bfloat16)
+    weight, _ = make_blockwise_fp8_layouts(source)
+
+    with pytest.raises(ValueError, match="must align to 128-element boundaries"):
+        weight.state.source_fragments((slice(1, 129), slice(None)))

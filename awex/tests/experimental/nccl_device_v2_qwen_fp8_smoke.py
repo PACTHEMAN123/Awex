@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""Validate BF16-to-FP8 device-v2 transfer with one mounted Qwen weight."""
+"""Validate 128x128 block-wise FP8 transfer with one mounted Qwen weight."""
 
 from __future__ import annotations  # noqa: I001
 
@@ -24,6 +24,7 @@ import json
 import os
 from pathlib import Path
 
+from awex.converter.weights_converter import per_block_cast_to_fp8
 from awex.transfer.nccl_device_v2 import _load_extension
 from safetensors import safe_open
 import torch
@@ -31,6 +32,7 @@ import torch.distributed as dist
 
 _DEFAULT_PARAMETER = "model.layers.0.mlp.experts.0.gate_proj.weight"
 _FP8_E4M3_CODE = 4
+_FLOAT32_CODE = 3
 
 
 def _parse_args() -> argparse.Namespace:
@@ -73,12 +75,22 @@ def main() -> None:
     torch.cuda.set_device(local_rank)
     dist.init_process_group("gloo")
     source = _load_weight(Path(args.model_path), args.parameter)
-    expected = source.to(torch.float8_e4m3fn).cuda()
-    tensor = source.cuda() if rank == 0 else torch.empty_like(expected)
+    expected_weight, expected_scale = per_block_cast_to_fp8(source, False)
+    expected_weight = expected_weight.cuda()
+    expected_scale = expected_scale.cuda()
+    if rank == 0:
+        weight = source.cuda()
+        scale = torch.empty_like(expected_scale)
+    else:
+        weight = torch.empty_like(expected_weight)
+        scale = torch.empty_like(expected_scale)
+    tensors = [weight, scale]
     extension = _load_extension()
     unique_id = _broadcast_unique_id(extension, rank)
     peer = 1 - rank
-    numel = tensor.numel()
+    rows, cols = source.shape
+    weight_numel = source.numel()
+    scale_numel = expected_scale.numel()
     handle = extension.create(
         unique_id,
         world_size,
@@ -94,41 +106,69 @@ def main() -> None:
         launches = []
         for sequence in (1, 2):
             if rank == 1:
-                tensor.zero_()
+                weight.zero_()
+                scale.zero_()
             dist.barrier()
             launches.append(
                 dict(
                     extension.launch(
                         handle,
-                        [tensor],
-                        [numel],
-                        [0],
-                        [numel * tensor.element_size()],
-                        [numel * tensor.element_size()],
-                        [_FP8_E4M3_CODE],
-                        [1],
-                        [peer],
-                        [0],
-                        [1, 0] if rank == 1 else [0, 1],
+                        tensors,
+                        [weight_numel, scale_numel * 4],
+                        [0, 0],
+                        [cols * weight.element_size(), scale_numel * 4],
+                        [cols * weight.element_size(), scale_numel * 4],
+                        [_FP8_E4M3_CODE, _FLOAT32_CODE],
+                        [1, 4],
+                        [scale, scale],
+                        [1, 0] if rank == 0 else [0, 0],
+                        [rows, 0] if rank == 0 else [0, 0],
+                        [cols, 0] if rank == 0 else [0, 0],
+                        [0, 0],
+                        [0, 0],
+                        [scale.stride(0), 0] if rank == 0 else [0, 0],
+                        [128, 0] if rank == 0 else [0, 0],
+                        [128, 0] if rank == 0 else [0, 0],
+                        [peer, peer],
+                        [0, 1],
+                        [2, 0] if rank == 1 else [0, 2],
                         rank == 0,
                         sequence,
                     )
                 )
             )
             dist.barrier()
-            if rank == 1 and not torch.equal(tensor.float(), expected.float()):
-                difference = (tensor.float() - expected.float()).abs().max().item()
-                raise AssertionError(f"Qwen BF16-to-FP8 mismatch: max_abs={difference}")
+            if rank == 1 and not torch.equal(weight.float(), expected_weight.float()):
+                difference = (
+                    (weight.float() - expected_weight.float()).abs().max().item()
+                )
+                raise AssertionError(
+                    f"Qwen block-wise FP8 weight mismatch: max_abs={difference}"
+                )
+            if rank == 1 and not torch.equal(scale, expected_scale):
+                difference = (scale - expected_scale).abs().max().item()
+                raise AssertionError(
+                    f"Qwen block-wise FP8 scale mismatch: max_abs={difference}"
+                )
 
         metrics = launches[-1]
-        if rank == 0 and metrics["tensor_bytes"] != 2 * metrics["wire_bytes"]:
-            raise AssertionError(f"Expected 2x BF16-to-FP8 compression: {metrics}")
+        expected_wire_bytes = weight_numel + scale_numel * 4
+        expected_tensor_bytes = weight_numel * weight.element_size() + scale_numel * 4
+        if metrics["wire_bytes"] != expected_wire_bytes:
+            raise AssertionError(f"Unexpected block-wise wire bytes: {metrics}")
+        if metrics["tensor_bytes"] != expected_tensor_bytes:
+            raise AssertionError(f"Unexpected block-wise tensor bytes: {metrics}")
+        expected_quant_tasks = 1 if rank == 0 else 0
+        if metrics["blockwise_fp8_tasks"] != expected_quant_tasks:
+            raise AssertionError(f"Unexpected block-wise task count: {metrics}")
+        if metrics["blockwise_fp8_matrix_count"] != expected_quant_tasks:
+            raise AssertionError(f"Unexpected block-wise matrix count: {metrics}")
         if not metrics["plan_cache_hit"]:
             raise AssertionError(f"Second launch missed the plan cache: {metrics}")
         dist.barrier()
         print(
             f"rank={rank} parameter={args.parameter} shape={tuple(source.shape)} "
-            f"qwen_fp8={metrics}",
+            f"qwen_block_fp8={metrics}",
             flush=True,
         )
     finally:

@@ -21,6 +21,10 @@ import torch
 
 from awex import logging
 from awex.converter.sglang_converter import SGlangToHFWeightConverter
+from awex.transfer.tensor_layout import (
+    StaticTensorLayout,
+    make_blockwise_fp8_layouts,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +66,70 @@ def _build_mcore_converter_qwen3_moe():
         Megatron fused linear_qkv with GQA-aware group strides — the base
         equal-thirds split only holds when q/k/v head counts match.
         """
+
+        def __init__(self, hf_config, rank_info, infer_conf, tf_config):
+            super().__init__(hf_config, rank_info, infer_conf, tf_config)
+            infer_hf_config = infer_conf.get("hf_config", {})
+            quantization_config = self._read_cfg_value(
+                infer_hf_config, "quantization_config", {}
+            ) or {}
+            quant_method = self._read_cfg_value(
+                quantization_config, "quant_method", None
+            )
+            block_size = self._read_cfg_value(
+                quantization_config, "weight_block_size", None
+            )
+            activation_scheme = self._read_cfg_value(
+                quantization_config, "activation_scheme", "dynamic"
+            )
+            self.blockwise_fp8 = bool(
+                quant_method
+                and "fp8" in str(quant_method).lower()
+                and tuple(block_size or ()) == (128, 128)
+            )
+            if self.blockwise_fp8 and activation_scheme != "dynamic":
+                raise ValueError(
+                    "Qwen 128 x 128 FP8 requires dynamic activation scaling"
+                )
+            if self.blockwise_fp8:
+                logger.info(
+                    "Qwen converter enabled 128 x 128 block-wise FP8 outputs"
+                )
+
+        def _uses_blockwise_fp8(self, name: str, parameter) -> bool:
+            shape = tuple(int(dim) for dim in parameter.shape)
+            is_attention_weight = name.endswith(
+                (
+                    ".self_attn.q_proj.weight",
+                    ".self_attn.k_proj.weight",
+                    ".self_attn.v_proj.weight",
+                    ".self_attn.o_proj.weight",
+                )
+            )
+            is_mlp_weight = ".mlp." in name and name.endswith(
+                (".gate_proj.weight", ".up_proj.weight", ".down_proj.weight")
+            )
+            return (
+                self.blockwise_fp8
+                and len(shape) == 2
+                and (is_attention_weight or is_mlp_weight)
+            )
+
+        def _apply_blockwise_fp8(self, converted):
+            outputs = []
+            for name, parameter in converted:
+                if not self._uses_blockwise_fp8(name, parameter):
+                    outputs.append((name, parameter))
+                    continue
+                source = parameter
+                if isinstance(parameter, torch.Tensor):
+                    source = StaticTensorLayout(
+                        tuple(int(dim) for dim in parameter.shape), (parameter,)
+                    )
+                weight, scale = make_blockwise_fp8_layouts(source)
+                outputs.append((name, weight))
+                outputs.append((f"{name}_scale_inv", scale))
+            return outputs
 
         def _fuse_qkv(self, name: str) -> bool:
             return False
@@ -139,13 +207,41 @@ def _build_mcore_converter_qwen3_moe():
             from awex.models.qwen3 import build_qwen3_dense_qkv_layouts
 
             layouts = build_qwen3_dense_qkv_layouts(parameter, self.hf_config)
-            return [
+            converted = [
                 (
                     f"model.layers.{layer_number}.self_attn.{projection}_proj.{suffix}",
                     layouts[projection],
                 )
                 for projection in ("q", "k", "v")
             ]
+            return self._apply_blockwise_fp8(converted)
+
+        def convert_param(
+            self, name: str, parameter: torch.Tensor, vp_stage: int = None
+        ):
+            canonical_name = self._canonicalize_source_name(name, vp_stage)
+            if self.blockwise_fp8 and canonical_name.endswith(
+                "self_attention.linear_qkv.weight"
+            ):
+                layer_number, _ = canonical_name.replace(
+                    "decoder.layers.", "", 1
+                ).split(".", 1)
+                from awex.models.qwen3 import build_qwen3_dense_qkv_layouts
+
+                layouts = build_qwen3_dense_qkv_layouts(parameter, self.hf_config)
+                return self._apply_blockwise_fp8(
+                    [
+                        (
+                            f"model.layers.{layer_number}.self_attn."
+                            f"{projection}_proj.weight",
+                            layouts[projection],
+                        )
+                        for projection in ("q", "k", "v")
+                    ]
+                )
+            return self._apply_blockwise_fp8(
+                super().convert_param(name, parameter, vp_stage=vp_stage)
+            )
 
         def _convert_attention_param(
             self, name: str, parameter: torch.Tensor, layer_number: str

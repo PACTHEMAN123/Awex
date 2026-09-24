@@ -66,6 +66,7 @@ import torch.distributed as dist  # noqa: E402
 
 from awex import logging  # noqa: E402
 from awex.transfer.tensor_layout import (  # noqa: E402
+    BlockwiseFp8Layout,
     StaticTensorLayout,
     slice_layout_fragments,
 )
@@ -93,6 +94,15 @@ class _V2Batch:
     tensor_row_strides: list[int]
     wire_dtypes: list[int]
     wire_element_bytes: list[int]
+    quant_scale_tensors: list[torch.Tensor]
+    quant_modes: list[int]
+    quant_rows: list[int]
+    quant_cols: list[int]
+    quant_row_offsets: list[int]
+    quant_col_offsets: list[int]
+    quant_scale_row_strides: list[int]
+    quant_block_rows: list[int]
+    quant_block_cols: list[int]
     peers: list[int]
     ordinals: list[int]
     region_indices: list[int]
@@ -264,6 +274,15 @@ def _append_tensor_range(
     tensor_lengths: list[int],
     wire_dtypes: list[int],
     wire_element_bytes: list[int],
+    quant_scale_tensors: list[torch.Tensor],
+    quant_modes: list[int],
+    quant_rows: list[int],
+    quant_cols: list[int],
+    quant_row_offsets: list[int],
+    quant_col_offsets: list[int],
+    quant_scale_row_strides: list[int],
+    quant_block_rows: list[int],
+    quant_block_cols: list[int],
     peers: list[int],
     ordinals: list[int],
     region_indices: list[int],
@@ -277,6 +296,13 @@ def _append_tensor_range(
     peer_offset: int,
     ordinal: int,
     region_index: int,
+    quant_scale_tensor: torch.Tensor | None = None,
+    quant_rows_value: int = 0,
+    quant_cols_value: int = 0,
+    quant_row_offset: int = 0,
+    quant_col_offset: int = 0,
+    quant_scale_row_stride: int = 0,
+    quant_block_shape: tuple[int, int] = (0, 0),
 ) -> int:
     # Preserve one descriptor per physical TransferPlan span. C++ concatenates
     # these descriptors into a virtual peer stream before selecting channels
@@ -306,6 +332,17 @@ def _append_tensor_range(
     tensor_lengths.append(nbytes // wire_item_bytes * tensor_element_bytes)
     wire_dtypes.append(wire_dtype_code)
     wire_element_bytes.append(wire_item_bytes)
+    quant_scale_tensors.append(
+        tensor if quant_scale_tensor is None else quant_scale_tensor
+    )
+    quant_modes.append(0 if quant_scale_tensor is None else 1)
+    quant_rows.append(int(quant_rows_value))
+    quant_cols.append(int(quant_cols_value))
+    quant_row_offsets.append(int(quant_row_offset))
+    quant_col_offsets.append(int(quant_col_offset))
+    quant_scale_row_strides.append(int(quant_scale_row_stride))
+    quant_block_rows.append(int(quant_block_shape[0]))
+    quant_block_cols.append(int(quant_block_shape[1]))
     peers.append(peer)
     ordinals.append(ordinal)
     region_indices.append(region_index)
@@ -330,6 +367,15 @@ def _build_send_batch(
     tensor_row_strides: list[int] = []
     wire_dtypes: list[int] = []
     wire_element_bytes: list[int] = []
+    quant_scale_tensors: list[torch.Tensor] = []
+    quant_modes: list[int] = []
+    quant_rows: list[int] = []
+    quant_cols: list[int] = []
+    quant_row_offsets: list[int] = []
+    quant_col_offsets: list[int] = []
+    quant_scale_row_strides: list[int] = []
+    quant_block_rows: list[int] = []
+    quant_block_cols: list[int] = []
     peers: list[int] = []
     ordinals: list[int] = []
     region_indices: list[int] = []
@@ -341,7 +387,28 @@ def _build_send_batch(
         ordinal = 0
         for op in operations:
             parameter = parameters[op.send_shard_meta.name]
-            if isinstance(parameter, StaticTensorLayout):
+            blockwise_state = None
+            source_fragments = None
+            if isinstance(parameter, BlockwiseFp8Layout):
+                if parameter.kind == "weight":
+                    blockwise_state = parameter.state
+                    source_layout = blockwise_state.source
+                    if (
+                        op.send_tensor_span_numels
+                        and isinstance(source_layout, StaticTensorLayout)
+                        and source_layout.span_numels != op.send_tensor_span_numels
+                    ):
+                        raise NCCLDeviceV2UnavailableError(
+                            "Compiled block-wise source layout does not match "
+                            f"the transfer plan for {op.send_shard_meta.name}"
+                        )
+                    source_fragments = blockwise_state.source_fragments(op.train_slices)
+                    fragments = [fragment.tensor for fragment in source_fragments]
+                else:
+                    blockwise_state = parameter.state
+                    tensor = blockwise_state.scale[op.train_slices]
+                    fragments = [tensor]
+            elif isinstance(parameter, StaticTensorLayout):
                 if (
                     op.send_tensor_span_numels
                     and parameter.span_numels != op.send_tensor_span_numels
@@ -359,9 +426,15 @@ def _build_send_batch(
                 if allow_staging and not tensor.is_contiguous():
                     tensor = tensor.contiguous()
                 fragments = [tensor]
-            for fragment in fragments:
+            for fragment_number, fragment in enumerate(fragments):
                 _ensure_cuda_tensor(fragment, op.send_shard_meta.name)
                 target_dtype = _wire_dtype(op, fragment.dtype)
+                if blockwise_state is not None and source_fragments is not None:
+                    if target_dtype != torch.float8_e4m3fn:
+                        raise NCCLDeviceV2UnavailableError(
+                            "Block-wise FP8 weight requires an E4M3 receiver: "
+                            f"{op.recv_shard_meta.name} uses {target_dtype}"
+                        )
                 _, _, wire_item_bytes = _dtype_descriptor(
                     target_dtype, op.recv_shard_meta.name
                 )
@@ -369,6 +442,9 @@ def _build_send_batch(
                 row_bytes, row_stride = _tensor_copy_layout(
                     fragment, op.send_shard_meta.name
                 )
+                quant_fragment = None
+                if source_fragments is not None:
+                    quant_fragment = source_fragments[fragment_number]
                 ordinal = _append_tensor_range(
                     tensors=tensors,
                     tensor_offsets=tensor_offsets,
@@ -379,6 +455,15 @@ def _build_send_batch(
                     tensor_lengths=tensor_lengths,
                     wire_dtypes=wire_dtypes,
                     wire_element_bytes=wire_element_bytes,
+                    quant_scale_tensors=quant_scale_tensors,
+                    quant_modes=quant_modes,
+                    quant_rows=quant_rows,
+                    quant_cols=quant_cols,
+                    quant_row_offsets=quant_row_offsets,
+                    quant_col_offsets=quant_col_offsets,
+                    quant_scale_row_strides=quant_scale_row_strides,
+                    quant_block_rows=quant_block_rows,
+                    quant_block_cols=quant_block_cols,
                     peers=peers,
                     ordinals=ordinals,
                     region_indices=region_indices,
@@ -392,6 +477,31 @@ def _build_send_batch(
                     peer_offset=peer_offset,
                     ordinal=ordinal,
                     region_index=rank,
+                    quant_scale_tensor=(
+                        blockwise_state.scale if quant_fragment is not None else None
+                    ),
+                    quant_rows_value=(
+                        int(fragment.shape[0]) if quant_fragment is not None else 0
+                    ),
+                    quant_cols_value=(
+                        int(fragment.shape[1]) if quant_fragment is not None else 0
+                    ),
+                    quant_row_offset=(
+                        quant_fragment.row_offset if quant_fragment is not None else 0
+                    ),
+                    quant_col_offset=(
+                        quant_fragment.col_offset if quant_fragment is not None else 0
+                    ),
+                    quant_scale_row_stride=(
+                        int(blockwise_state.scale.stride(0))
+                        if quant_fragment is not None
+                        else 0
+                    ),
+                    quant_block_shape=(
+                        blockwise_state.block_shape
+                        if quant_fragment is not None
+                        else (0, 0)
+                    ),
                 )
                 peer_offset += length
         expected_counts[peer] = ordinal
@@ -406,6 +516,15 @@ def _build_send_batch(
         tensor_row_strides=tensor_row_strides,
         wire_dtypes=wire_dtypes,
         wire_element_bytes=wire_element_bytes,
+        quant_scale_tensors=quant_scale_tensors,
+        quant_modes=quant_modes,
+        quant_rows=quant_rows,
+        quant_cols=quant_cols,
+        quant_row_offsets=quant_row_offsets,
+        quant_col_offsets=quant_col_offsets,
+        quant_scale_row_strides=quant_scale_row_strides,
+        quant_block_rows=quant_block_rows,
+        quant_block_cols=quant_block_cols,
         peers=peers,
         ordinals=ordinals,
         region_indices=region_indices,
@@ -433,6 +552,15 @@ def _build_recv_batch(
     tensor_row_strides: list[int] = []
     wire_dtypes: list[int] = []
     wire_element_bytes: list[int] = []
+    quant_scale_tensors: list[torch.Tensor] = []
+    quant_modes: list[int] = []
+    quant_rows: list[int] = []
+    quant_cols: list[int] = []
+    quant_row_offsets: list[int] = []
+    quant_col_offsets: list[int] = []
+    quant_scale_row_strides: list[int] = []
+    quant_block_rows: list[int] = []
+    quant_block_cols: list[int] = []
     peers: list[int] = []
     ordinals: list[int] = []
     region_indices: list[int] = []
@@ -493,6 +621,15 @@ def _build_recv_batch(
                     tensor_lengths=tensor_lengths,
                     wire_dtypes=wire_dtypes,
                     wire_element_bytes=wire_element_bytes,
+                    quant_scale_tensors=quant_scale_tensors,
+                    quant_modes=quant_modes,
+                    quant_rows=quant_rows,
+                    quant_cols=quant_cols,
+                    quant_row_offsets=quant_row_offsets,
+                    quant_col_offsets=quant_col_offsets,
+                    quant_scale_row_strides=quant_scale_row_strides,
+                    quant_block_rows=quant_block_rows,
+                    quant_block_cols=quant_block_cols,
                     peers=peers,
                     ordinals=ordinals,
                     region_indices=region_indices,
@@ -521,6 +658,15 @@ def _build_recv_batch(
         tensor_row_strides=tensor_row_strides,
         wire_dtypes=wire_dtypes,
         wire_element_bytes=wire_element_bytes,
+        quant_scale_tensors=quant_scale_tensors,
+        quant_modes=quant_modes,
+        quant_rows=quant_rows,
+        quant_cols=quant_cols,
+        quant_row_offsets=quant_row_offsets,
+        quant_col_offsets=quant_col_offsets,
+        quant_scale_row_strides=quant_scale_row_strides,
+        quant_block_rows=quant_block_rows,
+        quant_block_cols=quant_block_cols,
         peers=peers,
         ordinals=ordinals,
         region_indices=region_indices,
@@ -759,6 +905,15 @@ class NCCLDeviceV2Transport:
                 batch.tensor_row_strides,
                 batch.wire_dtypes,
                 batch.wire_element_bytes,
+                batch.quant_scale_tensors,
+                batch.quant_modes,
+                batch.quant_rows,
+                batch.quant_cols,
+                batch.quant_row_offsets,
+                batch.quant_col_offsets,
+                batch.quant_scale_row_strides,
+                batch.quant_block_rows,
+                batch.quant_block_cols,
                 batch.peers,
                 batch.ordinals,
                 batch.expected_counts,

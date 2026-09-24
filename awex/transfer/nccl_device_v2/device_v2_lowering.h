@@ -55,6 +55,15 @@ struct V2LoweringTask {
   V2DataType wire_dtype = V2DataType::kOpaque;
   std::uint32_t tensor_element_bytes = 0;
   std::uint32_t wire_element_bytes = 0;
+  std::uintptr_t quant_scale_ptr = 0;
+  std::uint64_t quant_rows = 0;
+  std::uint64_t quant_cols = 0;
+  std::uint64_t quant_row_offset = 0;
+  std::uint64_t quant_col_offset = 0;
+  std::uint64_t quant_scale_row_stride = 0;
+  V2QuantMode quant_mode = V2QuantMode::kNone;
+  std::uint32_t quant_block_rows = 0;
+  std::uint32_t quant_block_cols = 0;
   std::uint32_t peer = 0;
   std::uint32_t ordinal = 0;
 };
@@ -183,6 +192,15 @@ inline void v2AppendFragments(const std::vector<V2StreamSpan>& spans, std::uint6
       task.wire_dtype,
       task.tensor_element_bytes,
       task.wire_element_bytes,
+      task.quant_scale_ptr,
+      task.quant_rows,
+      task.quant_cols,
+      task.quant_row_offset,
+      task.quant_col_offset,
+      task.quant_scale_row_stride,
+      task.quant_mode,
+      task.quant_block_rows,
+      task.quant_block_cols,
     });
   }
   const std::size_t fragment_count = schedule->fragments.size() - work->fragment_begin;
@@ -243,6 +261,12 @@ inline V2Schedule lowerFixedTasks(const std::vector<V2LoweringTask>& tasks,
         task.tensor_row_bytes % task.tensor_element_bytes != 0 ||
         task.tensor_row_stride % task.tensor_element_bytes != 0 || task.nbytes % task.wire_element_bytes != 0) {
       throw std::invalid_argument("invalid v2 tensor row layout");
+    }
+    if (task.quant_mode == V2QuantMode::kBlockwiseFloat8E4M3 &&
+        (direction != V2Direction::kSend || task.quant_scale_ptr == 0 || task.quant_rows == 0 ||
+         task.quant_cols == 0 || task.quant_scale_row_stride == 0 || task.quant_block_rows != 128 ||
+         task.quant_block_cols != 128 || task.wire_dtype != V2DataType::kFloat8E4M3)) {
+      throw std::invalid_argument("invalid v2 block-wise FP8 task");
     }
     if (task.ordinal != peer_tasks[task.peer].size()) {
       throw std::invalid_argument("v2 task order is not dense within its peer stream");

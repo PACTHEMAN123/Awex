@@ -27,6 +27,55 @@ struct V2BatchShared {
   unsigned long long step_cache[kMaxWorksPerBatch];
 };
 
+__global__ void blockwise_fp8_scale_kernel(const V2QuantMatrix* matrices, std::uint32_t matrix_count,
+                                           std::uint32_t max_blocks) {
+  const std::uint32_t matrix_index = blockIdx.y;
+  const std::uint32_t block_index = blockIdx.x;
+  if (matrix_index >= matrix_count || block_index >= max_blocks) return;
+
+  const V2QuantMatrix matrix = matrices[matrix_index];
+  const std::uint64_t block_cols = (matrix.cols + matrix.block_cols - 1) / matrix.block_cols;
+  const std::uint64_t block_rows = (matrix.rows + matrix.block_rows - 1) / matrix.block_rows;
+  if (block_index >= block_rows * block_cols) return;
+
+  const std::uint64_t local_block_row = block_index / block_cols;
+  const std::uint64_t local_block_col = block_index % block_cols;
+  const std::uint64_t row_begin = local_block_row * matrix.block_rows;
+  const std::uint64_t col_begin = local_block_col * matrix.block_cols;
+  const std::uint64_t rows = matrix.block_rows < matrix.rows - row_begin ? matrix.block_rows : matrix.rows - row_begin;
+  const std::uint64_t cols = matrix.block_cols < matrix.cols - col_begin ? matrix.block_cols : matrix.cols - col_begin;
+  const auto* tensor = reinterpret_cast<const std::uint8_t*>(matrix.tensor_ptr);
+
+  float local_max = 0.0F;
+  for (std::uint64_t index = threadIdx.x; index < rows * cols; index += blockDim.x) {
+    const std::uint64_t row = row_begin + index / cols;
+    const std::uint64_t col = col_begin + index % cols;
+    const auto* source = tensor + row * matrix.tensor_row_stride + col * matrix.tensor_element_bytes;
+    local_max = fmaxf(local_max, fabsf(v2LoadNumeric(source, matrix.tensor_dtype)));
+  }
+
+  for (int offset = kWarpSize / 2; offset > 0; offset /= 2) {
+    local_max = fmaxf(local_max, __shfl_down_sync(0xffffffffU, local_max, offset));
+  }
+  __shared__ float warp_max[kThreadsPerBlock / kWarpSize];
+  const int lane = threadIdx.x % kWarpSize;
+  const int warp = threadIdx.x / kWarpSize;
+  if (lane == 0) warp_max[warp] = local_max;
+  __syncthreads();
+  if (warp == 0) {
+    local_max = lane < blockDim.x / kWarpSize ? warp_max[lane] : 0.0F;
+    for (int offset = kWarpSize / 2; offset > 0; offset /= 2) {
+      local_max = fmaxf(local_max, __shfl_down_sync(0xffffffffU, local_max, offset));
+    }
+    if (lane == 0) {
+      const std::uint64_t scale_row = matrix.row_offset / matrix.block_rows + local_block_row;
+      const std::uint64_t scale_col = matrix.col_offset / matrix.block_cols + local_block_col;
+      auto* scales = reinterpret_cast<float*>(matrix.scale_ptr);
+      scales[scale_row * matrix.scale_row_stride + scale_col] = fmaxf(local_max, 1.0e-4F) / 448.0F;
+    }
+  }
+}
+
 __device__ __forceinline__ std::uint32_t v2Roles(V2Direction direction, int tid, int nthreads, int* nworkers) {
   const bool send = direction == V2Direction::kSend;
   *nworkers = nthreads - (nthreads >= 3 * kWarpSize ? kWarpSize : 0);

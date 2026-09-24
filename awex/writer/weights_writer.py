@@ -36,7 +36,7 @@ from awex.models.registry import get_train_weights_converter
 from awex.sharding.param_sharding import (
     get_rank_info_extractor,
 )
-from awex.transfer.tensor_layout import StaticTensorLayout
+from awex.transfer.tensor_layout import BlockwiseFp8Layout, StaticTensorLayout
 from awex.util import device as device_util
 from awex.util.common import (
     check_train_infer_params_meta,
@@ -253,6 +253,8 @@ class WeightsExchangeShardingWriter(WeightExchangeWriter):
             ):
                 if required is not None and hf_name not in required:
                     continue
+                if isinstance(hf_param, BlockwiseFp8Layout):
+                    hf_param = hf_param.materialize()
                 converted[hf_name] = hf_param
         if (
             getattr(self.hf_config, "tie_word_embeddings", False)
@@ -302,18 +304,26 @@ class WeightsExchangeShardingWriter(WeightExchangeWriter):
                         raise ValueError(
                             f"Duplicate compiled device parameter: {target_name}"
                         )
-                    tensors = (
-                        target.spans
-                        if isinstance(target, StaticTensorLayout)
-                        else (target,)
-                    )
+                    if isinstance(target, BlockwiseFp8Layout):
+                        tensors = (
+                            target.state.source_spans
+                            if target.kind == "weight"
+                            else (target.state.scale,)
+                        )
+                    elif isinstance(target, StaticTensorLayout):
+                        tensors = target.spans
+                    else:
+                        tensors = (target,)
                     source_storage = source_parameter.untyped_storage().data_ptr()
-                    if any(
+                    requires_source_alias = not isinstance(
+                        target, BlockwiseFp8Layout
+                    ) or target.kind == "weight"
+                    if requires_source_alias and any(
                         tensor.untyped_storage().data_ptr() != source_storage
                         for tensor in tensors
                     ):
                         raise ValueError(
-                            "Qwen3 device plan only supports copy-only "
+                            "Qwen3 device plan only supports source-aliasing "
                             f"conversions, but {source_name} -> {target_name} "
                             "materialized new storage"
                         )

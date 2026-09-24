@@ -39,8 +39,10 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <set>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace py = pybind11;
@@ -57,6 +59,7 @@ struct LaunchBuffers {
   v2::V2ChannelQueue* channels = nullptr;
   std::uint32_t* channel_ids = nullptr;
   std::uint32_t* active_peers = nullptr;
+  v2::V2QuantMatrix* quant_matrices = nullptr;
 };
 
 struct DeviceState {
@@ -80,6 +83,8 @@ struct DeviceState {
   v2::V2Direction direction = v2::V2Direction::kSend;
   std::vector<v2::V2LoweringTask> tasks;
   std::vector<std::uint32_t> active_peers;
+  std::vector<v2::V2QuantMatrix> quant_matrices;
+  std::uint32_t max_quant_blocks = 0;
   v2::V2Schedule schedule;
   LaunchBuffers buffers;
   int rank = 0;
@@ -238,9 +243,14 @@ void release_buffers(LaunchBuffers* buffers) {
     AWEX_CUDA_V2_CHECK(cudaFree(buffers->active_peers));
     buffers->active_peers = nullptr;
   }
+  if (buffers->quant_matrices != nullptr) {
+    AWEX_CUDA_V2_CHECK(cudaFree(buffers->quant_matrices));
+    buffers->quant_matrices = nullptr;
+  }
 }
 
-void allocate_buffers(const v2::V2Schedule& schedule, std::size_t active_peer_count, LaunchBuffers* buffers) {
+void allocate_buffers(const v2::V2Schedule& schedule, std::size_t active_peer_count,
+                      std::size_t quant_matrix_count, LaunchBuffers* buffers) {
   try {
     if (!schedule.works.empty()) {
       AWEX_CUDA_V2_CHECK(cudaMalloc(reinterpret_cast<void**>(&buffers->works),
@@ -266,6 +276,10 @@ void allocate_buffers(const v2::V2Schedule& schedule, std::size_t active_peer_co
       AWEX_CUDA_V2_CHECK(cudaMalloc(reinterpret_cast<void**>(&buffers->active_peers),
                                     active_peer_count * sizeof(std::uint32_t)));
     }
+    if (quant_matrix_count != 0) {
+      AWEX_CUDA_V2_CHECK(cudaMalloc(reinterpret_cast<void**>(&buffers->quant_matrices),
+                                    quant_matrix_count * sizeof(v2::V2QuantMatrix)));
+    }
   } catch (...) {
     release_buffers(buffers);
     throw;
@@ -273,7 +287,8 @@ void allocate_buffers(const v2::V2Schedule& schedule, std::size_t active_peer_co
 }
 
 void upload_buffers(const v2::V2Schedule& schedule, const std::vector<std::uint32_t>& active_peers,
-                    LaunchBuffers* buffers, cudaStream_t stream) {
+                    const std::vector<v2::V2QuantMatrix>& quant_matrices, LaunchBuffers* buffers,
+                    cudaStream_t stream) {
   if (!schedule.works.empty()) {
     AWEX_CUDA_V2_CHECK(cudaMemcpyAsync(buffers->works, schedule.works.data(),
                                        schedule.works.size() * sizeof(v2::V2Work), cudaMemcpyHostToDevice, stream));
@@ -302,6 +317,11 @@ void upload_buffers(const v2::V2Schedule& schedule, const std::vector<std::uint3
     AWEX_CUDA_V2_CHECK(cudaMemcpyAsync(buffers->active_peers, active_peers.data(),
                                        active_peers.size() * sizeof(std::uint32_t), cudaMemcpyHostToDevice, stream));
   }
+  if (!quant_matrices.empty()) {
+    AWEX_CUDA_V2_CHECK(cudaMemcpyAsync(buffers->quant_matrices, quant_matrices.data(),
+                                       quant_matrices.size() * sizeof(v2::V2QuantMatrix), cudaMemcpyHostToDevice,
+                                       stream));
+  }
 }
 
 bool same_tasks(const std::vector<v2::V2LoweringTask>& left, const std::vector<v2::V2LoweringTask>& right) {
@@ -313,6 +333,10 @@ bool same_tasks(const std::vector<v2::V2LoweringTask>& left, const std::vector<v
         a.tensor_row_bytes != b.tensor_row_bytes || a.tensor_row_stride != b.tensor_row_stride ||
         a.tensor_dtype != b.tensor_dtype || a.wire_dtype != b.wire_dtype ||
         a.tensor_element_bytes != b.tensor_element_bytes || a.wire_element_bytes != b.wire_element_bytes ||
+        a.quant_scale_ptr != b.quant_scale_ptr || a.quant_rows != b.quant_rows || a.quant_cols != b.quant_cols ||
+        a.quant_row_offset != b.quant_row_offset || a.quant_col_offset != b.quant_col_offset ||
+        a.quant_scale_row_stride != b.quant_scale_row_stride || a.quant_mode != b.quant_mode ||
+        a.quant_block_rows != b.quant_block_rows || a.quant_block_cols != b.quant_block_cols ||
         a.peer != b.peer || a.ordinal != b.ordinal) {
       return false;
     }
@@ -359,6 +383,61 @@ std::uint32_t dtype_bytes(v2::V2DataType dtype) {
       return 0;
   }
   return 0;
+}
+
+std::vector<v2::V2QuantMatrix> build_quant_matrices(
+  const std::vector<v2::V2LoweringTask>& tasks, std::uint32_t* max_blocks) {
+  using Key = std::tuple<std::uintptr_t, std::uintptr_t, std::uint64_t, std::uint64_t, std::uint64_t,
+                         std::uint64_t, std::uint64_t, std::uint64_t, std::uint32_t, std::uint32_t,
+                         std::uint32_t, std::uint32_t>;
+  std::set<Key> seen;
+  std::vector<v2::V2QuantMatrix> matrices;
+  *max_blocks = 0;
+  for (const auto& task : tasks) {
+    if (task.quant_mode == v2::V2QuantMode::kNone) continue;
+    const Key key{
+      task.tensor_ptr,
+      task.quant_scale_ptr,
+      task.tensor_row_stride,
+      task.quant_rows,
+      task.quant_cols,
+      task.quant_row_offset,
+      task.quant_col_offset,
+      task.quant_scale_row_stride,
+      static_cast<std::uint32_t>(task.tensor_dtype),
+      task.tensor_element_bytes,
+      task.quant_block_rows,
+      task.quant_block_cols,
+    };
+    if (!seen.insert(key).second) continue;
+    matrices.push_back(v2::V2QuantMatrix{
+      task.tensor_ptr,
+      task.quant_scale_ptr,
+      task.tensor_row_stride,
+      task.quant_rows,
+      task.quant_cols,
+      task.quant_row_offset,
+      task.quant_col_offset,
+      task.quant_scale_row_stride,
+      task.tensor_dtype,
+      task.tensor_element_bytes,
+      task.quant_block_rows,
+      task.quant_block_cols,
+    });
+    const std::uint64_t row_blocks =
+      (task.quant_rows + task.quant_block_rows - 1) / task.quant_block_rows;
+    const std::uint64_t col_blocks =
+      (task.quant_cols + task.quant_block_cols - 1) / task.quant_block_cols;
+    const std::uint64_t blocks = row_blocks * col_blocks;
+    if (blocks > std::numeric_limits<std::uint32_t>::max()) {
+      throw std::runtime_error("nccl_device_v2 block-wise FP8 matrix is too large");
+    }
+    *max_blocks = std::max(*max_blocks, static_cast<std::uint32_t>(blocks));
+  }
+  if (matrices.size() > 65535) {
+    throw std::runtime_error("nccl_device_v2 has too many block-wise FP8 matrix fragments");
+  }
+  return matrices;
 }
 
 void initialize_sparse_window(DeviceState* state, const std::vector<std::uint32_t>& active_peers,
@@ -441,12 +520,21 @@ std::vector<v2::V2LoweringTask> build_tasks(
   const DeviceState& state, const py::list& tensors, const std::vector<int64_t>& lengths,
   const std::vector<int64_t>& tensor_offsets, const std::vector<int64_t>& tensor_row_bytes,
   const std::vector<int64_t>& tensor_row_strides, const std::vector<int64_t>& wire_dtypes,
-  const std::vector<int64_t>& wire_element_bytes, const std::vector<int64_t>& peers,
-  const std::vector<int64_t>& ordinals, const std::vector<int64_t>& expected_counts, bool sender,
-  std::vector<std::uint32_t>* active_peers) {
+  const std::vector<int64_t>& wire_element_bytes, const py::list& quant_scale_tensors,
+  const std::vector<int64_t>& quant_modes, const std::vector<int64_t>& quant_rows,
+  const std::vector<int64_t>& quant_cols, const std::vector<int64_t>& quant_row_offsets,
+  const std::vector<int64_t>& quant_col_offsets, const std::vector<int64_t>& quant_scale_row_strides,
+  const std::vector<int64_t>& quant_block_rows, const std::vector<int64_t>& quant_block_cols,
+  const std::vector<int64_t>& peers, const std::vector<int64_t>& ordinals,
+  const std::vector<int64_t>& expected_counts, bool sender, std::vector<std::uint32_t>* active_peers) {
   if (tensors.size() != lengths.size() || tensors.size() != tensor_offsets.size() ||
       tensors.size() != tensor_row_bytes.size() || tensors.size() != tensor_row_strides.size() ||
       tensors.size() != wire_dtypes.size() || tensors.size() != wire_element_bytes.size() ||
+      tensors.size() != quant_scale_tensors.size() || tensors.size() != quant_modes.size() ||
+      tensors.size() != quant_rows.size() || tensors.size() != quant_cols.size() ||
+      tensors.size() != quant_row_offsets.size() || tensors.size() != quant_col_offsets.size() ||
+      tensors.size() != quant_scale_row_strides.size() || tensors.size() != quant_block_rows.size() ||
+      tensors.size() != quant_block_cols.size() ||
       tensors.size() != peers.size() || tensors.size() != ordinals.size()) {
     throw std::runtime_error("nccl_device_v2 tensor/task descriptor lengths do not match");
   }
@@ -489,6 +577,41 @@ std::vector<v2::V2LoweringTask> build_tasks(
     if (!sender && requires_cast) {
       throw std::runtime_error("nccl_device_v2 receiver tensor must use the wire dtype");
     }
+    if (quant_modes[index] < static_cast<int64_t>(v2::V2QuantMode::kNone) ||
+        quant_modes[index] > static_cast<int64_t>(v2::V2QuantMode::kBlockwiseFloat8E4M3)) {
+      throw std::runtime_error("nccl_device_v2 quantization mode is invalid");
+    }
+    const auto quant_mode = static_cast<v2::V2QuantMode>(quant_modes[index]);
+    std::uintptr_t quant_scale_ptr = 0;
+    if (quant_mode != v2::V2QuantMode::kNone) {
+      if (!sender || wire_dtype != v2::V2DataType::kFloat8E4M3 ||
+          local_dtype == v2::V2DataType::kOpaque || quant_rows[index] <= 0 || quant_cols[index] <= 0 ||
+          quant_row_offsets[index] < 0 || quant_col_offsets[index] < 0 ||
+          quant_scale_row_strides[index] <= 0 || quant_block_rows[index] != 128 || quant_block_cols[index] != 128 ||
+          tensor_offsets[index] != 0 || tensor_row_bytes[index] != quant_cols[index] * local_element_bytes ||
+          lengths[index] != quant_rows[index] * quant_cols[index] * wire_item_bytes ||
+          quant_row_offsets[index] % quant_block_rows[index] != 0 ||
+          quant_col_offsets[index] % quant_block_cols[index] != 0) {
+        throw std::runtime_error("nccl_device_v2 block-wise FP8 descriptor is invalid");
+      }
+      const auto scale = quant_scale_tensors[index].cast<torch::Tensor>();
+      if (!scale.is_cuda() || scale.get_device() != state.device || scale.scalar_type() != at::ScalarType::Float ||
+          !scale.is_contiguous()) {
+        throw std::runtime_error("nccl_device_v2 block-wise FP8 scale tensor must be contiguous CUDA FP32");
+      }
+      const std::uint64_t scale_rows =
+        (static_cast<std::uint64_t>(quant_row_offsets[index] + quant_rows[index]) + quant_block_rows[index] - 1) /
+        quant_block_rows[index];
+      const std::uint64_t scale_cols =
+        (static_cast<std::uint64_t>(quant_col_offsets[index] + quant_cols[index]) + quant_block_cols[index] - 1) /
+        quant_block_cols[index];
+      const std::uint64_t required_scale_numel =
+        (scale_rows - 1) * quant_scale_row_strides[index] + scale_cols;
+      if (required_scale_numel > static_cast<std::uint64_t>(scale.numel())) {
+        throw std::runtime_error("nccl_device_v2 block-wise FP8 scale tensor is too small");
+      }
+      quant_scale_ptr = reinterpret_cast<std::uintptr_t>(scale.data_ptr());
+    }
     const int64_t peer = peers[index];
     const int64_t ordinal = ordinals[index];
     if (peer < 0 || peer >= state.world_size || peer == state.rank) {
@@ -518,6 +641,15 @@ std::vector<v2::V2LoweringTask> build_tasks(
       wire_dtype,
       local_element_bytes,
       wire_item_bytes,
+      quant_scale_ptr,
+      static_cast<std::uint64_t>(quant_rows[index]),
+      static_cast<std::uint64_t>(quant_cols[index]),
+      static_cast<std::uint64_t>(quant_row_offsets[index]),
+      static_cast<std::uint64_t>(quant_col_offsets[index]),
+      static_cast<std::uint64_t>(quant_scale_row_strides[index]),
+      quant_mode,
+      static_cast<std::uint32_t>(quant_block_rows[index]),
+      static_cast<std::uint32_t>(quant_block_cols[index]),
       static_cast<std::uint32_t>(peer),
       static_cast<std::uint32_t>(ordinal),
     });
@@ -532,9 +664,13 @@ std::vector<v2::V2LoweringTask> build_tasks(
 py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64_t>& lengths,
                 const std::vector<int64_t>& tensor_offsets, const std::vector<int64_t>& tensor_row_bytes,
                 const std::vector<int64_t>& tensor_row_strides, const std::vector<int64_t>& wire_dtypes,
-                const std::vector<int64_t>& wire_element_bytes, const std::vector<int64_t>& peers,
-                const std::vector<int64_t>& ordinals, const std::vector<int64_t>& expected_counts, bool sender,
-                int64_t sequence) {
+                const std::vector<int64_t>& wire_element_bytes, const py::list& quant_scale_tensors,
+                const std::vector<int64_t>& quant_modes, const std::vector<int64_t>& quant_rows,
+                const std::vector<int64_t>& quant_cols, const std::vector<int64_t>& quant_row_offsets,
+                const std::vector<int64_t>& quant_col_offsets, const std::vector<int64_t>& quant_scale_row_strides,
+                const std::vector<int64_t>& quant_block_rows, const std::vector<int64_t>& quant_block_cols,
+                const std::vector<int64_t>& peers, const std::vector<int64_t>& ordinals,
+                const std::vector<int64_t>& expected_counts, bool sender, int64_t sequence) {
   using Clock = std::chrono::steady_clock;
   const auto launch_start = Clock::now();
   auto* state = reinterpret_cast<DeviceState*>(handle);
@@ -547,7 +683,9 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
 
   std::vector<std::uint32_t> active_peers;
   const auto tasks = build_tasks(*state, tensors, lengths, tensor_offsets, tensor_row_bytes, tensor_row_strides,
-                                 wire_dtypes, wire_element_bytes, peers, ordinals, expected_counts, sender,
+                                 wire_dtypes, wire_element_bytes, quant_scale_tensors, quant_modes, quant_rows,
+                                 quant_cols, quant_row_offsets, quant_col_offsets, quant_scale_row_strides,
+                                 quant_block_rows, quant_block_cols, peers, ordinals, expected_counts, sender,
                                  &active_peers);
   const v2::V2Direction direction = sender ? v2::V2Direction::kSend : v2::V2Direction::kRecv;
   AWEX_CUDA_V2_CHECK(cudaSetDevice(state->device));
@@ -570,16 +708,20 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
     const auto lowering_start = Clock::now();
     auto schedule = v2::lowerFixedTasks(tasks, active_peers, direction, config);
     host_lowering_time_ms = std::chrono::duration<double, std::milli>(Clock::now() - lowering_start).count();
+    std::uint32_t max_quant_blocks = 0;
+    auto quant_matrices = build_quant_matrices(tasks, &max_quant_blocks);
 
     initialize_sparse_window(state, active_peers, direction, stream);
     LaunchBuffers buffers;
     try {
       const auto metadata_start = Clock::now();
-      allocate_buffers(schedule, active_peers.size(), &buffers);
-      upload_buffers(schedule, active_peers, &buffers, stream);
+      allocate_buffers(schedule, active_peers.size(), quant_matrices.size(), &buffers);
+      upload_buffers(schedule, active_peers, quant_matrices, &buffers, stream);
       metadata_upload_time_ms = std::chrono::duration<double, std::milli>(Clock::now() - metadata_start).count();
       state->tasks = tasks;
       state->active_peers = active_peers;
+      state->quant_matrices = std::move(quant_matrices);
+      state->max_quant_blocks = max_quant_blocks;
       state->schedule = std::move(schedule);
       state->buffers = buffers;
       state->direction = direction;
@@ -612,16 +754,22 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
   std::uint64_t tensor_bytes = 0;
   std::uint64_t wire_bytes = 0;
   std::uint64_t streaming_cast_tasks = 0;
+  std::uint64_t blockwise_fp8_tasks = 0;
   for (const auto& task : tasks) {
     wire_bytes += task.nbytes;
     tensor_bytes += task.nbytes / task.wire_element_bytes * task.tensor_element_bytes;
     if (task.tensor_dtype != task.wire_dtype || task.tensor_element_bytes != task.wire_element_bytes) {
       ++streaming_cast_tasks;
     }
+    if (task.quant_mode == v2::V2QuantMode::kBlockwiseFloat8E4M3) {
+      ++blockwise_fp8_tasks;
+    }
   }
   metrics["tensor_bytes"] = py::int_(tensor_bytes);
   metrics["wire_bytes"] = py::int_(wire_bytes);
   metrics["streaming_cast_tasks"] = py::int_(streaming_cast_tasks);
+  metrics["blockwise_fp8_tasks"] = py::int_(blockwise_fp8_tasks);
+  metrics["blockwise_fp8_matrix_count"] = py::int_(state->quant_matrices.size());
   metrics["channel_limit"] = py::int_(state->total_channels);
   metrics["topology_requested_channels_per_peer"] = py::int_(state->topology.requested_channels_per_peer);
   metrics["topology_channels_per_peer"] = py::int_(state->topology.channels_per_peer);
@@ -672,9 +820,27 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
       state->timeout_cycles,
   };
   const auto kernel_start = Clock::now();
+  cudaEvent_t quant_start = nullptr;
+  cudaEvent_t quant_end = nullptr;
+  if (!state->quant_matrices.empty()) {
+    AWEX_CUDA_V2_CHECK(cudaEventCreate(&quant_start));
+    AWEX_CUDA_V2_CHECK(cudaEventCreate(&quant_end));
+    AWEX_CUDA_V2_CHECK(cudaEventRecord(quant_start, stream));
+    AWEX_CUDA_V2_CHECK(v2::launchBlockwiseFp8Scales(state->buffers.quant_matrices,
+                                                    static_cast<std::uint32_t>(state->quant_matrices.size()),
+                                                    state->max_quant_blocks, stream));
+    AWEX_CUDA_V2_CHECK(cudaEventRecord(quant_end, stream));
+  }
   AWEX_CUDA_V2_CHECK(v2::launchDeviceV2(args, stream));
   AWEX_CUDA_V2_CHECK(cudaStreamSynchronize(stream));
   metrics["kernel_transfer_time_ms"] = std::chrono::duration<double, std::milli>(Clock::now() - kernel_start).count();
+  float quant_scale_kernel_time_ms = 0.0F;
+  if (quant_start != nullptr) {
+    AWEX_CUDA_V2_CHECK(cudaEventElapsedTime(&quant_scale_kernel_time_ms, quant_start, quant_end));
+    AWEX_CUDA_V2_CHECK(cudaEventDestroy(quant_start));
+    AWEX_CUDA_V2_CHECK(cudaEventDestroy(quant_end));
+  }
+  metrics["quant_scale_kernel_time_ms"] = py::float_(quant_scale_kernel_time_ms);
 
   v2::V2WindowHeader header{};
   AWEX_CUDA_V2_CHECK(cudaMemcpy(&header, state->local_base, sizeof(header), cudaMemcpyDeviceToHost));

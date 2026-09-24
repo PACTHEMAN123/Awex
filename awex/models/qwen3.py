@@ -104,6 +104,9 @@ def qwen3_dense_span_numels(
 ) -> Tuple[int, ...]:
     """Return source span sizes for a canonical Q/K/V local shard."""
 
+    if parameter_name.endswith("_scale_inv"):
+        return ()
+
     projections = {
         ".self_attn.q_proj.": _config_int(hf_config, "num_attention_heads")
         // _config_int(hf_config, "num_key_value_heads")
@@ -151,31 +154,9 @@ def _build_mcore_converter_qwen3():
         def convert_param_to_device_layout(
             self, name: str, parameter: torch.Tensor, vp_stage: int = None
         ):
-            canonical_name = self._canonicalize_source_name(name, vp_stage)
-            is_qkv_parameter = (
-                "self_attention.linear_qkv.weight" in canonical_name
-                or "self_attention.linear_qkv.bias" in canonical_name
+            return super().convert_param_to_device_layout(
+                name, parameter, vp_stage=vp_stage
             )
-            if not is_qkv_parameter:
-                return self.convert_param(name, parameter, vp_stage=vp_stage)
-
-            layer_number, remaining_name = canonical_name.replace(
-                "decoder.layers.", "", 1
-            ).split(".", 1)
-            if remaining_name not in {
-                "self_attention.linear_qkv.weight",
-                "self_attention.linear_qkv.bias",
-            }:
-                raise ValueError(f"Unexpected Qwen3 dense QKV name: {canonical_name}")
-            suffix = "weight" if canonical_name.endswith("weight") else "bias"
-            layouts = build_qwen3_dense_qkv_layouts(parameter, self.hf_config)
-            return [
-                (
-                    f"model.layers.{layer_number}.self_attn.{projection}_proj.{suffix}",
-                    layouts[projection],
-                )
-                for projection in ("q", "k", "v")
-            ]
 
     return McoreToHFWeightConverterQwen3
 

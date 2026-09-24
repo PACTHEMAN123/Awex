@@ -312,14 +312,28 @@ __device__ __forceinline__ void v2CastTensorToContiguous(
   std::uint8_t* destination, const std::uint8_t* tensor, std::uint64_t tensor_offset,
   std::uint64_t wire_offset, std::uint64_t nbytes, std::uint64_t row_bytes, std::uint64_t row_stride,
   V2DataType tensor_dtype, V2DataType wire_dtype, std::uint32_t tensor_element_bytes,
-  std::uint32_t wire_element_bytes, int tid, int nthreads) {
+  std::uint32_t wire_element_bytes, std::uintptr_t quant_scale_ptr, std::uint64_t quant_rows,
+  std::uint64_t quant_cols, std::uint64_t quant_row_offset, std::uint64_t quant_col_offset,
+  std::uint64_t quant_scale_row_stride, V2QuantMode quant_mode, std::uint32_t quant_block_rows,
+  std::uint32_t quant_block_cols, int tid, int nthreads) {
   const std::uint64_t wire_end = wire_offset + nbytes;
   const std::uint64_t first_element = wire_offset / wire_element_bytes;
   const std::uint64_t element_end = (wire_end + wire_element_bytes - 1) / wire_element_bytes;
   for (std::uint64_t element = first_element + tid; element < element_end; element += nthreads) {
     const std::uint64_t logical_offset = tensor_offset + element * tensor_element_bytes;
     const auto* source = v2TensorAddress(tensor, logical_offset, row_bytes, row_stride);
-    const V2ScalarBytes encoded = v2EncodeNumeric(v2LoadNumeric(source, tensor_dtype), wire_dtype);
+    float value = v2LoadNumeric(source, tensor_dtype);
+    if (quant_mode == V2QuantMode::kBlockwiseFloat8E4M3) {
+      const std::uint64_t row = element / quant_cols;
+      const std::uint64_t col = element % quant_cols;
+      if (row < quant_rows) {
+        const std::uint64_t scale_row = (quant_row_offset + row) / quant_block_rows;
+        const std::uint64_t scale_col = (quant_col_offset + col) / quant_block_cols;
+        const auto* scales = reinterpret_cast<const float*>(quant_scale_ptr);
+        value /= scales[scale_row * quant_scale_row_stride + scale_col];
+      }
+    }
+    const V2ScalarBytes encoded = v2EncodeNumeric(value, wire_dtype);
     const std::uint64_t element_wire_begin = element * wire_element_bytes;
     const std::uint64_t begin = element_wire_begin < wire_offset ? wire_offset : element_wire_begin;
     const std::uint64_t element_wire_end = element_wire_begin + wire_element_bytes;
@@ -350,7 +364,10 @@ __device__ __forceinline__ void v2CopyFragmentsToContiguous(const V2KernelArgs& 
       v2CastTensorToContiguous(destination + begin - work_offset, tensor, fragment.tensor_offset, wire_offset,
                                end - begin, fragment.tensor_row_bytes, fragment.tensor_row_stride,
                                fragment.tensor_dtype, fragment.wire_dtype, fragment.tensor_element_bytes,
-                               fragment.wire_element_bytes, tid, nthreads);
+                               fragment.wire_element_bytes, fragment.quant_scale_ptr, fragment.quant_rows,
+                               fragment.quant_cols, fragment.quant_row_offset, fragment.quant_col_offset,
+                               fragment.quant_scale_row_stride, fragment.quant_mode, fragment.quant_block_rows,
+                               fragment.quant_block_cols, tid, nthreads);
     }
   }
 }

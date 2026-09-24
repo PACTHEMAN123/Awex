@@ -58,6 +58,11 @@ enum class V2DataType : std::uint32_t {
   kFloat8E5M2 = 5,
 };
 
+enum class V2QuantMode : std::uint32_t {
+  kNone = 0,
+  kBlockwiseFloat8E4M3 = 1,
+};
+
 // This is the fixed-plan task shape consumed by the v2 lowering layer. The
 // fields intentionally mirror the existing device task without adding a new
 // logical operation or changing its ordering.
@@ -86,6 +91,30 @@ struct alignas(16) V2Fragment {
   V2DataType wire_dtype;
   std::uint32_t tensor_element_bytes;
   std::uint32_t wire_element_bytes;
+  std::uintptr_t quant_scale_ptr;
+  std::uint64_t quant_rows;
+  std::uint64_t quant_cols;
+  std::uint64_t quant_row_offset;
+  std::uint64_t quant_col_offset;
+  std::uint64_t quant_scale_row_stride;
+  V2QuantMode quant_mode;
+  std::uint32_t quant_block_rows;
+  std::uint32_t quant_block_cols;
+};
+
+struct alignas(16) V2QuantMatrix {
+  std::uintptr_t tensor_ptr;
+  std::uintptr_t scale_ptr;
+  std::uint64_t tensor_row_stride;
+  std::uint64_t rows;
+  std::uint64_t cols;
+  std::uint64_t row_offset;
+  std::uint64_t col_offset;
+  std::uint64_t scale_row_stride;
+  V2DataType tensor_dtype;
+  std::uint32_t tensor_element_bytes;
+  std::uint32_t block_rows;
+  std::uint32_t block_cols;
 };
 
 struct alignas(16) V2Work {
