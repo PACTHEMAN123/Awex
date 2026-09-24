@@ -46,10 +46,11 @@ whose payload share justifies the next power of two. A single peer can use the
 rounded-up full budget. Peer pairs are symmetrically striped across disjoint
 channel groups until the channel ceiling is exhausted.
 
-GIN receive credits are coalesced from the FIFO depth rather than returned for
-every network step. The automatic batch is capped at four credits and every
-work tail returns its remainder, reducing reverse-path WQEs without weakening
-FIFO reuse or completion guarantees.
+GIN receive credits are coalesced only for a single active GIN peer. Its batch
+is derived from half the FIFO depth and capped at four; every work tail returns
+its remainder. Multiple network peers return each credit immediately so their
+shared contexts do not phase-block one another. This reduces reverse-path WQEs
+for a single heavy stream without weakening FIFO reuse or completion guarantees.
 Both paths remain capped by the configured channel ceiling and the
 device's SM capacity. The raw, requested, effective, and network-specific
 values are exposed in launch metrics.
