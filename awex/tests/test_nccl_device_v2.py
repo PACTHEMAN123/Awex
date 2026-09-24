@@ -99,11 +99,24 @@ def test_network_channels_reject_out_of_range_values(value):
         _resolve_network_channels_per_peer(value)
 
 
-def test_gin_connections_default_to_nccl_discovery(monkeypatch):
+def test_gin_connections_default_to_active_rdma_devices(monkeypatch):
     monkeypatch.delenv("AWEX_NCCL_DEVICE_V2_GIN_CONNECTIONS", raising=False)
     monkeypatch.delenv("NCCL_GIN_NCONNECTIONS", raising=False)
+    monkeypatch.setattr(
+        "awex.transfer.nccl_device_v2._detect_active_rdma_device_count", lambda: 3
+    )
 
-    assert _resolve_gin_connections(None) == 0
+    assert _resolve_gin_connections(None) == 3
+
+
+def test_gin_connections_fall_back_to_available_slots(monkeypatch):
+    monkeypatch.delenv("AWEX_NCCL_DEVICE_V2_GIN_CONNECTIONS", raising=False)
+    monkeypatch.delenv("NCCL_GIN_NCONNECTIONS", raising=False)
+    monkeypatch.setattr(
+        "awex.transfer.nccl_device_v2._detect_active_rdma_device_count", lambda: 0
+    )
+
+    assert _resolve_gin_connections(None) == 4
 
 
 def test_gin_connections_honor_nccl_configuration(monkeypatch):

@@ -51,8 +51,10 @@ values are exposed in launch metrics.
 choice; `NCCL_NCHANNELS_PER_NET_PEER` is used as a fallback so the regular and
 device paths can share an explicit channel setting.
 `AWEX_NCCL_DEVICE_V2_GIN_CONNECTIONS` controls the requested connection count
-and falls back to `NCCL_GIN_NCONNECTIONS` when set. If both are absent, NCCL
-discovers the available connections.
+and falls back to `NCCL_GIN_NCONNECTIONS` when set. If both are absent, Awex
+counts active RDMA devices with visible netdevs in sysfs and caps the result at
+the four GIN connection slots. It falls back to four when sysfs is unavailable;
+an explicit zero requests NCCL's native local-device discovery.
 `AWEX_NCCL_DEVICE_V2_GIN_CONTEXTS` controls the requested context count. If it
 is absent, NCCL creates one context per negotiated connection.
 `AWEX_NCCL_DEVICE_V2_FIFO_DEPTH` controls the number of reusable payload slots

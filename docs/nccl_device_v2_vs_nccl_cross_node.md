@@ -16,7 +16,7 @@
 | --- | --- | --- | --- |
 | 2. 跨机 channel 分片公式 | GIN 已改为多节点公式：`step / 2` 到 `step` | 多节点使用 `step / 2` 到 `step` | 已对齐 |
 | 3. 默认流水线粒度 | LSA 512 KiB；GIN 128 KiB；8 层 FIFO；4 MiB work chunk | 跨机 P2P 默认 128 KiB，并按消息大小和协议调节 | GIN step 和 SIMPLE 小消息调节已对齐；work chunk 仍是 Awex lowering 层概念 |
-| 5. 网络执行上下文 | connection 由 NCCL 探测；context 和 channel 根据实际 connection 数、peer 数及负荷自动确定 | 常规 NET 按 NIC、带宽、channel 和 flow 调度 | 默认路径无需手工指定并行度 |
+| 5. 网络执行上下文 | connection 由 active RDMA netdev 探测；context 和 channel 根据实际 connection 数、peer 数及负荷自动确定 | 常规 NET 按 NIC、带宽、channel 和 flow 调度 | 默认路径无需手工指定并行度 |
 
 ## 2. 跨机使用多节点 SIMPLE 分片公式
 
@@ -168,8 +168,9 @@ context = channel % ginContextCount
 ```
 
 NCCL 会把请求向上取整到实际 connection 数，因此默认结果是每个 connection 一个 context。
-connection 数本身也默认由 NCCL 根据可用 GIN 设备探测，不再由 Awex 强制设为 4。kernel 始终使用
-返回的 `dev_comm.ginContextCount` 做 channel 取模。两个请求值都可由环境变量覆盖。
+connection 数由 Awex 在 communicator 创建前统计 sysfs 中 active 且带 netdev 的 RDMA 设备，最多使用
+4 个 GIN connection slot；sysfs 不可见时回退到 4。显式设置为 0 才使用 NCCL 的原生 local-device
+discovery。kernel 始终使用返回的 `dev_comm.ginContextCount` 做 channel 取模。两个请求值都可由环境变量覆盖。
 
 源码：
 
@@ -200,8 +201,8 @@ v2 现在区分三层并行度：物理/后端 GIN connection、GIN context、CU
 channel 到 context 仍使用 NCCL 设备端示例采用的取模方式。标准 `nccl_comm` 的网络并行度则由
 topology、per-peer flow、net device 和 plugin/proxy 共同决定，仍比 v2 的公开信息更完整。
 
-需要注意，GIN context、NCCL channel、network flow 和 RDMA QP 不是一一等价的对象。v2 默认由 NCCL
-探测 connection，并让 NCCL 为每个 connection 创建一个 context；NCCL 返回的实际数量仍可能因
+需要注意，GIN context、NCCL channel、network flow 和 RDMA QP 不是一一等价的对象。v2 默认从 active
+RDMA netdev 推导 connection 数，并让 NCCL 为每个 connection 创建一个 context；NCCL 返回的实际数量仍可能因
 connection 数向上取整。可通过 `AWEX_NCCL_DEVICE_V2_GIN_CONNECTIONS` 和
 `AWEX_NCCL_DEVICE_V2_GIN_CONTEXTS` 分别覆盖这两个请求值，并结合以下指标做 sweep：
 
@@ -227,7 +228,7 @@ backend_execute_time_ms
 ## 结论
 
 本轮已经对齐跨机分片公式、128 KiB 网络 step、SIMPLE 小消息调节，并把默认 GIN 并行度改为
-运行时自动规划：NCCL 探测 connection，每个 connection 一个 context，channel 按 connection 与 peer
+运行时自动规划：active RDMA netdev 决定 connection，每个 connection 一个 context，channel 按 connection 与 peer
 payload 负荷分配。GDAKI reliable doorbell 默认使用带普通 DBR 回退的 mode 2。connection、context、
 channel、doorbell batch 以及 reliable doorbell mode 都保留独立覆盖项用于诊断。
 

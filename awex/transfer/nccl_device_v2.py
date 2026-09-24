@@ -229,13 +229,49 @@ def _resolve_network_channels_per_peer(
     return network_channels_per_peer
 
 
+def _detect_active_rdma_device_count(
+    sysfs_root: str = "/sys/class/infiniband",
+) -> int:
+    """Count active RDMA devices backed by a visible network interface."""
+
+    try:
+        devices = list(os.scandir(sysfs_root))
+    except OSError:
+        return 0
+    active_devices = 0
+    for device in devices:
+        net_path = os.path.join(device.path, "device", "net")
+        try:
+            if not any(os.scandir(net_path)):
+                continue
+            ports = list(os.scandir(os.path.join(device.path, "ports")))
+        except OSError:
+            continue
+        for port in ports:
+            try:
+                with open(
+                    os.path.join(port.path, "state"), encoding="ascii"
+                ) as state_file:
+                    state = state_file.read()
+            except OSError:
+                continue
+            if "ACTIVE" in state:
+                active_devices += 1
+                break
+    return active_devices
+
+
 def _resolve_gin_connections(gin_connections: int | None) -> int:
     if gin_connections is None:
         configured = os.environ.get("AWEX_NCCL_DEVICE_V2_GIN_CONNECTIONS")
         if configured is None:
             configured = os.environ.get("NCCL_GIN_NCONNECTIONS")
         try:
-            gin_connections = 0 if configured is None else int(configured)
+            gin_connections = (
+                min(4, _detect_active_rdma_device_count()) or 4
+                if configured is None
+                else int(configured)
+            )
         except ValueError as exc:
             raise NCCLDeviceV2UnavailableError(
                 "AWEX_NCCL_DEVICE_V2_GIN_CONNECTIONS must be an integer"
