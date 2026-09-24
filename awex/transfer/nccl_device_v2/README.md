@@ -44,6 +44,11 @@ single heavy peer can consume a target issue budget of six channels per
 connection. Peer pairs are symmetrically striped across disjoint channel groups
 until a rank's channel budget is exhausted, avoiding serialization of
 independent peer flows.
+
+GIN receive credits are coalesced from the FIFO depth rather than returned for
+every network step. The automatic batch is capped at four credits and every
+work tail returns its remainder, reducing reverse-path WQEs without weakening
+FIFO reuse or completion guarantees.
 Both paths remain capped by the configured channel ceiling and the
 device's SM capacity. The raw, requested, effective, and network-specific
 values are exposed in launch metrics.

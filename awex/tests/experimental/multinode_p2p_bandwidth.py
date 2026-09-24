@@ -195,6 +195,7 @@ def main() -> None:
                 "fifo_depth",
                 "gin_connection_count",
                 "gin_context_count",
+                "gin_credit_batch",
                 "network_channel_budget",
                 "network_channels_per_peer",
                 "network_step_bytes",

@@ -26,13 +26,13 @@ namespace nccl_device_v2 {
 
 #if AWEX_NCCL_DEVICE_V2_HAS_EXPLICIT_SIGNAL_STRENGTH
 using V2GinReadySignalInc = ncclGin_StrongSignalInc;
-using V2GinCreditSignalInc = ncclGin_WeakSignalInc;
+using V2GinCreditSignalAdd = ncclGin_WeakSignalAdd;
 #else
 // NCCL 2.30.4 SignalInc has the strong ordering semantics later made
 // explicit by StrongSignalInc: the signal follows all earlier puts to the
 // same peer on the same context.
 using V2GinReadySignalInc = ncclGin_SignalInc;
-using V2GinCreditSignalInc = ncclGin_SignalInc;
+using V2GinCreditSignalAdd = ncclGin_SignalAdd;
 #endif
 
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2, 30, 7)
@@ -152,6 +152,8 @@ __device__ __forceinline__ void v2GinRunRecv(const V2KernelArgs& args, const V2W
   const ncclTeam world = ncclTeamWorld(args.dev_comm);
   const ncclGinSignal_t ready_signal = v2GinReadySignal(args, work.peer, channel);
   const ncclGinSignal_t credit_signal = v2GinCreditSignal(args, args.local_rank, channel);
+  const std::uint32_t half_fifo = args.layout.fifo_depth / 2;
+  const std::uint32_t credit_batch = half_fifo == 0 ? 1 : (half_fifo < 4 ? half_fifo : 4);
   std::uint64_t cursor = 0;
   std::uint64_t step = work.step_begin;
   while (cursor < work.nbytes) {
@@ -167,8 +169,13 @@ __device__ __forceinline__ void v2GinRunRecv(const V2KernelArgs& args, const V2W
     }
 
     v2GroupBarrier(barrier, nthreads);
-    if ((roles & kRolePostRecv) && v2LoadError(error) == 0) {
-      gin.signal(world, work.peer, V2GinCreditSignalInc{credit_signal});
+    const std::uint64_t work_step = step - work.step_begin + 1;
+    const bool work_complete = cursor + slice_bytes == work.nbytes;
+    const std::uint32_t returned_credits = static_cast<std::uint32_t>(
+      work_complete && work_step % credit_batch != 0 ? work_step % credit_batch : credit_batch);
+    if ((roles & kRolePostRecv) && v2LoadError(error) == 0 &&
+        (work_complete || work_step % credit_batch == 0)) {
+      gin.signal(world, work.peer, V2GinCreditSignalAdd{credit_signal, returned_credits});
     }
     if (v2LoadError(error) != 0) return;
     cursor += slice_bytes;
