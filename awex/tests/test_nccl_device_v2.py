@@ -136,7 +136,7 @@ def test_weighted_hca_assignments_keep_ranks_on_local_numa_rails():
 
 def test_parse_nvidia_topology_maps_active_hca_columns():
     output = """\
-        GPU0 GPU1 NIC0 NIC1 CPU Affinity
+        \x1b[4mGPU0 GPU1 NIC0 NIC1 CPU Affinity\x1b[0m
 GPU0    X    NV18 PIX  SYS  0-7
 GPU1    NV18 X    NODE PIX  0-7
 

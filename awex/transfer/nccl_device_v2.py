@@ -209,11 +209,13 @@ _HCA_DISTANCE_SCORES = {
     "NODE": 3,
     "SYS": 4,
 }
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
 def _parse_nvidia_topology(
     output: str, endpoints: list[_RdmaEndpoint], gpu_ids: list[str]
 ) -> list[list[int]] | None:
+    output = _ANSI_ESCAPE_RE.sub("", output)
     lines = [line.split() for line in output.splitlines() if line.strip()]
     header = next((fields for fields in lines if fields[0] == "GPU0"), None)
     if header is None:
