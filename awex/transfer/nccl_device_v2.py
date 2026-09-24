@@ -38,6 +38,67 @@ class NCCLDeviceV2UnavailableError(RuntimeError):
     """Raised when the isolated NCCL Device v2 path cannot be initialized."""
 
 
+def _active_rdma_devices(
+    sysfs_root: str = "/sys/class/infiniband",
+) -> list[str]:
+    """Return active RDMA devices in stable PCI order."""
+
+    try:
+        devices = list(os.scandir(sysfs_root))
+    except OSError:
+        return []
+    active_devices: list[tuple[str, str]] = []
+    for device in devices:
+        net_path = os.path.join(device.path, "device", "net")
+        try:
+            if not any(os.scandir(net_path)):
+                continue
+            ports = list(os.scandir(os.path.join(device.path, "ports")))
+        except OSError:
+            continue
+        for port in ports:
+            try:
+                with open(
+                    os.path.join(port.path, "state"), encoding="ascii"
+                ) as state_file:
+                    state = state_file.read()
+            except OSError:
+                continue
+            if "ACTIVE" in state:
+                pci_path = os.path.realpath(os.path.join(device.path, "device"))
+                active_devices.append((pci_path, device.name))
+                break
+    return [name for _, name in sorted(active_devices)]
+
+
+def _configure_gin_hca_policy() -> None:
+    """Optionally spread local ranks evenly across active RDMA devices."""
+
+    policy = os.environ.get(
+        "AWEX_NCCL_DEVICE_V2_HCA_POLICY", "topology"
+    ).strip().lower()
+    if policy == "topology" or "NCCL_IB_HCA" in os.environ:
+        return
+    if policy != "balanced":
+        raise NCCLDeviceV2UnavailableError(
+            "AWEX_NCCL_DEVICE_V2_HCA_POLICY must be topology or balanced"
+        )
+    try:
+        local_rank = int(os.environ["LOCAL_RANK"])
+        local_world_size = int(os.environ["LOCAL_WORLD_SIZE"])
+    except (KeyError, ValueError) as exc:
+        raise NCCLDeviceV2UnavailableError(
+            "balanced HCA policy requires LOCAL_RANK and LOCAL_WORLD_SIZE"
+        ) from exc
+    devices = _active_rdma_devices()
+    if not devices or local_world_size <= 0 or not 0 <= local_rank < local_world_size:
+        return
+    device_index = min(
+        len(devices) - 1, local_rank * len(devices) // local_world_size
+    )
+    os.environ["NCCL_IB_HCA"] = f"={devices[device_index]}:1"
+
+
 def _preload_configured_nccl() -> None:
     """Load the configured NCCL before torch can load another SONAME match."""
 
@@ -59,6 +120,7 @@ def _preload_configured_nccl() -> None:
             return
 
 
+_configure_gin_hca_policy()
 _preload_configured_nccl()
 
 import torch  # noqa: E402
@@ -234,31 +296,7 @@ def _detect_active_rdma_device_count(
 ) -> int:
     """Count active RDMA devices backed by a visible network interface."""
 
-    try:
-        devices = list(os.scandir(sysfs_root))
-    except OSError:
-        return 0
-    active_devices = 0
-    for device in devices:
-        net_path = os.path.join(device.path, "device", "net")
-        try:
-            if not any(os.scandir(net_path)):
-                continue
-            ports = list(os.scandir(os.path.join(device.path, "ports")))
-        except OSError:
-            continue
-        for port in ports:
-            try:
-                with open(
-                    os.path.join(port.path, "state"), encoding="ascii"
-                ) as state_file:
-                    state = state_file.read()
-            except OSError:
-                continue
-            if "ACTIVE" in state:
-                active_devices += 1
-                break
-    return active_devices
+    return len(_active_rdma_devices(sysfs_root))
 
 
 def _resolve_gin_connections(gin_connections: int | None) -> int:

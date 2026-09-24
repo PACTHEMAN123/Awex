@@ -15,11 +15,14 @@
 # specific language governing permissions and limitations
 # under the License.
 
+import os
+
 import pytest
 
 from awex.transfer.nccl_device_v2 import (
     NCCLDeviceV2Transport,
     NCCLDeviceV2UnavailableError,
+    _configure_gin_hca_policy,
     _resolve_fifo_depth,
     _resolve_gin_connections,
     _resolve_gin_context_count,
@@ -28,6 +31,30 @@ from awex.transfer.nccl_device_v2 import (
     _resolve_network_channels_per_peer,
     _resolve_network_step_bytes,
 )
+
+
+def test_balanced_hca_policy_groups_ranks_across_devices(monkeypatch):
+    monkeypatch.setenv("AWEX_NCCL_DEVICE_V2_HCA_POLICY", "balanced")
+    monkeypatch.setenv("LOCAL_RANK", "5")
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "8")
+    monkeypatch.delenv("NCCL_IB_HCA", raising=False)
+    monkeypatch.setattr(
+        "awex.transfer.nccl_device_v2._active_rdma_devices",
+        lambda: ["mlx5_3", "mlx5_8", "mlx5_19", "mlx5_30"],
+    )
+
+    _configure_gin_hca_policy()
+
+    assert os.environ["NCCL_IB_HCA"] == "=mlx5_19:1"
+
+
+def test_balanced_hca_policy_preserves_explicit_nccl_selection(monkeypatch):
+    monkeypatch.setenv("AWEX_NCCL_DEVICE_V2_HCA_POLICY", "balanced")
+    monkeypatch.setenv("NCCL_IB_HCA", "=mlx5_8:1")
+
+    _configure_gin_hca_policy()
+
+    assert os.environ["NCCL_IB_HCA"] == "=mlx5_8:1"
 
 
 def test_fifo_depth_defaults_to_sixteen(monkeypatch):
