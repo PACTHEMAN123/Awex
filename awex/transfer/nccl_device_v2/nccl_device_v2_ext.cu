@@ -351,7 +351,8 @@ bool same_tasks(const std::vector<v2::V2LoweringTask>& left, const std::vector<v
 }
 
 void initialize_sparse_window(DeviceState* state, const std::vector<std::uint32_t>& active_peers,
-                              const std::vector<v2::V2LoweringTask>& tasks, cudaStream_t stream) {
+                              const std::vector<v2::V2LoweringTask>& tasks, v2::V2Direction direction,
+                              cudaStream_t stream) {
   if (state->window_initialized) {
     if (active_peers != state->window_active_peers) {
       throw std::runtime_error("nccl_device_v2 active peers changed after window initialization");
@@ -360,25 +361,29 @@ void initialize_sparse_window(DeviceState* state, const std::vector<std::uint32_
   }
   const std::uint32_t inactive = std::numeric_limits<std::uint32_t>::max();
   std::vector<std::uint32_t> local_payload_slots(state->world_size, inactive);
-  for (std::size_t index = 0; index < active_peers.size(); ++index) {
-    local_payload_slots[active_peers[index]] = static_cast<std::uint32_t>(index);
+  std::uint32_t payload_peer_count = 0;
+  for (const std::uint32_t peer : active_peers) {
+    const bool gin = state->peer_transports[peer] == static_cast<std::uint8_t>(v2::V2Transport::kGin);
+    if (gin || direction == v2::V2Direction::kSend) {
+      local_payload_slots[peer] = payload_peer_count++;
+    }
   }
   const auto payload_peer_slots = v2::topology_detail::allGather(
     state->comm, local_payload_slots.data(), local_payload_slots.size(), state->world_size, stream);
-  std::uint32_t payload_peer_count = 0;
-  for (int source = 0; source < state->world_size; ++source) {
-    std::uint32_t source_peer_count = 0;
-    for (int peer = 0; peer < state->world_size; ++peer) {
-      const bool source_active = payload_peer_slots[static_cast<std::size_t>(source) * state->world_size + peer] !=
-                                 inactive;
-      const bool peer_active =
-        payload_peer_slots[static_cast<std::size_t>(peer) * state->world_size + source] != inactive;
-      if (source_active != peer_active) {
-        throw std::runtime_error("nccl_device_v2 peer plans are not symmetric across ranks");
+  for (const std::uint32_t peer : active_peers) {
+    const bool local_has_payload =
+      payload_peer_slots[static_cast<std::size_t>(state->rank) * state->world_size + peer] != inactive;
+    const bool peer_has_payload =
+      payload_peer_slots[static_cast<std::size_t>(peer) * state->world_size + state->rank] != inactive;
+    const bool gin = state->peer_transports[peer] == static_cast<std::uint8_t>(v2::V2Transport::kGin);
+    if (gin) {
+      if (!local_has_payload || !peer_has_payload) {
+        throw std::runtime_error("nccl_device_v2 GIN peers must provide send and receive payload windows");
       }
-      source_peer_count += source_active ? 1U : 0U;
+    } else if (local_has_payload != (direction == v2::V2Direction::kSend) ||
+               peer_has_payload != (direction == v2::V2Direction::kRecv)) {
+      throw std::runtime_error("nccl_device_v2 LSA peers must provide only the sender payload window");
     }
-    payload_peer_count = std::max(payload_peer_count, source_peer_count);
   }
 
   const bool local_gin = v2::v2HasGinPeer(active_peers, state->peer_transports);
@@ -576,7 +581,7 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
   const bool plan_cache_hit = state->plan_initialized;
   if (!state->plan_initialized) {
     const auto initialization_start = Clock::now();
-    initialize_sparse_window(state, active_peers, tasks, stream);
+    initialize_sparse_window(state, active_peers, tasks, direction, stream);
     v2::V2LoweringConfig config;
     config.local_rank = static_cast<std::uint32_t>(state->rank);
     config.world_size = static_cast<std::uint32_t>(state->world_size);
