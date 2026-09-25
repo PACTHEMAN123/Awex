@@ -69,10 +69,6 @@ def main() -> None:
         8,
         512 * 1024,
         4 * 1024 * 1024,
-        16,
-        128 * 1024,
-        4 * 1024 * 1024,
-        1,
     )
     try:
         launch_metrics = []
@@ -118,41 +114,25 @@ def main() -> None:
             )
         if metrics["channel_count"] != 32:
             raise AssertionError(f"expected 32 active channels, got {dict(metrics)}")
-        if metrics["min_work_step_bytes"] != 512 * 1024:
-            raise AssertionError(f"expected 512 KiB LSA steps, got {dict(metrics)}")
-        if metrics["fifo_depth"] != 8:
-            raise AssertionError(f"expected main's LSA FIFO depth, got {dict(metrics)}")
-        if metrics["chunk_bytes"] != 4 * 1024 * 1024:
-            raise AssertionError(f"expected main's LSA chunk size, got {dict(metrics)}")
         if metrics["threads_per_channel"] != 640:
             raise AssertionError(f"expected 640 channel threads, got {dict(metrics)}")
         if metrics["warps_per_channel"] != 20:
             raise AssertionError(f"expected 20 channel warps, got {dict(metrics)}")
-        expected_payload_peers = 1
+        expected_payload_peers = 1 if rank == 0 else 0
         if metrics["payload_peer_count"] != expected_payload_peers:
             raise AssertionError(
                 f"expected {expected_payload_peers} payload peers, got {dict(metrics)}"
             )
         if metrics["registered_window_bytes"] >= metrics["dense_window_bytes"]:
             raise AssertionError(f"expected a sparse window, got {dict(metrics)}")
-        if metrics["lsa_peer_count"] != 1 or metrics["gin_peer_count"] != 0:
-            raise AssertionError(f"expected the LSA path, got {dict(metrics)}")
-        if metrics["gin_enabled"]:
-            raise AssertionError(f"GIN unexpectedly enabled: {dict(metrics)}")
-        if metrics["slot_bytes"] != 512 * 1024:
-            raise AssertionError(f"GIN changed the LSA window layout: {dict(metrics)}")
         if launch_metrics[0]["plan_cache_hit"]:
-            raise AssertionError(
-                f"first launch unexpectedly hit cache: {dict(metrics)}"
-            )
+            raise AssertionError(f"first launch unexpectedly hit cache: {dict(metrics)}")
         if not launch_metrics[1]["plan_cache_hit"]:
             raise AssertionError(f"second launch missed cache: {dict(metrics)}")
         if launch_metrics[1]["host_lowering_time_ms"] != 0.0:
             raise AssertionError(f"cached launch repeated lowering: {dict(metrics)}")
         if launch_metrics[1]["metadata_upload_time_ms"] != 0.0:
-            raise AssertionError(
-                f"cached launch repeated metadata upload: {dict(metrics)}"
-            )
+            raise AssertionError(f"cached launch repeated metadata upload: {dict(metrics)}")
         if metrics["fragment_count"] <= metrics["work_count"]:
             raise AssertionError(
                 f"expected a chunk crossing tensor spans, got {dict(metrics)}"

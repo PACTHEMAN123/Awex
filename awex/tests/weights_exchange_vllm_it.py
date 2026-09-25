@@ -82,9 +82,8 @@ vllm_inference_config = {
 
 class VLLMWeightsExchangeIT:
     """
-    Megatron ranks use the first LOCAL_WORLD_SIZE visible GPUs on each node.
-    The vLLM child process, started only by global training rank 0, uses the
-    next inference TP GPUs on that node.
+    Megatron ranks use the first WORLD_SIZE visible GPUs. The vLLM child
+    process, started only by training rank 0, uses the next inference TP GPUs.
 
     Key rule: Do NOT rely on changing os.environ["CUDA_VISIBLE_DEVICES"] in the same process
               after torch.cuda has been touched. Instead:
@@ -105,9 +104,6 @@ class VLLMWeightsExchangeIT:
         use_mbridge=False,
         host="127.0.0.1",
         port=8000,
-        train_only=False,
-        meta_server_host="",
-        meta_server_port=0,
         validate=False,
         dump_weights_list_for_validation=None,
         dump_weights_dir_for_validation=None,
@@ -125,9 +121,6 @@ class VLLMWeightsExchangeIT:
         self.rank = int(os.environ.get("RANK", "0"))
         self.local_rank = int(os.environ.get("LOCAL_RANK", "0"))
         self.world_size = int(os.environ.get("WORLD_SIZE", "1"))
-        self.local_world_size = int(
-            os.environ.get("LOCAL_WORLD_SIZE", str(self.world_size))
-        )
         self.is_driver = self.rank == 0
         self.train_parallelism.validate_world_size(self.world_size)
         if self.world_size > 1 and comm_backend == "file":
@@ -142,9 +135,6 @@ class VLLMWeightsExchangeIT:
         }
         self.host = host
         self.port = port
-        self.train_only = train_only
-        self.meta_server_host = meta_server_host
-        self.meta_server_port = meta_server_port
         self.use_mbridge = use_mbridge
         self.validate = validate
         self.dump_weights_list_for_validation = dump_weights_list_for_validation or []
@@ -168,28 +158,22 @@ class VLLMWeightsExchangeIT:
             # Fallback: use torch to detect. (May touch CUDA, but that's OK with set_device below.)
             visible_devices = list(range(device_util.device_count()))
 
-        inference_gpus = inference_tp if self.is_driver and not self.train_only else 0
-        need = self.local_world_size + inference_gpus
+        need = self.world_size + inference_tp
         if len(visible_devices) < need:
             raise RuntimeError(
-                f"Need at least {need} visible devices ({self.local_world_size} "
-                f"local Megatron ranks + {inference_gpus} for vLLM on this rank). "
+                f"Need at least {need} visible devices ({self.world_size} for "
+                f"Megatron + {inference_tp} for vLLM). "
                 f"Found {len(visible_devices)} via visible devices env='{visible_env or '(unset)'}'."
             )
-        if not 0 <= self.local_rank < self.local_world_size:
+        if not 0 <= self.local_rank < self.world_size:
             raise RuntimeError(
-                f"LOCAL_RANK ({self.local_rank}) must be in "
-                f"[0, {self.local_world_size})."
+                f"LOCAL_RANK ({self.local_rank}) must be in [0, {self.world_size})."
             )
 
         megatron_device = visible_devices[self.local_rank]
-        vllm_devices = (
-            visible_devices[
-                self.local_world_size : self.local_world_size + inference_tp
-            ]
-            if self.is_driver
-            else []
-        )
+        vllm_devices = visible_devices[
+            self.world_size : self.world_size + inference_tp
+        ]
         return vllm_devices, megatron_device
 
     def initialize(self):
@@ -197,7 +181,7 @@ class VLLMWeightsExchangeIT:
         self._init_distributed()
         self._share_meta_server_address()
         self._init_megatron_engine()
-        if self.is_driver and not self.train_only:
+        if self.is_driver:
             self._start_vllm_server()
             self._awex_init()
         self._training_barrier()
@@ -221,10 +205,7 @@ class VLLMWeightsExchangeIT:
             os.environ.setdefault("WORLD_SIZE", "1")
             os.environ.setdefault("MASTER_PORT", "17443")
             os.environ.setdefault("MASTER_ADDR", "localhost")
-        default_socket_ifname = (
-            "eth0" if self.world_size > self.local_world_size else "lo"
-        )
-        os.environ.setdefault("GLOO_SOCKET_IFNAME", default_socket_ifname)
+        os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo")
 
         device_util.set_device(self.local_rank)
         if not dist.is_initialized():
@@ -253,9 +234,7 @@ class VLLMWeightsExchangeIT:
 
     def _start_meta_server(self):
         if self.is_driver:
-            ip, port = start_meta_server(
-                host=self.meta_server_host, port=self.meta_server_port
-            )
+            ip, port = start_meta_server()
             self.meta_server_addr = f"{ip}:{port}"
 
     def _share_meta_server_address(self):
@@ -301,7 +280,7 @@ class VLLMWeightsExchangeIT:
             str(self.inference_config["tp_size"]),
             "--pipeline-parallel-size",
             str(self.inference_config["pp_size"]),
-            "--no-enable-log-requests",
+            "--disable-log-requests",
             "--enforce-eager",
         ]
         gpu_memory_utilization = self.inference_config.get(
@@ -448,7 +427,7 @@ class VLLMWeightsExchangeIT:
             else:
                 executor_context = (
                     ThreadPoolExecutor(max_workers=1)
-                    if self.is_driver and not self.train_only
+                    if self.is_driver
                     else nullcontext()
                 )
                 with executor_context as executor:
@@ -489,7 +468,7 @@ class VLLMWeightsExchangeIT:
 
 
 def main(args):
-    os.environ.setdefault("NCCL_DEBUG", "WARNING")
+    os.environ["NCCL_DEBUG"] = "WARNING"
     if getattr(args, "nccl_device_chunk_mb", None) is not None:
         os.environ["AWEX_NCCL_DEVICE_CHUNK_BYTES"] = str(
             args.nccl_device_chunk_mb * 1024 * 1024
@@ -517,9 +496,6 @@ def main(args):
         use_mbridge=args.use_mbridge,
         host=args.host,
         port=args.port,
-        train_only=args.train_only,
-        meta_server_host=args.meta_server_host,
-        meta_server_port=args.meta_server_port,
         validate=args.validate,
         dump_weights_list_for_validation=args.dump_weights_list_for_validation,
         dump_weights_dir_for_validation=args.dump_weights_dir_for_validation,
@@ -670,25 +646,6 @@ if __name__ == "__main__":
     )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument(
-        "--train-only",
-        action="store_true",
-        help=(
-            "Run only the Megatron writer. The inference node must run its own "
-            "Awex reader controller against the same meta server."
-        ),
-    )
-    parser.add_argument(
-        "--meta-server-host",
-        default="",
-        help="Address on which the training node exposes the Awex meta server.",
-    )
-    parser.add_argument(
-        "--meta-server-port",
-        type=int,
-        default=0,
-        help="Fixed Awex meta-server port (0 selects a free port).",
-    )
     parser.add_argument(
         "--validate",
         action="store_true",

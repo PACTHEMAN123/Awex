@@ -17,35 +17,27 @@
 
 import copy
 import sys
-from types import SimpleNamespace
 
 import pytest
 
-from awex.tests import weights_exchange_vllm_infer_it
 from awex.tests.experimental.compare_megatron_vllm_weights_multi import (
     _should_include_name,
-)
-from awex.tests.weights_exchange_multi_vllm_it import (
-    MultiVLLMWeightsExchangeIT,
 )
 from awex.tests.weights_exchange_vllm_it import (
     VLLMWeightsExchangeIT,
     vllm_inference_config,
 )
+from awex.tests.weights_exchange_multi_vllm_it import (
+    MultiVLLMWeightsExchangeIT,
+)
 from awex.util import device as device_util
 
 
-def _set_distributed_env(
-    monkeypatch, rank=0, local_rank=0, world_size=2, local_world_size=None
-):
+def _set_distributed_env(monkeypatch, rank=0, local_rank=0, world_size=2):
     monkeypatch.setenv("AWEX_DEVICE_TYPE", "cuda")
     monkeypatch.setenv("RANK", str(rank))
     monkeypatch.setenv("LOCAL_RANK", str(local_rank))
     monkeypatch.setenv("WORLD_SIZE", str(world_size))
-    if local_world_size is None:
-        monkeypatch.delenv("LOCAL_WORLD_SIZE", raising=False)
-    else:
-        monkeypatch.setenv("LOCAL_WORLD_SIZE", str(local_world_size))
 
 
 @pytest.mark.parametrize(
@@ -142,108 +134,6 @@ def test_explicit_expert_tp_can_share_world_ranks_with_dense_tp(monkeypatch):
 @pytest.mark.parametrize(
     "integration_class", [VLLMWeightsExchangeIT, MultiVLLMWeightsExchangeIT]
 )
-def test_multinode_device_selection_uses_local_world_size(
-    monkeypatch, integration_class
-):
-    _set_distributed_env(
-        monkeypatch, rank=0, local_rank=0, world_size=2, local_world_size=1
-    )
-    monkeypatch.setattr(
-        device_util, "visible_devices_env_value", lambda: "0,1,2"
-    )
-    config = copy.deepcopy(vllm_inference_config)
-    config["tp_size"] = 2
-
-    integration = integration_class(
-        inference_config=config,
-        comm_backend="nccl",
-        train_tp_size=2,
-    )
-
-    assert integration.megatron_device == 0
-    assert integration.vllm_visible_devices == [1, 2]
-
-
-@pytest.mark.parametrize(
-    "integration_class", [VLLMWeightsExchangeIT, MultiVLLMWeightsExchangeIT]
-)
-def test_multinode_non_driver_does_not_reserve_vllm_devices(
-    monkeypatch, integration_class
-):
-    _set_distributed_env(
-        monkeypatch, rank=1, local_rank=0, world_size=2, local_world_size=1
-    )
-    monkeypatch.setattr(device_util, "visible_devices_env_value", lambda: "4")
-    config = copy.deepcopy(vllm_inference_config)
-    config["tp_size"] = 2
-
-    integration = integration_class(
-        inference_config=config,
-        comm_backend="nccl",
-        train_tp_size=2,
-    )
-
-    assert integration.megatron_device == 4
-    assert integration.vllm_visible_devices == []
-
-
-@pytest.mark.parametrize(
-    "integration_class", [VLLMWeightsExchangeIT, MultiVLLMWeightsExchangeIT]
-)
-def test_train_only_does_not_reserve_inference_devices(
-    monkeypatch, integration_class
-):
-    _set_distributed_env(monkeypatch, world_size=1)
-    monkeypatch.setattr(device_util, "visible_devices_env_value", lambda: "4")
-    config = copy.deepcopy(vllm_inference_config)
-    config["tp_size"] = 2
-
-    integration = integration_class(
-        inference_config=config,
-        comm_backend="nccl_device_v2",
-        train_only=True,
-    )
-
-    assert integration.megatron_device == 4
-    assert integration.vllm_visible_devices == []
-
-
-@pytest.mark.parametrize(
-    "integration_class", [VLLMWeightsExchangeIT, MultiVLLMWeightsExchangeIT]
-)
-def test_train_only_initialize_does_not_control_inference_server(
-    monkeypatch, integration_class
-):
-    _set_distributed_env(monkeypatch, world_size=1)
-    monkeypatch.setattr(device_util, "visible_devices_env_value", lambda: "0")
-    config = copy.deepcopy(vllm_inference_config)
-    config["num_engines"] = 2
-    integration = integration_class(
-        inference_config=config,
-        comm_backend="nccl_device_v2",
-        train_only=True,
-    )
-    calls = []
-    monkeypatch.setattr(integration, "_start_meta_server", lambda: None)
-    monkeypatch.setattr(integration, "_init_distributed", lambda: None)
-    monkeypatch.setattr(integration, "_share_meta_server_address", lambda: None)
-    monkeypatch.setattr(integration, "_init_megatron_engine", lambda: None)
-    for method_name in ("_start_vllm_server", "_wait_for_health", "_awex_init"):
-        monkeypatch.setattr(
-            integration,
-            method_name,
-            lambda *args, name=method_name: calls.append((name, args)),
-        )
-    monkeypatch.setattr(integration, "_training_barrier", lambda: None)
-
-    integration.initialize()
-
-    assert calls == []
-
-
-@pytest.mark.parametrize(
-    "integration_class", [VLLMWeightsExchangeIT, MultiVLLMWeightsExchangeIT]
-)
 def test_vllm_child_uses_current_python(monkeypatch, integration_class):
     _set_distributed_env(monkeypatch, world_size=1)
     monkeypatch.setattr(
@@ -272,100 +162,3 @@ def test_vllm_child_uses_current_python(monkeypatch, integration_class):
     integration._start_vllm_server()
 
     assert launched[0][0] == sys.executable
-    assert "--no-enable-log-requests" in launched[0]
-    assert "--disable-log-requests" not in launched[0]
-
-
-def test_inference_only_vllm_child_uses_current_request_log_flag(monkeypatch):
-    launched = []
-
-    monkeypatch.setattr(
-        weights_exchange_vllm_infer_it.subprocess,
-        "Popen",
-        lambda command, **kwargs: launched.append(command),
-    )
-    args = SimpleNamespace(
-        model_path="model",
-        host="127.0.0.1",
-        port=8000,
-        num_engines=1,
-        vllm_tp_size=1,
-        vllm_gpu_memory_utilization=0.8,
-    )
-
-    weights_exchange_vllm_infer_it._start_vllm_server(args)
-
-    assert launched[0][0] == sys.executable
-    assert "--no-enable-log-requests" in launched[0]
-    assert "--disable-log-requests" not in launched[0]
-
-
-def test_inference_only_vllm_children_split_visible_devices(monkeypatch):
-    launched = []
-    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "2,3,5,7")
-    monkeypatch.setattr(
-        weights_exchange_vllm_infer_it.subprocess,
-        "Popen",
-        lambda command, **kwargs: launched.append((command, kwargs["env"])),
-    )
-    args = SimpleNamespace(
-        model_path="model",
-        host="127.0.0.1",
-        port=8000,
-        num_engines=2,
-        vllm_tp_size=2,
-        vllm_gpu_memory_utilization=0.8,
-    )
-
-    groups = weights_exchange_vllm_infer_it._inference_device_groups(args)
-    for engine_rank, devices in enumerate(groups):
-        weights_exchange_vllm_infer_it._start_vllm_server(
-            args, engine_rank, devices
-        )
-
-    assert groups == [["2", "3"], ["5", "7"]]
-    assert launched[0][0][launched[0][0].index("--port") + 1] == "8000"
-    assert launched[1][0][launched[1][0].index("--port") + 1] == "8001"
-    assert launched[0][1]["CUDA_VISIBLE_DEVICES"] == "2,3"
-    assert launched[1][1]["CUDA_VISIBLE_DEVICES"] == "5,7"
-    assert launched[0][1]["AWEX_NODE_LOCAL_RANK_OFFSET"] == "0"
-    assert launched[1][1]["AWEX_NODE_LOCAL_RANK_OFFSET"] == "2"
-    assert launched[0][1]["AWEX_NODE_LOCAL_WORLD_SIZE"] == "4"
-    assert launched[1][1]["AWEX_NODE_LOCAL_WORLD_SIZE"] == "4"
-    assert launched[0][1]["AWEX_NODE_LOCAL_GPU_IDS"] == "2,3,5,7"
-    assert launched[1][1]["AWEX_NODE_LOCAL_GPU_IDS"] == "2,3,5,7"
-
-
-def test_inference_only_vllm_children_require_enough_devices(monkeypatch):
-    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1,2")
-    args = SimpleNamespace(num_engines=2, vllm_tp_size=2)
-
-    with pytest.raises(RuntimeError, match="Need 4 visible GPUs"):
-        weights_exchange_vllm_infer_it._inference_device_groups(args)
-
-
-def test_inference_only_profiles_multi_engine_end_to_end_update(monkeypatch):
-    args = SimpleNamespace(num_engines=2, comm_backend="nccl_device_v2")
-    updates = []
-    profiles = []
-    monkeypatch.setattr(
-        weights_exchange_vllm_infer_it,
-        "_update_engine",
-        lambda _args, rank, step_id: updates.append((rank, step_id)),
-    )
-    monkeypatch.setattr(
-        weights_exchange_vllm_infer_it,
-        "emit_profile",
-        lambda _logger, **values: profiles.append(values),
-    )
-
-    weights_exchange_vllm_infer_it._update_engines(args, step_id=3)
-
-    assert sorted(updates) == [(0, 3), (1, 3)]
-    assert len(profiles) == 1
-    assert profiles[0]["event"] == "end_to_end_update"
-    assert profiles[0]["role"] == "driver"
-    assert profiles[0]["backend"] == "nccl_device_v2"
-    assert profiles[0]["step_id"] == 3
-    assert profiles[0]["num_engines"] == 2
-    assert profiles[0]["end_to_end_update_time_ms"] >= 0

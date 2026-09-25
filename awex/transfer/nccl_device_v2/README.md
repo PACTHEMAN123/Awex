@@ -21,108 +21,53 @@ fixed TransferPlan spans for one peer
   -> 20 warps divided across the active works in a batch
   -> explicit WaitSend/WaitRecv, worker, and PostSend/PostRecv roles
   -> volatile 16-byte vector loads, unrolled across 8 instructions
-  -> FIFO slot = absolute step % transport FIFO depth
+  -> FIFO slot = absolute step % 8
 ```
 
-Channel sizing follows NCCL's `addP2pToPlan` policy for each transport without
-sharing transport configuration. Intra-node SIMPLE traffic retains main's
-FIFO depth 8, 512 KiB step, 4 MiB chunk, and symmetric bit-reversed channel
-placement. It uses `minPartSize = stepSize / 8` and
-`maxPartSize = stepSize * 32`; cross-node GIN traffic uses the multi-node
-range `stepSize / 2` through `stepSize`, its own FIFO depth 16 and contiguous
-channel groups. GIN defaults to NCCL's 128 KiB network P2P chunk and applies
-NCCL's small-message `/4` and `/2` tuning. The network step can be overridden with
-`AWEX_NCCL_DEVICE_V2_NET_STEP_BYTES`, with `NCCL_P2P_NET_CHUNKSIZE` used as a
-fallback.
-
-The topology layer mirrors NCCL's NVLink path formula,
-`2 * max(1, pathBandwidth / linkBandwidth)`. Once GIN is initialized, remote
-peer channel demand is raised to two channels per negotiated GIN connection,
-rounded up to a power of two. Awex detects the active RDMA devices and requests
-one GIN context per connection. Network channel limits are
-then computed from the negotiated connection count and each active peer's byte
-share. Each peer first receives enough power-of-two channels to keep one FIFO
-window in flight, capped at two channels per connection. Remaining channels
-are charged against one shared per-rank issue budget and only promote peers
-whose payload share justifies the next power of two. A single peer can use the
-rounded-up full budget. Peer pairs are symmetrically striped across disjoint
-channel groups until the channel ceiling is exhausted.
-
-GIN receive credits are coalesced only for a single active GIN peer. Its batch
-is derived from half the FIFO depth and capped at four; every work tail returns
-its remainder. Multiple network peers return each credit immediately so their
-shared contexts do not phase-block one another. This reduces reverse-path WQEs
-for a single heavy stream without weakening FIFO reuse or completion guarantees.
-Both paths remain capped by the configured channel ceiling and the device's SM
-capacity. Effective values are exposed in launch metrics. Per-peer channel
-counts are always derived from the negotiated connection count, FIFO window,
-and actual payload bytes; there is no separate manual channel override.
-`AWEX_NCCL_DEVICE_V2_GIN_CONNECTIONS` controls the requested connection count
-and falls back to `NCCL_GIN_NCONNECTIONS` when set. If both are absent, Awex
-counts active RDMA devices with visible netdevs in sysfs and caps the result at
-the four GIN connection slots. It falls back to four when sysfs is unavailable;
-an explicit zero requests NCCL's native local-device discovery.
-Before NCCL initialization, the default `balanced` HCA policy discovers every
-active RDMA port, reads its link rate from sysfs, and combines it with the
-GPU-to-NIC distances reported by `nvidia-smi topo -m`. A rank uses a remote
-NUMA rail only when no local rail is active. Within the local set, PIX/NODE
-affinity is preserved and equal-affinity choices minimize assigned bytes per
-Gbps. Uniform rank loads therefore preserve contiguous PCI-local groups, while
-heterogeneous ports receive work in proportion to their capacity and skewed
-rank loads use longest-processing-time placement. Multi-engine vLLM launchers provide node-level
-rank offsets so each engine does not restart allocation at the first HCA.
-Within a rank, the device scheduler measures the actual bytes for every peer
-and weights channel promotion against that byte share. `NCCL_IB_HCA` remains
-the highest-priority explicit selection. Set `AWEX_NCCL_DEVICE_V2_HCA_POLICY`
-to `topology` to retain NCCL's native per-GPU selection.
-Awex always requests one context per detected connection. This explicit mapping
-is required for NCCL 2.30.4, which does not round a one-context request up to
-the connection count.
-`AWEX_NCCL_DEVICE_V2_GIN_FIFO_DEPTH` controls only GIN's reusable payload slots
-per peer and channel, from 1 through 64; the default is 16. The former
-`AWEX_NCCL_DEVICE_V2_FIFO_DEPTH` name remains a GIN-only compatibility alias;
-neither setting changes the LSA FIFO. GIN chunking is derived independently
-from its network step and cannot overwrite `AWEX_NCCL_DEVICE_CHUNK_BYTES`,
-which retains its original LSA meaning.
-Every GIN put uses the regular doorbell path. Doorbell aggregation was removed
-after the two-node sweep showed that batching reduced throughput.
-`AWEX_NCCL_DEVICE_V2_GIN_RELIABLE_DB` controls NCCL's GDAKI reliable doorbell
-mode and falls back to `NCCL_GIN_GDAKI_USE_RELIABLE_DB`. Its default is mode
-two: try the no-DBR hardware path, then software emulation, and finally the
-regular valid-DBR path when the faster modes are unavailable.
-NCCL's internal
-collective-graph channel count is not used as a v2 execution cap because this
-backend has a different CTA shape. Work groups use CUDA named barriers,
+For intra-node SIMPLE traffic, work channel count follows NCCL's
+`addP2pToPlan` sizing: `minPartSize = stepSize / 8`,
+`maxPartSize = stepSize * 32`. The topology layer mirrors NCCL's NVLink path
+formula, `2 * max(1, pathBandwidth / linkBandwidth)`. It rounds the per-peer
+path demand up to a power of two, then caps it by the configured channel
+ceiling and the device's SM capacity. The raw, requested, and effective values
+are exposed in launch metrics. NCCL's internal collective-graph channel count
+is not used as a v2 execution cap because this backend has a different CTA
+shape. Work groups use CUDA named barriers,
 leaving barrier 0 to CTA-wide synchronization. When a work has at least three
 warps, its final warp is reserved for the Post role so it can publish the
 previous step while worker warps begin the next one.
 
-The backend selects a transport per peer without changing the fixed plan or
-the public `nccl_device_v2` backend name. Peers in the local LSA team keep the
-NVLink read protocol: a sender stages into its local FIFO, the receiver reads
-that window, and `ready_step`/`consumed_step` carry ownership. Peers outside the
-LSA team use GIN puts into the receiver's FIFO. Strong ready signals order the
-put stream and weak credit signals release reusable sender slots. Every
-`(peer, channel)` still owns an independent monotonically increasing step
-stream. Both paths share one symmetric registered allocation sized for the
-larger transport requirements, but each work carries its own FIFO depth, step
-size, chunk size, and channel placement policy.
+The transport is fixed to NVLink read mode. A sender's worker warps stage source
+data into its local registered FIFO window and publish `ready_step`; receiver
+warps issue volatile loads from that remote window, scatter into local tensor
+fragments, then publish `consumed_step` back to the sender. Every
+`(peer, channel)` owns an independent monotonically increasing step stream.
+Wait roles cache observed steps and poll with volatile loads. Post roles use a
+system fence followed by a relaxed system store, avoiding system-scope RMWs on
+the normal control path. Eight 512 KiB FIFO steps provide 4 MiB of in-flight
+payload per channel-peer connection.
 
-GIN is initialized only when the cached plan contains a non-LSA edge. That
-path requires Linux, CUDA 12.2 or newer, NCCL 2.30.4 or newer with aggregate
-`nccl_device.h` headers, a GIN-capable communicator, and a fully connected
-supported RDMA fabric. The launch metrics expose `lsa_peer_count`,
-`gin_peer_count`, `gin_type`, `gin_connection_count`, `gin_context_count`,
-`network_channels_per_peer`, and the
-effective work step sizes so a deployment can confirm which path and
-parallelism were selected. GIN contexts are distinct from physical GIN
-connections. Indexed GIN signals are reset behind a world barrier before each
-cached-plan launch.
+Peers outside the communicator's LSA team use NCCL GIN puts while local peers
+retain the original NVLink read path. LSA keeps its existing FIFO depth 8,
+512 KiB step, 4 MiB chunk, and channel placement. GIN uses independent network
+step, FIFO, chunk, and channel settings, so enabling cross-node transfers cannot
+retune the local protocol.
 
-The Python transport and batch binding live in `awex/transfer/nccl_device_v2.py`.
-RDMA discovery and HCA placement live in `awex/transfer/nccl_device_v2_gin.py`.
-On the C++ side, `device_v2_gin_config.h` owns GIN capability checks, device
-communicator lifetime, and channel planning; `device_v2_gin.cuh` contains only
-the device protocol. The existing v1 transport is not used as a compatibility
-layer. The top-level writer/reader route to this backend only when
+Before NCCL initialization, the default HCA policy discovers active RDMA ports,
+reads their link rates from sysfs, and combines them with `nvidia-smi topo -m`
+GPU-to-NIC distances. It keeps ranks on local NUMA rails where possible and
+balances rank payload across equal-affinity ports by capacity. An explicit
+`NCCL_IB_HCA` selection takes precedence; setting
+`AWEX_NCCL_DEVICE_V2_HCA_POLICY=topology` leaves selection to NCCL.
+
+GIN is initialized only when the fixed plan contains a non-LSA peer. The path
+requires Linux and NCCL 2.30.4 or newer with GIN-capable Device API headers.
+RDMA discovery and host configuration live in `nccl_device_v2_gin.py`; device
+communicator setup lives in `device_v2_gin_config.h`, and the CUDA protocol is
+implemented in `device_v2_gin.cuh`.
+
+The Python transport entry point lives next to this directory in
+`awex/transfer/nccl_device_v2.py`. It has its own task binding and extension
+loader; the existing v1 transport is not used as a compatibility layer. The
+top-level writer/reader route to this backend only when
 `comm_backend=nccl_device_v2`.

@@ -748,24 +748,32 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
     AWEX_NCCL_V2_CHECK(ncclGetUniqueId(&unique_id));
     return py::bytes(reinterpret_cast<const char*>(&unique_id), sizeof(unique_id));
   });
-  module.def("create", [](const py::bytes& id, int world_size, int rank, int device, int timeout_ms, int max_channels,
-                          int fifo_depth, int64_t step_bytes, int64_t chunk_bytes, int gin_fifo_depth,
-                          int64_t network_step_bytes, int64_t gin_chunk_bytes, int gin_context_count) {
-    if (fifo_depth <= 0 || gin_fifo_depth <= 0 || step_bytes <= 0 || network_step_bytes <= 0 || chunk_bytes < 0 ||
-        gin_chunk_bytes < 0) {
-      throw std::runtime_error("invalid nccl_device_v2 step/chunk bytes");
-    }
-    if (gin_context_count <= 0) {
-      throw std::runtime_error("invalid nccl_device_v2 network parallelism");
-    }
-    const std::string unique_id = id;
-    auto state = make_state(unique_id, world_size, rank, device, timeout_ms, static_cast<std::uint32_t>(max_channels),
-                            static_cast<std::uint32_t>(fifo_depth), static_cast<std::size_t>(step_bytes),
-                            static_cast<std::size_t>(chunk_bytes), static_cast<std::uint32_t>(gin_fifo_depth),
-                            static_cast<std::size_t>(network_step_bytes), static_cast<std::size_t>(gin_chunk_bytes),
-                            static_cast<std::uint32_t>(gin_context_count));
-    return reinterpret_cast<int64_t>(state.release());
-  });
+  module.def(
+    "create",
+    [](const py::bytes& id, int world_size, int rank, int device, int timeout_ms, int max_channels, int fifo_depth,
+       int64_t step_bytes, int64_t chunk_bytes, int gin_fifo_depth, int64_t network_step_bytes,
+       int64_t gin_chunk_bytes, int gin_context_count) {
+      if (fifo_depth <= 0 || gin_fifo_depth <= 0 || step_bytes <= 0 || network_step_bytes <= 0 || chunk_bytes < 0 ||
+          gin_chunk_bytes < 0) {
+        throw std::runtime_error("invalid nccl_device_v2 step/chunk bytes");
+      }
+      if (gin_context_count <= 0) {
+        throw std::runtime_error("invalid nccl_device_v2 network parallelism");
+      }
+      const std::string unique_id = id;
+      auto state = make_state(unique_id, world_size, rank, device, timeout_ms,
+                              static_cast<std::uint32_t>(max_channels), static_cast<std::uint32_t>(fifo_depth),
+                              static_cast<std::size_t>(step_bytes), static_cast<std::size_t>(chunk_bytes),
+                              static_cast<std::uint32_t>(gin_fifo_depth),
+                              static_cast<std::size_t>(network_step_bytes),
+                              static_cast<std::size_t>(gin_chunk_bytes),
+                              static_cast<std::uint32_t>(gin_context_count));
+      return reinterpret_cast<int64_t>(state.release());
+    },
+    py::arg("id"), py::arg("world_size"), py::arg("rank"), py::arg("device"), py::arg("timeout_ms"),
+    py::arg("max_channels"), py::arg("fifo_depth"), py::arg("step_bytes"), py::arg("chunk_bytes"),
+    py::arg("gin_fifo_depth") = 16, py::arg("network_step_bytes") = 128 * 1024,
+    py::arg("gin_chunk_bytes") = 4 * 1024 * 1024, py::arg("gin_context_count") = 1);
   module.def("launch", &launch);
   module.def("destroy", [](int64_t handle) {
     auto* state = reinterpret_cast<DeviceState*>(handle);
