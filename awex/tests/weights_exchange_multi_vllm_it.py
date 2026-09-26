@@ -20,11 +20,9 @@ import copy
 import os
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import nullcontext
 
 import requests
 import torch
@@ -32,6 +30,10 @@ import torch.distributed as dist
 
 from awex import logging
 from awex.meta.meta_server import start_meta_server, stop_meta_server
+from awex.publication import (
+    create_publication_mechanism,
+    publication_mechanism_names,
+)
 from awex.tests.megatron_parallel import resolve_megatron_parallelism
 from awex.util import device as device_util
 from awex.util.profile import emit_profile, profile_phase
@@ -100,50 +102,83 @@ class MultiVLLMWeightsExchangeIT:
         inference_config=None,
         comm_backend=None,
         train_tp_size=1,
+        train_pp_size=1,
+        train_cp_size=1,
         train_ep_size=1,
         train_expert_tp_size=None,
         use_mbridge=False,
         host="127.0.0.1",
         port=8000,
+        remote_inference=False,
+        meta_server_host="",
+        meta_server_port=0,
+        publication_store_host="",
         validate=False,
         dump_weights_list_for_validation=None,
         dump_weights_dir_for_validation=None,
+        publication_mechanism="awex",
+        publication_bucket_mb=256,
+        publication_timeout_seconds=1800,
     ):
         self.comm_backend = comm_backend
+        self.publication_mechanism_name = publication_mechanism
         self.device_backend = device_util.get_device_type()
         self.train_parallelism = resolve_megatron_parallelism(
             tp_size=train_tp_size,
+            pp_size=train_pp_size,
+            cp_size=train_cp_size,
             ep_size=train_ep_size,
             expert_tp_size=train_expert_tp_size,
         )
         self.train_tp_size = self.train_parallelism.tp_size
+        self.train_pp_size = self.train_parallelism.pp_size
+        self.train_cp_size = self.train_parallelism.cp_size
         self.train_ep_size = self.train_parallelism.ep_size
         self.train_expert_tp_size = self.train_parallelism.expert_tp_size
         self.rank = int(os.environ.get("RANK", "0"))
         self.local_rank = int(os.environ.get("LOCAL_RANK", "0"))
         self.world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        self.local_world_size = int(
+            os.environ.get("LOCAL_WORLD_SIZE", str(self.world_size))
+        )
         self.is_driver = self.rank == 0
         self.train_parallelism.validate_world_size(self.world_size)
-        if self.world_size > 1 and comm_backend == "file":
+        if (
+            publication_mechanism == "awex"
+            and self.world_size > 1
+            and comm_backend == "file"
+        ):
             raise RuntimeError("Multi-rank training requires the NCCL or HCCL backend.")
 
         self.meta_server_addr = None
         self.inference_config = inference_config or copy.deepcopy(vllm_inference_config)
         self.inference_config["comm_backend"] = comm_backend
-        self.train_config = {
-            "comm_backend": comm_backend,
-            "enable_debug_mode": enable_debug_mode,
-        }
         self.host = host
         self.port = port
+        self.remote_inference = remote_inference
+        self.meta_server_host = meta_server_host
+        self.meta_server_port = meta_server_port
+        self.publication_store_host = publication_store_host
         self.use_mbridge = use_mbridge
         self.validate = validate
         self.dump_weights_list_for_validation = dump_weights_list_for_validation or []
         self.dump_weights_dir_for_validation = dump_weights_dir_for_validation
 
+        self.publication = create_publication_mechanism(
+            publication_mechanism,
+            self,
+            bucket_size=publication_bucket_mb << 20,
+            timeout_seconds=publication_timeout_seconds,
+        )
+        self.train_config = {
+            "comm_backend": self.publication.training_engine_backend,
+            "enable_debug_mode": enable_debug_mode,
+        }
+
         self.vllm_visible_devices, self.megatron_device = self._select_devices()
 
         self.megatron_engine = None
+        self.mcore_bridge = None
         self.vllm_processes = []
 
     def _select_devices(self):
@@ -161,37 +196,54 @@ class MultiVLLMWeightsExchangeIT:
             # Fallback: use torch to detect. (May touch CUDA, but that's OK with set_device below.)
             visible_devices = list(range(device_util.device_count()))
 
-        need = self.world_size + total_inference_gpus
+        inference_gpus = (
+            total_inference_gpus
+            if self.is_driver and not self.remote_inference
+            else 0
+        )
+        need = self.local_world_size + inference_gpus
         if len(visible_devices) < need:
             raise RuntimeError(
-                f"Need at least {need} visible devices ({self.world_size} for "
-                f"Megatron + {total_inference_gpus} for {num_engines} vLLM "
-                f"engines at TP{inference_tp}). "
+                f"Need at least {need} visible devices ({self.local_world_size} "
+                f"local Megatron ranks + {inference_gpus} for {num_engines} "
+                f"vLLM engines at TP{inference_tp}). "
                 f"Found {len(visible_devices)} via visible devices env='{visible_env or '(unset)'}'."
             )
-        if not 0 <= self.local_rank < self.world_size:
+        if not 0 <= self.local_rank < self.local_world_size:
             raise RuntimeError(
-                f"LOCAL_RANK ({self.local_rank}) must be in [0, {self.world_size})."
+                f"LOCAL_RANK ({self.local_rank}) must be in "
+                f"[0, {self.local_world_size})."
             )
 
         megatron_device = visible_devices[self.local_rank]
-        vllm_devices = visible_devices[
-            self.world_size : self.world_size + total_inference_gpus
-        ]
+        vllm_devices = (
+            visible_devices[
+                self.local_world_size : self.local_world_size + total_inference_gpus
+            ]
+            if self.is_driver and not self.remote_inference
+            else []
+        )
         return vllm_devices, megatron_device
 
     def initialize(self):
-        self._start_meta_server()
+        if self.publication.uses_awex_meta_server:
+            self._start_meta_server()
         self._init_distributed()
-        self._share_meta_server_address()
+        if self.publication.uses_awex_meta_server:
+            self._share_meta_server_address()
         self._init_megatron_engine()
+        self.publication.initialize_training()
         if self.is_driver:
-            self._start_vllm_server()
-            self._awex_init()
+            if not self.remote_inference:
+                self._start_vllm_server()
+            self._wait_for_all_health()
+            self.publication.initialize_driver()
         self._training_barrier()
 
     def destroy(self):
+        self._training_barrier()
         if self.is_driver:
+            self.publication.close()
             for process in self.vllm_processes:
                 if process.poll() is None:
                     process.terminate()
@@ -200,7 +252,6 @@ class MultiVLLMWeightsExchangeIT:
                     process.wait(timeout=10)
                 except subprocess.TimeoutExpired:
                     process.kill()
-        self._training_barrier()
         if self.is_driver and self.meta_server_addr is not None:
             stop_meta_server()
         self._training_barrier()
@@ -212,7 +263,10 @@ class MultiVLLMWeightsExchangeIT:
             os.environ.setdefault("WORLD_SIZE", "1")
             os.environ.setdefault("MASTER_PORT", "17443")
             os.environ.setdefault("MASTER_ADDR", "localhost")
-        os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo")
+        default_socket_ifname = (
+            "eth0" if self.world_size > self.local_world_size else "lo"
+        )
+        os.environ.setdefault("GLOO_SOCKET_IFNAME", default_socket_ifname)
 
         device_util.set_device(self.local_rank)
         if not dist.is_initialized():
@@ -241,7 +295,9 @@ class MultiVLLMWeightsExchangeIT:
 
     def _start_meta_server(self):
         if self.is_driver:
-            ip, port = start_meta_server()
+            ip, port = start_meta_server(
+                host=self.meta_server_host, port=self.meta_server_port
+            )
             self.meta_server_addr = f"{ip}:{port}"
 
     def _share_meta_server_address(self):
@@ -252,6 +308,12 @@ class MultiVLLMWeightsExchangeIT:
         self.meta_server_addr = addresses[0]
         self.inference_config["meta_server_addr"] = self.meta_server_addr
         self.train_config["meta_server_addr"] = self.meta_server_addr
+
+    def publication_endpoints(self):
+        return [
+            (engine_rank, self.host, self.port + engine_rank)
+            for engine_rank in range(self.inference_config["num_engines"])
+        ]
 
     def _start_vllm_server(self):
         visible_env = device_util.visible_devices_env_names()[0]
@@ -294,6 +356,8 @@ class MultiVLLMWeightsExchangeIT:
                 "--disable-log-requests",
                 "--enforce-eager",
             ]
+            if self.inference_config.get("enable_expert_parallel"):
+                cmd.append("--enable-expert-parallel")
             gpu_memory_utilization = self.inference_config.get(
                 "gpu_memory_utilization"
             )
@@ -318,15 +382,26 @@ class MultiVLLMWeightsExchangeIT:
             )
             self.vllm_processes.append(subprocess.Popen(cmd, env=env))
 
-        for engine_rank in range(num_engines):
-            self._wait_for_health(engine_rank)
+    def _wait_for_all_health(self):
+        num_engines = self.inference_config["num_engines"]
+        with ThreadPoolExecutor(max_workers=num_engines) as executor:
+            futures = [
+                executor.submit(self._wait_for_health, engine_rank)
+                for engine_rank in range(num_engines)
+            ]
+            for future in futures:
+                future.result()
 
     def _wait_for_health(self, engine_rank, timeout=180):
         url = f"http://{self.host}:{self.port + engine_rank}/health"
         start = time.time()
         while time.time() - start < timeout:
-            process = self.vllm_processes[engine_rank]
-            if process.poll() is not None:
+            process = (
+                self.vllm_processes[engine_rank]
+                if engine_rank < len(self.vllm_processes)
+                else None
+            )
+            if process is not None and process.poll() is not None:
                 raise RuntimeError(
                     f"vLLM engine {engine_rank} exited with code {process.returncode}."
                 )
@@ -340,46 +415,10 @@ class MultiVLLMWeightsExchangeIT:
             f"vLLM engine {engine_rank} failed to start within timeout."
         )
 
-    def _awex_init(self):
-        num_engines = self.inference_config["num_engines"]
-        with ThreadPoolExecutor(max_workers=num_engines) as executor:
-            list(executor.map(self._awex_init_engine, range(num_engines)))
-
-    def _awex_init_engine(self, engine_rank):
-        url = (
-            f"http://{self.host}:{self.port + engine_rank}/areal_awex_init"
-        )
-        payload = {
-            "meta_server_addr": self.meta_server_addr,
-            "engine_rank": engine_rank,
-            "num_engines": self.inference_config["num_engines"],
-            "comm_backend": self.inference_config["comm_backend"],
-            "enable_debug_mode": enable_debug_mode,
-            "nnodes": 1,
-            "node_rank": 0,
-        }
-        if self.device_backend == "npu":
-            payload["weights_exchange_ipc_backend"] = "cpu"
-        if self.validate:
-            payload["weights_validation_steps"] = 1
-            payload["validate_weights_every_n_steps"] = 1
-            if self.dump_weights_list_for_validation:
-                payload["dump_weights_list_for_validation"] = (
-                    self.dump_weights_list_for_validation
-                )
-            if self.dump_weights_dir_for_validation:
-                payload["dump_weights_dir_for_validation"] = (
-                    self.dump_weights_dir_for_validation
-                )
-        resp = requests.post(url, json=payload, timeout=60)
-        if resp.status_code != 200:
-            raise RuntimeError(
-                f"Awex init failed for engine {engine_rank}: {resp.text}"
-            )
-
     def _init_megatron_engine(self):
         self.train_config["tensor_model_parallel_size"] = self.train_tp_size
-        self.train_config["pipeline_model_parallel_size"] = 1
+        self.train_config["pipeline_model_parallel_size"] = self.train_pp_size
+        self.train_config["context_parallel_size"] = self.train_cp_size
         self.train_config["expert_model_parallel_size"] = self.train_ep_size
         self.train_config["expert_tensor_parallel_size"] = (
             self.train_expert_tp_size
@@ -401,6 +440,7 @@ class MultiVLLMWeightsExchangeIT:
         self.megatron_engine = MegatronEngine(
             self.train_config, self.mcore_hf_config, self.mcore_model
         )
+        self.megatron_engine.publication_bridge = self.mcore_bridge
         self.megatron_engine.initialize()
         logger.info("Megatron backend initialized")
 
@@ -417,8 +457,9 @@ class MultiVLLMWeightsExchangeIT:
 
         mpu.initialize_model_parallel(
             tensor_model_parallel_size=self.train_tp_size,
+            pipeline_model_parallel_size=self.train_pp_size,
             virtual_pipeline_model_parallel_size=None,
-            context_parallel_size=1,
+            context_parallel_size=self.train_cp_size,
             expert_model_parallel_size=self.train_ep_size,
             expert_tensor_parallel_size=self.train_expert_tp_size,
         )
@@ -436,44 +477,23 @@ class MultiVLLMWeightsExchangeIT:
             if getattr(torch, "npu", None) is not None:
                 torch.npu.manual_seed(0)
 
-        model, hf_config = megatron_model_from_hf(
+        loaded = megatron_model_from_hf(
             model_path=self.inference_config["model_path"],
             use_mbridge=self.use_mbridge,
+            return_bridge=(self.publication_mechanism_name == "verl_nccl_broadcast"),
         )
+        if len(loaded) == 3:
+            model, hf_config, self.mcore_bridge = loaded
+        else:
+            model, hf_config = loaded
         return model[0], hf_config
 
     def exchange_weights(self):
         if self.megatron_engine is None:
             raise RuntimeError("Megatron backend not initialized")
 
-        if self.comm_backend == "file":
-            temp_ctx = tempfile.TemporaryDirectory()
-            path = os.path.join(temp_ctx.name, "checkpoint")
-        else:
-            temp_ctx = nullcontext()
-            path = None
-
         end_to_end_start = time.perf_counter()
-        with temp_ctx:
-            if self.comm_backend == "file":
-                self.megatron_engine.write_weights(path=path)
-                self._awex_update(path=path)
-            else:
-                executor_context = (
-                    ThreadPoolExecutor(max_workers=1)
-                    if self.is_driver
-                    else nullcontext()
-                )
-                with executor_context as executor:
-                    future = (
-                        executor.submit(self._awex_update, path=None)
-                        if executor is not None
-                        else None
-                    )
-                    self._training_barrier()
-                    self.megatron_engine.write_weights()
-                    if future is not None:
-                        future.result()
+        self.publication.publish()
         logger.info("Update weights finished")
         if self.is_driver:
             step_id = int(self.megatron_engine.global_step)
@@ -481,7 +501,8 @@ class MultiVLLMWeightsExchangeIT:
                 logger,
                 event="end_to_end_update",
                 role="driver",
-                backend=self.comm_backend,
+                backend=self.publication_mechanism_name,
+                comm_backend=self.comm_backend,
                 phase=profile_phase(step_id),
                 step_id=step_id,
                 rank=int(self.rank),
@@ -489,29 +510,6 @@ class MultiVLLMWeightsExchangeIT:
                     time.perf_counter() - end_to_end_start
                 )
                 * 1000.0,
-            )
-
-    def _awex_update(self, path: str | None):
-        num_engines = self.inference_config["num_engines"]
-        with ThreadPoolExecutor(max_workers=num_engines) as executor:
-            futures = [
-                executor.submit(self._awex_update_engine, engine_rank, path)
-                for engine_rank in range(num_engines)
-            ]
-            for future in futures:
-                future.result()
-
-    def _awex_update_engine(self, engine_rank: int, path: str | None):
-        url = (
-            f"http://{self.host}:{self.port + engine_rank}/areal_awex_update"
-        )
-        payload = {"step_id": self.megatron_engine.global_step, "kwargs": {}}
-        if path is not None:
-            payload["kwargs"]["path"] = path
-        resp = requests.post(url, json=payload, timeout=300)
-        if resp.status_code != 200:
-            raise RuntimeError(
-                f"Awex update failed for engine {engine_rank}: {resp.text}"
             )
 
 
@@ -532,22 +530,30 @@ def main(args):
         inference_config["model_path"] = args.model_path
     inference_config["tp_size"] = args.vllm_tp_size
     inference_config["num_engines"] = args.num_engines
-    inference_config["gpu_memory_utilization"] = (
-        args.vllm_gpu_memory_utilization
-    )
+    inference_config["enable_expert_parallel"] = args.vllm_enable_expert_parallel
+    inference_config["gpu_memory_utilization"] = args.vllm_gpu_memory_utilization
 
     weights_exchange_it = MultiVLLMWeightsExchangeIT(
         inference_config=inference_config,
         comm_backend=comm_backend,
         train_tp_size=args.train_tp_size,
+        train_pp_size=args.train_pp_size,
+        train_cp_size=args.train_cp_size,
         train_ep_size=args.train_ep_size,
         train_expert_tp_size=args.train_expert_tp_size,
         use_mbridge=args.use_mbridge,
         host=args.host,
         port=args.port,
+        remote_inference=args.remote_inference,
+        meta_server_host=args.meta_server_host,
+        meta_server_port=args.meta_server_port,
+        publication_store_host=args.publication_store_host,
         validate=args.validate,
         dump_weights_list_for_validation=args.dump_weights_list_for_validation,
         dump_weights_dir_for_validation=args.dump_weights_dir_for_validation,
+        publication_mechanism=args.publication_mechanism,
+        publication_bucket_mb=args.publication_bucket_mb,
+        publication_timeout_seconds=args.publication_timeout_seconds,
     )
 
     try:
@@ -597,6 +603,26 @@ if __name__ == "__main__":
         help="Weight exchange communication backend (file/nccl/nccl_device/nccl_device_v2/hccl).",
     )
     parser.add_argument(
+        "--publication-mechanism",
+        choices=publication_mechanism_names(),
+        default="awex",
+        help="Weight publication mechanism exercised by the harness.",
+    )
+    parser.add_argument(
+        "--publication-bucket-mb",
+        type=_positive_int,
+        default=256,
+        metavar="MiB",
+        help="Per-buffer size for bucketed publication mechanisms.",
+    )
+    parser.add_argument(
+        "--publication-timeout-seconds",
+        type=_positive_int,
+        default=1800,
+        metavar="SECONDS",
+        help="Initialization and update timeout for publication mechanisms.",
+    )
+    parser.add_argument(
         "--model-path",
         default=vllm_inference_config["model_path"],
         help="HF model path used by Megatron and the vLLM server.",
@@ -610,6 +636,20 @@ if __name__ == "__main__":
             "Megatron dense tensor-parallel size. Torchrun WORLD_SIZE must "
             "satisfy both the dense and expert parallel layouts."
         ),
+    )
+    parser.add_argument(
+        "--train-pp-size",
+        type=_positive_int,
+        default=1,
+        metavar="N",
+        help="Megatron pipeline-parallel size.",
+    )
+    parser.add_argument(
+        "--train-cp-size",
+        type=_positive_int,
+        default=1,
+        metavar="N",
+        help="Megatron context-parallel size.",
     )
     parser.add_argument(
         "--train-ep-size",
@@ -651,6 +691,11 @@ if __name__ == "__main__":
             "Optional vLLM per-GPU memory utilization fraction; by default "
             "vLLM uses its own setting."
         ),
+    )
+    parser.add_argument(
+        "--vllm-enable-expert-parallel",
+        action="store_true",
+        help="Enable vLLM expert parallel mode for MoE inference.",
     )
     parser.add_argument(
         "--nccl-device-chunk-mb",
@@ -702,6 +747,30 @@ if __name__ == "__main__":
     )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument(
+        "--remote-inference",
+        action="store_true",
+        help=(
+            "Connect to already-running vLLM engines on --host instead of "
+            "launching locally."
+        ),
+    )
+    parser.add_argument(
+        "--meta-server-host",
+        default="",
+        help="Address on which the training driver exposes the Awex meta server.",
+    )
+    parser.add_argument(
+        "--meta-server-port",
+        type=int,
+        default=0,
+        help="Fixed Awex meta-server port (0 selects a free port).",
+    )
+    parser.add_argument(
+        "--publication-store-host",
+        default="",
+        help="Training-driver address reachable by remote NCCL bucket receivers.",
+    )
     parser.add_argument(
         "--validate",
         action="store_true",

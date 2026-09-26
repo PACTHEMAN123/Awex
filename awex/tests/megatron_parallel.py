@@ -24,12 +24,13 @@ from typing import Optional
 class MegatronParallelism:
     tp_size: int
     pp_size: int
+    cp_size: int
     ep_size: int
     expert_tp_size: int
 
     @property
     def dense_parallel_size(self) -> int:
-        return self.tp_size * self.pp_size
+        return self.tp_size * self.pp_size * self.cp_size
 
     @property
     def expert_parallel_size(self) -> int:
@@ -46,7 +47,7 @@ class MegatronParallelism:
         ):
             raise RuntimeError(
                 "Invalid Megatron parallel config for WORLD_SIZE. "
-                f"dense(tp*pp)={self.dense_parallel_size}, "
+                f"dense(tp*pp*cp)={self.dense_parallel_size}, "
                 "expert(expert_tp*ep*pp)="
                 f"{self.expert_parallel_size}, WORLD_SIZE={world_size}, "
                 f"required multiple={self.required_world_size_multiple}."
@@ -59,11 +60,13 @@ def resolve_megatron_parallelism(
     ep_size: int = 1,
     expert_tp_size: Optional[int] = None,
     pp_size: int = 1,
+    cp_size: int = 1,
 ) -> MegatronParallelism:
     resolved_expert_tp_size = tp_size if expert_tp_size is None else expert_tp_size
     values = {
         "tp_size": tp_size,
         "pp_size": pp_size,
+        "cp_size": cp_size,
         "ep_size": ep_size,
         "expert_tp_size": resolved_expert_tp_size,
     }

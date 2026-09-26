@@ -46,6 +46,19 @@ class PublicationMechanism(ABC):
         return None
 
 
+def publication_endpoints(harness):
+    endpoint_factory = getattr(harness, "publication_endpoints", None)
+    if callable(endpoint_factory):
+        return endpoint_factory()
+    return [
+        (
+            int(harness.inference_config.get("engine_rank", 0)),
+            harness.host,
+            harness.port,
+        )
+    ]
+
+
 _MECHANISMS: Dict[str, Type[PublicationMechanism]] = {}
 _VLLM_RECEIVERS = {}
 _BUILTINS_LOADED = False

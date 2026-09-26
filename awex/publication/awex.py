@@ -24,6 +24,7 @@ import requests
 
 from awex.publication.registry import (
     PublicationMechanism,
+    publication_endpoints,
     register_publication_mechanism,
 )
 
@@ -40,10 +41,21 @@ class AwexPublicationMechanism(PublicationMechanism):
 
     def initialize_driver(self) -> None:
         harness = self.harness
-        url = f"http://{harness.host}:{harness.port}/areal_awex_init"
+        endpoints = publication_endpoints(harness)
+        with ThreadPoolExecutor(max_workers=len(endpoints)) as executor:
+            futures = [
+                executor.submit(self._initialize_endpoint, endpoint)
+                for endpoint in endpoints
+            ]
+            for future in futures:
+                future.result()
+
+    def _initialize_endpoint(self, endpoint) -> None:
+        engine_rank, host, port = endpoint
+        harness = self.harness
         payload = {
             "meta_server_addr": harness.meta_server_addr,
-            "engine_rank": harness.inference_config["engine_rank"],
+            "engine_rank": engine_rank,
             "num_engines": harness.inference_config["num_engines"],
             "comm_backend": harness.inference_config["comm_backend"],
             "enable_debug_mode": harness.inference_config["enable_debug_mode"],
@@ -63,9 +75,13 @@ class AwexPublicationMechanism(PublicationMechanism):
                 payload["dump_weights_dir_for_validation"] = (
                     harness.dump_weights_dir_for_validation
                 )
-        response = requests.post(url, json=payload, timeout=60)
+        response = requests.post(
+            f"http://{host}:{port}/areal_awex_init", json=payload, timeout=60
+        )
         if response.status_code != 200:
-            raise RuntimeError(f"Awex init failed: {response.text}")
+            raise RuntimeError(
+                f"Awex init failed for engine {engine_rank}: {response.text}"
+            )
 
     def publish(self) -> None:
         harness = self.harness
@@ -100,10 +116,24 @@ class AwexPublicationMechanism(PublicationMechanism):
 
     def _request_update(self, path: str | None) -> None:
         harness = self.harness
-        url = f"http://{harness.host}:{harness.port}/areal_awex_update"
         payload = {"step_id": harness.megatron_engine.global_step, "kwargs": {}}
         if path is not None:
             payload["kwargs"]["path"] = path
-        response = requests.post(url, json=payload, timeout=300)
-        if response.status_code != 200:
-            raise RuntimeError(f"Awex update failed: {response.text}")
+        endpoints = publication_endpoints(harness)
+        with ThreadPoolExecutor(max_workers=len(endpoints)) as executor:
+            futures = [
+                executor.submit(
+                    requests.post,
+                    f"http://{host}:{port}/areal_awex_update",
+                    json=payload,
+                    timeout=300,
+                )
+                for _, host, port in endpoints
+            ]
+            for endpoint, future in zip(endpoints, futures):
+                response = future.result()
+                if response.status_code != 200:
+                    raise RuntimeError(
+                        f"Awex update failed for engine {endpoint[0]}: "
+                        f"{response.text}"
+                    )

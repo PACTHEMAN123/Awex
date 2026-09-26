@@ -30,6 +30,7 @@ import torch.distributed as dist
 from awex import logging
 from awex.publication.registry import (
     PublicationMechanism,
+    publication_endpoints,
     register_publication_mechanism,
     register_vllm_publication_receiver,
 )
@@ -545,7 +546,9 @@ class VerlNcclBroadcastReceiver:
 
     def initialize(self) -> dict:
         world_size = int(self.config["world_size"])
-        publication_rank = self.worker_rank + 1
+        publication_rank = (
+            int(self.config.get("rank_offset", 0)) + self.worker_rank + 1
+        )
         if not 1 <= publication_rank < world_size:
             raise ValueError(
                 f"Invalid publication rank {publication_rank} for world size {world_size}"
@@ -626,7 +629,9 @@ class VerlNcclBroadcastReceiver:
             metadata = next_metadata
 
         return {
-            "publication_rank": self.worker_rank + 1,
+            "publication_rank": (
+                int(self.config.get("rank_offset", 0)) + self.worker_rank + 1
+            ),
             "payload_bytes": total_bytes,
             "received_tensors": loaded_tensors,
             "bucket_count": bucket_index + 1,
@@ -682,12 +687,16 @@ class VerlNcclBroadcastPublicationMechanism(PublicationMechanism):
         self.exporter.initialize()
         if not harness.is_driver:
             return
-        store_host = "127.0.0.1"
+        store_host = getattr(harness, "publication_store_host", "") or "127.0.0.1"
         store_port = get_free_port()
+        inference_world_size = (
+            int(harness.inference_config["tp_size"])
+            * int(harness.inference_config.get("num_engines", 1))
+        )
         self.sender = VerlNcclBroadcastSender(
             host=store_host,
             port=store_port,
-            world_size=harness.inference_config["tp_size"] + 1,
+            world_size=inference_world_size + 1,
             group_id=self.group_id,
             bucket_size=self.bucket_size,
             timeout_seconds=self.timeout_seconds,
@@ -695,26 +704,39 @@ class VerlNcclBroadcastPublicationMechanism(PublicationMechanism):
 
     def initialize_driver(self) -> None:
         harness = self.harness
-        config = {
-            "store_host": self.sender.host,
-            "store_port": self.sender.port,
-            "world_size": self.sender.world_size,
-            "group_id": self.group_id,
-            "bucket_size": self.bucket_size,
-            "timeout_seconds": self.timeout_seconds,
-        }
-        url = f"http://{harness.host}:{harness.port}/publication_init"
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(
-                requests.post,
-                url,
-                json={"mechanism": self.name, "config": config},
-                timeout=self.timeout_seconds,
-            )
+        endpoints = publication_endpoints(harness)
+        inference_tp_size = int(harness.inference_config["tp_size"])
+        with ThreadPoolExecutor(max_workers=len(endpoints)) as executor:
+            futures = []
+            for engine_rank, host, port in endpoints:
+                config = {
+                    "store_host": self.sender.host,
+                    "store_port": self.sender.port,
+                    "world_size": self.sender.world_size,
+                    "group_id": self.group_id,
+                    "bucket_size": self.bucket_size,
+                    "timeout_seconds": self.timeout_seconds,
+                    "rank_offset": engine_rank * inference_tp_size,
+                }
+                futures.append(
+                    (
+                        engine_rank,
+                        executor.submit(
+                            requests.post,
+                            f"http://{host}:{port}/publication_init",
+                            json={"mechanism": self.name, "config": config},
+                            timeout=self.timeout_seconds,
+                        ),
+                    )
+                )
             self.sender.initialize_process_group()
-            response = future.result()
-        if response.status_code != 200:
-            raise RuntimeError(f"Publication init failed: {response.text}")
+            for engine_rank, future in futures:
+                response = future.result()
+                if response.status_code != 200:
+                    raise RuntimeError(
+                        f"Publication init failed for engine {engine_rank}: "
+                        f"{response.text}"
+                    )
 
     def publish(self) -> None:
         harness = self.harness
@@ -723,12 +745,7 @@ class VerlNcclBroadcastPublicationMechanism(PublicationMechanism):
         executor = None
         if harness.is_driver:
             executor = ThreadPoolExecutor(max_workers=1)
-            request_future = executor.submit(
-                requests.post,
-                f"http://{harness.host}:{harness.port}/publication_update",
-                json={"step_id": step_id},
-                timeout=self.timeout_seconds,
-            )
+            request_future = executor.submit(self._request_updates, step_id)
 
         harness._training_barrier()
         start = time.perf_counter()
@@ -743,18 +760,18 @@ class VerlNcclBroadcastPublicationMechanism(PublicationMechanism):
 
         if request_future is not None:
             try:
-                response = request_future.result()
+                responses = request_future.result()
             finally:
                 executor.shutdown(wait=True)
-            if response.status_code != 200:
-                raise RuntimeError(f"Publication update failed: {response.text}")
-            response_body = response.json()
             receiver_metrics = [
                 result
-                for result in _flatten_result_dicts(response_body.get("results"))
+                for response in responses
+                for result in _flatten_result_dicts(response.json().get("results"))
                 if "publication_rank" in result and "payload_bytes" in result
             ]
-            expected_receivers = int(harness.inference_config["tp_size"])
+            expected_receivers = int(harness.inference_config["tp_size"]) * int(
+                harness.inference_config.get("num_engines", 1)
+            )
             if len(receiver_metrics) != expected_receivers:
                 raise RuntimeError(
                     "Publication update returned metrics for "
@@ -793,19 +810,52 @@ class VerlNcclBroadcastPublicationMechanism(PublicationMechanism):
                 **metrics,
             )
 
+    def _request_updates(self, step_id: int):
+        endpoints = publication_endpoints(self.harness)
+        with ThreadPoolExecutor(max_workers=len(endpoints)) as executor:
+            futures = [
+                (
+                    engine_rank,
+                    executor.submit(
+                        requests.post,
+                        f"http://{host}:{port}/publication_update",
+                        json={"step_id": step_id},
+                        timeout=self.timeout_seconds,
+                    ),
+                )
+                for engine_rank, host, port in endpoints
+            ]
+            responses = []
+            for engine_rank, future in futures:
+                response = future.result()
+                if response.status_code != 200:
+                    raise RuntimeError(
+                        f"Publication update failed for engine {engine_rank}: "
+                        f"{response.text}"
+                    )
+                responses.append(response)
+            return responses
+
     def close(self) -> None:
         harness = self.harness
-        process = harness.vllm_process
-        if process is not None and process.poll() is None:
+        for engine_rank, host, port in publication_endpoints(harness):
             try:
                 response = requests.post(
-                    f"http://{harness.host}:{harness.port}/publication_close",
+                    f"http://{host}:{port}/publication_close",
                     timeout=min(self.timeout_seconds, 60),
                 )
                 if response.status_code != 200:
-                    logger.warning("Publication close failed: %s", response.text)
+                    logger.warning(
+                        "Publication close failed for engine %s: %s",
+                        engine_rank,
+                        response.text,
+                    )
             except requests.RequestException as exc:
-                logger.warning("Publication close request failed: %s", exc)
+                logger.warning(
+                    "Publication close request failed for engine %s: %s",
+                    engine_rank,
+                    exc,
+                )
         if self.sender is not None:
             self.sender.buffers = None
             self.sender.process_group = None

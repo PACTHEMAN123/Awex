@@ -25,8 +25,11 @@ from awex.publication.verl_nccl import (
     TensorChunkAssembler,
     TensorChunkMeta,
     VerlNcclBroadcastSender,
+    VerlNcclBroadcastReceiver,
     _flatten_result_dicts,
 )
+from awex.tests.megatron_parallel import resolve_megatron_parallelism
+from awex.tests.weights_exchange_multi_vllm_it import MultiVLLMWeightsExchangeIT
 from awex.tests.weights_exchange_vllm_it import (
     VLLMWeightsExchangeIT,
     vllm_inference_config,
@@ -218,3 +221,81 @@ def test_verl_mechanism_uses_common_file_writer_without_awex_meta(monkeypatch):
 
     assert integration.train_config["comm_backend"] == "file"
     assert not integration.publication.uses_awex_meta_server
+
+
+def test_context_parallelism_contributes_to_dense_world_size():
+    parallelism = resolve_megatron_parallelism(
+        tp_size=2,
+        pp_size=4,
+        cp_size=2,
+        ep_size=4,
+        expert_tp_size=1,
+    )
+
+    assert parallelism.dense_parallel_size == 16
+    assert parallelism.expert_parallel_size == 16
+    parallelism.validate_world_size(16)
+
+
+def test_remote_multi_engine_publication_endpoints(monkeypatch):
+    monkeypatch.setenv("AWEX_DEVICE_TYPE", "cuda")
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    monkeypatch.setenv("WORLD_SIZE", "1")
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "1")
+    monkeypatch.setattr(device_util, "visible_devices_env_value", lambda: "0")
+    config = copy.deepcopy(vllm_inference_config)
+    config["num_engines"] = 2
+
+    integration = MultiVLLMWeightsExchangeIT(
+        inference_config=config,
+        comm_backend="nccl",
+        host="10.0.0.8",
+        port=18000,
+        remote_inference=True,
+    )
+
+    assert integration.publication_endpoints() == [
+        (0, "10.0.0.8", 18000),
+        (1, "10.0.0.8", 18001),
+    ]
+    assert integration.vllm_visible_devices == []
+
+
+def test_bucket_receiver_offsets_rank_for_second_engine(monkeypatch):
+    class _Work:
+        def wait(self):
+            return None
+
+    monkeypatch.setattr(
+        "awex.publication.verl_nccl._create_tcp_store", lambda *args, **kwargs: object()
+    )
+    captured = {}
+
+    def _create_process_group(store, prefix, rank, world_size, timeout_seconds):
+        captured.update(rank=rank, world_size=world_size)
+        return object()
+
+    monkeypatch.setattr(
+        "awex.publication.verl_nccl._create_nccl_process_group",
+        _create_process_group,
+    )
+    monkeypatch.setattr(
+        "awex.publication.verl_nccl._broadcast", lambda *args, **kwargs: _Work()
+    )
+    monkeypatch.setattr(device_util, "get_torch_device", lambda: torch.device("cpu"))
+    receiver = VerlNcclBroadcastReceiver(
+        {
+            "store_host": "127.0.0.1",
+            "store_port": 1234,
+            "world_size": 9,
+            "group_id": "test",
+            "bucket_size": 8,
+            "timeout_seconds": 1,
+            "rank_offset": 4,
+        },
+        worker_rank=2,
+    )
+
+    assert receiver.initialize() == {"publication_rank": 7}
+    assert captured == {"rank": 7, "world_size": 9}
