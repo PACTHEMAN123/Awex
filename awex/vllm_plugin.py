@@ -24,6 +24,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from awex.config import InferenceConfig
+from awex.publication.vllm_adapter import PublicationVLLMServerAdapter
 from awex.vllm_awex_adapter import AwexVLLMServerAdapter
 
 logger = logging.getLogger(__name__)
@@ -135,6 +136,15 @@ class AwexUpdateRequest(OpenAIBaseModel):
     kwargs: dict[str, Any] | None = None
 
 
+class PublicationInitRequest(OpenAIBaseModel):
+    mechanism: str
+    config: dict[str, Any]
+
+
+class PublicationUpdateRequest(OpenAIBaseModel):
+    step_id: int
+
+
 def _to_json_response(success: bool, message: str):
     content = {"success": success, "message": message}
     status_code = 200 if success else 400
@@ -168,6 +178,15 @@ def _get_awex_adapter(raw_request):
     adapter = getattr(raw_request.app.state, "awex_adapter", None)
     if adapter is None:
         raise RuntimeError("Awex adapter not initialized. Call /areal_awex_init first.")
+    return adapter
+
+
+def _get_publication_adapter(raw_request):
+    adapter = getattr(raw_request.app.state, "publication_adapter", None)
+    if adapter is None:
+        raise RuntimeError(
+            "Publication adapter not initialized. Call /publication_init first."
+        )
     return adapter
 
 
@@ -354,10 +373,44 @@ def _patch_awex_worker() -> None:
         result = target(**task_kwargs)
         return _sanitize_for_ipc(result)
 
+    def publication_init(self, mechanism: str, config: dict):
+        from awex.publication.registry import create_vllm_publication_receiver
+
+        current = getattr(self, "_publication_receiver", None)
+        if current is not None:
+            current.close()
+        rank_info = _awex_rank_info(self, None)
+        receiver = create_vllm_publication_receiver(
+            mechanism,
+            config,
+            worker_rank=int(rank_info["global_rank"]),
+        )
+        self._publication_receiver = receiver
+        return _sanitize_for_ipc(receiver.initialize())
+
+    def publication_update(self, step_id: int):
+        receiver = getattr(self, "_publication_receiver", None)
+        if receiver is None:
+            raise RuntimeError("Publication receiver is not initialized")
+        result = receiver.update(self.model_runner.model, step_id)
+        return _sanitize_for_ipc(result)
+
+    def publication_close(self):
+        receiver = getattr(self, "_publication_receiver", None)
+        if receiver is None:
+            return {"closed": True}
+        try:
+            return _sanitize_for_ipc(receiver.close())
+        finally:
+            self._publication_receiver = None
+
     WorkerBase.awex_get_model_context = awex_get_model_context
     WorkerBase.awex_execute = awex_execute
     WorkerBase.awex_update_weights_from_disk = awex_update_weights_from_disk
     WorkerBase.flush_cache = flush_cache
+    WorkerBase.publication_init = publication_init
+    WorkerBase.publication_update = publication_update
+    WorkerBase.publication_close = publication_close
 
     def _make_awex_worker_method(task_module: str, task_qualname: str):
         method_name = task_qualname.split(".")[-1]
@@ -499,6 +552,73 @@ def register_awex_plugin() -> None:
         except Exception as exc:
             logger.exception("Awex update failed")
             return _to_json_error(f"Awex update failed: {exc}")
+
+    @router.post("/publication_init")
+    async def publication_init(request: PublicationInitRequest, raw_request: Request):
+        try:
+            logger.info(
+                "API server starts publication_init, mechanism=%s",
+                request.mechanism,
+            )
+            timeout_seconds = int(request.config.get("timeout_seconds", 1800))
+            adapter = PublicationVLLMServerAdapter(
+                raw_request.app.state.engine_client,
+                loop=asyncio.get_running_loop(),
+                timeout_seconds=timeout_seconds,
+            )
+            results = await asyncio.to_thread(
+                adapter.initialize, request.mechanism, request.config
+            )
+            raw_request.app.state.publication_adapter = adapter
+            return JSONResponse(
+                {
+                    "success": True,
+                    "message": "Publication initialized",
+                    "results": _sanitize_for_ipc(results),
+                }
+            )
+        except Exception as exc:
+            logger.exception("Publication init failed")
+            return _to_json_error(f"Publication init failed: {exc}")
+
+    @router.post("/publication_update")
+    async def publication_update(
+        request: PublicationUpdateRequest, raw_request: Request
+    ):
+        try:
+            logger.info(
+                "API server starts publication_update, step_id=%s",
+                request.step_id,
+            )
+            adapter = _get_publication_adapter(raw_request)
+            results = await asyncio.to_thread(adapter.update, request.step_id)
+            return JSONResponse(
+                {
+                    "success": True,
+                    "message": "Publication update done",
+                    "results": _sanitize_for_ipc(results),
+                }
+            )
+        except Exception as exc:
+            logger.exception("Publication update failed")
+            return _to_json_error(f"Publication update failed: {exc}")
+
+    @router.post("/publication_close")
+    async def publication_close(raw_request: Request):
+        try:
+            adapter = _get_publication_adapter(raw_request)
+            results = await asyncio.to_thread(adapter.close)
+            raw_request.app.state.publication_adapter = None
+            return JSONResponse(
+                {
+                    "success": True,
+                    "message": "Publication closed",
+                    "results": _sanitize_for_ipc(results),
+                }
+            )
+        except Exception as exc:
+            logger.exception("Publication close failed")
+            return _to_json_error(f"Publication close failed: {exc}")
 
 
 def register_awex_routes() -> None:
