@@ -87,7 +87,7 @@ fi
 : "${NODE_RANK:?set NODE_RANK to 0 or 1}"
 : "${TRAIN_DRIVER_HOST:?set TRAIN_DRIVER_HOST to training node-rank 0 container IP}"
 
-exec torchrun \
+exec python -m torch.distributed.run \
   --nnodes=2 \
   --nproc-per-node=8 \
   --node-rank="$NODE_RANK" \

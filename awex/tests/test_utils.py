@@ -464,6 +464,12 @@ def initialize_megatron_and_load_checkpoint(dcp_dir, hf_config, hf_model_dir):
         hf_config, "num_key_value_heads", hf_config.num_attention_heads
     )
     rope_theta = int(getattr(hf_config, "rope_theta", 10000))
+    try:
+        import transformer_engine.pytorch  # noqa: F401
+    except (AttributeError, ImportError, OSError):
+        transformer_impl = "local"
+    else:
+        transformer_impl = "transformer_engine"
 
     config_dict = {
         "num_layers": hf_config.num_hidden_layers,
@@ -495,7 +501,7 @@ def initialize_megatron_and_load_checkpoint(dcp_dir, hf_config, hf_model_dir):
         "load": dcp_dir,
         "no_load_optim": True,
         "no_load_rng": True,
-        "transformer_impl": "transformer_engine",  # Use TE which supports RMSNorm
+        "transformer_impl": transformer_impl,
         "num_experts": 0,
         "rotary_seq_len_interpolation_factor": 1.0,
         "padded_vocab_size": hf_config.vocab_size,
