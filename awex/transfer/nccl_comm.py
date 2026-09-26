@@ -561,7 +561,12 @@ def _group_homogeneous_p2p_ops_by_ring_stage(
     return staged_ops
 
 
-def _run_ring_staged_grouped_ops(ops: Sequence[dist.P2POp]) -> bool:
+def _run_ring_staged_grouped_ops(
+    ops: Sequence[dist.P2POp],
+    *,
+    rank: Optional[int] = None,
+    world_size: Optional[int] = None,
+) -> bool:
     """Run a homogeneous P2P batch one peer at a time.
 
     Returns ``False`` for mixed-direction batches, which require the legacy
@@ -572,8 +577,10 @@ def _run_ring_staged_grouped_ops(ops: Sequence[dist.P2POp]) -> bool:
         return True
 
     group = ops[0].group
-    rank = dist.get_rank(group=group)
-    world_size = dist.get_world_size(group=group)
+    if rank is None:
+        rank = dist.get_rank(group=group)
+    if world_size is None:
+        world_size = dist.get_world_size(group=group)
     staged_ops = _group_homogeneous_p2p_ops_by_ring_stage(
         ops, rank=rank, world_size=world_size
     )
@@ -638,6 +645,8 @@ def batch_send_recv(
     blocking: bool = True,
     use_group: bool = True,
     use_stream: bool = True,
+    rank: Optional[int] = None,
+    world_size: Optional[int] = None,
 ):
     """Execute send and recv P2P operations with optional grouping.
 
@@ -672,7 +681,9 @@ def batch_send_recv(
             # The separate train/inference path is one-way on every rank, so
             # use globally matched ring stages and cap in-flight work at one
             # peer. Mixed-direction colocate batches retain the legacy path.
-            if _run_ring_staged_grouped_ops(all_ops):
+            if _run_ring_staged_grouped_ops(
+                all_ops, rank=rank, world_size=world_size
+            ):
                 return []
         works = dist.batch_isend_irecv(all_ops)
         if not blocking:

@@ -450,7 +450,12 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
             transfer_start = time.perf_counter()
             if self.use_batch_send_recv:
                 batch_send_recv(
-                    send_ops=[], recv_ops=p2p_op_list, blocking=True, use_group=True
+                    send_ops=[],
+                    recv_ops=p2p_op_list,
+                    blocking=True,
+                    use_group=True,
+                    rank=self.transfer_rank,
+                    world_size=self.transfer_world_size,
                 )
             else:
                 self._send_recv_one_by_one(p2p_op_list, recv_traj_list)
