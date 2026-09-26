@@ -21,8 +21,37 @@ import torch
 
 from awex import logging
 from awex.converter.sglang_converter import SGlangToHFWeightConverter
+from awex.sharding.param_sharding import ShardingStrategy
 
 logger = logging.getLogger(__name__)
+
+
+class Qwen3ShardingStrategy(ShardingStrategy):
+    """Represent replicated GQA KV heads as logical TP replicas."""
+
+    def __init__(self, *args, hf_config=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        if isinstance(hf_config, dict):
+            num_kv_heads = hf_config.get("num_key_value_heads")
+        else:
+            num_kv_heads = getattr(hf_config, "num_key_value_heads", None)
+        self.num_kv_heads = int(num_kv_heads) if num_kv_heads else None
+
+    def get_sharding_strategy(self, parameter_name, **kwargs):
+        sharding_type, sharding_dim, num_shards = super().get_sharding_strategy(
+            parameter_name, **kwargs
+        )
+        is_kv_projection = ".self_attn.k_proj." in parameter_name or (
+            ".self_attn.v_proj." in parameter_name
+        )
+        if (
+            self.engine_name in {"sglang", "vllm"}
+            and is_kv_projection
+            and self.num_kv_heads
+            and num_shards > self.num_kv_heads
+        ):
+            return sharding_type, sharding_dim, self.num_kv_heads
+        return sharding_type, sharding_dim, num_shards
 
 
 class SGlangToHFWeightConverterQwen3Moe(SGlangToHFWeightConverter):
@@ -167,6 +196,7 @@ def _build_mcore_converter_qwen3_moe():
 
 CONFIG = {
     "model_name": "Qwen3MoeForCausalLM",
+    "sharding_strategy": Qwen3ShardingStrategy,
     "mcore_converter": _build_mcore_converter_qwen3_moe,
     "sglang_converter": SGlangToHFWeightConverterQwen3Moe,
     "vllm_converter": SGlangToHFWeightConverterQwen3Moe,

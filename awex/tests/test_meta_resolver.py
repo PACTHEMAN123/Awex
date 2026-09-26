@@ -645,6 +645,59 @@ def test_dp_tp_sharding_offsets():
     assert replica1_tp_ranks == {0, 1}
 
 
+def test_tp_sharding_groups_replicated_physical_ranks():
+    class _ReplicatedTPResolver(ParamMetaResolver):
+        def __init__(self):
+            config = MagicMock()
+            config.num_hidden_layers = 1
+            super().__init__(config)
+
+        def get_model_arch_name(self):
+            return "TestModel"
+
+        def get_parameters_meta(self):
+            return self._build_params_meta()
+
+        def _get_params_raw_meta(self):
+            return [
+                {
+                    "rank_info": make_rank_info(
+                        tp_rank=rank,
+                        tp_size=4,
+                        world_size=4,
+                        global_rank=rank,
+                        local_rank=rank,
+                    ),
+                    "params_meta": [
+                        {
+                            "name": "model.layers.0.self_attn.k_proj.weight",
+                            "numel": 8,
+                            "shape": (2, 4),
+                            "dtype": torch.float32,
+                        }
+                    ],
+                }
+                for rank in range(4)
+            ]
+
+        def _get_sharding_info(self, name, rank_info, param_meta):
+            return ShardingType.TP_SHARDING, 0, 2
+
+    param = _ReplicatedTPResolver().get_parameters_meta()[0]
+
+    assert param.global_shape == (4, 4)
+    assert param.global_numel == 16
+    assert len(param.replicas) == 2
+    assert [[shard.tp_rank for shard in replica.shards] for replica in param.replicas] == [
+        [0, 2],
+        [1, 3],
+    ]
+    assert [
+        [tuple(shard.global_offset) for shard in replica.shards]
+        for replica in param.replicas
+    ] == [[(0, 0), (2, 0)], [(0, 0), (2, 0)]]
+
+
 def test_build_params_meta_cp_fields_use_defaults():
     class _DummyResolver(ParamMetaResolver):
         def __init__(self):

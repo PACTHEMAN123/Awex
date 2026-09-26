@@ -175,16 +175,29 @@ class ParamMetaResolver(ABC):
                     f"Inconsistent number of replicas across {rank_key}s for param {name}: {replica_counts}"
                 )
 
-                num_replicas = replica_counts[0]
+                rank_keys = sorted(rank_to_shards.keys())
+                if len(rank_keys) % num_shards != 0:
+                    raise ValueError(
+                        f"Physical {rank_key} count ({len(rank_keys)}) must be "
+                        f"divisible by logical shard count ({num_shards}) for {name}"
+                    )
+                shard_replication = len(rank_keys) // num_shards
+                num_replicas = replica_counts[0] * shard_replication
                 replica_groups = []
                 for replica_idx in range(num_replicas):
+                    base_replica_idx = replica_idx // shard_replication
+                    shard_replica_idx = replica_idx % shard_replication
                     replica = []
-                    for rk in sorted(rank_to_shards.keys()):
+                    for logical_shard_idx in range(num_shards):
+                        rk = rank_keys[
+                            logical_shard_idx * shard_replication
+                            + shard_replica_idx
+                        ]
                         shard_list = rank_to_shards[rk]
-                        assert replica_idx < len(shard_list), (
-                            f"{replica_idx} {len(shard_list)}"
+                        assert base_replica_idx < len(shard_list), (
+                            f"{base_replica_idx} {len(shard_list)}"
                         )
-                        replica.append(shard_list[replica_idx])
+                        replica.append(shard_list[base_replica_idx])
                     replica.sort(key=lambda x: x.tp_rank)
                     replica_groups.append(replica)
                 replicas[name] = replica_groups

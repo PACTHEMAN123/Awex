@@ -100,6 +100,7 @@ class InferParamMetaResolver(ParamMetaResolver):
             self._model_arch_name,
             self.infer_engine_config,
             self.rank0_info,
+            hf_config=self.hf_config,
         )
         self._params_meta = self._build_params_meta()
         if self._inference_engine.config.enable_debug_mode:

@@ -29,8 +29,14 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from awex.models.qwen3_moe import CONFIG, SGlangToHFWeightConverterQwen3Moe
+from awex.models.qwen3_moe import (
+    CONFIG,
+    Qwen3ShardingStrategy,
+    SGlangToHFWeightConverterQwen3Moe,
+)
 from awex.models.registry import get_infer_weights_converter
+from awex.sharding.param_sharding import ShardingType
+from awex.sharding.rank_info import RankInfo
 from awex.transfer.tensor_layout import StaticTensorLayout
 from awex.util import device as device_util
 
@@ -204,6 +210,47 @@ def test_qkv_split_uses_local_tp_head_counts(
     assert torch.equal(result["model.layers.0.self_attn.q_proj.weight"], q)
     assert torch.equal(result["model.layers.0.self_attn.k_proj.weight"], k)
     assert torch.equal(result["model.layers.0.self_attn.v_proj.weight"], v)
+
+
+def test_kv_sharding_reports_logical_heads_when_tp_replicates():
+    rank_info = RankInfo(
+        tp_rank=0,
+        tp_size=4,
+        pp_rank=0,
+        pp_size=1,
+        dp_size=1,
+        dp_rank=0,
+        ep_rank=0,
+        ep_size=1,
+        ep_tp_rank=0,
+        ep_tp_size=1,
+        attn_tp_rank=0,
+        attn_tp_size=4,
+        attn_dp_rank=0,
+        world_size=4,
+        global_rank=0,
+        local_rank=0,
+        engine_rank=0,
+        is_infer=True,
+    )
+    strategy = Qwen3ShardingStrategy(
+        engine_name="vllm",
+        enable_dp_attention=False,
+        enable_dp_lm_head=False,
+        moe_dense_tp_size=4,
+        tp_size=4,
+        ep_size=1,
+        ep_tp_size=1,
+        rank_info=rank_info,
+        hf_config=_model_config(),
+    )
+
+    assert strategy.get_sharding_strategy(
+        "model.layers.0.self_attn.k_proj.weight"
+    ) == (ShardingType.TP_SHARDING, 0, NUM_KV_HEADS)
+    assert strategy.get_sharding_strategy(
+        "model.layers.0.self_attn.q_proj.weight"
+    ) == (ShardingType.TP_SHARDING, 0, 4)
 
 
 def test_mcore_qkv_device_layout_uses_stable_source_spans():

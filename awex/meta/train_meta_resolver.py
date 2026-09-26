@@ -62,6 +62,7 @@ class McoreParamMetaResolver(ParamMetaResolver):
         self._sharding_strategy = get_mcore_sharding_strategy(
             self._model_arch_name,
             self._rank_info,
+            hf_config=self.hf_config,
         )
         rank = self._rank_info.global_rank
         self._infer_conf = infer_conf

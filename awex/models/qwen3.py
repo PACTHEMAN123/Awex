@@ -31,6 +31,7 @@ from typing import Dict, Tuple
 import torch
 
 from awex.models.qwen3_moe import (
+    Qwen3ShardingStrategy,
     SGlangToHFWeightConverterQwen3Moe,
     _build_mcore_converter_qwen3_moe,
 )
@@ -182,6 +183,7 @@ def _build_mcore_converter_qwen3():
 
 CONFIG = {
     "model_name": "Qwen3ForCausalLM",
+    "sharding_strategy": Qwen3ShardingStrategy,
     "mcore_converter": _build_mcore_converter_qwen3,
     "sglang_converter": SGlangToHFWeightConverterQwen3Moe,
     "vllm_converter": SGlangToHFWeightConverterQwen3Moe,
