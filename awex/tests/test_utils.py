@@ -146,7 +146,8 @@ def get_local_model_dir(model_path: str = "Qwen/Qwen2-1.5B") -> str:
 def megatron_model_from_hf(
     model_path: str = "Qwen/Qwen2-1.5B",
     use_mbridge: bool = True,
-) -> Tuple[list, PretrainedConfig]:
+    return_bridge: bool = False,
+):
     """Convert HF/ModelScope model to DCP format and load into Megatron.
 
     This function:
@@ -155,7 +156,8 @@ def megatron_model_from_hf(
        If use_mbridge=False, it converts HF weights to Megatron DCP format.
     3. Initializes Megatron model with TP=PP=DP=EP=CP=1
     4. Loads the DCP checkpoint into Megatron model (when not using mbridge)
-    5. Returns Megatron model list and HF config
+    5. Returns Megatron model list and HF config. When ``return_bridge`` is
+       true, also returns the mbridge instance used to create the model.
 
     Note:
         The DCP path creates a temporary checkpoint in /tmp/megatron_dcp_<model_name>.
@@ -189,9 +191,21 @@ def megatron_model_from_hf(
 
     if use_mbridge:
         print("\nLoading HF weights into Megatron via mbridge...")
-        model = initialize_megatron_and_load_hf_with_mbridge(hf_config, hf_model_dir)
+        loaded = initialize_megatron_and_load_hf_with_mbridge(
+            hf_config,
+            hf_model_dir,
+            return_bridge=return_bridge,
+        )
+        if return_bridge:
+            model, bridge = loaded
+        else:
+            model = loaded
         if isinstance(model, list):
+            if return_bridge:
+                return model, hf_config, bridge
             return model, hf_config
+        if return_bridge:
+            return [model], hf_config, bridge
         return [model], hf_config
 
     # Create temporary directory for DCP checkpoint
@@ -291,6 +305,8 @@ def megatron_model_from_hf(
     model = initialize_megatron_and_load_checkpoint(dcp_dir, hf_config, hf_model_dir)
 
     # Return as list (Megatron expects a list for virtual pipeline parallelism support)
+    if return_bridge:
+        return [model], hf_config, None
     return [model], hf_config
 
 
@@ -326,7 +342,9 @@ def _ensure_mbridge_custom_fsdp_shim() -> None:
     sys.modules["megatron.core.distributed.custom_fsdp"] = shim
 
 
-def initialize_megatron_and_load_hf_with_mbridge(hf_config, hf_model_dir):
+def initialize_megatron_and_load_hf_with_mbridge(
+    hf_config, hf_model_dir, return_bridge=False
+):
     import torch.distributed as dist
     from megatron.core import parallel_state as mpu
 
@@ -386,6 +404,8 @@ def initialize_megatron_and_load_hf_with_mbridge(hf_config, hf_model_dir):
     model = bridge.get_model()
     bridge.load_weights(model, hf_model_dir)
 
+    if return_bridge:
+        return model, bridge
     return model
 
 
