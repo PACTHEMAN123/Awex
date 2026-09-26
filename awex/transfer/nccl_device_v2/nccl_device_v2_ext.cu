@@ -468,6 +468,22 @@ void initialize_sparse_window(DeviceState* state, const std::vector<std::uint32_
                           state->gin_fifo_depth, state->network_step_bytes, state->gin.context_count,
                           active_peers, state->peer_transports, std::move(peer_payload_bytes),
                           &state->peer_channels);
+      const auto peer_channel_matrix = v2::topology_detail::allGather(
+        state->comm, state->peer_channels.data(), state->peer_channels.size(), state->world_size, stream);
+      state->gin.channels_per_peer = 1;
+      for (const std::uint32_t peer : active_peers) {
+        if (state->peer_transports[peer] != static_cast<std::uint8_t>(v2::V2Transport::kGin)) continue;
+        const std::uint32_t local_channels =
+          peer_channel_matrix[static_cast<std::size_t>(state->rank) * state->world_size + peer];
+        const std::uint32_t remote_channels =
+          peer_channel_matrix[static_cast<std::size_t>(peer) * state->world_size + state->rank];
+        const std::uint32_t pair_channels = std::min(local_channels, remote_channels);
+        if (pair_channels == 0) {
+          throw std::runtime_error("nccl_device_v2 GIN peers negotiated zero channels");
+        }
+        state->peer_channels[peer] = pair_channels;
+        state->gin.channels_per_peer = std::max(state->gin.channels_per_peer, pair_channels);
+      }
     }
     state->window_active_peers = active_peers;
     state->window_initialized = true;
