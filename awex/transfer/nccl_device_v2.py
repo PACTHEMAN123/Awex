@@ -33,9 +33,14 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-
-class NCCLDeviceV2UnavailableError(RuntimeError):
-    """Raised when the isolated NCCL Device v2 path cannot be initialized."""
+from awex.transfer.nccl_device_v2_gin import (
+    NCCLDeviceV2UnavailableError,
+    _configure_gin_hca_policy,
+    _gin_chunk_bytes,
+    _resolve_gin_connections,
+    _resolve_gin_fifo_depth,
+    _resolve_gin_reliable_doorbell,
+)
 
 
 def _preload_configured_nccl() -> None:
@@ -59,6 +64,7 @@ def _preload_configured_nccl() -> None:
             return
 
 
+_configure_gin_hca_policy()
 _preload_configured_nccl()
 
 import torch  # noqa: E402
@@ -166,6 +172,29 @@ def _resolve_chunk_bytes(chunk_bytes: int | None) -> int:
             "nccl_device_v2 chunk_bytes must be a multiple of 16"
         )
     return chunk_bytes
+
+
+def _resolve_network_step_bytes(network_step_bytes: int | None) -> int:
+    if network_step_bytes is None:
+        configured = os.environ.get("AWEX_NCCL_DEVICE_V2_NET_STEP_BYTES")
+        if configured is None:
+            configured = os.environ.get("NCCL_P2P_NET_CHUNKSIZE")
+        try:
+            network_step_bytes = 128 * 1024 if configured is None else int(configured)
+        except ValueError as exc:
+            raise NCCLDeviceV2UnavailableError(
+                "AWEX_NCCL_DEVICE_V2_NET_STEP_BYTES must be an integer"
+            ) from exc
+    network_step_bytes = int(network_step_bytes)
+    if network_step_bytes <= 0:
+        raise NCCLDeviceV2UnavailableError(
+            "nccl_device_v2 network_step_bytes must be positive"
+        )
+    if network_step_bytes % 16 != 0:
+        raise NCCLDeviceV2UnavailableError(
+            "nccl_device_v2 network_step_bytes must be a multiple of 16"
+        )
+    return network_step_bytes
 
 
 def _sequence_from_step(step_id: int) -> int:
@@ -517,7 +546,13 @@ def _load_extension() -> Any:
                 name="awex_nccl_device_ext_v2",
                 sources=[source, kernel_source],
                 extra_include_paths=include_paths,
-                extra_cuda_cflags=["-O3"],
+                extra_cuda_cflags=[
+                    "-O3",
+                    "-DNCCL_OS_LINUX",
+                    "--expt-extended-lambda",
+                    "--expt-relaxed-constexpr",
+                    "-Xptxas=-maxrregcount=96",
+                ],
                 extra_ldflags=[
                     *(f"-L{path}" for path in library_paths),
                     *(
@@ -550,6 +585,9 @@ class NCCLDeviceV2Transport:
         chunk_bytes: int | None = None,
         infer_instance_world_size: int = 0,
         num_infer_engines: int = 1,
+        network_step_bytes: int | None = None,
+        gin_connections: int | None = None,
+        gin_reliable_doorbell: int | None = None,
     ):
         if world_size < 2 or world_size > 256:
             raise NCCLDeviceV2UnavailableError(
@@ -567,13 +605,29 @@ class NCCLDeviceV2Transport:
             raise NCCLDeviceV2UnavailableError(
                 "nccl_device_v2 max_channels must be at most 64"
             )
+        # Preserve main's LSA protocol. Remote peers use independent GIN
+        # settings below and cannot retune local FIFO/chunk behavior.
         self.fifo_depth = 8
         self.step_bytes = _env_int(
             "AWEX_NCCL_DEVICE_V2_STEP_BYTES", 512 * 1024, minimum=1
         )
+        self.network_step_bytes = _resolve_network_step_bytes(network_step_bytes)
+        self.gin_fifo_depth = _resolve_gin_fifo_depth()
+        self.gin_chunk_bytes = _gin_chunk_bytes(self.network_step_bytes)
+        self.gin_connections = _resolve_gin_connections(gin_connections)
+        # NCCL 2.30.4 needs one explicit context per requested connection.
+        self.gin_context_count = self.gin_connections or 1
+        self.gin_reliable_doorbell = _resolve_gin_reliable_doorbell(
+            gin_reliable_doorbell
+        )
+        if self.gin_connections:
+            os.environ["NCCL_GIN_NCONNECTIONS"] = str(self.gin_connections)
+        else:
+            os.environ.pop("NCCL_GIN_NCONNECTIONS", None)
+        os.environ["NCCL_GIN_GDAKI_USE_RELIABLE_DB"] = str(self.gin_reliable_doorbell)
         if self.chunk_bytes and self.chunk_bytes < self.step_bytes:
             raise NCCLDeviceV2UnavailableError(
-                "nccl_device_v2 chunk_bytes must be at least step_bytes"
+                "nccl_device_v2 chunk_bytes must be at least the LSA step_bytes"
             )
         self.infer_instance_world_size = int(infer_instance_world_size)
         self.num_infer_engines = int(num_infer_engines)
@@ -585,12 +639,23 @@ class NCCLDeviceV2Transport:
         self._prepared_recv = None
         logger.info(
             "Configured nccl_device_v2 rank=%s chunk_bytes=%s max_channels=%s "
-            "fifo_depth=%s step_bytes=%s",
+            "fifo_depth=%s step_bytes=%s gin_fifo_depth=%s "
+            "network_step_bytes=%s gin_chunk_bytes=%s "
+            "gin_connections=%s gin_context_count=%s "
+            "gin_reliable_doorbell=%s hca_policy=%s selected_hca=%s",
             self.rank,
             self.chunk_bytes,
             self.max_channels,
             self.fifo_depth,
             self.step_bytes,
+            self.gin_fifo_depth,
+            self.network_step_bytes,
+            self.gin_chunk_bytes,
+            self.gin_connections,
+            self.gin_context_count,
+            self.gin_reliable_doorbell,
+            os.environ.get("AWEX_NCCL_DEVICE_V2_HCA_POLICY", "balanced"),
+            os.environ.get("NCCL_IB_HCA", "topology"),
         )
 
     def _ensure_initialized(self) -> float:
@@ -623,17 +688,29 @@ class NCCLDeviceV2Transport:
                 self.fifo_depth,
                 self.step_bytes,
                 self.chunk_bytes,
+                self.gin_fifo_depth,
+                self.network_step_bytes,
+                self.gin_chunk_bytes,
+                self.gin_context_count,
             )
         )
         self._initialized = True
         logger.info(
             "Initialized nccl_device_v2 rank=%s world_size=%s window_config="
-            "channels:%s fifo:%s step_bytes:%s",
+            "channels:%s lsa_fifo:%s lsa_step_bytes:%s gin_fifo:%s "
+            "network_step_bytes:%s "
+            "gin_connections:%s gin_context_count:%s "
+            "gin_reliable_doorbell:%s",
             self.rank,
             self.world_size,
             self.max_channels,
             self.fifo_depth,
             self.step_bytes,
+            self.gin_fifo_depth,
+            self.network_step_bytes,
+            self.gin_connections,
+            self.gin_context_count,
+            self.gin_reliable_doorbell,
         )
         return (time.perf_counter() - start_time) * 1000.0
 
@@ -668,6 +745,17 @@ class NCCLDeviceV2Transport:
                 int(sequence),
             )
         )
+        extension_metrics["hca_policy"] = os.environ.get(
+            "AWEX_NCCL_DEVICE_V2_HCA_POLICY", "balanced"
+        )
+        extension_metrics["selected_hca"] = os.environ.get("NCCL_IB_HCA", "topology")
+        selected_hca_bandwidth = os.environ.get(
+            "AWEX_NCCL_DEVICE_V2_SELECTED_HCA_BANDWIDTH_GBPS"
+        )
+        if selected_hca_bandwidth is not None:
+            extension_metrics["selected_hca_bandwidth_gbps"] = float(
+                selected_hca_bandwidth
+            )
         copyback_start = time.perf_counter()
         if batch.copybacks:
             with torch.no_grad():
@@ -681,6 +769,7 @@ class NCCLDeviceV2Transport:
                 "transport_init_time_ms": init_time_ms,
                 "python_copyback_time_ms": copyback_time_ms,
                 "transport_total_time_ms": (time.perf_counter() - run_start) * 1000.0,
+                "gin_reliable_doorbell_mode": self.gin_reliable_doorbell,
             }
         )
         extension_metrics["reader_copyback_total_time_ms"] = (

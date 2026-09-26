@@ -17,7 +17,7 @@
 
 #pragma once
 
-#include "device_v2_primitives.cuh"
+#include "device_v2_gin.cuh"
 
 namespace awex {
 namespace nccl_device_v2 {
@@ -49,15 +49,16 @@ __device__ __forceinline__ void v2RunSend(const V2KernelArgs& args, const V2Work
   std::uint64_t step = work.step_begin;
   while (cursor < work.nbytes) {
     const std::uint64_t slice_bytes =
-      args.layout.slot_bytes < work.nbytes - cursor ? args.layout.slot_bytes : work.nbytes - cursor;
-    V2FifoSlot* slot = v2FifoSlot(args, args.local_rank, work.peer, channel, step, true);
+      work.step_bytes < work.nbytes - cursor ? work.step_bytes : work.nbytes - cursor;
+    V2FifoSlot* slot = v2FifoSlot(args, args.local_rank, work.peer, channel, step, work.fifo_depth, true);
     if (roles & kRoleWaitSend) {
-      *ready = v2WaitFree(slot, step, args.layout.fifo_depth, step_cache, error, args.timeout_cycles);
+      *ready = v2WaitFree(slot, step, work.fifo_depth, step_cache, error, args.timeout_cycles);
     }
     if (roles & kRoleWorker) {
       v2GroupBarrier(wait_barrier, nworkers);
       if (*ready) {
-        std::uint8_t* payload = v2FifoPayload(args, args.local_rank, work.peer, channel, step, true);
+        std::uint8_t* payload =
+          v2FifoPayload(args, args.local_rank, work.peer, channel, step, work.fifo_depth, true);
         v2CopyFragmentsToContiguous(args, work, payload, cursor, slice_bytes, tid, nworkers);
       }
     }
@@ -75,7 +76,8 @@ __device__ __forceinline__ void v2RunSend(const V2KernelArgs& args, const V2Work
   }
 
   if (work.final && work.nbytes != 0) {
-    V2FifoSlot* slot = v2FifoSlot(args, args.local_rank, work.peer, channel, step - 1, true);
+    V2FifoSlot* slot =
+      v2FifoSlot(args, args.local_rank, work.peer, channel, step - 1, work.fifo_depth, true);
     if (roles & kRoleWaitSend) {
       *ready = v2WaitConsumed(slot, step - 1, step_cache, error, args.timeout_cycles);
     }
@@ -93,14 +95,15 @@ __device__ __forceinline__ void v2RunRecv(const V2KernelArgs& args, const V2Work
   std::uint64_t step = work.step_begin;
   while (cursor < work.nbytes) {
     const std::uint64_t slice_bytes =
-      args.layout.slot_bytes < work.nbytes - cursor ? args.layout.slot_bytes : work.nbytes - cursor;
-    V2FifoSlot* slot = v2FifoSlot(args, work.peer, args.local_rank, channel, step, false);
+      work.step_bytes < work.nbytes - cursor ? work.step_bytes : work.nbytes - cursor;
+    V2FifoSlot* slot = v2FifoSlot(args, work.peer, args.local_rank, channel, step, work.fifo_depth, false);
     if (roles & kRoleWaitRecv) {
       *ready = v2WaitReady(&slot->ready_step, step, step_cache, error, args.timeout_cycles);
     }
     v2GroupBarrier(barrier, nthreads);
     if (*ready && (roles & kRoleWorker)) {
-      const std::uint8_t* payload = v2FifoPayload(args, work.peer, args.local_rank, channel, step, false);
+      const std::uint8_t* payload =
+        v2FifoPayload(args, work.peer, args.local_rank, channel, step, work.fifo_depth, false);
       v2CopyContiguousToFragments(args, work, payload, cursor, slice_bytes, tid, nworkers);
     }
 
@@ -134,7 +137,22 @@ __device__ __forceinline__ void v2RunBatch(const V2KernelArgs& args, const V2Wor
     v2GroupBarrier(main_barrier, subthreads);
 
     const V2Work& work = args.works[batch.work_begin + group];
-    if (args.direction == V2Direction::kSend) {
+    const bool use_gin = args.peer_transports[work.peer] == static_cast<std::uint8_t>(V2Transport::kGin);
+    if (use_gin) {
+#if AWEX_NCCL_DEVICE_V2_HAS_GIN
+      if (args.direction == V2Direction::kSend) {
+        v2GinRunSend(args, work, channel, subtid, subthreads, main_barrier, wait_barrier, &shared.ready[group]);
+      } else {
+        v2GinRunRecv(args, work, channel, subtid, subthreads, main_barrier, &shared.ready[group]);
+      }
+#else
+      if (subtid == 0) {
+        auto* error = &reinterpret_cast<V2WindowHeader*>(args.local_window)->error;
+        atomicCAS(error, 0U, 5U);
+      }
+      v2GroupBarrier(main_barrier, subthreads);
+#endif
+    } else if (args.direction == V2Direction::kSend) {
       v2RunSend(args, work, channel, subtid, subthreads, main_barrier, wait_barrier, &shared.ready[group],
                 &shared.step_cache[group]);
     } else {
@@ -154,6 +172,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 1) device_v2_kernel(V2Kernel
     peers_ready = 1;
     for (std::uint32_t index = 0; index < args.active_peer_count && peers_ready; ++index) {
       const std::uint32_t peer = args.active_peers[index];
+      if (args.peer_transports[peer] == static_cast<std::uint8_t>(V2Transport::kGin)) continue;
       auto* remote_header = reinterpret_cast<V2WindowHeader*>(args.peer_windows[peer]);
       unsigned long long cache = 0;
       peers_ready = v2WaitReady(&remote_header->epoch, args.epoch, &cache, &local_header->error,
@@ -169,6 +188,12 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 1) device_v2_kernel(V2Kernel
   for (std::uint32_t index = 0; index < queue.batch_count; ++index) {
     v2RunBatch(args, args.batches[queue.first_batch + index], channel);
   }
+#if AWEX_NCCL_DEVICE_V2_HAS_GIN
+  if (args.gin_enabled != 0) {
+    ncclGin gin{args.dev_comm, static_cast<int>(channel % args.dev_comm.ginContextCount)};
+    gin.flush(ncclCoopCta());
+  }
+#endif
 }
 
 }  // namespace nccl_device_v2

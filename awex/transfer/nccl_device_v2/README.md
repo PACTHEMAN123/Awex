@@ -47,6 +47,25 @@ system fence followed by a relaxed system store, avoiding system-scope RMWs on
 the normal control path. Eight 512 KiB FIFO steps provide 4 MiB of in-flight
 payload per channel-peer connection.
 
+Peers outside the communicator's LSA team use NCCL GIN puts while local peers
+retain the original NVLink read path. LSA keeps its existing FIFO depth 8,
+512 KiB step, 4 MiB chunk, and channel placement. GIN uses independent network
+step, FIFO, chunk, and channel settings, so enabling cross-node transfers cannot
+retune the local protocol.
+
+Before NCCL initialization, the default HCA policy discovers active RDMA ports,
+reads their link rates from sysfs, and combines them with `nvidia-smi topo -m`
+GPU-to-NIC distances. It keeps ranks on local NUMA rails where possible and
+balances rank payload across equal-affinity ports by capacity. An explicit
+`NCCL_IB_HCA` selection takes precedence; setting
+`AWEX_NCCL_DEVICE_V2_HCA_POLICY=topology` leaves selection to NCCL.
+
+GIN is initialized only when the fixed plan contains a non-LSA peer. The path
+requires Linux and NCCL 2.30.4 or newer with GIN-capable Device API headers.
+RDMA discovery and host configuration live in `nccl_device_v2_gin.py`; device
+communicator setup lives in `device_v2_gin_config.h`, and the CUDA protocol is
+implemented in `device_v2_gin.cuh`.
+
 The Python transport entry point lives next to this directory in
 `awex/transfer/nccl_device_v2.py`. It has its own task binding and extension
 loader; the existing v1 transport is not used as a compatibility layer. The

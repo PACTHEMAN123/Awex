@@ -37,8 +37,13 @@ struct V2LoweringConfig {
   std::uint32_t fifo_depth = kDefaultFifoDepth;
   std::size_t chunk_bytes = kDefaultChunkBytes;
   std::size_t step_bytes = kDefaultStepBytes;
+  std::uint32_t gin_fifo_depth = kDefaultFifoDepth;
+  std::size_t gin_chunk_bytes = kDefaultChunkBytes;
+  std::size_t network_step_bytes = kDefaultNetworkStepBytes;
   // Topology-derived upper bound for each peer, indexed by rank.
   std::vector<std::uint32_t> peer_channels;
+  // Transport selection for each peer, indexed by rank.
+  std::vector<std::uint8_t> peer_transports;
   // Indexed by peer * total_channels + channel.
   std::vector<std::uint64_t> initial_steps;
 };
@@ -112,13 +117,15 @@ inline std::pair<std::uint64_t, std::uint64_t> v2PartBounds(std::uint32_t parts,
 }
 
 inline std::uint32_t v2ChannelsForBytes(std::uint64_t bytes, std::uint32_t min_channels, std::uint32_t max_channels,
-                                        std::size_t step_bytes) {
+                                        std::size_t step_bytes, bool network) {
   if (bytes == 0) return 1;
 
-  // Mirrors NCCL addP2pToPlan for an intra-node SIMPLE P2P operation. The
-  // min/max inputs are supplied by the topology layer, not constants.
-  const std::uint64_t min_part_bytes = std::max<std::uint64_t>(1, step_bytes / 8);
-  const std::uint64_t max_part_bytes = static_cast<std::uint64_t>(step_bytes) * 32;
+  // Match NCCL addP2pToPlan: network P2P uses a much tighter part range than
+  // intra-node SIMPLE traffic so large messages spread across available rails.
+  const std::uint64_t min_part_bytes =
+    std::max<std::uint64_t>(1, network ? step_bytes / 2 : step_bytes / 8);
+  const std::uint64_t max_part_bytes =
+    network ? step_bytes : static_cast<std::uint64_t>(step_bytes) * 32;
   const std::uint64_t initial_channels = std::min<std::uint64_t>(min_channels, v2DivUp(bytes, min_part_bytes));
   std::uint32_t channels = std::max<std::uint32_t>(1, static_cast<std::uint32_t>(initial_channels));
   std::uint64_t part_bytes = std::max<std::uint64_t>(min_part_bytes, v2DivUp(bytes, channels));
@@ -127,6 +134,14 @@ inline std::uint32_t v2ChannelsForBytes(std::uint64_t bytes, std::uint32_t min_c
     part_bytes = v2DivUp(bytes, channels);
   }
   return channels;
+}
+
+inline std::size_t v2TransferStepBytes(std::uint64_t bytes, std::size_t step_bytes, bool network) {
+  if (!network) return step_bytes;
+  // Match NCCL's SIMPLE network chunk tuning after channel selection.
+  if (bytes < step_bytes) return std::max<std::size_t>(1, step_bytes / 4);
+  if (bytes < 8 * step_bytes) return std::max<std::size_t>(1, step_bytes / 2);
+  return step_bytes;
 }
 
 inline std::uint32_t v2Log2(std::uint32_t value) {
@@ -143,12 +158,22 @@ inline std::uint32_t v2ReverseBits(std::uint64_t value, std::uint32_t bits) {
   return result;
 }
 
-inline std::uint32_t v2ChannelBase(std::uint32_t local_rank, std::uint32_t peer, std::uint32_t world_size,
-                                   std::uint32_t total_channels) {
+inline std::uint32_t v2LsaChannelBase(std::uint32_t local_rank, std::uint32_t peer,
+                                      std::uint32_t world_size, std::uint32_t total_channels) {
   const std::uint32_t low = std::min(local_rank, peer);
   const std::uint32_t high = std::max(local_rank, peer);
   const std::uint64_t pair = static_cast<std::uint64_t>(low) * world_size + high;
   return v2ReverseBits(pair, v2Log2(total_channels));
+}
+
+inline std::uint32_t v2GinChannelBase(std::uint32_t local_rank, std::uint32_t peer,
+                                      std::uint32_t total_channels, std::uint32_t peer_channels) {
+  // This symmetric edge coloring gives consecutive peers disjoint channel
+  // groups until the per-rank channel budget is exhausted. Keeping a peer's
+  // channels contiguous also preserves the context/connection round robin.
+  const std::uint32_t group_count = std::max<std::uint32_t>(1, total_channels / peer_channels);
+  const std::uint32_t group = (local_rank + peer) % group_count;
+  return group * peer_channels;
 }
 
 struct V2StreamSpan {
@@ -197,11 +222,18 @@ inline V2Schedule lowerFixedTasks(const std::vector<V2LoweringTask>& tasks,
   if (config.peer_channels.size() != config.world_size) {
     throw std::invalid_argument("v2 peer channel table does not match world size");
   }
-  if (config.fifo_depth == 0 || config.step_bytes == 0) {
-    throw std::invalid_argument("v2 FIFO depth and step size must be positive");
+  if (config.peer_transports.size() != config.world_size) {
+    throw std::invalid_argument("v2 peer transport table does not match world size");
   }
-  if (config.chunk_bytes != 0 && config.chunk_bytes < config.step_bytes) {
-    throw std::invalid_argument("v2 chunk_bytes must be zero or at least step_bytes");
+  if (config.fifo_depth == 0 || config.gin_fifo_depth == 0 || config.step_bytes == 0 ||
+      config.network_step_bytes == 0 ||
+      config.step_bytes > std::numeric_limits<std::uint32_t>::max() ||
+      config.network_step_bytes > std::numeric_limits<std::uint32_t>::max()) {
+    throw std::invalid_argument("v2 FIFO depth and step sizes must be positive and fit in V2Work");
+  }
+  if ((config.chunk_bytes != 0 && config.chunk_bytes < config.step_bytes) ||
+      (config.gin_chunk_bytes != 0 && config.gin_chunk_bytes < config.network_step_bytes)) {
+    throw std::invalid_argument("v2 transport chunk_bytes must be zero or at least its step_bytes");
   }
 
   const std::size_t step_count = static_cast<std::size_t>(config.world_size) * config.total_channels;
@@ -252,22 +284,31 @@ inline V2Schedule lowerFixedTasks(const std::vector<V2LoweringTask>& tasks,
     }
     if (stream_bytes == 0) continue;
 
+    const bool network =
+      config.peer_transports[peer] == static_cast<std::uint8_t>(V2Transport::kGin);
+    const std::size_t planning_step_bytes = network ? config.network_step_bytes : config.step_bytes;
+    const std::size_t transport_chunk_bytes = network ? config.gin_chunk_bytes : config.chunk_bytes;
+    const std::uint32_t transport_fifo_depth = network ? config.gin_fifo_depth : config.fifo_depth;
+    const std::size_t transfer_step_bytes = v2TransferStepBytes(stream_bytes, planning_step_bytes, network);
     const std::uint32_t max_channels =
       std::max<std::uint32_t>(1, std::min(config.peer_channels[peer], config.total_channels));
     std::uint32_t min_channels = max_channels;
     while (static_cast<std::uint64_t>(min_channels) * config.world_size > config.total_channels && min_channels > 1) {
       min_channels /= 2;
     }
-    const std::uint32_t channel_count = v2ChannelsForBytes(stream_bytes, min_channels, max_channels, config.step_bytes);
+    const std::uint32_t channel_count =
+      v2ChannelsForBytes(stream_bytes, min_channels, max_channels, planning_step_bytes, network);
     schedule.peer_channel_counts[peer] = channel_count;
-    const std::uint32_t channel_base = v2ChannelBase(config.local_rank, peer, config.world_size, config.total_channels);
+    const std::uint32_t channel_base = network
+      ? v2GinChannelBase(config.local_rank, peer, config.total_channels, channel_count)
+      : v2LsaChannelBase(config.local_rank, peer, config.world_size, config.total_channels);
 
     for (std::uint32_t part = 0; part < channel_count; ++part) {
       const auto bounds = v2PartBounds(channel_count, part, stream_bytes);
       if (bounds.first == bounds.second) continue;
       const std::uint32_t channel = (channel_base + part) & (config.total_channels - 1);
       const std::uint64_t part_bytes = bounds.second - bounds.first;
-      const std::uint64_t effective_chunk_bytes = config.chunk_bytes == 0 ? part_bytes : config.chunk_bytes;
+      const std::uint64_t effective_chunk_bytes = transport_chunk_bytes == 0 ? part_bytes : transport_chunk_bytes;
       const std::uint64_t chunk_count = v2DivUp(part_bytes, effective_chunk_bytes);
       if (chunk_count > std::numeric_limits<std::uint32_t>::max()) {
         throw std::invalid_argument("v2 channel part has too many chunks");
@@ -281,11 +322,13 @@ inline V2Schedule lowerFixedTasks(const std::vector<V2LoweringTask>& tasks,
         work.peer = peer;
         work.chunk_ordinal = static_cast<std::uint32_t>(chunk);
         work.chunk_count = static_cast<std::uint32_t>(chunk_count);
+        work.step_bytes = static_cast<std::uint32_t>(transfer_step_bytes);
+        work.fifo_depth = transport_fifo_depth;
         work.stream_offset = chunk_begin;
         work.nbytes = chunk_end - chunk_begin;
         const std::size_t connection = static_cast<std::size_t>(peer) * config.total_channels + channel;
         work.step_begin = schedule.next_steps[connection];
-        schedule.next_steps[connection] += v2DivUp(work.nbytes, config.step_bytes);
+        schedule.next_steps[connection] += v2DivUp(work.nbytes, transfer_step_bytes);
         v2AppendFragments(spans, chunk_begin, chunk_end, &schedule, &work);
         queue.push_back(work);
         ++schedule.chunk_count;

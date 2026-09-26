@@ -337,10 +337,12 @@ inline V2Topology discoverV2Topology(ncclComm_t comm, int world_size, int rank, 
       0,
     };
     const std::vector<TopologyRecord> records = allGather(comm, &local_record, 1, world_size, stream);
+    const ncclTeam_t world_team = ncclTeamWorld(comm);
+    const ncclTeam_t lsa_team = ncclTeamLsa(comm);
 
     std::vector<std::uint8_t> local_path_links(world_size, 0);
     for (int peer = 0; peer < world_size; ++peer) {
-      if (peer == rank) continue;
+      if (peer == rank || !ncclTeamRankIsMember(lsa_team, world_team, peer)) continue;
       std::uint32_t links = 0;
       if (local_links.switch_links != 0 && records[peer].switch_links != 0) {
         links = std::min(local_links.switch_links, records[peer].switch_links);

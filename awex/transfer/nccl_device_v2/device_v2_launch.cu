@@ -21,6 +21,16 @@
 namespace awex {
 namespace nccl_device_v2 {
 
+cudaError_t launchDeviceV2Reset(const V2KernelArgs& args, cudaStream_t stream) {
+  if (args.gin_enabled == 0) return cudaSuccess;
+#if AWEX_NCCL_DEVICE_V2_HAS_GIN
+  v2GinResetSignalsKernel<<<1, 256, 0, stream>>>(args);
+  return cudaGetLastError();
+#else
+  return cudaErrorNotSupported;
+#endif
+}
+
 cudaError_t launchDeviceV2(const V2KernelArgs& args, cudaStream_t stream) {
   if (args.channel_count == 0) {
     return cudaSuccess;
