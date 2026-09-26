@@ -176,19 +176,25 @@ class ParamMetaResolver(ABC):
                 )
 
                 rank_keys = sorted(rank_to_shards.keys())
-                if len(rank_keys) % num_shards != 0:
+                has_shard_replication = len(rank_keys) > num_shards
+                if has_shard_replication and len(rank_keys) % num_shards != 0:
                     raise ValueError(
                         f"Physical {rank_key} count ({len(rank_keys)}) must be "
                         f"divisible by logical shard count ({num_shards}) for {name}"
                     )
-                shard_replication = len(rank_keys) // num_shards
+                logical_num_shards = num_shards if has_shard_replication else len(rank_keys)
+                shard_replication = (
+                    len(rank_keys) // logical_num_shards
+                    if logical_num_shards
+                    else 1
+                )
                 num_replicas = replica_counts[0] * shard_replication
                 replica_groups = []
                 for replica_idx in range(num_replicas):
                     base_replica_idx = replica_idx // shard_replication
                     shard_replica_idx = replica_idx % shard_replication
                     replica = []
-                    for logical_shard_idx in range(num_shards):
+                    for logical_shard_idx in range(logical_num_shards):
                         rk = rank_keys[
                             logical_shard_idx * shard_replication
                             + shard_replica_idx
