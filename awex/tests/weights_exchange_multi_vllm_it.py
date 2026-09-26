@@ -514,7 +514,7 @@ class MultiVLLMWeightsExchangeIT:
 
 
 def main(args):
-    os.environ["NCCL_DEBUG"] = "WARNING"
+    os.environ.setdefault("NCCL_DEBUG", "WARNING")
     if getattr(args, "nccl_device_chunk_mb", None) is not None:
         os.environ["AWEX_NCCL_DEVICE_CHUNK_BYTES"] = str(
             args.nccl_device_chunk_mb * 1024 * 1024
