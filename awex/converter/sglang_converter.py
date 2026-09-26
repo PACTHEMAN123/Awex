@@ -117,26 +117,47 @@ class SGlangToHFWeightConverter:
                 # Keep fused format
                 return [(name, parameter)]
             else:
-                # Split into separate Q, K, V projections. The fused dim0 is
-                # proportional to num_heads : num_kv_heads : num_kv_heads,
-                # which only degenerates to equal thirds for MHA — GQA models
-                # (num_kv_heads < num_heads) need head-count-weighted sizes.
-                # The ratio is TP-invariant since both head counts are divided
-                # by the same TP degree.
                 num_heads = int(self.total_num_heads)
                 num_kv_heads = int(self.total_kv_heads or num_heads)
-                total_units = num_heads + 2 * num_kv_heads
+                tp_size = max(1, int(self.tp_size))
+                if num_heads % tp_size != 0:
+                    raise ValueError(
+                        f"num_heads ({num_heads}) must be divisible by "
+                        f"tp_size ({tp_size})"
+                    )
+                local_num_heads = num_heads // tp_size
+                if tp_size >= num_kv_heads:
+                    if tp_size % num_kv_heads != 0:
+                        raise ValueError(
+                            f"tp_size ({tp_size}) must be divisible by "
+                            f"num_kv_heads ({num_kv_heads}) when KV heads "
+                            "are replicated"
+                        )
+                    local_num_kv_heads = 1
+                else:
+                    if num_kv_heads % tp_size != 0:
+                        raise ValueError(
+                            f"num_kv_heads ({num_kv_heads}) must be divisible "
+                            f"by tp_size ({tp_size})"
+                        )
+                    local_num_kv_heads = num_kv_heads // tp_size
+
+                # Query heads are always sharded across TP ranks. When TP is
+                # wider than the number of KV heads, runtimes replicate each
+                # KV head, so the local fused ratio differs from the global
+                # num_heads:num_kv_heads:num_kv_heads ratio.
+                total_units = local_num_heads + 2 * local_num_kv_heads
                 shape0 = parameter.shape[0]
-                if (shape0 * num_heads) % total_units != 0 or (
-                    shape0 * num_kv_heads
+                if (shape0 * local_num_heads) % total_units != 0 or (
+                    shape0 * local_num_kv_heads
                 ) % total_units != 0:
                     raise ValueError(
                         f"qkv dim0 {shape0} of {name} is not divisible into "
                         f"q/k/v with num_heads={num_heads}, "
-                        f"num_kv_heads={num_kv_heads}"
+                        f"num_kv_heads={num_kv_heads}, tp_size={tp_size}"
                     )
-                q_size = shape0 * num_heads // total_units
-                kv_size = shape0 * num_kv_heads // total_units
+                q_size = shape0 * local_num_heads // total_units
+                kv_size = shape0 * local_num_kv_heads // total_units
                 return [
                     (
                         name.replace("qkv_proj", "q_proj").replace(

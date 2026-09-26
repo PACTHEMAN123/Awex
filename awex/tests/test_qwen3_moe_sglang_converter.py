@@ -181,6 +181,31 @@ def test_qkv_split_is_gqa_aware():
     assert torch.equal(result["model.layers.0.self_attn.v_proj.weight"], v)
 
 
+@pytest.mark.parametrize(
+    ("tp_size", "local_q_heads", "local_kv_heads"),
+    [
+        (2, NUM_HEADS // 2, NUM_KV_HEADS // 2),
+        (4, NUM_HEADS // 4, 1),
+    ],
+)
+def test_qkv_split_uses_local_tp_head_counts(
+    tp_size, local_q_heads, local_kv_heads
+):
+    converter = _make_converter(tp_size=tp_size)
+    q = torch.randn(local_q_heads * HEAD_DIM, HIDDEN)
+    k = torch.randn(local_kv_heads * HEAD_DIM, HIDDEN)
+    v = torch.randn(local_kv_heads * HEAD_DIM, HIDDEN)
+    fused = torch.cat([q, k, v], dim=0)
+
+    result = dict(
+        converter.convert_param("model.layers.0.self_attn.qkv_proj.weight", fused)
+    )
+
+    assert torch.equal(result["model.layers.0.self_attn.q_proj.weight"], q)
+    assert torch.equal(result["model.layers.0.self_attn.k_proj.weight"], k)
+    assert torch.equal(result["model.layers.0.self_attn.v_proj.weight"], v)
+
+
 def test_mcore_qkv_device_layout_uses_stable_source_spans():
     converter_class = CONFIG["mcore_converter"]()
     converter = converter_class.__new__(converter_class)
