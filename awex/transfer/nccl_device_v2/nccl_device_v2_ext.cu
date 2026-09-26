@@ -67,6 +67,7 @@ struct DeviceState {
   v2::V2WindowLayout layout{};
   std::size_t window_bytes = 0;
   std::size_t dense_window_bytes = 0;
+  std::uint32_t payload_peer_count = 0;
   std::uint64_t timeout_cycles = 0;
   std::uint64_t last_sequence = 0;
   std::uint32_t total_channels = 1;
@@ -370,6 +371,15 @@ void initialize_sparse_window(DeviceState* state, const std::vector<std::uint32_
   }
   const auto payload_peer_slots = v2::topology_detail::allGather(
     state->comm, local_payload_slots.data(), local_payload_slots.size(), state->world_size, stream);
+  std::uint32_t payload_peer_capacity = 0;
+  for (int source = 0; source < state->world_size; ++source) {
+    std::uint32_t source_payload_peer_count = 0;
+    for (int peer = 0; peer < state->world_size; ++peer) {
+      source_payload_peer_count +=
+        payload_peer_slots[static_cast<std::size_t>(source) * state->world_size + peer] != inactive ? 1U : 0U;
+    }
+    payload_peer_capacity = std::max(payload_peer_capacity, source_payload_peer_count);
+  }
   for (const std::uint32_t peer : active_peers) {
     const bool local_has_payload =
       payload_peer_slots[static_cast<std::size_t>(state->rank) * state->world_size + peer] != inactive;
@@ -398,8 +408,9 @@ void initialize_sparse_window(DeviceState* state, const std::vector<std::uint32_
     state->gin.enabled ? std::max(state->fifo_depth, state->gin_fifo_depth) : state->fifo_depth;
   const std::size_t slot_bytes =
     state->gin.enabled ? std::max(state->step_bytes, state->network_step_bytes) : state->step_bytes;
+  state->payload_peer_count = payload_peer_count;
   state->layout = v2::makeV2WindowLayout(state->world_size, state->total_channels, layout_fifo_depth, slot_bytes,
-                                         payload_peer_count);
+                                         payload_peer_capacity);
   state->window_bytes = state->layout.window_bytes;
   state->dense_window_bytes = v2::makeV2WindowLayout(state->world_size, state->total_channels, layout_fifo_depth,
                                                       slot_bytes, state->world_size)
@@ -692,7 +703,8 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
   metrics["local_step_bytes"] = py::int_(state->step_bytes);
   metrics["network_step_bytes"] = py::int_(state->network_step_bytes);
   metrics["slot_bytes"] = py::int_(state->layout.slot_bytes);
-  metrics["payload_peer_count"] = py::int_(state->layout.payload_peer_count);
+  metrics["payload_peer_count"] = py::int_(state->payload_peer_count);
+  metrics["payload_peer_capacity"] = py::int_(state->layout.payload_peer_count);
   metrics["control_window_bytes"] = py::int_(state->layout.payload_offset);
   metrics["payload_buffer_bytes"] = py::int_(
     static_cast<std::size_t>(state->layout.payload_peer_count) * state->total_channels * state->layout.fifo_depth *
