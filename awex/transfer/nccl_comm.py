@@ -521,6 +521,97 @@ def _interleave_p2p_ops_by_peer(ops: Sequence[dist.P2POp]) -> List[dist.P2POp]:
     return interleaved
 
 
+def _group_homogeneous_p2p_ops_by_ring_stage(
+    ops: Sequence[dist.P2POp], rank: int, world_size: int
+) -> Optional[Dict[int, List[dist.P2POp]]]:
+    """Group one-way P2P ops into globally matched ring stages.
+
+    For a send ``src -> dst``, both endpoints assign the edge to stage
+    ``(dst - src) % world_size``. Each rank therefore talks to at most one
+    peer per stage, while preserving operation order within that peer.
+
+    Mixed send/recv batches need a different two-phase schedule and return
+    ``None`` so the caller can use the existing grouped path.
+    """
+
+    if not ops:
+        return {}
+
+    directions = set()
+    for op in ops:
+        if op.op is dist.isend or op.op is dist.send:
+            directions.add("send")
+        elif op.op is dist.irecv or op.op is dist.recv:
+            directions.add("recv")
+        else:
+            return None
+    if len(directions) != 1:
+        return None
+
+    direction = next(iter(directions))
+    staged_ops: Dict[int, List[dist.P2POp]] = {}
+    for op in ops:
+        if direction == "send":
+            stage = (op.peer - rank) % world_size
+        else:
+            stage = (rank - op.peer) % world_size
+        if stage == 0:
+            raise ValueError("Ring-staged P2P does not support self communication")
+        staged_ops.setdefault(stage, []).append(op)
+    return staged_ops
+
+
+def _run_ring_staged_grouped_ops(ops: Sequence[dist.P2POp]) -> bool:
+    """Run a homogeneous P2P batch one peer at a time.
+
+    Returns ``False`` for mixed-direction batches, which require the legacy
+    grouped execution path.
+    """
+
+    if not ops:
+        return True
+
+    group = ops[0].group
+    rank = dist.get_rank(group=group)
+    world_size = dist.get_world_size(group=group)
+    staged_ops = _group_homogeneous_p2p_ops_by_ring_stage(
+        ops, rank=rank, world_size=world_size
+    )
+    if staged_ops is None:
+        return False
+
+    trace = os.environ.get("AWEX_P2P_TRACE", "").strip().lower() in {
+        "1",
+        "true",
+    }
+    for stage in range(1, world_size):
+        stage_ops = staged_ops.get(stage)
+        if not stage_ops:
+            continue
+        if trace:
+            logger.info(
+                "[P2P-TRACE rank=%s] stage=%s peer=%s nops=%s pre-wait",
+                rank,
+                stage,
+                stage_ops[0].peer,
+                len(stage_ops),
+            )
+        works = dist.batch_isend_irecv(stage_ops)
+        for work in works:
+            work.wait()
+        # Work.wait() only guarantees enqueue completion for NCCL. Drain the
+        # peer before advancing so thousands of P2P kernels cannot accumulate.
+        device_util.synchronize(device_id=device_util.current_device())
+        if trace:
+            logger.info(
+                "[P2P-TRACE rank=%s] stage=%s peer=%s complete",
+                rank,
+                stage,
+                stage_ops[0].peer,
+            )
+    return True
+
+
 def _run_p2p_op(op: dist.P2POp, async_op: bool) -> Optional[dist.Work]:
     """Run a single P2P op, returning Work for async operations.
 
@@ -575,6 +666,14 @@ def batch_send_recv(
     # Grouped execution path using batch_isend_irecv.
     if use_group:
         all_ops = _interleave_p2p_ops_by_peer(send_ops + recv_ops)
+        if blocking and len({op.peer for op in all_ops}) > 1:
+            # A single NCCL group containing thousands of operations across
+            # many peers can exhaust runtime P2P resources and never drain.
+            # The separate train/inference path is one-way on every rank, so
+            # use globally matched ring stages and cap in-flight work at one
+            # peer. Mixed-direction colocate batches retain the legacy path.
+            if _run_ring_staged_grouped_ops(all_ops):
+                return []
         works = dist.batch_isend_irecv(all_ops)
         if not blocking:
             return works
