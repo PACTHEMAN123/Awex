@@ -12,6 +12,7 @@ base_port_start="${BASE_PORT_START:-19000}"
 num_updates="${NUM_UPDATES:-7}"
 warmup_updates="${WARMUP_UPDATES:-2}"
 health_timeout_seconds="${HEALTH_TIMEOUT_SECONDS:-900}"
+run_timeout_seconds="${RUN_TIMEOUT_SECONDS:-3600}"
 
 read -r -a experiments <<< "${EXPERIMENTS:-B1 B3 B2 B4}"
 read -r -a backends <<< \
@@ -20,6 +21,7 @@ read -r -a backends <<< \
 mkdir -p "$log_dir"
 
 sampler_pid=""
+server_pid=""
 
 stop_sampler() {
   if [[ -n "$sampler_pid" ]] && kill -0 "$sampler_pid" 2>/dev/null; then
@@ -29,7 +31,29 @@ stop_sampler() {
   sampler_pid=""
 }
 
-trap stop_sampler EXIT INT TERM
+stop_server() {
+  if [[ -n "$server_pid" ]] && kill -0 "$server_pid" 2>/dev/null; then
+    kill -INT "$server_pid"
+    for _ in {1..30}; do
+      if ! kill -0 "$server_pid" 2>/dev/null; then
+        break
+      fi
+      sleep 1
+    done
+    if kill -0 "$server_pid" 2>/dev/null; then
+      kill -TERM "$server_pid"
+    fi
+    wait "$server_pid" 2>/dev/null || true
+  fi
+  server_pid=""
+}
+
+cleanup_run() {
+  stop_server
+  stop_sampler
+}
+
+trap cleanup_run EXIT INT TERM
 
 start_sampler() {
   local output_path="$1"
@@ -109,21 +133,54 @@ for experiment in "${experiments[@]}"; do
       node_role="infer-${inference_node_index}"
       log_path="${log_dir}/${prefix}-${node_role}.log"
       start_sampler "${log_dir}/${prefix}-${node_role}-gpu.csv"
-      set +e
+      if [[ "$backend" == verl-nccl-bucket ]]; then
+        update_path="/publication_update"
+      else
+        update_path="/areal_awex_update"
+      fi
+      expected_updates=$((num_updates * engines_per_node))
+      deadline=$((SECONDS + run_timeout_seconds))
+
       MODEL_PATH="$MODEL_PATH" \
       BASE_PORT="$base_port" \
       NUM_UPDATES="$num_updates" \
       WARMUP_UPDATES="$warmup_updates" \
         awex/tests/experimental/run_1train_2infer.sh \
-          infer "$experiment" "$backend" 2>&1 | tee "$log_path"
-      run_status="${PIPESTATUS[0]}"
-      set -e
-      stop_sampler
-      if [[ "$run_status" -ne 0 ]]; then
-        printf '%s inference node %s failed with status %s.\n' \
-          "$prefix" "$inference_node_index" "$run_status" >&2
-        exit "$run_status"
+          infer "$experiment" "$backend" > "$log_path" 2>&1 &
+      server_pid="$!"
+
+      completed_updates=0
+      while (( SECONDS < deadline )); do
+        completed_updates="$(
+          grep -F -c \
+            "\"POST ${update_path} HTTP/1.1\" 200 OK" "$log_path" || true
+        )"
+        if [[ "$completed_updates" -ge "$expected_updates" ]]; then
+          break
+        fi
+        if ! kill -0 "$server_pid" 2>/dev/null; then
+          set +e
+          wait "$server_pid"
+          run_status="$?"
+          set -e
+          server_pid=""
+          stop_sampler
+          printf '%s inference node %s exited after %s/%s updates (status %s).\n' \
+            "$prefix" "$inference_node_index" "$completed_updates" \
+            "$expected_updates" "$run_status" >&2
+          exit 1
+        fi
+        sleep 2
+      done
+
+      if [[ "$completed_updates" -lt "$expected_updates" ]]; then
+        printf '%s inference node %s timed out after %s/%s updates.\n' \
+          "$prefix" "$inference_node_index" "$completed_updates" \
+          "$expected_updates" >&2
+        exit 1
       fi
+      stop_server
+      stop_sampler
     else
       for ((engine = 0; engine < engines_per_node; engine++)); do
         wait_for_health "$INFERENCE_HOST_0" "$((base_port + engine))"
