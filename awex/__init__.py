@@ -15,10 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-from awex.config import InferenceConfig as InferenceConfig
-from awex.reader.nccl_reader import NCCLWorkerWeightsReader as NCCLWorkerWeightsReader
-from awex.reader.weights_reader import WeightsReader as WeightsReader
-from awex.writer.nccl_writer import NCCLWeightsWriter as NCCLWeightsWriter
+from importlib import import_module
 
 __all__ = [
     "InferenceConfig",
@@ -26,3 +23,23 @@ __all__ = [
     "WeightsReader",
     "NCCLWorkerWeightsReader",
 ]
+
+_LAZY_EXPORTS = {
+    "InferenceConfig": ("awex.config", "InferenceConfig"),
+    "NCCLWeightsWriter": ("awex.writer.nccl_writer", "NCCLWeightsWriter"),
+    "WeightsReader": ("awex.reader.weights_reader", "WeightsReader"),
+    "NCCLWorkerWeightsReader": (
+        "awex.reader.nccl_reader",
+        "NCCLWorkerWeightsReader",
+    ),
+}
+
+
+def __getattr__(name):
+    target = _LAZY_EXPORTS.get(name)
+    if target is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module_name, attribute_name = target
+    value = getattr(import_module(module_name), attribute_name)
+    globals()[name] = value
+    return value

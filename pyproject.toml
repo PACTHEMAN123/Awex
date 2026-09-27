@@ -47,7 +47,7 @@ Issues = "https://github.com/inclusionAI/awex/issues"
 Documentation = "https://github.com/inclusionAI/awex"
 
 [project.entry-points."vllm.general_plugins"]
-awex_adapter = "awex.vllm_plugin:register_awex_plugin"
+awex_adapter = "awex.vllm_plugin_entrypoint:register_awex_plugin"
 
 [tool.setuptools]
 packages = ["awex"]
