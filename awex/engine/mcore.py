@@ -80,6 +80,11 @@ class MegatronEngine(TrainingEngine):
         if self.enable_colocate_mode:
             self.release_memory_occupation()
 
+    def close(self) -> None:
+        if self.weights_exchange_writer is not None:
+            self.weights_exchange_writer.close()
+            self.weights_exchange_writer = None
+
     def release_memory_occupation(self, tags: Optional[List[str]] = None) -> None:
         """Release memory occupation.
 

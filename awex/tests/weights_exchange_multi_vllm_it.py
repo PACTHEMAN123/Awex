@@ -242,6 +242,9 @@ class MultiVLLMWeightsExchangeIT:
 
     def destroy(self):
         self._training_barrier()
+        if self.megatron_engine is not None:
+            self.megatron_engine.close()
+        self._training_barrier()
         if self.is_driver:
             self.publication.close()
             for process in self.vllm_processes:

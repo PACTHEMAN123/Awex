@@ -65,6 +65,10 @@ class WeightExchangeWriter(ABC):
     def write_weights(self, step_id, **kwargs):
         pass
 
+    def close(self) -> None:
+        """Release writer-owned resources."""
+        return None
+
 
 class FileWeightExchangeWriter(WeightExchangeWriter):
     def __init__(self, train_engine):

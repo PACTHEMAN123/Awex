@@ -97,11 +97,9 @@ inline void v2ConfigureGinChannels(V2GinState* state, std::uint32_t total_channe
     std::min(total_channels, v2PowerOfTwoUp(2 * state->connection_count));
   state->channel_budget = std::min(total_channels, 6 * state->connection_count);
 
-  std::uint64_t total_bytes = 0;
   std::vector<std::uint32_t> gin_peers;
   for (const std::uint32_t peer : active_peers) {
     if (transports[peer] == static_cast<std::uint8_t>(V2Transport::kGin)) {
-      total_bytes += state->peer_payload_bytes[peer];
       gin_peers.push_back(peer);
     }
   }
@@ -113,32 +111,42 @@ inline void v2ConfigureGinChannels(V2GinState* state, std::uint32_t total_channe
   } else {
     const std::uint64_t fifo_window_bytes =
       static_cast<std::uint64_t>(network_step_bytes) * gin_fifo_depth;
-    std::uint32_t assigned_channels = 0;
+    std::vector<std::uint32_t> desired_channels(peer_channels->size(), 1);
     for (const std::uint32_t peer : gin_peers) {
       const std::uint64_t window_demand =
         std::max<std::uint64_t>(1, v2DivideUp(state->peer_payload_bytes[peer], fifo_window_bytes));
-      const std::uint32_t channels = v2PowerOfTwoUp(
+      desired_channels[peer] = v2PowerOfTwoUp(
         static_cast<std::uint32_t>(std::min<std::uint64_t>(base_channels, window_demand)));
-      (*peer_channels)[peer] = channels;
-      assigned_channels += channels;
+      (*peer_channels)[peer] = 1;
     }
 
-    std::sort(gin_peers.begin(), gin_peers.end(), [&](std::uint32_t left, std::uint32_t right) {
-      return state->peer_payload_bytes[left] > state->peer_payload_bytes[right];
-    });
-    std::uint32_t remaining_channels =
-      assigned_channels < state->channel_budget ? state->channel_budget - assigned_channels : 0;
-    for (const std::uint32_t peer : gin_peers) {
-      const std::uint64_t weighted_demand = total_bytes == 0
-        ? 1
-        : v2DivideUp(static_cast<std::uint64_t>(state->channel_budget) * state->peer_payload_bytes[peer],
-                     total_bytes);
-      while ((*peer_channels)[peer] <= remaining_channels &&
-             2 * (*peer_channels)[peer] <= weighted_demand &&
-             (*peer_channels)[peer] <= total_channels / 2) {
-        remaining_channels -= (*peer_channels)[peer];
-        (*peer_channels)[peer] *= 2;
+    // Start with one channel per peer, then spend the shared budget on the
+    // highest remaining bytes-per-channel pressure while preserving powers of two.
+    std::uint32_t assigned_channels = static_cast<std::uint32_t>(gin_peers.size());
+    while (assigned_channels < state->channel_budget) {
+      std::uint32_t selected_peer = std::numeric_limits<std::uint32_t>::max();
+      for (const std::uint32_t peer : gin_peers) {
+        const std::uint32_t channels = (*peer_channels)[peer];
+        if (channels >= desired_channels[peer] || assigned_channels + channels > state->channel_budget) {
+          continue;
+        }
+        if (selected_peer == std::numeric_limits<std::uint32_t>::max()) {
+          selected_peer = peer;
+          continue;
+        }
+        const std::uint32_t selected_channels = (*peer_channels)[selected_peer];
+        const std::uint64_t peer_pressure = state->peer_payload_bytes[peer] * selected_channels;
+        const std::uint64_t selected_pressure = state->peer_payload_bytes[selected_peer] * channels;
+        if (peer_pressure > selected_pressure ||
+            (peer_pressure == selected_pressure && peer < selected_peer)) {
+          selected_peer = peer;
+        }
       }
+      if (selected_peer == std::numeric_limits<std::uint32_t>::max()) {
+        break;
+      }
+      assigned_channels += (*peer_channels)[selected_peer];
+      (*peer_channels)[selected_peer] *= 2;
     }
   }
 
