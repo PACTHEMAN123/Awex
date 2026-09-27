@@ -32,20 +32,35 @@ stop_sampler() {
 }
 
 stop_server() {
-  if [[ -n "$server_pid" ]] && kill -0 "$server_pid" 2>/dev/null; then
-    kill -INT "$server_pid"
+  if [[ -n "$server_pid" ]] && kill -0 -- "-$server_pid" 2>/dev/null; then
+    kill -TERM -- "-$server_pid"
     for _ in {1..30}; do
-      if ! kill -0 "$server_pid" 2>/dev/null; then
+      if ! kill -0 -- "-$server_pid" 2>/dev/null; then
         break
       fi
       sleep 1
     done
-    if kill -0 "$server_pid" 2>/dev/null; then
-      kill -TERM "$server_pid"
+    if kill -0 -- "-$server_pid" 2>/dev/null; then
+      kill -KILL -- "-$server_pid"
     fi
     wait "$server_pid" 2>/dev/null || true
   fi
   server_pid=""
+}
+
+wait_for_gpu_idle() {
+  local deadline=$((SECONDS + 120))
+  while (( SECONDS < deadline )); do
+    if [[ -z "$(
+      nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null
+    )" ]]; then
+      return 0
+    fi
+    sleep 1
+  done
+  printf 'GPU processes remained after inference server cleanup:\n' >&2
+  nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader >&2
+  return 1
 }
 
 cleanup_run() {
@@ -132,6 +147,7 @@ for experiment in "${experiments[@]}"; do
     if [[ "$role" == infer ]]; then
       node_role="infer-${inference_node_index}"
       log_path="${log_dir}/${prefix}-${node_role}.log"
+      wait_for_gpu_idle
       start_sampler "${log_dir}/${prefix}-${node_role}-gpu.csv"
       if [[ "$backend" == verl-nccl-bucket ]]; then
         update_path="/publication_update"
@@ -141,6 +157,7 @@ for experiment in "${experiments[@]}"; do
       expected_updates=$((num_updates * engines_per_node))
       deadline=$((SECONDS + run_timeout_seconds))
 
+      setsid env \
       MODEL_PATH="$MODEL_PATH" \
       BASE_PORT="$base_port" \
       NUM_UPDATES="$num_updates" \
@@ -180,6 +197,7 @@ for experiment in "${experiments[@]}"; do
         exit 1
       fi
       stop_server
+      wait_for_gpu_idle
       stop_sampler
     else
       for ((engine = 0; engine < engines_per_node; engine++)); do
