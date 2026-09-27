@@ -241,7 +241,7 @@ void destroy_state(DeviceState* state) {
     state->local_base = nullptr;
   }
   if (state->comm != nullptr) {
-    AWEX_NCCL_V2_CHECK(ncclCommAbort(state->comm));
+    AWEX_NCCL_V2_CHECK(ncclCommDestroy(state->comm));
     state->comm = nullptr;
   }
 }
