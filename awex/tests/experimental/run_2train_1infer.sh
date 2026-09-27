@@ -75,6 +75,7 @@ if [[ "$role" == infer ]]; then
     --vllm-tp-size "$infer_tp" \
     --num-engines "$num_engines" \
     --vllm-gpu-memory-utilization "$gpu_memory_utilization" \
+    --num-updates "$num_updates" \
     --profile \
     --warmup-updates "$warmup_updates" \
     --sync-transfer-start \
