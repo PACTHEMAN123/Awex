@@ -19,7 +19,11 @@ def dependency_closure(root_distribution):
     while queue:
         name = queue.popleft()
         canonical_name = canonicalize_name(name)
-        distribution = metadata.distribution(name)
+        try:
+            distribution = metadata.distribution(name)
+        except metadata.PackageNotFoundError:
+            print(f"skipped unavailable dependency {name}")
+            continue
         distributions[canonical_name] = distribution
         active_extras = requested_extras[canonical_name]
 
