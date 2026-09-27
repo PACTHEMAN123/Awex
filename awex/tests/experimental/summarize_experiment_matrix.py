@@ -12,8 +12,7 @@ from awex.tests.experimental.analyze_profile_run import (
     summarize_profiles,
 )
 
-
-EXPERIMENTS = ("A1", "A2", "A3", "A4")
+DEFAULT_EXPERIMENTS = ("A1", "A2", "A3", "A4")
 BACKENDS = ("verl-nccl-bucket", "awex-nccl", "awex-nccl-device-v2-gin")
 
 
@@ -55,7 +54,9 @@ def summarize_gpu_node(path):
     for samples in by_timestamp.values():
         total_memory = sum(sample["memory"] for sample in samples)
         mean_gpu_util = sum(sample["gpu_util"] for sample in samples) / len(samples)
-        mean_memory_util = sum(sample["memory_util"] for sample in samples) / len(samples)
+        mean_memory_util = sum(sample["memory_util"] for sample in samples) / len(
+            samples
+        )
         node_memory.append(total_memory)
         node_gpu_util.append(mean_gpu_util)
         node_memory_util.append(mean_memory_util)
@@ -85,14 +86,22 @@ def summarize_gpu_node(path):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--log-dir", type=Path, required=True)
+    parser.add_argument("--node-role", required=True)
     parser.add_argument(
-        "--node-role", choices=("train-r0", "train-r1", "infer"), required=True
+        "--experiments",
+        default=",".join(DEFAULT_EXPERIMENTS),
+        help="Comma-separated experiment names to summarize.",
     )
     parser.add_argument("--json-out", type=Path)
     args = parser.parse_args()
 
     runs = []
-    for experiment in EXPERIMENTS:
+    experiments = tuple(
+        experiment.strip()
+        for experiment in args.experiments.split(",")
+        if experiment.strip()
+    )
+    for experiment in experiments:
         for backend in BACKENDS:
             prefix = run_prefix(experiment, backend)
             log_path = args.log_dir / f"{prefix}-{args.node_role}.log"

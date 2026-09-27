@@ -69,6 +69,24 @@ def _unit_interval_float(value: str) -> float:
     return parsed
 
 
+def _inference_endpoint(value: str) -> tuple[int, str, int]:
+    try:
+        rank_text, host, port_text = value.split(",", 2)
+        engine_rank = int(rank_text)
+        port = int(port_text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "must have the form ENGINE_RANK,HOST,PORT"
+        ) from exc
+    if engine_rank < 0:
+        raise argparse.ArgumentTypeError("engine rank must be non-negative")
+    if not host:
+        raise argparse.ArgumentTypeError("host must not be empty")
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError("port must be in [1, 65535]")
+    return engine_rank, host, port
+
+
 vllm_inference_config = {
     "model_path": "/home/model/Qwen3-0.6B",
     "tp_size": DEFAULT_VLLM_TP_SIZE,
@@ -119,6 +137,7 @@ class MultiVLLMWeightsExchangeIT:
         publication_mechanism="awex",
         publication_bucket_mb=256,
         publication_timeout_seconds=1800,
+        inference_endpoints=None,
     ):
         self.comm_backend = comm_backend
         self.publication_mechanism_name = publication_mechanism
@@ -163,6 +182,7 @@ class MultiVLLMWeightsExchangeIT:
         self.validate = validate
         self.dump_weights_list_for_validation = dump_weights_list_for_validation or []
         self.dump_weights_dir_for_validation = dump_weights_dir_for_validation
+        self.inference_endpoints = list(inference_endpoints or [])
 
         self.publication = create_publication_mechanism(
             publication_mechanism,
@@ -197,9 +217,7 @@ class MultiVLLMWeightsExchangeIT:
             visible_devices = list(range(device_util.device_count()))
 
         inference_gpus = (
-            total_inference_gpus
-            if self.is_driver and not self.remote_inference
-            else 0
+            total_inference_gpus if self.is_driver and not self.remote_inference else 0
         )
         need = self.local_world_size + inference_gpus
         if len(visible_devices) < need:
@@ -313,6 +331,8 @@ class MultiVLLMWeightsExchangeIT:
         self.train_config["meta_server_addr"] = self.meta_server_addr
 
     def publication_endpoints(self):
+        if self.inference_endpoints:
+            return self.inference_endpoints
         return [
             (engine_rank, self.host, self.port + engine_rank)
             for engine_rank in range(self.inference_config["num_engines"])
@@ -361,9 +381,7 @@ class MultiVLLMWeightsExchangeIT:
             ]
             if self.inference_config.get("enable_expert_parallel"):
                 cmd.append("--enable-expert-parallel")
-            gpu_memory_utilization = self.inference_config.get(
-                "gpu_memory_utilization"
-            )
+            gpu_memory_utilization = self.inference_config.get("gpu_memory_utilization")
             if gpu_memory_utilization is not None:
                 cmd.extend(
                     [
@@ -386,17 +404,18 @@ class MultiVLLMWeightsExchangeIT:
             self.vllm_processes.append(subprocess.Popen(cmd, env=env))
 
     def _wait_for_all_health(self):
-        num_engines = self.inference_config["num_engines"]
-        with ThreadPoolExecutor(max_workers=num_engines) as executor:
+        endpoints = self.publication_endpoints()
+        with ThreadPoolExecutor(max_workers=len(endpoints)) as executor:
             futures = [
-                executor.submit(self._wait_for_health, engine_rank)
-                for engine_rank in range(num_engines)
+                executor.submit(self._wait_for_health, endpoint)
+                for endpoint in endpoints
             ]
             for future in futures:
                 future.result()
 
-    def _wait_for_health(self, engine_rank, timeout=180):
-        url = f"http://{self.host}:{self.port + engine_rank}/health"
+    def _wait_for_health(self, endpoint, timeout=180):
+        engine_rank, host, port = endpoint
+        url = f"http://{host}:{port}/health"
         start = time.time()
         while time.time() - start < timeout:
             process = (
@@ -414,18 +433,14 @@ class MultiVLLMWeightsExchangeIT:
                     return
             except requests.RequestException:
                 time.sleep(1)
-        raise RuntimeError(
-            f"vLLM engine {engine_rank} failed to start within timeout."
-        )
+        raise RuntimeError(f"vLLM engine {engine_rank} failed to start within timeout.")
 
     def _init_megatron_engine(self):
         self.train_config["tensor_model_parallel_size"] = self.train_tp_size
         self.train_config["pipeline_model_parallel_size"] = self.train_pp_size
         self.train_config["context_parallel_size"] = self.train_cp_size
         self.train_config["expert_model_parallel_size"] = self.train_ep_size
-        self.train_config["expert_tensor_parallel_size"] = (
-            self.train_expert_tp_size
-        )
+        self.train_config["expert_tensor_parallel_size"] = self.train_expert_tp_size
 
         try:
             logger.info(
@@ -509,9 +524,7 @@ class MultiVLLMWeightsExchangeIT:
                 phase=profile_phase(step_id),
                 step_id=step_id,
                 rank=int(self.rank),
-                end_to_end_update_time_ms=(
-                    time.perf_counter() - end_to_end_start
-                )
+                end_to_end_update_time_ms=(time.perf_counter() - end_to_end_start)
                 * 1000.0,
             )
 
@@ -557,6 +570,7 @@ def main(args):
         publication_mechanism=args.publication_mechanism,
         publication_bucket_mb=args.publication_bucket_mb,
         publication_timeout_seconds=args.publication_timeout_seconds,
+        inference_endpoints=args.inference_endpoint,
     )
 
     try:
@@ -751,6 +765,17 @@ if __name__ == "__main__":
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument(
+        "--inference-endpoint",
+        action="append",
+        type=_inference_endpoint,
+        default=[],
+        metavar="ENGINE_RANK,HOST,PORT",
+        help=(
+            "Remote inference endpoint. Repeat once per engine to distribute "
+            "engines across multiple hosts."
+        ),
+    )
+    parser.add_argument(
         "--remote-inference",
         action="store_true",
         help=(
@@ -792,6 +817,15 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if args.warmup_updates < 0 or args.warmup_updates >= args.num_updates:
         parser.error("--warmup-updates must be in [0, --num-updates)")
+    if args.inference_endpoint:
+        if not args.remote_inference:
+            parser.error("--inference-endpoint requires --remote-inference")
+        endpoint_ranks = sorted(endpoint[0] for endpoint in args.inference_endpoint)
+        if endpoint_ranks != list(range(args.num_engines)):
+            parser.error(
+                "--inference-endpoint ranks must cover every engine rank in "
+                "[0, --num-engines) exactly once"
+            )
     if args.device_backend and args.device_backend != "auto":
         os.environ["AWEX_DEVICE_TYPE"] = args.device_backend
     if device_util.get_device_type() == "npu" and args.comm_backend == "nccl":
