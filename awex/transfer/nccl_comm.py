@@ -521,6 +521,36 @@ def _interleave_p2p_ops_by_peer(ops: Sequence[dist.P2POp]) -> List[dist.P2POp]:
     return interleaved
 
 
+def _chunk_p2p_ops_by_peer(
+    ops: Sequence[dist.P2POp], max_ops_per_peer: int
+) -> List[List[dist.P2POp]]:
+    """Split P2P work into bounded, peer-aligned NCCL groups.
+
+    Every batch contains the same ordinal range for every local peer. A sender
+    and its receiver therefore submit matching operations in the same batch,
+    even when their total peer counts differ.
+    """
+    if max_ops_per_peer <= 0:
+        raise ValueError("max_ops_per_peer must be positive")
+    if not ops:
+        return []
+
+    by_peer: Dict[int, List[dist.P2POp]] = {}
+    for op in ops:
+        by_peer.setdefault(op.peer, []).append(op)
+
+    batches = []
+    max_peer_ops = max(len(peer_ops) for peer_ops in by_peer.values())
+    for start in range(0, max_peer_ops, max_ops_per_peer):
+        batch = []
+        stop = start + max_ops_per_peer
+        for peer in sorted(by_peer):
+            batch.extend(by_peer[peer][start:stop])
+        if batch:
+            batches.append(_interleave_p2p_ops_by_peer(batch))
+    return batches
+
+
 def _run_p2p_op(op: dist.P2POp, async_op: bool) -> Optional[dist.Work]:
     """Run a single P2P op, returning Work for async operations.
 
@@ -575,13 +605,36 @@ def batch_send_recv(
     # Grouped execution path using batch_isend_irecv.
     if use_group:
         all_ops = _interleave_p2p_ops_by_peer(send_ops + recv_ops)
-        works = dist.batch_isend_irecv(all_ops)
-        if not blocking:
-            return works
-        for work in works:
-            work.wait()
-        device_util.synchronize()
-        return []
+        configured_batch_size = os.environ.get(
+            "AWEX_NCCL_MAX_OPS_PER_PEER_BATCH", "64"
+        )
+        try:
+            max_ops_per_peer = int(configured_batch_size)
+        except ValueError as exc:
+            raise ValueError(
+                "AWEX_NCCL_MAX_OPS_PER_PEER_BATCH must be an integer"
+            ) from exc
+        op_batches = _chunk_p2p_ops_by_peer(all_ops, max_ops_per_peer)
+        if len(op_batches) > 1:
+            logger.info(
+                "Executing %s P2P ops in %s peer-aligned NCCL groups "
+                "(max %s ops per peer)",
+                len(all_ops),
+                len(op_batches),
+                max_ops_per_peer,
+            )
+        pending_works = []
+        for op_batch in op_batches:
+            works = dist.batch_isend_irecv(op_batch)
+            if not blocking:
+                pending_works.extend(works)
+                continue
+            for work in works:
+                work.wait()
+            # Bound both group size and in-flight device work before the next
+            # ordinal range is submitted.
+            device_util.synchronize()
+        return pending_works
 
     # Manual execution path with explicit interleaving and CUDA streams.
     streams = _get_comm_streams() if use_stream else []
