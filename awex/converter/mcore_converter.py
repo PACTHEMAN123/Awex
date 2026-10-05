@@ -1355,12 +1355,33 @@ def convert_qkv_bias_along_tp_attention(
     return merged
 
 
+def _to_local_mcore_tensor(parameter: torch.Tensor) -> torch.Tensor:
+    """Return the rank-local payload for Megatron DTensor parameters.
+
+    Megatron-FSDP represents tensor-parallel parameters as DTensors whose
+    public shape is the global pre-TP shape. Awex metadata and converters work
+    on the shard owned by each Megatron rank, so feeding the DTensor itself
+    makes TP-sharded weights look replicated and doubles their logical shape.
+    """
+
+    try:
+        from torch.distributed.tensor import DTensor
+    except ImportError:
+        return parameter
+    if isinstance(parameter, DTensor):
+        return parameter.to_local()
+    return parameter
+
+
 def get_mcore_model_parameters(model) -> Dict[str, torch.Tensor]:
-    params_dict = dict(model.named_parameters())
+    params_dict = {
+        name: _to_local_mcore_tensor(param)
+        for name, param in model.named_parameters()
+    }
     state_dict = model.state_dict()
     for name, param in state_dict.items():
         # there is a bug in megatron GPTModel: decoder.layers[n].mlp.router.expert_bias" in GPTModel
         # is not registered in named_parameter, but in state_dict().
         if "expert_bias" in name:
-            params_dict[name] = param
+            params_dict[name] = _to_local_mcore_tensor(param)
     return params_dict
