@@ -517,7 +517,9 @@ def _load_extension() -> Any:
                 name="awex_nccl_device_ext_v2",
                 sources=[source, kernel_source],
                 extra_include_paths=include_paths,
-                extra_cuda_cflags=["-O3"],
+                # NCCL 2.30 GIN headers trigger a CUDA 13.2 front-end ICE in
+                # C++20 mode; the Device API itself only requires C++17.
+                extra_cuda_cflags=["-O3", "-std=c++17"],
                 extra_ldflags=[
                     *(f"-L{path}" for path in library_paths),
                     *(

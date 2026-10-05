@@ -100,31 +100,38 @@ def main() -> None:
                         )
 
         metrics = launch_metrics[-1]
-        if metrics["topology_nvlink_count"] != 18:
+        transport = metrics["transport"]
+        if transport == "lsa" and metrics["topology_nvlink_count"] != 18:
             raise AssertionError(f"expected NV18 topology, got {dict(metrics)}")
-        if metrics["topology_raw_channels"] != 36:
+        if transport == "lsa" and metrics["topology_raw_channels"] != 36:
             raise AssertionError(
                 f"expected 36 raw topology channels, got {dict(metrics)}"
             )
         if metrics["topology_requested_channels_per_peer"] != 64:
             raise AssertionError(f"expected 64 requested channels, got {dict(metrics)}")
-        if metrics["topology_channels_per_peer"] != 64:
+        expected_channels_per_peer = 64 if transport == "lsa" else 2
+        if metrics["topology_channels_per_peer"] != expected_channels_per_peer:
             raise AssertionError(
-                f"expected 64 effective topology channels, got {dict(metrics)}"
+                f"expected {expected_channels_per_peer} effective topology channels, got {dict(metrics)}"
             )
-        if metrics["channel_count"] != 32:
-            raise AssertionError(f"expected 32 active channels, got {dict(metrics)}")
+        expected_active_channels = 32 if transport == "lsa" else 2
+        if metrics["channel_count"] != expected_active_channels:
+            raise AssertionError(
+                f"expected {expected_active_channels} active channels, got {dict(metrics)}"
+            )
         if metrics["threads_per_channel"] != 640:
             raise AssertionError(f"expected 640 channel threads, got {dict(metrics)}")
         if metrics["warps_per_channel"] != 20:
             raise AssertionError(f"expected 20 channel warps, got {dict(metrics)}")
-        expected_payload_peers = 1 if rank == 0 else 0
+        expected_payload_peers = (1 if rank == 0 else 0) if transport == "lsa" else world_size
         if metrics["payload_peer_count"] != expected_payload_peers:
             raise AssertionError(
                 f"expected {expected_payload_peers} payload peers, got {dict(metrics)}"
             )
-        if metrics["registered_window_bytes"] >= metrics["dense_window_bytes"]:
+        if transport == "lsa" and metrics["registered_window_bytes"] >= metrics["dense_window_bytes"]:
             raise AssertionError(f"expected a sparse window, got {dict(metrics)}")
+        if transport == "gin" and metrics["registered_window_bytes"] != metrics["dense_window_bytes"]:
+            raise AssertionError(f"expected a dense GIN window, got {dict(metrics)}")
         if launch_metrics[0]["plan_cache_hit"]:
             raise AssertionError(f"first launch unexpectedly hit cache: {dict(metrics)}")
         if not launch_metrics[1]["plan_cache_hit"]:
