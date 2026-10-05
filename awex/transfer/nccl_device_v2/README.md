@@ -37,15 +37,25 @@ leaving barrier 0 to CTA-wide synchronization. When a work has at least three
 warps, its final warp is reserved for the Post role so it can publish the
 previous step while worker warps begin the next one.
 
-The transport is fixed to NVLink read mode. A sender's worker warps stage source
-data into its local registered FIFO window and publish `ready_step`; receiver
-warps issue volatile loads from that remote window, scatter into local tensor
-fragments, then publish `consumed_step` back to the sender. Every
-`(peer, channel)` owns an independent monotonically increasing step stream.
-Wait roles cache observed steps and poll with volatile loads. Post roles use a
-system fence followed by a relaxed system store, avoiding system-scope RMWs on
-the normal control path. Eight 512 KiB FIFO steps provide 4 MiB of in-flight
-payload per channel-peer connection.
+Within one LSA domain, a sender's worker warps stage source data into its local
+registered FIFO window and publish `ready_step`; receiver warps issue volatile
+loads from that remote window, scatter into local tensor fragments, then
+publish `consumed_step` back to the sender.
+
+Across nodes, NCCL commonly exposes network connections only between matching
+local ranks (`NCCL_GIN_CONNECTION_RAIL`). V2 preserves arbitrary logical peer
+transfers with a two-hop route: the sender writes over its GIN rail into a
+proxy window on the destination node, then the receiver reads that proxy over
+LSA/NVLink. Acknowledgements take the reverse GIN-rail-plus-LSA route. A hybrid
+world barrier resets the ordinary-memory FIFO tokens safely between recurrent
+publications, and `NCCL_WIN_STRICT_ORDERING` orders each payload write before
+its ready token. This avoids requiring a full-mesh GIN topology or changing
+the Python `TransferPlan`.
+
+Every `(peer, channel)` owns an independent step stream. Eight 512 KiB FIFO
+steps provide 4 MiB of in-flight payload per channel-peer connection. The H20
+four-node recipe caps execution at eight channels, which keeps the 32-rank
+dense proxy window near 1 GiB per GPU.
 
 The Python transport entry point lives next to this directory in
 `awex/transfer/nccl_device_v2.py`. It has its own task binding and extension
