@@ -171,9 +171,6 @@ std::unique_ptr<DeviceState> make_state(const std::string& unique_id_bytes, int 
     }
     const ncclTeam_t lsa_team = ncclTeamLsa(state->comm);
     state->use_gin = lsa_team.nRanks != world_size || lsa_team.rank != rank || lsa_team.stride != 1;
-    if (state->use_gin && properties.ginType == NCCL_GIN_TYPE_NONE) {
-      throw std::runtime_error("nccl_device_v2 requires NCCL GIN for a multi-node communicator");
-    }
 
     state->topology = v2::discoverV2Topology(state->comm, world_size, rank, device, channel_limit);
     state->total_channels = state->use_gin ? state->topology.channels_per_peer : state->topology.total_channels;
