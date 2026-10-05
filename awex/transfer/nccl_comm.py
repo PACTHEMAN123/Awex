@@ -671,64 +671,34 @@ def batch_send_recv(
                     f"rank {rank} has peers outside the opposite half: {invalid_peers}"
                 )
             logger.info(
-                "Executing %s P2P ops across %s peers in %s globally "
-                "ordered NCCL stages (max %s ops per peer group)",
+                "Executing %s P2P ops across %s peers in %s pair-local "
+                "NCCL stages (max %s ops per peer group)",
                 len(all_ops),
                 len(by_peer),
                 half,
                 max_ops_per_peer,
             )
             device = device_util.current_device()
-            torch_device = device_util.get_torch_device(device)
-            dummy_buffer = torch.zeros(
-                max_ops_per_peer,
-                dtype=torch.int8,
-                device=torch_device,
-                requires_grad=False,
-            )
             for stage in range(half):
                 peer = _bipartite_peer_for_stage(rank, world_size, stage)
                 peer_ops = by_peer.get(peer, [])
-                local_chunks = math.ceil(len(peer_ops) / max_ops_per_peer)
-                max_chunks_tensor = torch.tensor(
-                    local_chunks, dtype=torch.int32, device=torch_device
+                op_batches = _chunk_p2p_ops_by_peer(
+                    peer_ops, max_ops_per_peer
                 )
-                dist.all_reduce(
-                    max_chunks_tensor,
-                    op=dist.ReduceOp.MAX,
-                    group=process_group,
-                )
-                stage_chunks = int(max_chunks_tensor.item())
-                for chunk_idx in range(stage_chunks):
-                    start = chunk_idx * max_ops_per_peer
-                    op_batch = list(peer_ops[start : start + max_ops_per_peer])
-                    p2p_fn = dist.irecv if rank < half else dist.isend
-                    for dummy_idx in range(len(op_batch), max_ops_per_peer):
-                        op_batch.append(
-                            dist.P2POp(
-                                p2p_fn,
-                                dummy_buffer[dummy_idx : dummy_idx + 1],
-                                peer,
-                                group=process_group,
-                            )
-                        )
+                for op_batch in op_batches:
                     works = dist.batch_isend_irecv(op_batch)
                     for work in works:
                         work.wait()
                     device_util.synchronize(device_id=device)
-                dist.barrier(
-                    group=process_group,
-                    device_ids=[device],
-                )
                 logger.info(
-                    "Completed globally ordered NCCL peer stage %s/%s for rank %s "
-                    "with peer %s and %s real ops across %s padded groups",
+                    "Completed pair-local NCCL peer stage %s/%s for rank %s "
+                    "with peer %s and %s ops across %s groups",
                     stage + 1,
                     half,
                     rank,
                     peer,
                     len(peer_ops),
-                    stage_chunks,
+                    len(op_batches),
                 )
             return []
         op_batches = _chunk_p2p_ops_by_peer(all_ops, max_ops_per_peer)

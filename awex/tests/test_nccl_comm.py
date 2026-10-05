@@ -112,8 +112,6 @@ def test_bipartite_peer_stages_are_inverse_matchings():
 
 def test_batch_send_recv_serializes_bipartite_peers_by_stage(monkeypatch):
     submitted = []
-    barriers = []
-    all_reduces = []
 
     class Work:
         def wait(self):
@@ -135,20 +133,13 @@ def test_batch_send_recv_serializes_bipartite_peers_by_stage(monkeypatch):
     )
     monkeypatch.setattr(
         nccl_comm.dist,
-        "all_reduce",
-        lambda tensor, op, group: (all_reduces.append(group), tensor.fill_(2)),
-    )
-    monkeypatch.setattr(
-        nccl_comm.dist,
-        "P2POp",
-        lambda op, tensor, peer, group: SimpleNamespace(
-            op=op, tensor=tensor, peer=peer, group=group
-        ),
-    )
-    monkeypatch.setattr(
-        nccl_comm.dist,
         "barrier",
-        lambda group, device_ids: barriers.append((group, device_ids)),
+        lambda *args, **kwargs: pytest.fail("peer-local stages must not barrier"),
+    )
+    monkeypatch.setattr(
+        nccl_comm.dist,
+        "all_reduce",
+        lambda *args, **kwargs: pytest.fail("peer-local stages must not reduce"),
     )
     monkeypatch.setattr(nccl_comm.device_util, "current_device", lambda: 0)
     monkeypatch.setattr(
@@ -169,14 +160,6 @@ def test_batch_send_recv_serializes_bipartite_peers_by_stage(monkeypatch):
     assert result == []
     assert [[op.peer for op in batch] for batch in submitted] == [
         [4, 4],
-        [4, 4],
-        [7, 7],
-        [7, 7],
-        [6, 6],
-        [6, 6],
-        [5, 5],
+        [4],
         [5, 5],
     ]
-    assert all(len(batch) == 2 for batch in submitted)
-    assert len(all_reduces) == 4
-    assert len(barriers) == 4

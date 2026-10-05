@@ -350,7 +350,10 @@ class NCCLWeightsWriter(WeightsExchangeShardingWriter):
                     f"Writer: Executing {len(p2p_op_list)} send ops via batch_send_recv"
                 )
             sync_start_barrier_time_ms = 0.0
-            if os.environ.get("AWEX_PROFILE_SYNC_START", "0") == "1":
+            if (
+                using_device_transport
+                and os.environ.get("AWEX_PROFILE_SYNC_START", "0") == "1"
+            ):
                 sync_start = time.perf_counter()
                 dist.barrier(
                     group=self.weights_update_group,
@@ -404,17 +407,19 @@ class NCCLWeightsWriter(WeightsExchangeShardingWriter):
                 duration,
                 "Send weights using NCCL",
             )
-            completion_barrier_start = time.perf_counter()
-            dist.barrier(
-                group=self.weights_update_group,
-                device_ids=[device_util.current_device()],
-            )
-            completion_barrier_time_ms = (
-                time.perf_counter() - completion_barrier_start
-            ) * 1000.0
-            logger.info(
-                f"Barrier passed for writer step {step_id} with rank {self.transfer_rank}"
-            )
+            completion_barrier_time_ms = 0.0
+            if using_device_transport:
+                completion_barrier_start = time.perf_counter()
+                dist.barrier(
+                    group=self.weights_update_group,
+                    device_ids=[device_util.current_device()],
+                )
+                completion_barrier_time_ms = (
+                    time.perf_counter() - completion_barrier_start
+                ) * 1000.0
+                logger.info(
+                    f"Barrier passed for writer step {step_id} with rank {self.transfer_rank}"
+                )
             kernel_transfer_time_ms = profile_metrics.get(
                 "kernel_transfer_time_ms", 0.0
             )

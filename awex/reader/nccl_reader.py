@@ -430,7 +430,10 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
                 f"Reader: Executing {len(p2p_op_list)} recv ops via batch_send_recv"
             )
         sync_start_barrier_time_ms = 0.0
-        if os.environ.get("AWEX_PROFILE_SYNC_START", "0") == "1":
+        if (
+            self.device_transport is not None
+            and os.environ.get("AWEX_PROFILE_SYNC_START", "0") == "1"
+        ):
             sync_start = time.perf_counter()
             dist.barrier(
                 group=self.weights_update_group,
@@ -489,16 +492,19 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
             duration,
             "Receive weights using NCCL",
         )
-        completion_barrier_start = time.perf_counter()
-        dist.barrier(
-            group=self.weights_update_group, device_ids=[device_util.current_device()]
-        )
-        completion_barrier_time_ms = (
-            time.perf_counter() - completion_barrier_start
-        ) * 1000.0
-        logger.info(
-            f"Barrier passed for reader step {step_id} with rank {self.transfer_rank}"
-        )
+        completion_barrier_time_ms = 0.0
+        if self.device_transport is not None:
+            completion_barrier_start = time.perf_counter()
+            dist.barrier(
+                group=self.weights_update_group,
+                device_ids=[device_util.current_device()],
+            )
+            completion_barrier_time_ms = (
+                time.perf_counter() - completion_barrier_start
+            ) * 1000.0
+            logger.info(
+                f"Barrier passed for reader step {step_id} with rank {self.transfer_rank}"
+            )
         kernel_transfer_time_ms = profile_metrics.get("kernel_transfer_time_ms", 0.0)
         effective_gbps = 0.0
         if kernel_transfer_time_ms > 0:
