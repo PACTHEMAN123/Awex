@@ -56,6 +56,24 @@ def test_get_mcore_model_parameters_uses_dtensor_local_payload(monkeypatch):
     assert parameters["decoder.layers.0.mlp.router.expert_bias"] is expert_bias_local
 
 
+def test_get_mcore_model_parameters_prefers_megatron_fsdp_orig_param(monkeypatch):
+    import torch.distributed.tensor as tensor_module
+
+    monkeypatch.setattr(tensor_module, "DTensor", _FakeDTensor)
+    qkv_tp_local = torch.arange(12).reshape(3, 4)
+    qkv_dp_shard = torch.arange(4)
+    parameter = _FakeDTensor(qkv_dp_shard)
+    parameter.orig_param = qkv_tp_local
+    model = _FakeModel(parameter, torch.arange(2))
+
+    parameters = get_mcore_model_parameters(model)
+
+    assert (
+        parameters["decoder.layers.0.self_attention.linear_qkv.weight"]
+        is qkv_tp_local
+    )
+
+
 def test_get_mcore_model_parameters_preserves_regular_tensors():
     qkv = torch.arange(12).reshape(3, 4)
     expert_bias = torch.arange(2)

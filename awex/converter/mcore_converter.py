@@ -1358,12 +1358,16 @@ def convert_qkv_bias_along_tp_attention(
 def _to_local_mcore_tensor(parameter: torch.Tensor) -> torch.Tensor:
     """Return the rank-local payload for Megatron DTensor parameters.
 
-    Megatron-FSDP represents tensor-parallel parameters as DTensors whose
-    public shape is the global pre-TP shape. Awex metadata and converters work
-    on the shard owned by each Megatron rank, so feeding the DTensor itself
-    makes TP-sharded weights look replicated and doubles their logical shape.
+    During optimizer phases Megatron-FSDP swaps model parameters for DP-sharded
+    DTensors and keeps the forward-ready tensor-parallel weight in ``orig_param``.
+    Awex must publish that TP-local weight: the DTensor's public shape is global
+    while ``to_local()`` is only an uneven flat DP shard. Plain TP DTensors do
+    not have ``orig_param`` and can be localized directly.
     """
 
+    original = getattr(parameter, "orig_param", None)
+    if isinstance(original, torch.Tensor):
+        parameter = original
     try:
         from torch.distributed.tensor import DTensor
     except ImportError:
