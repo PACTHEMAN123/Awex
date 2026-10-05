@@ -123,6 +123,8 @@ __device__ __forceinline__ void v2RunSendGin(const V2KernelArgs& args, const V2W
   const std::uint32_t roles = v2Roles(V2Direction::kSend, tid, nthreads, &nworkers);
   auto* error = &reinterpret_cast<V2WindowHeader*>(args.local_window)->error;
   const ncclTeam world = ncclTeamWorld(args.dev_comm);
+  const ncclTeam rail = ncclTeamRail(args.dev_comm);
+  const int gin_peer = ncclTeamRankToTeam(rail, world, work.peer);
   const ncclGinSignal_t ack_signal = v2GinAckSignal(args, work.peer, channel);
   const ncclGinSignal_t ready_signal = v2GinReadySignal(args, args.local_rank, channel);
   std::uint64_t cursor = 0;
@@ -145,7 +147,7 @@ __device__ __forceinline__ void v2RunSendGin(const V2KernelArgs& args, const V2W
 
     v2GroupBarrier(main_barrier, nthreads);
     if ((roles & kRolePostSend) && v2LoadError(error) == 0) {
-      gin.put(world, work.peer,
+      gin.put(rail, gin_peer,
               args.window, v2GinPayloadOffset(args, args.local_rank, channel, step),
               args.window, v2GinPayloadOffset(args, work.peer, channel, step),
               slice_bytes, ncclGin_SignalInc{ready_signal});
@@ -173,6 +175,8 @@ __device__ __forceinline__ void v2RunRecvGin(const V2KernelArgs& args, const V2W
   const std::uint32_t roles = v2Roles(V2Direction::kRecv, tid, nthreads, &nworkers);
   auto* error = &reinterpret_cast<V2WindowHeader*>(args.local_window)->error;
   const ncclTeam world = ncclTeamWorld(args.dev_comm);
+  const ncclTeam rail = ncclTeamRail(args.dev_comm);
+  const int gin_peer = ncclTeamRankToTeam(rail, world, work.peer);
   const ncclGinSignal_t ready_signal = v2GinReadySignal(args, work.peer, channel);
   const ncclGinSignal_t ack_signal = v2GinAckSignal(args, args.local_rank, channel);
   std::uint64_t cursor = 0;
@@ -192,7 +196,7 @@ __device__ __forceinline__ void v2RunRecvGin(const V2KernelArgs& args, const V2W
 
     v2GroupBarrier(barrier, nthreads);
     if ((roles & kRolePostRecv) && v2LoadError(error) == 0) {
-      gin.signal(world, work.peer, ncclGin_SignalInc{ack_signal});
+      gin.signal(rail, gin_peer, ncclGin_SignalInc{ack_signal});
     }
     if (v2LoadError(error) != 0) return;
     cursor += slice_bytes;
@@ -259,7 +263,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 1) device_v2_kernel(V2Kernel
     __syncthreads();
 
     ncclGinBarrierSession<ncclCoopCta> barrier{
-      ncclCoopCta(), gin, ncclTeamTagWorld(), channel};
+      ncclCoopCta(), gin, ncclTeamTagRail(), channel};
     const ncclResult_t entry = barrier.sync(ncclCoopCta(), cuda::memory_order_acquire,
                                              ncclGinFenceLevel::Relaxed, args.timeout_cycles);
     if (entry != ncclSuccess) {

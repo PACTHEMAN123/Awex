@@ -420,13 +420,12 @@ void initialize_gin_window(DeviceState* state, cudaStream_t stream) {
                                               &state->window, NCCL_WIN_COLL_SYMMETRIC));
 
     ncclDevCommRequirements_t requirements = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
-    requirements.ginForceEnable = true;
     requirements.ginContextCount = static_cast<int>(state->total_channels);
     requirements.ginSignalCount = static_cast<int>(
       2 * state->world_size * state->total_channels);
-    requirements.ginConnectionType = NCCL_GIN_CONNECTION_FULL;
+    requirements.ginConnectionType = NCCL_GIN_CONNECTION_RAIL;
     requirements.ginQueueDepth = 1024;
-    requirements.worldGinBarrierCount = static_cast<int>(state->total_channels);
+    requirements.railGinBarrierCount = static_cast<int>(state->total_channels);
     state->dev_comm = reinterpret_cast<ncclDevComm_t*>(std::malloc(sizeof(ncclDevComm_t)));
     if (state->dev_comm == nullptr) throw std::bad_alloc();
     AWEX_NCCL_V2_CHECK(ncclDevCommCreate(state->comm, &requirements, state->dev_comm));
@@ -448,6 +447,26 @@ void initialize_gin_window(DeviceState* state, cudaStream_t stream) {
       state->local_base = nullptr;
     }
     throw;
+  }
+}
+
+void validate_gin_peers(DeviceState* state, const std::vector<std::uint32_t>& active_peers,
+                        cudaStream_t stream) {
+  const ncclTeam_t world = ncclTeamWorld(state->comm);
+  const ncclTeam_t rail = ncclTeamRail(state->comm);
+  std::uint32_t invalid_peer = 0;
+  for (const std::uint32_t peer : active_peers) {
+    if (!ncclTeamRankIsMember(rail, world, static_cast<int>(peer))) {
+      invalid_peer = peer + 1;
+      break;
+    }
+  }
+  const auto invalid_peers =
+    v2::topology_detail::allGather(state->comm, &invalid_peer, 1, state->world_size, stream);
+  if (std::any_of(invalid_peers.begin(), invalid_peers.end(),
+                  [](std::uint32_t value) { return value != 0; })) {
+    throw std::runtime_error(
+      "nccl_device_v2 transfer plan contains a peer outside its NCCL GIN rail");
   }
 }
 
@@ -557,6 +576,7 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
     host_lowering_time_ms = std::chrono::duration<double, std::milli>(Clock::now() - lowering_start).count();
 
     if (state->use_gin) {
+      validate_gin_peers(state, active_peers, stream);
       expand_gin_channels(&schedule, state->total_channels);
       initialize_gin_window(state, stream);
     } else {
@@ -600,7 +620,7 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
   metrics["vector_bytes"] = py::int_(v2::kCopyPackBytes);
   metrics["copy_unroll"] = py::int_(v2::kCopyUnroll);
   metrics["channel_limit"] = py::int_(state->total_channels);
-  metrics["transport"] = py::str(state->use_gin ? "gin" : "lsa");
+  metrics["transport"] = py::str(state->use_gin ? "gin_rail" : "lsa");
   metrics["topology_requested_channels_per_peer"] = py::int_(state->topology.requested_channels_per_peer);
   metrics["topology_channels_per_peer"] = py::int_(state->topology.channels_per_peer);
   metrics["topology_nvml_available"] = py::bool_(state->topology.nvml_available);
