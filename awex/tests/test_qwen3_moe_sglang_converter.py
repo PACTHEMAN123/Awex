@@ -243,3 +243,30 @@ def test_expert_split_values_match_fused_slices():
             gate_up[f"{prefix}.up_proj.weight"], w13[expert_id, MOE_INTERMEDIATE:]
         )
         assert torch.equal(down[f"{prefix}.down_proj.weight"], w2[expert_id])
+
+
+def test_vllm_routed_expert_container_matches_hf_names():
+    converter = _make_converter()
+    w13 = torch.randn(NUM_EXPERTS, 2 * MOE_INTERMEDIATE, HIDDEN)
+    w2 = torch.randn(NUM_EXPERTS, HIDDEN, MOE_INTERMEDIATE)
+
+    converted_names = {
+        name
+        for name, _ in converter.convert_param(
+            "model.layers.0.mlp.experts.routed_experts.w13_weight", w13
+        )
+    }
+    converted_names.update(
+        name
+        for name, _ in converter.convert_param(
+            "model.layers.0.mlp.experts.routed_experts.w2_weight", w2
+        )
+    )
+
+    expected_names = {
+        name
+        for name in _expected_hf_names(range(NUM_EXPERTS))
+        if ".mlp.experts." in name
+    }
+    assert converted_names == expected_names
+    assert not any("routed_experts" in name for name in converted_names)

@@ -40,6 +40,16 @@ class SGlangToHFWeightConverterQwen3Moe(SGlangToHFWeightConverter):
         # inference side must unfuse qkv_proj for transfer-plan matching.
         return False
 
+    def convert_param(
+        self, name: str, parameter: torch.Tensor
+    ) -> List[Tuple[str, torch.Tensor]]:
+        # vLLM exposes the fused expert tensors below an implementation-only
+        # routed_experts container. The base converter attaches the expert id
+        # to every "experts" token, so leaving that segment in place produces
+        # mlp.experts.<id>.routed_experts.<id> instead of the HF contract.
+        name = name.replace(".experts.routed_experts.", ".experts.")
+        return super().convert_param(name, parameter)
+
     def _convert_layer_norm_param(
         self, name: str, parameter: torch.Tensor, layer_number: str
     ) -> List[Tuple[str, torch.Tensor]]:
