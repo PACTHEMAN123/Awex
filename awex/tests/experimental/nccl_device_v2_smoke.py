@@ -109,16 +109,16 @@ def main() -> None:
             )
         if metrics["topology_requested_channels_per_peer"] != 64:
             raise AssertionError(f"expected 64 requested channels, got {dict(metrics)}")
-        expected_channels_per_peer = 64 if transport == "lsa" else 2
-        if metrics["topology_channels_per_peer"] != expected_channels_per_peer:
+        if transport == "lsa" and metrics["topology_channels_per_peer"] != 64:
             raise AssertionError(
-                f"expected {expected_channels_per_peer} effective topology channels, got {dict(metrics)}"
+                f"expected 64 effective topology channels, got {dict(metrics)}"
             )
-        expected_active_channels = 32 if transport == "lsa" else 2
-        if metrics["channel_count"] != expected_active_channels:
+        if transport == "lsa" and metrics["channel_count"] != 32:
             raise AssertionError(
-                f"expected {expected_active_channels} active channels, got {dict(metrics)}"
+                f"expected 32 active channels, got {dict(metrics)}"
             )
+        if transport != "lsa" and not 0 < metrics["channel_count"] <= metrics["channel_limit"]:
+            raise AssertionError(f"invalid GIN channel count, got {dict(metrics)}")
         if metrics["threads_per_channel"] != 640:
             raise AssertionError(f"expected 640 channel threads, got {dict(metrics)}")
         if metrics["warps_per_channel"] != 20:

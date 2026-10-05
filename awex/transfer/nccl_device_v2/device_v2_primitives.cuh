@@ -182,34 +182,27 @@ __device__ __forceinline__ std::uint8_t* v2GinPayload(const V2KernelArgs& args,
   return args.local_window + v2GinPayloadOffset(args, connection_rank, channel, step);
 }
 
-__device__ __forceinline__ ncclGinSignal_t v2GinReadySignal(const V2KernelArgs& args,
-                                                            std::uint32_t sender_rank,
-                                                            std::uint32_t channel) {
-  return static_cast<ncclGinSignal_t>(sender_rank * args.layout.channel_count + channel);
+__device__ __forceinline__ const std::uint8_t* v2GinProxyPayload(
+  const V2KernelArgs& args, std::uint32_t proxy_rank, std::uint32_t connection_rank,
+  std::uint32_t channel, unsigned long long step) {
+  const auto* window = reinterpret_cast<const std::uint8_t*>(args.peer_windows[proxy_rank]);
+  return window + v2GinPayloadOffset(args, connection_rank, channel, step);
 }
 
-__device__ __forceinline__ ncclGinSignal_t v2GinAckSignal(const V2KernelArgs& args,
-                                                          std::uint32_t receiver_rank,
-                                                          std::uint32_t channel) {
-  const std::uint32_t ready_signal_count = args.world_size * args.layout.channel_count;
-  return static_cast<ncclGinSignal_t>(ready_signal_count +
-                                     receiver_rank * args.layout.channel_count + channel);
+__device__ __forceinline__ std::size_t v2GinSlotOffset(const V2KernelArgs& args,
+                                                       std::uint32_t connection_rank,
+                                                       std::uint32_t channel,
+                                                       unsigned long long step) {
+  const std::size_t connection =
+    static_cast<std::size_t>(connection_rank) * args.layout.channel_count + channel;
+  const std::size_t slot =
+    connection * args.layout.fifo_depth + static_cast<std::size_t>(step % args.layout.fifo_depth);
+  return args.layout.state_offset + slot * sizeof(V2FifoSlot);
 }
 
-__device__ __forceinline__ bool v2GinWaitSignal(const ncclGin& gin, ncclGinSignal_t signal,
-                                                unsigned long long least, unsigned long long* cache,
-                                                volatile unsigned int* error,
-                                                unsigned long long timeout_cycles) {
-  const unsigned long long start = clock64();
-  while (*cache < least) {
-    *cache = gin.readSignal(signal);
-    if (v2LoadError(error) != 0) return false;
-    if (clock64() - start > timeout_cycles) {
-      atomicExch_system(const_cast<unsigned int*>(error), 5U);
-      return false;
-    }
-  }
-  return true;
+__device__ __forceinline__ unsigned long long v2GinGeneration(const V2KernelArgs& args,
+                                                              unsigned long long step) {
+  return (step - 1) / args.layout.fifo_depth + 1;
 }
 
 __device__ __forceinline__ void v2CopyContiguous(std::uint8_t* destination, const std::uint8_t* source,

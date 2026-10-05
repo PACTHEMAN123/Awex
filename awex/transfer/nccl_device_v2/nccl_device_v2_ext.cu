@@ -417,15 +417,31 @@ void initialize_gin_window(DeviceState* state, cudaStream_t stream) {
     AWEX_NCCL_V2_CHECK(ncclMemAlloc(&state->local_base, state->window_bytes));
     AWEX_CUDA_V2_CHECK(cudaMemsetAsync(state->local_base, 0, state->layout.payload_offset, stream));
     AWEX_NCCL_V2_CHECK(ncclCommWindowRegister(state->comm, state->local_base, state->window_bytes,
-                                              &state->window, NCCL_WIN_COLL_SYMMETRIC));
+                                              &state->window,
+                                              NCCL_WIN_COLL_SYMMETRIC | NCCL_WIN_STRICT_ORDERING));
+
+    const ncclTeam_t lsa = ncclTeamLsa(state->comm);
+    const int node_rank_begin = state->rank - lsa.rank;
+    state->remote_bases.assign(state->world_size, nullptr);
+    for (int peer = 0; peer < lsa.nRanks; ++peer) {
+      AWEX_NCCL_V2_CHECK(
+        ncclGetLsaDevicePointer(state->window, 0, peer, &state->remote_bases[node_rank_begin + peer]));
+    }
+    AWEX_CUDA_V2_CHECK(cudaMalloc(reinterpret_cast<void**>(&state->device_peer_windows),
+                                  checked_multiply(static_cast<std::size_t>(state->world_size), sizeof(uintptr_t),
+                                                   "nccl_device_v2 GIN proxy window table")));
+    std::vector<uintptr_t> peer_windows(state->world_size, 0);
+    for (int peer = node_rank_begin; peer < node_rank_begin + lsa.nRanks; ++peer) {
+      peer_windows[peer] = reinterpret_cast<uintptr_t>(state->remote_bases[peer]);
+    }
+    AWEX_CUDA_V2_CHECK(cudaMemcpyAsync(state->device_peer_windows, peer_windows.data(),
+                                       peer_windows.size() * sizeof(uintptr_t), cudaMemcpyHostToDevice, stream));
 
     ncclDevCommRequirements_t requirements = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
     requirements.ginContextCount = static_cast<int>(state->total_channels);
-    requirements.ginSignalCount = static_cast<int>(
-      2 * state->world_size * state->total_channels);
     requirements.ginConnectionType = NCCL_GIN_CONNECTION_RAIL;
     requirements.ginQueueDepth = 1024;
-    requirements.railGinBarrierCount = static_cast<int>(state->total_channels);
+    requirements.barrierCount = static_cast<int>(state->total_channels);
     state->dev_comm = reinterpret_cast<ncclDevComm_t*>(std::malloc(sizeof(ncclDevComm_t)));
     if (state->dev_comm == nullptr) throw std::bad_alloc();
     AWEX_NCCL_V2_CHECK(ncclDevCommCreate(state->comm, &requirements, state->dev_comm));
@@ -437,6 +453,10 @@ void initialize_gin_window(DeviceState* state, cudaStream_t stream) {
       ncclDevCommDestroy(state->comm, state->dev_comm);
       std::free(state->dev_comm);
       state->dev_comm = nullptr;
+    }
+    if (state->device_peer_windows != nullptr) {
+      cudaFree(state->device_peer_windows);
+      state->device_peer_windows = nullptr;
     }
     if (state->window != nullptr) {
       ncclCommWindowDeregister(state->comm, state->window);
@@ -450,23 +470,30 @@ void initialize_gin_window(DeviceState* state, cudaStream_t stream) {
   }
 }
 
-void validate_gin_peers(DeviceState* state, const std::vector<std::uint32_t>& active_peers,
-                        cudaStream_t stream) {
-  const ncclTeam_t world = ncclTeamWorld(state->comm);
-  const ncclTeam_t rail = ncclTeamRail(state->comm);
+void validate_gin_topology(DeviceState* state, const std::vector<std::uint32_t>& active_peers,
+                           cudaStream_t stream) {
+  const ncclTeam_t lsa = ncclTeamLsa(state->comm);
   std::uint32_t invalid_peer = 0;
   for (const std::uint32_t peer : active_peers) {
-    if (!ncclTeamRankIsMember(rail, world, static_cast<int>(peer))) {
+    const bool same_node = peer / lsa.nRanks == static_cast<std::uint32_t>(state->rank) / lsa.nRanks;
+    if (same_node) {
       invalid_peer = peer + 1;
       break;
     }
   }
+  const std::uint32_t local_lsa_size = static_cast<std::uint32_t>(lsa.nRanks);
+  const auto lsa_sizes =
+    v2::topology_detail::allGather(state->comm, &local_lsa_size, 1, state->world_size, stream);
   const auto invalid_peers =
     v2::topology_detail::allGather(state->comm, &invalid_peer, 1, state->world_size, stream);
-  if (std::any_of(invalid_peers.begin(), invalid_peers.end(),
-                  [](std::uint32_t value) { return value != 0; })) {
+  const bool uniform_lsa = state->world_size % lsa.nRanks == 0 &&
+    std::all_of(lsa_sizes.begin(), lsa_sizes.end(),
+                [local_lsa_size](std::uint32_t value) { return value == local_lsa_size; });
+  const bool has_local_peer = std::any_of(
+    invalid_peers.begin(), invalid_peers.end(), [](std::uint32_t value) { return value != 0; });
+  if (!uniform_lsa || has_local_peer) {
     throw std::runtime_error(
-      "nccl_device_v2 transfer plan contains a peer outside its NCCL GIN rail");
+      "nccl_device_v2 GIN routing requires uniform LSA teams and cross-node transfer peers");
   }
 }
 
@@ -576,7 +603,7 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
     host_lowering_time_ms = std::chrono::duration<double, std::milli>(Clock::now() - lowering_start).count();
 
     if (state->use_gin) {
-      validate_gin_peers(state, active_peers, stream);
+      validate_gin_topology(state, active_peers, stream);
       expand_gin_channels(&schedule, state->total_channels);
       initialize_gin_window(state, stream);
     } else {
@@ -620,7 +647,7 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
   metrics["vector_bytes"] = py::int_(v2::kCopyPackBytes);
   metrics["copy_unroll"] = py::int_(v2::kCopyUnroll);
   metrics["channel_limit"] = py::int_(state->total_channels);
-  metrics["transport"] = py::str(state->use_gin ? "gin_rail" : "lsa");
+  metrics["transport"] = py::str(state->use_gin ? "gin_rail_lsa" : "lsa");
   metrics["topology_requested_channels_per_peer"] = py::int_(state->topology.requested_channels_per_peer);
   metrics["topology_channels_per_peer"] = py::int_(state->topology.channels_per_peer);
   metrics["topology_nvml_available"] = py::bool_(state->topology.nvml_available);
