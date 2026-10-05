@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""Two-rank CUDA smoke test for the experimental NCCL Device v2 backend."""
+"""Cross-node CUDA smoke test for the experimental NCCL Device v2 backend."""
 
 from __future__ import annotations  # noqa: I001
 
@@ -42,30 +42,32 @@ def main() -> None:
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
-    if world_size != 2:
-        raise RuntimeError("nccl_device_v2_smoke requires exactly two ranks")
+    if world_size not in (2, 4):
+        raise RuntimeError("nccl_device_v2_smoke requires two or four ranks")
 
     torch.cuda.set_device(local_rank)
     dist.init_process_group("gloo")
     extension = _load_extension()
     unique_id = _broadcast_unique_id(extension, rank)
+    sender = rank < world_size // 2
+    peer = world_size - 1 - rank
+    patterns = tuple((pattern + (rank if sender else peer)) & 0xFF for pattern in _PATTERNS)
     tensors = [
         torch.full(
             (nbytes,),
-            _PATTERNS[index] if rank == 0 else 0,
+            patterns[index] if sender else 0,
             dtype=torch.uint8,
             device="cuda",
         )
         for index, nbytes in enumerate(_TENSOR_BYTES)
     ]
-    peer = 1 - rank
     handle = extension.create(
         unique_id,
         world_size,
         rank,
         local_rank,
         60_000,
-        64,
+        int(os.environ.get("AWEX_NCCL_DEVICE_V2_MAX_CHANNELS", "64")),
         8,
         512 * 1024,
         4 * 1024 * 1024,
@@ -73,7 +75,7 @@ def main() -> None:
     try:
         launch_metrics = []
         for sequence in (1, 2):
-            if rank == 1 and sequence > 1:
+            if not sender and sequence > 1:
                 for tensor in tensors:
                     tensor.zero_()
             dist.barrier()
@@ -86,15 +88,15 @@ def main() -> None:
                 list(_TENSOR_BYTES),
                 [peer] * len(tensors),
                 list(range(len(tensors))),
-                [len(tensors), 0] if rank == 1 else [0, len(tensors)],
-                rank == 0,
+                [len(tensors) if index == peer else 0 for index in range(world_size)],
+                sender,
                 sequence,
             )
             launch_metrics.append(metrics)
             dist.barrier()
-            if rank == 1:
+            if not sender:
                 for index, tensor in enumerate(tensors):
-                    if not torch.all(tensor == _PATTERNS[index]).item():
+                    if not torch.all(tensor == patterns[index]).item():
                         raise AssertionError(
                             f"payload mismatch in tensor {index} at sequence {sequence}"
                         )
@@ -123,7 +125,7 @@ def main() -> None:
             raise AssertionError(f"expected 640 channel threads, got {dict(metrics)}")
         if metrics["warps_per_channel"] != 20:
             raise AssertionError(f"expected 20 channel warps, got {dict(metrics)}")
-        expected_payload_peers = (1 if rank == 0 else 0) if transport == "lsa" else world_size
+        expected_payload_peers = (1 if sender else 0) if transport == "lsa" else world_size
         if metrics["payload_peer_count"] != expected_payload_peers:
             raise AssertionError(
                 f"expected {expected_payload_peers} payload peers, got {dict(metrics)}"
