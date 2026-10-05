@@ -390,6 +390,8 @@ def nccl_build_send_ops(
     copy_op_list = []
     send_traj_list = []
     train_slice_context = {}
+    wire_parameters = {}
+    wire_cast_bytes = 0
     while len(unfinished_ranks) > 0:
         finished_ranks = set()
         for recv_rank in sorted(unfinished_ranks):
@@ -399,6 +401,17 @@ def nccl_build_send_ops(
             if progress < num_operations:
                 op = operations[progress]
                 send_tensor = parameters[op.send_shard_meta.name]
+                recv_dtype = getattr(op.recv_shard_meta, "dtype", None)
+                if recv_dtype is not None and send_tensor.dtype != recv_dtype:
+                    wire_key = (op.send_shard_meta.name, recv_dtype)
+                    wire_tensor = wire_parameters.get(wire_key)
+                    if wire_tensor is None:
+                        wire_tensor = send_tensor.to(recv_dtype)
+                        wire_parameters[wire_key] = wire_tensor
+                        wire_cast_bytes += int(wire_tensor.numel()) * int(
+                            wire_tensor.element_size()
+                        )
+                    send_tensor = wire_tensor
                 tensor_sliced = slice_tensor(
                     send_tensor, op, True, slice_context=train_slice_context
                 )
@@ -420,6 +433,13 @@ def nccl_build_send_ops(
                 finished_ranks.add(recv_rank)
         for rank in finished_ranks:
             unfinished_ranks.remove(rank)
+    if wire_parameters:
+        logger.info(
+            "[nccl_build_send_ops] Cast %s source parameters to receiver wire "
+            "dtypes (%s cached bytes)",
+            len(wire_parameters),
+            wire_cast_bytes,
+        )
     if mem_debug:
         context_bytes = sum(
             int(t.numel()) * int(t.element_size()) for t in train_slice_context.values()

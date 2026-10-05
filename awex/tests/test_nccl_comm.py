@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from awex.transfer import nccl_comm
 
@@ -62,6 +63,36 @@ def test_batch_send_recv_bounds_group_size_by_peer(monkeypatch):
 def test_chunk_p2p_ops_rejects_non_positive_limit():
     with pytest.raises(ValueError, match="must be positive"):
         nccl_comm._chunk_p2p_ops_by_peer(_ops(0, 1), max_ops_per_peer=0)
+
+
+def test_nccl_build_send_ops_uses_receiver_wire_dtype(monkeypatch):
+    monkeypatch.setattr(
+        nccl_comm.dist,
+        "P2POp",
+        lambda op, tensor, peer, group: SimpleNamespace(
+            op=op, tensor=tensor, peer=peer, group=group
+        ),
+    )
+    operation = SimpleNamespace(
+        send_shard_meta=SimpleNamespace(name="weight", dtype=torch.float32),
+        recv_shard_meta=SimpleNamespace(name="weight", dtype=torch.bfloat16),
+        train_slices=(slice(None),),
+        recv_rank=0,
+    )
+    transfer_plan = SimpleNamespace(operations={0: [operation]})
+
+    p2p_ops, copy_ops, send_traj = nccl_comm.nccl_build_send_ops(
+        {"weight": torch.arange(8, dtype=torch.float32)},
+        transfer_plan,
+        weights_update_group="process-group",
+        copy_rank=-1,
+    )
+
+    assert len(p2p_ops) == 1
+    assert p2p_ops[0].tensor.dtype == torch.bfloat16
+    assert p2p_ops[0].tensor.tolist() == list(range(8))
+    assert copy_ops == []
+    assert send_traj == []
 
 
 def test_bipartite_peer_stages_are_inverse_matchings():
