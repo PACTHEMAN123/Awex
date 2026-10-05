@@ -551,6 +551,20 @@ def _chunk_p2p_ops_by_peer(
     return batches
 
 
+def _bipartite_peer_for_stage(rank: int, world_size: int, stage: int) -> int:
+    """Return the unique opposite-half peer for a bipartite P2P stage."""
+    if world_size <= 1 or world_size % 2 != 0:
+        raise ValueError("peer-staged P2P requires a positive even world size")
+    half = world_size // 2
+    if rank < 0 or rank >= world_size:
+        raise ValueError(f"rank {rank} is outside world size {world_size}")
+    if stage < 0 or stage >= half:
+        raise ValueError(f"stage {stage} is outside [0, {half})")
+    if rank < half:
+        return half + ((rank - stage) % half)
+    return ((rank - half) + stage) % half
+
+
 def _run_p2p_op(op: dist.P2POp, async_op: bool) -> Optional[dist.Work]:
     """Run a single P2P op, returning Work for async operations.
 
@@ -577,6 +591,7 @@ def batch_send_recv(
     blocking: bool = True,
     use_group: bool = True,
     use_stream: bool = True,
+    use_peer_stages: bool = False,
 ):
     """Execute send and recv P2P operations with optional grouping.
 
@@ -614,6 +629,44 @@ def batch_send_recv(
             raise ValueError(
                 "AWEX_NCCL_MAX_OPS_PER_PEER_BATCH must be an integer"
             ) from exc
+        if use_peer_stages:
+            if not blocking:
+                raise ValueError("peer-staged P2P requires blocking execution")
+            process_group = all_ops[0].group
+            rank = dist.get_rank(group=process_group)
+            world_size = dist.get_world_size(group=process_group)
+            half = world_size // 2
+            by_peer: Dict[int, List[dist.P2POp]] = {}
+            for op in all_ops:
+                by_peer.setdefault(op.peer, []).append(op)
+            expected_half = range(half, world_size) if rank < half else range(half)
+            invalid_peers = sorted(set(by_peer) - set(expected_half))
+            if invalid_peers:
+                raise ValueError(
+                    f"rank {rank} has peers outside the opposite half: {invalid_peers}"
+                )
+            logger.info(
+                "Executing %s P2P ops across %s peers in %s globally "
+                "ordered NCCL stages (max %s ops per peer group)",
+                len(all_ops),
+                len(by_peer),
+                half,
+                max_ops_per_peer,
+            )
+            for stage in range(half):
+                peer = _bipartite_peer_for_stage(rank, world_size, stage)
+                peer_ops = by_peer.get(peer, [])
+                for start in range(0, len(peer_ops), max_ops_per_peer):
+                    op_batch = peer_ops[start : start + max_ops_per_peer]
+                    works = dist.batch_isend_irecv(op_batch)
+                    for work in works:
+                        work.wait()
+                    device_util.synchronize()
+                dist.barrier(
+                    group=process_group,
+                    device_ids=[device_util.current_device()],
+                )
+            return []
         op_batches = _chunk_p2p_ops_by_peer(all_ops, max_ops_per_peer)
         if len(op_batches) > 1:
             logger.info(

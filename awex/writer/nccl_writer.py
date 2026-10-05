@@ -375,6 +375,7 @@ class NCCLWeightsWriter(WeightsExchangeShardingWriter):
                         recv_ops=[],
                         blocking=True,
                         use_group=True,
+                        use_peer_stages=True,
                     )
                 else:
                     self._send_recv_one_by_one(p2p_op_list, send_traj_list)
