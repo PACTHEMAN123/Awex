@@ -36,6 +36,10 @@ class Qwen3ForCausalLM:
         return iter(self._params)
 
 
+class CUDAGraphWrapper(Qwen3ForCausalLM):
+    """Matches the runtime wrapper class exposed by veRL's vLLM worker."""
+
+
 def _model(tie_word_embeddings=True):
     config = SimpleNamespace(
         tie_word_embeddings=tie_word_embeddings,
@@ -92,3 +96,34 @@ def test_tied_embeddings_get_an_lm_head_alias_on_every_engine(engine_name):
 def test_untied_embeddings_get_no_alias(engine_name):
     names = _resolve(engine_name, _model(tie_word_embeddings=False))
     assert "lm_head.weight" not in names
+
+
+def test_runtime_wrapper_uses_hf_architecture_for_converter_and_metadata():
+    model = CUDAGraphWrapper(_model().config, _model()._params)
+    identity = SimpleNamespace(convert_param=lambda name, param: [(name, param)])
+    with ExitStack() as stack:
+        stack.enter_context(
+            patch(
+                "awex.meta.infer_meta_resolver.get_rank_info_extractor",
+                return_value=lambda ctx, rank: SimpleNamespace(
+                    tp_rank=0, ep_rank=0, global_rank=0
+                ),
+            )
+        )
+        get_converter = stack.enter_context(
+            patch(
+                "awex.meta.infer_meta_resolver.get_infer_weights_converter",
+                return_value=identity,
+            )
+        )
+        meta = InferParamMetaResolver._get_model_param_info(
+            "vllm",
+            SimpleNamespace(tp_size=1, ep_size=1, device_backend="cuda"),
+            convert_params=True,
+            engine_rank=0,
+            model=model,
+            model_context={"pp_rank": 0, "pp_size": 1},
+        )
+
+    assert meta["model_arch_name"] == "Qwen3ForCausalLM"
+    assert get_converter.call_args.args[:2] == ("vllm", "Qwen3ForCausalLM")

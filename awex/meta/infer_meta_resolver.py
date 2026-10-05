@@ -202,7 +202,18 @@ class InferParamMetaResolver(ParamMetaResolver):
         model_context = kwargs["model_context"]
         params_meta = []
         rank_info = get_rank_info_extractor(engine_name)(model_context, engine_rank)
-        model_arch_name = type(model).__name__
+        hf_config = getattr(model, "config", None)
+        if hf_config is None:
+            if isinstance(model_context, dict):
+                hf_config = model_context.get("hf_config")
+            else:
+                hf_config = getattr(model_context, "hf_config", None)
+        architectures = getattr(hf_config, "architectures", None)
+        if architectures is None and isinstance(hf_config, dict):
+            architectures = hf_config.get("architectures")
+        model_arch_name = (
+            architectures[0] if architectures else type(model).__name__
+        )
         meta = {
             "rank_info": rank_info,
             "params_meta": params_meta,
@@ -211,7 +222,7 @@ class InferParamMetaResolver(ParamMetaResolver):
         sglang_to_hf_weight_converter = get_infer_weights_converter(
             engine_name,
             model_arch_name,
-            hf_config=model.config,
+            hf_config=hf_config,
             infer_engine_config=infer_engine_config,
             rank_info=rank_info,
         )
@@ -225,9 +236,6 @@ class InferParamMetaResolver(ParamMetaResolver):
             else:
                 params.append((name, param))
         if convert_params:
-            hf_config = getattr(model, "config", None) or getattr(
-                model_context, "hf_config", None
-            )
             if getattr(hf_config, "tie_word_embeddings", False):
                 pp_rank = model_context.get("pp_rank", 0)
                 pp_size = model_context.get("pp_size", 1)
