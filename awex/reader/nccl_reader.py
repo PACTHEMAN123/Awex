@@ -439,6 +439,11 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
             sync_start_barrier_time_ms = (
                 time.perf_counter() - sync_start
             ) * 1000.0
+            logger.info(
+                "Reader rank %s passed profile sync-start barrier for step %s",
+                self.transfer_rank,
+                step_id,
+            )
         backend_execute_start = time.perf_counter()
         if self.device_transport is not None:
             profile_metrics.update(

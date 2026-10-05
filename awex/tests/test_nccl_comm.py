@@ -6,9 +6,9 @@ import torch
 from awex.transfer import nccl_comm
 
 
-def _ops(peer, count):
+def _ops(peer, count, group="process-group"):
     return [
-        SimpleNamespace(peer=peer, ordinal=index, group="process-group")
+        SimpleNamespace(peer=peer, ordinal=index, group=group)
         for index in range(count)
     ]
 
@@ -127,8 +127,12 @@ def test_batch_send_recv_serializes_bipartite_peers_by_stage(monkeypatch):
     monkeypatch.setattr(
         nccl_comm.dist, "batch_isend_irecv", fake_batch_isend_irecv
     )
-    monkeypatch.setattr(nccl_comm.dist, "get_rank", lambda group: 0)
-    monkeypatch.setattr(nccl_comm.dist, "get_world_size", lambda group: 8)
+    process_group = SimpleNamespace(rank=lambda: 0, size=lambda: 8)
+    monkeypatch.setattr(
+        nccl_comm.dist,
+        "get_rank",
+        lambda group: pytest.fail("custom group rank must not use default mapping"),
+    )
     monkeypatch.setattr(
         nccl_comm.dist,
         "all_reduce",
@@ -156,7 +160,7 @@ def test_batch_send_recv_serializes_bipartite_peers_by_stage(monkeypatch):
 
     result = nccl_comm.batch_send_recv(
         send_ops=[],
-        recv_ops=_ops(4, 3) + _ops(5, 2),
+        recv_ops=_ops(4, 3, process_group) + _ops(5, 2, process_group),
         blocking=True,
         use_group=True,
         use_peer_stages=True,

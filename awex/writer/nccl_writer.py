@@ -359,6 +359,11 @@ class NCCLWeightsWriter(WeightsExchangeShardingWriter):
                 sync_start_barrier_time_ms = (
                     time.perf_counter() - sync_start
                 ) * 1000.0
+                logger.info(
+                    "Writer rank %s passed profile sync-start barrier for step %s",
+                    self.transfer_rank,
+                    step_id,
+                )
             backend_execute_start = time.perf_counter()
             if using_device_transport:
                 profile_metrics.update(

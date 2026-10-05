@@ -653,8 +653,13 @@ def batch_send_recv(
             if not blocking:
                 raise ValueError("peer-staged P2P requires blocking execution")
             process_group = all_ops[0].group
-            rank = dist.get_rank(group=process_group)
-            world_size = dist.get_world_size(group=process_group)
+            # This is a custom process group whose rank space differs from the
+            # actor's default process group. dist.get_rank(group=...) consults
+            # the default-group mapping and can return the actor-local rank
+            # here, causing writers to be scheduled as readers. Query the
+            # custom group directly instead.
+            rank = process_group.rank()
+            world_size = process_group.size()
             half = world_size // 2
             by_peer: Dict[int, List[dist.P2POp]] = {}
             for op in all_ops:
