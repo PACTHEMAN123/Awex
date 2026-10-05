@@ -48,8 +48,6 @@ namespace v2 = awex::nccl_device_v2;
 
 namespace {
 
-constexpr int kMaxRanks = 256;
-
 struct LaunchBuffers {
   v2::V2Work* works = nullptr;
   v2::V2Fragment* fragments = nullptr;
@@ -61,6 +59,7 @@ struct LaunchBuffers {
 
 struct DeviceState {
   ncclComm_t comm = nullptr;
+  ncclDevComm_t* dev_comm = nullptr;
   ncclWindow_t window = nullptr;
   void* local_base = nullptr;
   std::vector<void*> remote_bases;
@@ -76,6 +75,7 @@ struct DeviceState {
   std::uint32_t fifo_depth = v2::kDefaultFifoDepth;
   std::size_t chunk_bytes = v2::kDefaultChunkBytes;
   std::size_t step_bytes = v2::kDefaultStepBytes;
+  bool use_gin = false;
   bool plan_initialized = false;
   v2::V2Direction direction = v2::V2Direction::kSend;
   std::vector<v2::V2LoweringTask> tasks;
@@ -124,7 +124,7 @@ std::uint32_t power_of_two_down(std::uint32_t value) {
 std::unique_ptr<DeviceState> make_state(const std::string& unique_id_bytes, int world_size, int rank, int device,
                                         int timeout_ms, std::uint32_t max_channels, std::uint32_t fifo_depth,
                                         std::size_t step_bytes, std::size_t chunk_bytes) {
-  if (world_size < 2 || world_size > kMaxRanks) {
+  if (world_size < 2 || world_size > v2::kMaxRanks) {
     throw std::runtime_error("nccl_device_v2 world_size must be in [2, 256]");
   }
   if (rank < 0 || rank >= world_size) {
@@ -170,12 +170,13 @@ std::unique_ptr<DeviceState> make_state(const std::string& unique_id_bytes, int 
       throw std::runtime_error("The loaded NCCL communicator does not support the Device API");
     }
     const ncclTeam_t lsa_team = ncclTeamLsa(state->comm);
-    if (lsa_team.nRanks != world_size || lsa_team.rank != rank || lsa_team.stride != 1) {
-      throw std::runtime_error("nccl_device_v2 requires a contiguous LSA domain");
+    state->use_gin = lsa_team.nRanks != world_size || lsa_team.rank != rank || lsa_team.stride != 1;
+    if (state->use_gin && properties.ginType == NCCL_GIN_TYPE_NONE) {
+      throw std::runtime_error("nccl_device_v2 requires NCCL GIN for a multi-node communicator");
     }
 
     state->topology = v2::discoverV2Topology(state->comm, world_size, rank, device, channel_limit);
-    state->total_channels = state->topology.total_channels;
+    state->total_channels = state->use_gin ? state->topology.channels_per_peer : state->topology.total_channels;
   } catch (...) {
     if (state->comm != nullptr) {
       ncclCommAbort(state->comm);
@@ -191,6 +192,11 @@ void destroy_state(DeviceState* state) {
   }
   AWEX_CUDA_V2_CHECK(cudaSetDevice(state->device));
   release_buffers(&state->buffers);
+  if (state->dev_comm != nullptr) {
+    AWEX_NCCL_V2_CHECK(ncclDevCommDestroy(state->comm, state->dev_comm));
+    std::free(state->dev_comm);
+    state->dev_comm = nullptr;
+  }
   if (state->device_payload_peer_slots != nullptr) {
     AWEX_CUDA_V2_CHECK(cudaFree(state->device_payload_peer_slots));
     state->device_payload_peer_slots = nullptr;
@@ -304,6 +310,17 @@ void upload_buffers(const v2::V2Schedule& schedule, const std::vector<std::uint3
   }
 }
 
+void expand_gin_channels(v2::V2Schedule* schedule, std::uint32_t total_channels) {
+  std::vector<v2::V2ChannelQueue> channels(total_channels);
+  std::vector<std::uint32_t> channel_ids(total_channels);
+  for (std::uint32_t channel = 0; channel < total_channels; ++channel) channel_ids[channel] = channel;
+  for (std::size_t index = 0; index < schedule->channel_ids.size(); ++index) {
+    channels[schedule->channel_ids[index]] = schedule->channels[index];
+  }
+  schedule->channels = std::move(channels);
+  schedule->channel_ids = std::move(channel_ids);
+}
+
 bool same_tasks(const std::vector<v2::V2LoweringTask>& left, const std::vector<v2::V2LoweringTask>& right) {
   if (left.size() != right.size()) return false;
   for (std::size_t index = 0; index < left.size(); ++index) {
@@ -381,6 +398,49 @@ void initialize_sparse_window(DeviceState* state, const std::vector<std::uint32_
     if (state->device_peer_windows != nullptr) {
       cudaFree(state->device_peer_windows);
       state->device_peer_windows = nullptr;
+    }
+    if (state->window != nullptr) {
+      ncclCommWindowDeregister(state->comm, state->window);
+      state->window = nullptr;
+    }
+    if (state->local_base != nullptr) {
+      ncclMemFree(state->local_base);
+      state->local_base = nullptr;
+    }
+    throw;
+  }
+}
+
+void initialize_gin_window(DeviceState* state, cudaStream_t stream) {
+  state->layout = v2::makeV2WindowLayout(state->world_size, state->total_channels, state->fifo_depth,
+                                         state->step_bytes, state->world_size);
+  state->window_bytes = state->layout.window_bytes;
+  state->dense_window_bytes = state->window_bytes;
+  try {
+    AWEX_NCCL_V2_CHECK(ncclMemAlloc(&state->local_base, state->window_bytes));
+    AWEX_CUDA_V2_CHECK(cudaMemsetAsync(state->local_base, 0, state->layout.payload_offset, stream));
+    AWEX_NCCL_V2_CHECK(ncclCommWindowRegister(state->comm, state->local_base, state->window_bytes,
+                                              &state->window, NCCL_WIN_COLL_SYMMETRIC));
+
+    ncclDevCommRequirements_t requirements = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
+    requirements.ginForceEnable = true;
+    requirements.ginContextCount = static_cast<int>(state->total_channels);
+    requirements.ginSignalCount = static_cast<int>(
+      2 * state->world_size * state->total_channels);
+    requirements.ginConnectionType = NCCL_GIN_CONNECTION_FULL;
+    requirements.ginQueueDepth = 1024;
+    requirements.worldGinBarrierCount = static_cast<int>(state->total_channels);
+    state->dev_comm = reinterpret_cast<ncclDevComm_t*>(std::malloc(sizeof(ncclDevComm_t)));
+    if (state->dev_comm == nullptr) throw std::bad_alloc();
+    AWEX_NCCL_V2_CHECK(ncclDevCommCreate(state->comm, &requirements, state->dev_comm));
+    if (state->dev_comm->ginContextCount == 0) {
+      throw std::runtime_error("nccl_device_v2 did not receive a GIN context");
+    }
+  } catch (...) {
+    if (state->dev_comm != nullptr) {
+      ncclDevCommDestroy(state->comm, state->dev_comm);
+      std::free(state->dev_comm);
+      state->dev_comm = nullptr;
     }
     if (state->window != nullptr) {
       ncclCommWindowDeregister(state->comm, state->window);
@@ -499,7 +559,12 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
     auto schedule = v2::lowerFixedTasks(tasks, active_peers, direction, config);
     host_lowering_time_ms = std::chrono::duration<double, std::milli>(Clock::now() - lowering_start).count();
 
-    initialize_sparse_window(state, active_peers, direction, stream);
+    if (state->use_gin) {
+      expand_gin_channels(&schedule, state->total_channels);
+      initialize_gin_window(state, stream);
+    } else {
+      initialize_sparse_window(state, active_peers, direction, stream);
+    }
     LaunchBuffers buffers;
     try {
       const auto metadata_start = Clock::now();
@@ -538,6 +603,7 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
   metrics["vector_bytes"] = py::int_(v2::kCopyPackBytes);
   metrics["copy_unroll"] = py::int_(v2::kCopyUnroll);
   metrics["channel_limit"] = py::int_(state->total_channels);
+  metrics["transport"] = py::str(state->use_gin ? "gin" : "lsa");
   metrics["topology_requested_channels_per_peer"] = py::int_(state->topology.requested_channels_per_peer);
   metrics["topology_channels_per_peer"] = py::int_(state->topology.channels_per_peer);
   metrics["topology_nvml_available"] = py::bool_(state->topology.nvml_available);
@@ -567,6 +633,7 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
   metrics["plan_initialization_time_ms"] = plan_initialization_time_ms;
 
   AWEX_CUDA_V2_CHECK(cudaMemsetAsync(state->local_base, 0, state->layout.payload_offset, stream));
+  const ncclDevComm_t device_comm = state->dev_comm == nullptr ? ncclDevComm_t{} : *state->dev_comm;
   const v2::V2KernelArgs args{
       state->buffers.works,
       state->buffers.fragments,
@@ -575,6 +642,7 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
       state->buffers.channel_ids,
       state->buffers.active_peers,
       schedule.channel_count,
+      state->use_gin ? state->total_channels : schedule.channel_count,
       static_cast<std::uint32_t>(cached_peers.size()),
       static_cast<std::uint32_t>(state->rank),
       static_cast<std::uint32_t>(state->world_size),
@@ -583,6 +651,9 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
       reinterpret_cast<std::uint8_t*>(state->local_base),
       state->device_peer_windows,
       state->device_payload_peer_slots,
+      device_comm,
+      state->window,
+      state->use_gin,
       static_cast<unsigned long long>(sequence),
       state->timeout_cycles,
   };

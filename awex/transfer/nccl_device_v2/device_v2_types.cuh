@@ -18,6 +18,14 @@
 #pragma once
 
 #include <cuda_runtime.h>
+#include <nccl.h>
+#if __has_include(<nccl_device.h>)
+#include <nccl_device.h>
+#else
+#include <nccl_device/core.h>
+#include <nccl_device/gin.h>
+#include <nccl_device/gin_barrier.h>
+#endif
 
 #include <cstddef>
 #include <cstdint>
@@ -30,6 +38,7 @@ constexpr int kThreadsPerBlock = 640;
 constexpr int kWarpsPerBlock = kThreadsPerBlock / kWarpSize;
 constexpr int kMaxWorksPerBatch = 8;
 constexpr int kMaxChannels = 64;
+constexpr int kMaxRanks = 256;
 constexpr int kCopyPackBytes = 16;
 constexpr int kCopyUnroll = 8;
 constexpr std::uint32_t kDefaultFifoDepth = 8;
@@ -128,6 +137,7 @@ struct V2KernelArgs {
   const std::uint32_t* channel_ids;
   const std::uint32_t* active_peers;
   std::uint32_t channel_count;
+  std::uint32_t launch_channel_count;
   std::uint32_t active_peer_count;
   std::uint32_t local_rank;
   std::uint32_t world_size;
@@ -136,6 +146,9 @@ struct V2KernelArgs {
   std::uint8_t* local_window;
   const std::uintptr_t* peer_windows;
   const std::uint32_t* payload_peer_slots;
+  ncclDevComm_t dev_comm;
+  ncclWindow_t window;
+  bool use_gin;
   unsigned long long epoch;
   unsigned long long timeout_cycles;
 };

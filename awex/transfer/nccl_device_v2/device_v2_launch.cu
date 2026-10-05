@@ -22,10 +22,10 @@ namespace awex {
 namespace nccl_device_v2 {
 
 cudaError_t launchDeviceV2(const V2KernelArgs& args, cudaStream_t stream) {
-  if (args.channel_count == 0) {
+  if (args.launch_channel_count == 0) {
     return cudaSuccess;
   }
-  device_v2_kernel<<<args.channel_count, kThreadsPerBlock, 0, stream>>>(args);
+  device_v2_kernel<<<args.launch_channel_count, kThreadsPerBlock, 0, stream>>>(args);
   return cudaGetLastError();
 }
 
