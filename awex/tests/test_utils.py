@@ -398,11 +398,38 @@ def initialize_megatron_and_load_hf_with_mbridge(
 
     # Some Megatron builds don't ship custom_fsdp; shim it so mbridge can import.
     _ensure_mbridge_custom_fsdp_shim()
-    from mbridge import AutoBridge
+    try:
+        from mbridge import AutoBridge
+    except ModuleNotFoundError as exc:
+        if exc.name != "mbridge":
+            raise
 
-    bridge = AutoBridge.from_pretrained(hf_model_dir)
-    model = bridge.get_model()
-    bridge.load_weights(model, hf_model_dir)
+        from megatron.bridge import AutoBridge
+
+        bridge = AutoBridge.from_hf_pretrained(hf_model_dir)
+        provider = bridge.to_megatron_provider(load_weights=False)
+        parallel_overrides = {
+            "tensor_model_parallel_size": mpu.get_tensor_model_parallel_world_size(),
+            "pipeline_model_parallel_size": mpu.get_pipeline_model_parallel_world_size(),
+            "context_parallel_size": mpu.get_context_parallel_world_size(),
+            "expert_model_parallel_size": mpu.get_expert_model_parallel_world_size(),
+            "expert_tensor_parallel_size": mpu.get_expert_tensor_parallel_world_size(),
+            "sequence_parallel": mpu.get_tensor_model_parallel_world_size() > 1,
+        }
+        for name, value in parallel_overrides.items():
+            if hasattr(provider, name):
+                setattr(provider, name, value)
+        provider.finalize()
+        model = provider.provide_distributed_model(
+            wrap_with_ddp=False,
+            fp16=provider.fp16,
+            bf16=provider.bf16,
+        )
+        bridge.load_hf_weights(model, hf_model_dir)
+    else:
+        bridge = AutoBridge.from_pretrained(hf_model_dir)
+        model = bridge.get_model()
+        bridge.load_weights(model, hf_model_dir)
 
     if return_bridge:
         return model, bridge
