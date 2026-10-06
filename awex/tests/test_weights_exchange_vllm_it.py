@@ -17,9 +17,11 @@
 
 import copy
 import sys
+from types import SimpleNamespace
 
 import pytest
 
+from awex.tests import weights_exchange_vllm_infer_it
 from awex.tests.experimental.compare_megatron_vllm_weights_multi import (
     _should_include_name,
 )
@@ -38,6 +40,39 @@ def _set_distributed_env(monkeypatch, rank=0, local_rank=0, world_size=2):
     monkeypatch.setenv("RANK", str(rank))
     monkeypatch.setenv("LOCAL_RANK", str(local_rank))
     monkeypatch.setenv("WORLD_SIZE", str(world_size))
+
+
+def test_inference_only_vllm_children_keep_node_local_rank_offsets(monkeypatch):
+    launched = []
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "2,3,5,7")
+    monkeypatch.setattr(
+        weights_exchange_vllm_infer_it.subprocess,
+        "Popen",
+        lambda command, **kwargs: launched.append((command, kwargs["env"])),
+    )
+    args = SimpleNamespace(
+        model_path="model",
+        host="127.0.0.1",
+        port=8000,
+        num_engines=2,
+        vllm_tp_size=2,
+        vllm_gpu_memory_utilization=0.8,
+        vllm_enable_expert_parallel=False,
+    )
+
+    groups = weights_exchange_vllm_infer_it._inference_device_groups(args)
+    for engine_rank, devices in enumerate(groups):
+        weights_exchange_vllm_infer_it._start_vllm_server(
+            args, engine_rank, devices
+        )
+
+    assert groups == [["2", "3"], ["5", "7"]]
+    assert launched[0][1]["AWEX_NODE_LOCAL_RANK_OFFSET"] == "0"
+    assert launched[1][1]["AWEX_NODE_LOCAL_RANK_OFFSET"] == "2"
+    assert launched[0][1]["AWEX_NODE_LOCAL_WORLD_SIZE"] == "4"
+    assert launched[1][1]["AWEX_NODE_LOCAL_WORLD_SIZE"] == "4"
+    assert launched[0][1]["AWEX_NODE_LOCAL_GPU_IDS"] == "2,3,5,7"
+    assert launched[1][1]["AWEX_NODE_LOCAL_GPU_IDS"] == "2,3,5,7"
 
 
 @pytest.mark.parametrize(

@@ -17,6 +17,8 @@
 
 """Run the inference-side Awex reader without a training-node control link."""
 
+from __future__ import annotations
+
 import argparse
 import os
 import subprocess
@@ -109,9 +111,20 @@ def _start_vllm_server(
     ]
     if args.vllm_enable_expert_parallel:
         cmd.append("--enable-expert-parallel")
+    node_devices = [
+        device.strip()
+        for device in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
+        if device.strip()
+    ]
+    required = args.num_engines * args.vllm_tp_size
+    if len(node_devices) < required:
+        node_devices = [str(device) for device in range(required)]
     env = _server_environment()
     if devices is not None:
         env["CUDA_VISIBLE_DEVICES"] = ",".join(devices)
+    env["AWEX_NODE_LOCAL_RANK_OFFSET"] = str(engine_rank * args.vllm_tp_size)
+    env["AWEX_NODE_LOCAL_WORLD_SIZE"] = str(required)
+    env["AWEX_NODE_LOCAL_GPU_IDS"] = ",".join(node_devices[:required])
     logger.info(
         "Starting inference-node vLLM engine %s/%s on devices %s: %s",
         engine_rank,
