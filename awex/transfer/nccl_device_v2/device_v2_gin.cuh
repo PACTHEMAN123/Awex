@@ -78,10 +78,10 @@ __device__ __forceinline__ bool v2GinWaitSignal(const V2KernelArgs& args, const 
   while (true) {
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2, 30, 7)
     const unsigned long long observed =
-      cuda::atomic_ref<unsigned long long>{*signal_ref.ptr}.load(cuda::memory_order_acquire) - signal_ref.offset;
+      cuda::atomic_ref<std::uint64_t>{*signal_ref.ptr}.load(cuda::memory_order_acquire) - signal_ref.offset;
 #else
     const unsigned long long observed =
-      cuda::atomic_ref<unsigned long long>{*signal_ref}.load(cuda::memory_order_acquire);
+      cuda::atomic_ref<std::uint64_t>{*signal_ref}.load(cuda::memory_order_acquire);
 #endif
     if (observed >= expected) return v2LoadError(error) == 0;
     if (v2LoadError(error) != 0) return false;
