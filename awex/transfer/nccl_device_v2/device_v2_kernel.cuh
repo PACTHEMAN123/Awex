@@ -192,13 +192,18 @@ __device__ __forceinline__ void v2RunRelay(const V2KernelArgs& args, const V2Wor
       ncclGin gin{args.dev_comm, static_cast<int>(channel % args.dev_comm.ginContextCount)};
       const ncclTeam world = ncclTeamWorld(args.dev_comm);
       if (output_gin) {
+        const std::uint64_t work_step = output_step - work.forward_step_begin + 1;
+        const bool work_complete = cursor + slice_bytes == work.nbytes;
+        const std::uint32_t request_flags = work_complete || work_step % args.gin_request_batch == 0
+          ? ncclGinOptFlagsDefault
+          : ncclGinOptFlagsAggregateRequests;
         gin.put(world, work.forward_peer, args.window,
                 v2GinPayloadOffset(args, work.forward_peer, args.local_rank, channel, output_step, work.fifo_depth),
                 args.window,
                 v2GinPayloadOffset(args, args.local_rank, work.forward_peer, channel, output_step, work.fifo_depth),
                 slice_bytes, V2GinReadySignalInc{v2GinReadySignal(args, args.local_rank, channel)}, ncclGin_None{},
                 ncclCoopThread{}, ncclGin_None{}, cuda::thread_scope_thread, cuda::thread_scope_device,
-                ncclGinOptFlagsDefault);
+                request_flags);
       } else
 #endif
       {
