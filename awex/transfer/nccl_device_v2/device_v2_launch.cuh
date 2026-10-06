@@ -22,7 +22,7 @@
 namespace awex {
 namespace nccl_device_v2 {
 
-cudaError_t launchDeviceV2(const V2KernelArgs& args, cudaStream_t stream);
+cudaError_t launchDeviceV2(const V2KernelArgs& args, cudaStream_t stream, bool collect_profile);
 cudaError_t launchDeviceV2Reset(const V2KernelArgs& args, cudaStream_t stream);
 
 }  // namespace nccl_device_v2
