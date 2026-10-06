@@ -40,8 +40,9 @@ struct V2LoweringConfig {
   std::uint32_t gin_fifo_depth = kDefaultFifoDepth;
   std::size_t gin_chunk_bytes = kDefaultChunkBytes;
   std::size_t network_step_bytes = kDefaultNetworkStepBytes;
-  // Ring lanes are derived from GIN queue multiplicity. Zero preserves the
-  // legacy eight-lane fallback for transports without GIN topology data.
+  // A ring stripe spans the physical GIN connections. Extra contexts provide
+  // queue parallelism without consuming channel groups needed by other roots.
+  // Zero preserves the legacy eight-lane fallback without GIN topology data.
   std::uint32_t ring_channels = 0;
   // Topology-derived upper bound for each peer, indexed by rank.
   std::vector<std::uint32_t> peer_channels;
@@ -340,8 +341,9 @@ inline V2Schedule lowerFixedTasks(const std::vector<V2LoweringTask>& tasks,
     const std::size_t transport_chunk_bytes = network ? config.gin_chunk_bytes : config.chunk_bytes;
     const std::uint32_t transport_fifo_depth = network ? config.gin_fifo_depth : config.fifo_depth;
     const std::size_t transfer_step_bytes = v2TransferStepBytes(stream_bytes, planning_step_bytes, network);
-    // Match ring lanes to GIN queue multiplicity. When roots outnumber channel
-    // groups, the scheduler below globally orders colliding routes.
+    // Match each root's stripe to the physical GIN rails. Extra contexts are
+    // selected by channel id, while narrower stripes leave disjoint channel
+    // groups for more roots before collision ordering is required.
     const std::uint32_t ring_channels =
       config.ring_channels == 0 ? 8 : config.ring_channels;
     const std::uint32_t max_channels = ring ? std::max<std::uint32_t>(
