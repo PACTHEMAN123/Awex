@@ -69,7 +69,7 @@ forwards the same step to its successor before returning predecessor credit. The
 relay supports LSA-to-LSA, GIN-to-GIN, and mixed LSA/GIN edges. Ring mode
 requires each active logical rollout stream to be present and identical across
 all rollout instances; initialization rejects partial or divergent replicas.
-Each ring is striped across four deterministic channel lanes so the reduced
+Each ring is striped across eight deterministic channel lanes so the reduced
 root payload does not serialize behind a single network channel.
 
 The default ring strategy uses the same ascending rollout-instance order for

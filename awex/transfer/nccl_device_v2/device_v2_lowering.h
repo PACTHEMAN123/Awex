@@ -329,11 +329,11 @@ inline V2Schedule lowerFixedTasks(const std::vector<V2LoweringTask>& tasks,
     const std::size_t transport_chunk_bytes = network ? config.gin_chunk_bytes : config.chunk_bytes;
     const std::uint32_t transport_fifo_depth = network ? config.gin_fifo_depth : config.fifo_depth;
     const std::size_t transfer_step_bytes = v2TransferStepBytes(stream_bytes, planning_step_bytes, network);
-    // Four lanes recover network parallelism without exceeding the smallest
-    // GIN peer width negotiated by the H20 topology. The folded ring id keeps
-    // a root's logical streams and a receiver's source roots in separate lane
-    // groups, while remaining deterministic at every hop.
-    const std::uint32_t max_channels = ring ? std::min<std::uint32_t>(4, config.total_channels) :
+    // Eight lanes recover network parallelism across the four H20 rails. The
+    // folded ring id keeps a root's logical streams and a receiver's source
+    // roots in separate lane groups, while remaining deterministic at every
+    // hop.
+    const std::uint32_t max_channels = ring ? std::min<std::uint32_t>(8, config.total_channels) :
       std::max<std::uint32_t>(1, std::min(config.peer_channels[peer], config.total_channels));
     std::uint32_t min_channels = max_channels;
     while (static_cast<std::uint64_t>(min_channels) * config.world_size > config.total_channels && min_channels > 1) {
