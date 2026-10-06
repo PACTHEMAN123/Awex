@@ -228,23 +228,7 @@ __device__ __forceinline__ void v2RunRelay(const V2KernelArgs& args, const V2Wor
 #if AWEX_NCCL_DEVICE_V2_HAS_GIN
       ncclGin gin{args.dev_comm, static_cast<int>(channel % args.dev_comm.ginContextCount)};
       const ncclTeam world = ncclTeamWorld(args.dev_comm);
-      if (output_gin) {
-        gin.put(world, work.forward_peer, args.window,
-                v2GinPayloadOffset(args, work.forward_peer, args.local_rank, channel, output_step, work.fifo_depth),
-                args.window,
-                v2GinPayloadOffset(args, args.local_rank, work.forward_peer, channel, output_step, work.fifo_depth),
-                slice_bytes, V2GinReadySignalInc{v2GinReadySignal(args, args.local_rank, channel)}, ncclGin_None{},
-                ncclCoopThread{}, ncclGin_None{}, cuda::thread_scope_thread, cuda::thread_scope_device,
-                ncclGinOptFlagsDefault);
-      } else
-#endif
-      {
-        output_slot->bytes = static_cast<std::uint32_t>(slice_bytes);
-        v2Publish(&output_slot->ready_step, output_step);
-      }
-
       if (input_gin) {
-#if AWEX_NCCL_DEVICE_V2_HAS_GIN
         const std::uint64_t work_step = input_step - work.step_begin + 1;
         const bool work_complete = cursor + slice_bytes == work.nbytes;
         const std::uint32_t returned_credits = static_cast<std::uint32_t>(
@@ -254,10 +238,30 @@ __device__ __forceinline__ void v2RunRelay(const V2KernelArgs& args, const V2Wor
           gin.signal(world, work.peer,
                      V2GinCreditSignalAdd{v2GinCreditSignal(args, args.local_rank, channel), returned_credits});
         }
-#endif
       } else {
         v2Publish(&input_slot->consumed_step, input_step);
       }
+
+      // The input is no longer needed after the fused local copy. Release it
+      // before a potentially backpressured forward put so congestion on the
+      // successor does not unnecessarily stall the predecessor.
+      if (output_gin) {
+        gin.put(world, work.forward_peer, args.window,
+                v2GinPayloadOffset(args, work.forward_peer, args.local_rank, channel, output_step, work.fifo_depth),
+                args.window,
+                v2GinPayloadOffset(args, args.local_rank, work.forward_peer, channel, output_step, work.fifo_depth),
+                slice_bytes, V2GinReadySignalInc{v2GinReadySignal(args, args.local_rank, channel)}, ncclGin_None{},
+                ncclCoopThread{}, ncclGin_None{}, cuda::thread_scope_thread, cuda::thread_scope_device,
+                ncclGinOptFlagsDefault);
+      } else {
+        output_slot->bytes = static_cast<std::uint32_t>(slice_bytes);
+        v2Publish(&output_slot->ready_step, output_step);
+      }
+#else
+      v2Publish(&input_slot->consumed_step, input_step);
+      output_slot->bytes = static_cast<std::uint32_t>(slice_bytes);
+      v2Publish(&output_slot->ready_step, output_step);
+#endif
       profile->post_cycles += clock64() - post_start;
     }
     if (v2LoadError(error) != 0) return;
