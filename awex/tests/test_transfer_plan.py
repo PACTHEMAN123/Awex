@@ -229,6 +229,72 @@ class TestTransferPlanBuilder:
         assert ops
         assert all(op.send_rank == builder.infer_world_size + 1 for op in ops)
 
+    def test_default_replica_assignment_balances_inference_engines(self):
+        builder = TransferPlanBuilder(
+            infer_world_size=4,
+            train_world_size=2,
+            num_infer_engines=4,
+            group_replicated_inference=False,
+        )
+        inference_meta = self._create_test_parameter_meta("param1")
+        train0 = self._create_test_shard_meta(shape=(4, 4), global_rank=0)
+        train1 = self._create_test_shard_meta(shape=(4, 4), global_rank=1)
+        training_meta = ParameterMeta(
+            name="param1",
+            global_numel=16,
+            global_shape=(4, 4),
+            dtype=torch.float32,
+            shards=[train0, train1],
+            replicas=[
+                ParameterReplicaMeta(shards=[train0]),
+                ParameterReplicaMeta(shards=[train1]),
+            ],
+        )
+
+        ops = builder._build_parameter_communication_plan(
+            "param1", inference_meta, training_meta
+        )
+
+        assert {(op.recv_rank, op.send_rank) for op in ops} == {
+            (0, 4),
+            (1, 5),
+            (2, 4),
+            (3, 5),
+        }
+
+    def test_ring_replica_assignment_groups_inference_engines(self):
+        builder = TransferPlanBuilder(
+            infer_world_size=4,
+            train_world_size=2,
+            num_infer_engines=4,
+            group_replicated_inference=True,
+        )
+        inference_meta = self._create_test_parameter_meta("param1")
+        train0 = self._create_test_shard_meta(shape=(4, 4), global_rank=0)
+        train1 = self._create_test_shard_meta(shape=(4, 4), global_rank=1)
+        training_meta = ParameterMeta(
+            name="param1",
+            global_numel=16,
+            global_shape=(4, 4),
+            dtype=torch.float32,
+            shards=[train0, train1],
+            replicas=[
+                ParameterReplicaMeta(shards=[train0]),
+                ParameterReplicaMeta(shards=[train1]),
+            ],
+        )
+
+        ops = builder._build_parameter_communication_plan(
+            "param1", inference_meta, training_meta
+        )
+
+        assert {(op.recv_rank, op.send_rank) for op in ops} == {
+            (0, 4),
+            (1, 4),
+            (2, 4),
+            (3, 4),
+        }
+
     def test_build_parameter_plan_handles_lm_head_cp_replicas_without_special_checks(
         self,
     ):

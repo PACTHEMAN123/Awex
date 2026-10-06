@@ -197,6 +197,7 @@ class TransferPlanBuilder:
         num_infer_engines: int = 1,
         enable_debug_mode: bool = False,
         strict_param_key_match: bool = False,
+        group_replicated_inference: bool = None,
     ):
         if num_infer_engines <= 0:
             raise ValueError("num_infer_engines must be positive")
@@ -208,10 +209,17 @@ class TransferPlanBuilder:
         self.num_infer_engines = num_infer_engines
         self.enable_debug_mode = enable_debug_mode
         self.strict_param_key_match = strict_param_key_match
+        self.group_replicated_inference = (
+            os.environ.get("AWEX_NCCL_DEVICE_V2_RING_BROADCAST", "0").lower()
+            in {"1", "true", "yes"}
+            if group_replicated_inference is None
+            else bool(group_replicated_inference)
+        )
         logger.info(
             f"TransferPlanBuilder: infer_world_size: {infer_world_size}, train_world_size: {train_world_size}, world_size: {self.world_size}, "
             f"infer_instance_world_size: {self.infer_instance_world_size}, num_infer_engines: {num_infer_engines}, "
-            f"enable_debug_mode: {enable_debug_mode}, strict_param_key_match: {strict_param_key_match}"
+            f"enable_debug_mode: {enable_debug_mode}, strict_param_key_match: {strict_param_key_match}, "
+            f"group_replicated_inference: {self.group_replicated_inference}"
         )
 
     def build_weights_mapping_operations(
@@ -350,10 +358,16 @@ class TransferPlanBuilder:
         # and each training replica gets an equal number of inference replicas
         replica_assignments = []
 
-        # Use round-robin assignment to distribute inference replicas evenly
+        replicas_per_engine = len(inference_meta.replicas)
         for inf_replica_idx in range(num_inference_replicas):
-            # Assign each inference replica to a training replica using modulo
-            train_replica_idx = inf_replica_idx % num_training_replicas
+            if self.group_replicated_inference:
+                # Equivalent logical replicas across inference engines must use
+                # the same source replica so Device v2 can lower one root
+                # injection followed by a replica ring.
+                logical_replica_idx = inf_replica_idx % replicas_per_engine
+                train_replica_idx = logical_replica_idx % num_training_replicas
+            else:
+                train_replica_idx = inf_replica_idx % num_training_replicas
             replica_assignments.append((inf_replica_idx, train_replica_idx))
 
         logger.debug(
