@@ -690,9 +690,9 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
     config.gin_fifo_depth = state->gin_fifo_depth;
     config.gin_chunk_bytes = state->gin_chunk_bytes;
     config.network_step_bytes = state->network_step_bytes;
-    config.ring_channels = state->gin.connection_count == 0
+    config.ring_channels = state->gin.context_count == 0
       ? 0
-      : v2::v2PowerOfTwoUp(state->gin.connection_count);
+      : v2::v2PowerOfTwoUp(state->gin.context_count);
     config.peer_channels = state->peer_channels;
     config.peer_transports = state->peer_transports;
     const auto lowering_start = Clock::now();
