@@ -141,6 +141,57 @@ def test_v2_swizzle_rotates_ring_by_root(monkeypatch):
     assert last_batch.forward_peers == [-1]
 
 
+def test_v2_swizzle_groups_round_robin_engines_by_node(monkeypatch):
+    monkeypatch.setattr(nccl_device_v2, "_ensure_cuda_tensor", lambda *_: None)
+    monkeypatch.setenv("AWEX_NODE_LOCAL_WORLD_SIZE", "8")
+    tensor = torch.arange(8, dtype=torch.int32)
+    targets = list(range(0, 16, 2))
+    send_plan = TransferPlan(
+        operations={peer: [_replica_operation(16, peer)] for peer in targets}
+    )
+
+    send_batch = _build_send_batch(
+        {"weight": tensor},
+        send_plan,
+        rank=16,
+        world_size=32,
+        chunk_bytes=16,
+        infer_instance_world_size=2,
+        num_infer_engines=8,
+        ring_broadcast=True,
+        ring_swizzle=True,
+    )
+    assert send_batch.peers == [0]
+
+    local_relay = _build_recv_batch(
+        {"weight": torch.empty_like(tensor)},
+        TransferPlan(operations={16: [_replica_operation(16, 0)]}),
+        rank=0,
+        world_size=32,
+        chunk_bytes=16,
+        infer_instance_world_size=2,
+        num_infer_engines=8,
+        ring_broadcast=True,
+        ring_swizzle=True,
+    )
+    assert local_relay.peers == [16]
+    assert local_relay.forward_peers == [4]
+
+    cross_node_relay = _build_recv_batch(
+        {"weight": torch.empty_like(tensor)},
+        TransferPlan(operations={16: [_replica_operation(16, 12)]}),
+        rank=12,
+        world_size=32,
+        chunk_bytes=16,
+        infer_instance_world_size=2,
+        num_infer_engines=8,
+        ring_broadcast=True,
+        ring_swizzle=True,
+    )
+    assert cross_node_relay.peers == [8]
+    assert cross_node_relay.forward_peers == [2]
+
+
 def test_v2_swizzle_switch_is_inert_when_ring_broadcast_is_off(monkeypatch):
     monkeypatch.setattr(nccl_device_v2, "_ensure_cuda_tensor", lambda *_: None)
     tensor = torch.arange(8, dtype=torch.int32)

@@ -222,10 +222,54 @@ def _resolve_bool(name: str, value: bool | None = None) -> bool:
     )
 
 
-def _ring_order(root: int, peers: list[int], strategy: _RingOrderStrategy) -> list[int]:
+def _ring_order(
+    root: int,
+    peers: list[int],
+    strategy: _RingOrderStrategy,
+    *,
+    infer_instance_world_size: int = 0,
+    num_infer_engines: int = 1,
+) -> list[int]:
     ordered = sorted(peers)
     if strategy is _RingOrderStrategy.FIXED or len(ordered) < 2:
         return ordered
+
+    try:
+        local_world_size = int(os.environ.get("AWEX_NODE_LOCAL_WORLD_SIZE", "0"))
+    except ValueError:
+        local_world_size = 0
+    instance_world_size = int(infer_instance_world_size)
+    engine_count = int(num_infer_engines)
+    engines_per_node = (
+        local_world_size // instance_world_size
+        if instance_world_size > 0
+        and local_world_size % instance_world_size == 0
+        else 0
+    )
+    node_count = (
+        (engine_count + engines_per_node - 1) // engines_per_node
+        if engines_per_node > 0
+        else 0
+    )
+    if 1 < node_count <= engine_count:
+        # veRL assigns engine groups round-robin across rollout nodes. Grouping
+        # equal node slots keeps most relay hops on the NCCL LSA transport.
+        node_groups: list[list[int]] = [[] for _ in range(node_count)]
+        for peer in ordered:
+            engine = peer // instance_world_size
+            node_groups[engine % node_count].append(peer)
+        if all(node_groups):
+            node_offset = int(root) % node_count
+            member_offset = (int(root) // node_count) % max(
+                len(group) for group in node_groups
+            )
+            swizzled: list[int] = []
+            for node_index in range(node_count):
+                group = node_groups[(node_offset + node_index) % node_count]
+                offset = member_offset % len(group)
+                swizzled.extend(group[offset:] + group[:offset])
+            return swizzled
+
     offset = int(root) % len(ordered)
     return ordered[offset:] + ordered[:offset]
 
@@ -296,7 +340,13 @@ def _apply_send_ring_routes(
         strategy = (
             _RingOrderStrategy.ROOT_SWIZZLE if swizzle else _RingOrderStrategy.FIXED
         )
-        order = _ring_order(root, targets, strategy)
+        order = _ring_order(
+            root,
+            targets,
+            strategy,
+            infer_instance_world_size=instance_world_size,
+            num_infer_engines=engine_count,
+        )
         canonical = [signature(index) for index in indices_by_peer[order[0]]]
         if not canonical or any(
             [signature(index) for index in indices_by_peer[target]] != canonical
@@ -355,7 +405,13 @@ def _apply_recv_ring_routes(
     ]
     strategy = _RingOrderStrategy.ROOT_SWIZZLE if swizzle else _RingOrderStrategy.FIXED
     for index, root in enumerate(list(batch.peers)):
-        order = _ring_order(root, targets, strategy)
+        order = _ring_order(
+            root,
+            targets,
+            strategy,
+            infer_instance_world_size=instance_world_size,
+            num_infer_engines=engine_count,
+        )
         position = order.index(rank)
         batch.peers[index] = root if position == 0 else order[position - 1]
         batch.forward_peers[index] = (
