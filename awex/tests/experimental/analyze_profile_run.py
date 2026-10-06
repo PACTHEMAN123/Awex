@@ -43,6 +43,10 @@ SHAPE_FIELDS = (
     "fragment_count",
     "chunk_count",
     "batch_count",
+    "ring_channel_collision_count",
+    "ring_instance_world_size",
+    "gin_connection_count",
+    "gin_context_count",
     "registered_window_bytes",
     "payload_buffer_bytes",
 )
