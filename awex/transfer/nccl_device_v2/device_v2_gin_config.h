@@ -78,9 +78,6 @@ inline void v2ValidateGinSupport(const V2GinState& state, int nccl_version) {
   if (nccl_version < NCCL_VERSION(2, 30, 4)) {
     throw std::runtime_error("nccl_device_v2 GIN transport requires NCCL 2.30.4 or newer at runtime");
   }
-  if (state.type == NCCL_GIN_TYPE_NONE) {
-    throw std::runtime_error("nccl_device_v2 found non-LSA peers, but the NCCL communicator has no GIN support");
-  }
 #else
   (void)nccl_version;
   throw std::runtime_error(
@@ -167,9 +164,11 @@ inline void v2InitializeGin(V2GinState* state, ncclComm_t comm, int world_size,
 #if AWEX_NCCL_DEVICE_V2_HAS_GIN
   state->signal_count = 2U * static_cast<std::uint32_t>(world_size) * total_channels;
   ncclDevCommRequirements requirements = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
+  requirements.ginForceEnable = true;
   requirements.ginContextCount = static_cast<int>(std::min(context_count, total_channels));
   requirements.ginSignalCount = static_cast<int>(state->signal_count);
   requirements.ginConnectionType = NCCL_GIN_CONNECTION_FULL;
+  requirements.ginQueueDepth = 1024;
   requirements.worldGinBarrierCount = 1;
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2, 30, 7)
   requirements.ginStrongSignalsRequired = true;
@@ -184,6 +183,10 @@ inline void v2InitializeGin(V2GinState* state, ncclComm_t comm, int world_size,
   state->connection_count = static_cast<std::uint32_t>(state->dev_comm.ginConnectionCount);
   if (state->context_count == 0 || state->connection_count == 0) {
     throw std::runtime_error("nccl_device_v2 GIN initialization returned no contexts or connections");
+  }
+  state->type = static_cast<ncclGinType_t>(state->dev_comm.ginNetDeviceTypes[0]);
+  if (state->type == NCCL_GIN_TYPE_NONE) {
+    throw std::runtime_error("nccl_device_v2 GIN initialization returned no network backend");
   }
   state->peer_payload_bytes = std::move(peer_payload_bytes);
   v2ConfigureGinChannels(state, total_channels, gin_fifo_depth, network_step_bytes, active_peers,
