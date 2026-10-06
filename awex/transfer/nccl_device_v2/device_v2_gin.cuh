@@ -53,6 +53,10 @@ __device__ __forceinline__ ncclGinSignal_t v2GinCreditSignal(const V2KernelArgs&
                                       channel);
 }
 
+__device__ __forceinline__ ncclGinCounter_t v2GinRelayCounter(std::uint32_t channel) {
+  return static_cast<ncclGinCounter_t>(channel);
+}
+
 __device__ __forceinline__ std::size_t v2GinPayloadOffset(const V2KernelArgs& args, std::uint32_t window_rank,
                                                           std::uint32_t peer, std::uint32_t channel,
                                                           unsigned long long step, std::uint32_t fifo_depth) {
@@ -75,6 +79,21 @@ __device__ __forceinline__ bool v2GinWaitSignal(const V2KernelArgs& args, const 
   auto* error = &reinterpret_cast<V2WindowHeader*>(args.local_window)->error;
   const unsigned long long start = clock64();
   while (gin.readSignal(signal) < expected) {
+    if (v2LoadError(error) != 0) return false;
+    if (clock64() - start > args.timeout_cycles) {
+      atomicCAS(error, 0U, error_code);
+      return false;
+    }
+  }
+  return true;
+}
+
+__device__ __forceinline__ bool v2GinWaitCounter(const V2KernelArgs& args, const ncclGin& gin,
+                                                 ncclGinCounter_t counter, unsigned long long expected,
+                                                 unsigned int error_code) {
+  auto* error = &reinterpret_cast<V2WindowHeader*>(args.local_window)->error;
+  const unsigned long long start = clock64();
+  while (gin.readCounter(counter) < expected) {
     if (v2LoadError(error) != 0) return false;
     if (clock64() - start > args.timeout_cycles) {
       atomicCAS(error, 0U, error_code);
@@ -210,6 +229,9 @@ __global__ void v2GinResetSignalsKernel(V2KernelArgs args) {
     ncclGin gin{args.dev_comm, static_cast<int>(context)};
     for (std::uint32_t signal = threadIdx.x; signal < args.gin_signal_count; signal += blockDim.x) {
       gin.resetSignal(static_cast<ncclGinSignal_t>(signal));
+    }
+    for (std::uint32_t counter = threadIdx.x; counter < args.gin_counter_count; counter += blockDim.x) {
+      gin.resetCounter(static_cast<ncclGinCounter_t>(counter));
     }
     coop.sync();
   }
