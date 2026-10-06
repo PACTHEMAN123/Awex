@@ -178,6 +178,19 @@ inline std::uint32_t v2GinChannelBase(std::uint32_t local_rank, std::uint32_t pe
   return group * peer_channels;
 }
 
+inline std::uint32_t v2RingChannelBase(std::uint32_t ring_id, std::uint32_t total_channels,
+                                       std::uint32_t ring_channels) {
+  const std::uint32_t group_count = total_channels / ring_channels;
+  if (group_count <= 1) return 0;
+  std::uint32_t group = 0;
+  std::uint32_t value = ring_id;
+  while (value != 0) {
+    group ^= value % group_count;
+    value /= group_count;
+  }
+  return (group % group_count) * ring_channels;
+}
+
 struct V2StreamSpan {
   const V2LoweringTask* task;
   std::uint64_t begin;
@@ -316,7 +329,11 @@ inline V2Schedule lowerFixedTasks(const std::vector<V2LoweringTask>& tasks,
     const std::size_t transport_chunk_bytes = network ? config.gin_chunk_bytes : config.chunk_bytes;
     const std::uint32_t transport_fifo_depth = network ? config.gin_fifo_depth : config.fifo_depth;
     const std::size_t transfer_step_bytes = v2TransferStepBytes(stream_bytes, planning_step_bytes, network);
-    const std::uint32_t max_channels = ring ? 1U :
+    // Four lanes recover network parallelism without exceeding the smallest
+    // GIN peer width negotiated by the H20 topology. The folded ring id keeps
+    // a root's logical streams and a receiver's source roots in separate lane
+    // groups, while remaining deterministic at every hop.
+    const std::uint32_t max_channels = ring ? std::min<std::uint32_t>(4, config.total_channels) :
       std::max<std::uint32_t>(1, std::min(config.peer_channels[peer], config.total_channels));
     std::uint32_t min_channels = max_channels;
     while (static_cast<std::uint64_t>(min_channels) * config.world_size > config.total_channels && min_channels > 1) {
@@ -326,7 +343,7 @@ inline V2Schedule lowerFixedTasks(const std::vector<V2LoweringTask>& tasks,
       v2ChannelsForBytes(stream_bytes, min_channels, max_channels, planning_step_bytes, network);
     schedule.peer_channel_counts[peer] = channel_count;
     const std::uint32_t channel_base = ring
-      ? (route.ring_id & (config.total_channels - 1))
+      ? v2RingChannelBase(route.ring_id, config.total_channels, channel_count)
       : network
       ? v2GinChannelBase(config.local_rank, peer, config.total_channels, channel_count)
       : v2LsaChannelBase(config.local_rank, peer, config.world_size, config.total_channels);
