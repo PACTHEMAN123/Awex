@@ -893,8 +893,14 @@ class NCCLDeviceV2Transport:
         self.gin_fifo_depth = _resolve_gin_fifo_depth()
         self.gin_chunk_bytes = _gin_chunk_bytes(self.network_step_bytes)
         self.gin_connections = _resolve_gin_connections(gin_connections)
-        # NCCL 2.30.4 needs one explicit context per requested connection.
-        self.gin_context_count = self.gin_connections or 1
+        # Keep two independent device queues per physical GIN connection. The
+        # context index still round-robins connections, while the second queue
+        # avoids serializing every ring lane on one HCA doorbell stream.
+        self.gin_context_count = (
+            min(self.max_channels, 2 * self.gin_connections)
+            if self.gin_connections
+            else 1
+        )
         self.gin_reliable_doorbell = _resolve_gin_reliable_doorbell(
             gin_reliable_doorbell
         )
