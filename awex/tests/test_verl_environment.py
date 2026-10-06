@@ -29,6 +29,20 @@ def test_multi_gpu_worker_keeps_native_local_rank_mapping():
     assert "AWEX_NODE_LOCAL_RANK_OFFSET" not in env
 
 
+def test_vllm_worker_maps_subset_rank_to_node_local_gpu():
+    env = {
+        "AWEX_NCCL_DEVICE_V2_HCA_POLICY": "balanced",
+        "CUDA_VISIBLE_DEVICES": "4,5,6,7",
+        "RAY_LOCAL_WORLD_SIZE": "8",
+    }
+
+    configure_device_v2_ray_locality(env, worker_local_rank=2)
+
+    assert env["LOCAL_RANK"] == "2"
+    assert env["AWEX_NODE_LOCAL_RANK_OFFSET"] == "4"
+    assert env["AWEX_NODE_LOCAL_WORLD_SIZE"] == "8"
+
+
 def test_explicit_local_rank_offset_is_preserved():
     env = {
         "AWEX_NCCL_DEVICE_V2_HCA_POLICY": "balanced",

@@ -363,6 +363,10 @@ def _patch_awex_worker() -> None:
     def awex_execute(
         self, task_module: str, task_qualname: str, task_kwargs: dict | None = None
     ):
+        parallel_config = self.model_runner.vllm_config.parallel_config
+        configure_device_v2_ray_locality(
+            worker_local_rank=int(getattr(parallel_config, "rank", 0) or 0)
+        )
         module = __import__(task_module, fromlist=["__dummy__"])
         target = module
         for attr in task_qualname.split("."):
