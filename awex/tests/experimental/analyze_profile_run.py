@@ -34,7 +34,6 @@ SHAPE_FIELDS = (
     "active_peer_count",
     "lsa_peer_count",
     "gin_peer_count",
-    "gin_counter_count",
     "channel_count",
     "network_channels_per_peer",
     "network_channel_budget",

@@ -152,13 +152,9 @@ __device__ __forceinline__ void v2RunRelay(const V2KernelArgs& args, const V2Wor
   const bool input_gin = args.peer_transports[work.peer] == static_cast<std::uint8_t>(V2Transport::kGin);
   const bool output_gin =
     args.peer_transports[work.forward_peer] == static_cast<std::uint8_t>(V2Transport::kGin);
-  const bool direct_gin_relay = input_gin && output_gin;
   std::uint64_t cursor = 0;
   std::uint64_t input_step = work.step_begin;
   std::uint64_t output_step = work.forward_step_begin;
-  std::uint64_t direct_completion_target = 0;
-  std::uint32_t direct_pending = 0;
-  bool direct_counter_initialized = false;
 
   while (cursor < work.nbytes) {
     const std::uint64_t slice_bytes =
@@ -218,12 +214,8 @@ __device__ __forceinline__ void v2RunRelay(const V2KernelArgs& args, const V2Wor
         v2FifoPayload(args, args.local_rank, work.forward_peer, channel, output_step, work.fifo_depth, true);
     }
     if (*ready && (roles & kRoleWorker)) {
-      if (direct_gin_relay) {
-        v2CopyContiguousToFragments(args, work, input_payload, cursor, slice_bytes, tid, nworkers);
-      } else {
-        v2CopyContiguousToFragmentsAndContiguous(args, work, output_payload, input_payload, cursor, slice_bytes, tid,
-                                                 nworkers);
-      }
+      v2CopyContiguousToFragmentsAndContiguous(args, work, output_payload, input_payload, cursor, slice_bytes, tid,
+                                               nworkers);
     }
 
     v2GroupBarrier(barrier, nthreads);
@@ -236,59 +228,31 @@ __device__ __forceinline__ void v2RunRelay(const V2KernelArgs& args, const V2Wor
 #if AWEX_NCCL_DEVICE_V2_HAS_GIN
       ncclGin gin{args.dev_comm, static_cast<int>(channel % args.dev_comm.ginContextCount)};
       const ncclTeam world = ncclTeamWorld(args.dev_comm);
-      const bool work_complete = cursor + slice_bytes == work.nbytes;
       if (input_gin) {
-        if (!direct_gin_relay) {
-          const std::uint64_t work_step = input_step - work.step_begin + 1;
-          const std::uint32_t returned_credits = static_cast<std::uint32_t>(
-            work_complete && work_step % args.gin_credit_batch != 0 ? work_step % args.gin_credit_batch
-                                                                    : args.gin_credit_batch);
-          if (work_complete || work_step % args.gin_credit_batch == 0) {
-            gin.signal(world, work.peer,
-                       V2GinCreditSignalAdd{v2GinCreditSignal(args, args.local_rank, channel), returned_credits});
-          }
+        const std::uint64_t work_step = input_step - work.step_begin + 1;
+        const bool work_complete = cursor + slice_bytes == work.nbytes;
+        const std::uint32_t returned_credits = static_cast<std::uint32_t>(
+          work_complete && work_step % args.gin_credit_batch != 0 ? work_step % args.gin_credit_batch
+                                                                  : args.gin_credit_batch);
+        if (work_complete || work_step % args.gin_credit_batch == 0) {
+          gin.signal(world, work.peer,
+                     V2GinCreditSignalAdd{v2GinCreditSignal(args, args.local_rank, channel), returned_credits});
         }
       } else {
         v2Publish(&input_slot->consumed_step, input_step);
       }
 
+      // The input is no longer needed after the fused local copy. Release it
+      // before a potentially backpressured forward put so congestion on the
+      // successor does not unnecessarily stall the predecessor.
       if (output_gin) {
-        const std::size_t destination_offset =
-          v2GinPayloadOffset(args, work.forward_peer, args.local_rank, channel, output_step, work.fifo_depth);
-        if (direct_gin_relay) {
-          const ncclGinCounter_t completion_counter = v2GinRelayCounter(channel);
-          if (!direct_counter_initialized) {
-            direct_completion_target = gin.readCounter(completion_counter);
-            direct_counter_initialized = true;
-          }
-          gin.put(world, work.forward_peer, args.window, destination_offset, args.window,
-                  v2GinPayloadOffset(args, args.local_rank, work.peer, channel, input_step, work.fifo_depth),
-                  slice_bytes, V2GinReadySignalInc{v2GinReadySignal(args, args.local_rank, channel)},
-                  ncclGin_CounterInc{completion_counter}, ncclCoopThread{}, ncclGin_None{},
-                  cuda::thread_scope_thread, cuda::thread_scope_device, ncclGinOptFlagsDefault);
-          ++direct_completion_target;
-          ++direct_pending;
-          if (direct_pending == work.fifo_depth || work_complete) {
-            const unsigned long long completion_start = clock64();
-            const bool completed =
-              v2GinWaitCounter(args, gin, completion_counter, direct_completion_target, 6U);
-            profile->flush_cycles += clock64() - completion_start;
-            if (completed) {
-              gin.signal(world, work.peer,
-                         V2GinCreditSignalAdd{v2GinCreditSignal(args, args.local_rank, channel), direct_pending});
-              direct_pending = 0;
-            }
-          }
-        } else {
-          // The fused copy made the input reusable before this potentially
-          // backpressured put, so its credit was already returned above.
-          gin.put(world, work.forward_peer, args.window, destination_offset, args.window,
-                  v2GinPayloadOffset(args, args.local_rank, work.forward_peer, channel, output_step,
-                                     work.fifo_depth),
-                  slice_bytes, V2GinReadySignalInc{v2GinReadySignal(args, args.local_rank, channel)},
-                  ncclGin_None{}, ncclCoopThread{}, ncclGin_None{}, cuda::thread_scope_thread,
-                  cuda::thread_scope_device, ncclGinOptFlagsDefault);
-        }
+        gin.put(world, work.forward_peer, args.window,
+                v2GinPayloadOffset(args, work.forward_peer, args.local_rank, channel, output_step, work.fifo_depth),
+                args.window,
+                v2GinPayloadOffset(args, args.local_rank, work.forward_peer, channel, output_step, work.fifo_depth),
+                slice_bytes, V2GinReadySignalInc{v2GinReadySignal(args, args.local_rank, channel)}, ncclGin_None{},
+                ncclCoopThread{}, ncclGin_None{}, cuda::thread_scope_thread, cuda::thread_scope_device,
+                ncclGinOptFlagsDefault);
       } else {
         output_slot->bytes = static_cast<std::uint32_t>(slice_bytes);
         v2Publish(&output_slot->ready_step, output_step);
