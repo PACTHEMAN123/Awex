@@ -93,7 +93,6 @@ __device__ __forceinline__ std::uint32_t v2GinRoles(V2Direction direction, int t
   return roles;
 }
 
-template <bool EnableProfiler>
 __device__ __forceinline__ void v2GinRunSend(const V2KernelArgs& args, const V2Work& work, std::uint32_t channel,
                                              int tid, int nthreads, int main_barrier, int wait_barrier, int* ready,
                                              V2KernelProfile* profile) {
@@ -110,11 +109,11 @@ __device__ __forceinline__ void v2GinRunSend(const V2KernelArgs& args, const V2W
     const std::uint64_t slice_bytes =
       work.step_bytes < work.nbytes - cursor ? work.step_bytes : work.nbytes - cursor;
     if ((roles & kRoleWaitSend) && step > work.fifo_depth) {
-      const unsigned long long wait_start = V2ProfileRecorder<EnableProfiler>::start();
+      const unsigned long long wait_start = clock64();
       *ready = v2GinWaitSignal(args, gin, credit_signal, step - work.fifo_depth, 3U);
-      V2ProfileRecorder<EnableProfiler>::outputWait(profile, wait_start);
+      profile->output_wait_cycles += clock64() - wait_start;
     }
-    const unsigned long long copy_start = tid == 0 ? V2ProfileRecorder<EnableProfiler>::start() : 0;
+    const unsigned long long copy_start = tid == 0 ? clock64() : 0;
     if (roles & kRoleWorker) {
       v2GroupBarrier(wait_barrier, nworkers);
       if (*ready) {
@@ -126,11 +125,11 @@ __device__ __forceinline__ void v2GinRunSend(const V2KernelArgs& args, const V2W
 
     v2GroupBarrier(main_barrier, nthreads);
     if (tid == 0) {
-      V2ProfileRecorder<EnableProfiler>::copy(profile, copy_start);
-      V2ProfileRecorder<EnableProfiler>::slice(profile);
+      profile->copy_cycles += clock64() - copy_start;
+      ++profile->slice_count;
     }
     if ((roles & kRolePostSend) && v2LoadError(error) == 0) {
-      const unsigned long long post_start = V2ProfileRecorder<EnableProfiler>::start();
+      const unsigned long long post_start = clock64();
       // The cumulative ready counter requires ordered completion so a later
       // put cannot satisfy the wait for an earlier FIFO step.
       gin.put(world, work.peer, args.window,
@@ -138,7 +137,7 @@ __device__ __forceinline__ void v2GinRunSend(const V2KernelArgs& args, const V2W
               v2GinPayloadOffset(args, args.local_rank, work.peer, channel, step, work.fifo_depth), slice_bytes,
               V2GinReadySignalInc{ready_signal}, ncclGin_None{}, ncclCoopThread{}, ncclGin_None{},
               cuda::thread_scope_thread, cuda::thread_scope_device, ncclGinOptFlagsDefault);
-      V2ProfileRecorder<EnableProfiler>::post(profile, post_start);
+      profile->post_cycles += clock64() - post_start;
     }
     if (v2LoadError(error) != 0) return;
     cursor += slice_bytes;
@@ -147,15 +146,14 @@ __device__ __forceinline__ void v2GinRunSend(const V2KernelArgs& args, const V2W
 
   if (work.final && work.nbytes != 0) {
     if (roles & kRoleWaitSend) {
-      const unsigned long long wait_start = V2ProfileRecorder<EnableProfiler>::start();
+      const unsigned long long wait_start = clock64();
       *ready = v2GinWaitSignal(args, gin, credit_signal, step - 1, 4U);
-      V2ProfileRecorder<EnableProfiler>::finalWait(profile, wait_start);
+      profile->final_wait_cycles += clock64() - wait_start;
     }
     v2GroupBarrier(main_barrier, nthreads);
   }
 }
 
-template <bool EnableProfiler>
 __device__ __forceinline__ void v2GinRunRecv(const V2KernelArgs& args, const V2Work& work, std::uint32_t channel,
                                              int tid, int nthreads, int barrier, int* ready,
                                              V2KernelProfile* profile) {
@@ -173,11 +171,11 @@ __device__ __forceinline__ void v2GinRunRecv(const V2KernelArgs& args, const V2W
     const std::uint64_t slice_bytes =
       work.step_bytes < work.nbytes - cursor ? work.step_bytes : work.nbytes - cursor;
     if (roles & kRoleWaitRecv) {
-      const unsigned long long wait_start = V2ProfileRecorder<EnableProfiler>::start();
+      const unsigned long long wait_start = clock64();
       *ready = v2GinWaitSignal(args, gin, ready_signal, step, 2U);
-      V2ProfileRecorder<EnableProfiler>::inputWait(profile, wait_start);
+      profile->input_wait_cycles += clock64() - wait_start;
     }
-    const unsigned long long copy_start = tid == 0 ? V2ProfileRecorder<EnableProfiler>::start() : 0;
+    const unsigned long long copy_start = tid == 0 ? clock64() : 0;
     v2GroupBarrier(barrier, nthreads);
     if (*ready && (roles & kRoleWorker)) {
       v2CopyContiguousToFragments(
@@ -187,8 +185,8 @@ __device__ __forceinline__ void v2GinRunRecv(const V2KernelArgs& args, const V2W
 
     v2GroupBarrier(barrier, nthreads);
     if (tid == 0) {
-      V2ProfileRecorder<EnableProfiler>::copy(profile, copy_start);
-      V2ProfileRecorder<EnableProfiler>::slice(profile);
+      profile->copy_cycles += clock64() - copy_start;
+      ++profile->slice_count;
     }
     const std::uint64_t work_step = step - work.step_begin + 1;
     const bool work_complete = cursor + slice_bytes == work.nbytes;
@@ -196,9 +194,9 @@ __device__ __forceinline__ void v2GinRunRecv(const V2KernelArgs& args, const V2W
       work_complete && work_step % credit_batch != 0 ? work_step % credit_batch : credit_batch);
     if ((roles & kRolePostRecv) && v2LoadError(error) == 0 &&
         (work_complete || work_step % credit_batch == 0)) {
-      const unsigned long long post_start = V2ProfileRecorder<EnableProfiler>::start();
+      const unsigned long long post_start = clock64();
       gin.signal(world, work.peer, V2GinCreditSignalAdd{credit_signal, returned_credits});
-      V2ProfileRecorder<EnableProfiler>::post(profile, post_start);
+      profile->post_cycles += clock64() - post_start;
     }
     if (v2LoadError(error) != 0) return;
     cursor += slice_bytes;

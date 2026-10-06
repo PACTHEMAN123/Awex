@@ -31,15 +31,11 @@ cudaError_t launchDeviceV2Reset(const V2KernelArgs& args, cudaStream_t stream) {
 #endif
 }
 
-cudaError_t launchDeviceV2(const V2KernelArgs& args, cudaStream_t stream, bool collect_profile) {
+cudaError_t launchDeviceV2(const V2KernelArgs& args, cudaStream_t stream) {
   if (args.channel_count == 0) {
     return cudaSuccess;
   }
-  if (collect_profile) {
-    device_v2_kernel<true><<<args.channel_count, kThreadsPerBlock, 0, stream>>>(args);
-  } else {
-    device_v2_kernel<false><<<args.channel_count, kThreadsPerBlock, 0, stream>>>(args);
-  }
+  device_v2_kernel<<<args.channel_count, kThreadsPerBlock, 0, stream>>>(args);
   return cudaGetLastError();
 }
 

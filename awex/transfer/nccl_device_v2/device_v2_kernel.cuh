@@ -40,7 +40,6 @@ __device__ __forceinline__ std::uint32_t v2Roles(V2Direction direction, int tid,
 // In read mode the producer owns the FIFO payload. The sender only writes its
 // local window; the receiver performs the NVLink read and returns credits by
 // writing consumed_step back into the sender's window.
-template <bool EnableProfiler>
 __device__ __forceinline__ void v2RunSend(const V2KernelArgs& args, const V2Work& work, std::uint32_t channel, int tid,
                                           int nthreads, int main_barrier, int wait_barrier, int* ready,
                                           unsigned long long* step_cache, V2KernelProfile* profile) {
@@ -54,11 +53,11 @@ __device__ __forceinline__ void v2RunSend(const V2KernelArgs& args, const V2Work
       work.step_bytes < work.nbytes - cursor ? work.step_bytes : work.nbytes - cursor;
     V2FifoSlot* slot = v2FifoSlot(args, args.local_rank, work.peer, channel, step, work.fifo_depth, true);
     if (roles & kRoleWaitSend) {
-      const unsigned long long wait_start = V2ProfileRecorder<EnableProfiler>::start();
+      const unsigned long long wait_start = clock64();
       *ready = v2WaitFree(slot, step, work.fifo_depth, step_cache, error, args.timeout_cycles);
-      V2ProfileRecorder<EnableProfiler>::outputWait(profile, wait_start);
+      profile->output_wait_cycles += clock64() - wait_start;
     }
-    const unsigned long long copy_start = tid == 0 ? V2ProfileRecorder<EnableProfiler>::start() : 0;
+    const unsigned long long copy_start = tid == 0 ? clock64() : 0;
     if (roles & kRoleWorker) {
       v2GroupBarrier(wait_barrier, nworkers);
       if (*ready) {
@@ -72,14 +71,14 @@ __device__ __forceinline__ void v2RunSend(const V2KernelArgs& args, const V2Work
     // Workers can begin the next step while Post fences and publishes this one.
     v2GroupBarrier(main_barrier, nthreads);
     if (tid == 0) {
-      V2ProfileRecorder<EnableProfiler>::copy(profile, copy_start);
-      V2ProfileRecorder<EnableProfiler>::slice(profile);
+      profile->copy_cycles += clock64() - copy_start;
+      ++profile->slice_count;
     }
     if ((roles & kRolePostSend) && v2LoadError(error) == 0) {
-      const unsigned long long post_start = V2ProfileRecorder<EnableProfiler>::start();
+      const unsigned long long post_start = clock64();
       slot->bytes = static_cast<std::uint32_t>(slice_bytes);
       v2Publish(&slot->ready_step, step);
-      V2ProfileRecorder<EnableProfiler>::post(profile, post_start);
+      profile->post_cycles += clock64() - post_start;
     }
     if (v2LoadError(error) != 0) return;
     cursor += slice_bytes;
@@ -90,15 +89,14 @@ __device__ __forceinline__ void v2RunSend(const V2KernelArgs& args, const V2Work
     V2FifoSlot* slot =
       v2FifoSlot(args, args.local_rank, work.peer, channel, step - 1, work.fifo_depth, true);
     if (roles & kRoleWaitSend) {
-      const unsigned long long wait_start = V2ProfileRecorder<EnableProfiler>::start();
+      const unsigned long long wait_start = clock64();
       *ready = v2WaitConsumed(slot, step - 1, step_cache, error, args.timeout_cycles);
-      V2ProfileRecorder<EnableProfiler>::finalWait(profile, wait_start);
+      profile->final_wait_cycles += clock64() - wait_start;
     }
     v2GroupBarrier(main_barrier, nthreads);
   }
 }
 
-template <bool EnableProfiler>
 __device__ __forceinline__ void v2RunRecv(const V2KernelArgs& args, const V2Work& work, std::uint32_t channel, int tid,
                                           int nthreads, int barrier, int* ready,
                                           unsigned long long* step_cache, V2KernelProfile* profile) {
@@ -112,11 +110,11 @@ __device__ __forceinline__ void v2RunRecv(const V2KernelArgs& args, const V2Work
       work.step_bytes < work.nbytes - cursor ? work.step_bytes : work.nbytes - cursor;
     V2FifoSlot* slot = v2FifoSlot(args, work.peer, args.local_rank, channel, step, work.fifo_depth, false);
     if (roles & kRoleWaitRecv) {
-      const unsigned long long wait_start = V2ProfileRecorder<EnableProfiler>::start();
+      const unsigned long long wait_start = clock64();
       *ready = v2WaitReady(&slot->ready_step, step, step_cache, error, args.timeout_cycles);
-      V2ProfileRecorder<EnableProfiler>::inputWait(profile, wait_start);
+      profile->input_wait_cycles += clock64() - wait_start;
     }
-    const unsigned long long copy_start = tid == 0 ? V2ProfileRecorder<EnableProfiler>::start() : 0;
+    const unsigned long long copy_start = tid == 0 ? clock64() : 0;
     v2GroupBarrier(barrier, nthreads);
     if (*ready && (roles & kRoleWorker)) {
       const std::uint8_t* payload =
@@ -126,13 +124,13 @@ __device__ __forceinline__ void v2RunRecv(const V2KernelArgs& args, const V2Work
 
     v2GroupBarrier(barrier, nthreads);
     if (tid == 0) {
-      V2ProfileRecorder<EnableProfiler>::copy(profile, copy_start);
-      V2ProfileRecorder<EnableProfiler>::slice(profile);
+      profile->copy_cycles += clock64() - copy_start;
+      ++profile->slice_count;
     }
     if ((roles & kRolePostRecv) && v2LoadError(error) == 0) {
-      const unsigned long long post_start = V2ProfileRecorder<EnableProfiler>::start();
+      const unsigned long long post_start = clock64();
       v2Publish(&slot->consumed_step, step);
-      V2ProfileRecorder<EnableProfiler>::post(profile, post_start);
+      profile->post_cycles += clock64() - post_start;
     }
     if (v2LoadError(error) != 0) return;
     cursor += slice_bytes;
@@ -144,7 +142,6 @@ __device__ __forceinline__ void v2RunRecv(const V2KernelArgs& args, const V2Work
 // successor before returning credit to its predecessor. Both LSA and GIN edges
 // use the same route channel and byte partition, so mixed intra/inter-node rings
 // retain NCCL broadcast's chunk-pipelined behavior.
-template <bool EnableProfiler>
 __device__ __forceinline__ void v2RunRelay(const V2KernelArgs& args, const V2Work& work, std::uint32_t channel,
                                            int tid, int nthreads, int barrier, int* ready,
                                            unsigned long long* input_cache, unsigned long long* output_cache,
@@ -174,31 +171,31 @@ __device__ __forceinline__ void v2RunRelay(const V2KernelArgs& args, const V2Wor
       bool output_ready = false;
 #if AWEX_NCCL_DEVICE_V2_HAS_GIN
       ncclGin gin{args.dev_comm, static_cast<int>(channel % args.dev_comm.ginContextCount)};
-      unsigned long long wait_start = V2ProfileRecorder<EnableProfiler>::start();
+      unsigned long long wait_start = clock64();
       input_ready = input_gin
         ? v2GinWaitSignal(args, gin, v2GinReadySignal(args, work.peer, channel), input_step, 2U)
         : v2WaitReady(&input_slot->ready_step, input_step, input_cache, error, args.timeout_cycles);
-      V2ProfileRecorder<EnableProfiler>::inputWait(profile, wait_start);
-      wait_start = V2ProfileRecorder<EnableProfiler>::start();
+      profile->input_wait_cycles += clock64() - wait_start;
+      wait_start = clock64();
       output_ready = output_gin
         ? (output_step <= work.fifo_depth ||
            v2GinWaitSignal(args, gin, v2GinCreditSignal(args, work.forward_peer, channel),
                            output_step - work.fifo_depth, 3U))
         : v2WaitFree(output_slot, output_step, work.fifo_depth, output_cache, error, args.timeout_cycles);
-      V2ProfileRecorder<EnableProfiler>::outputWait(profile, wait_start);
+      profile->output_wait_cycles += clock64() - wait_start;
 #else
-      unsigned long long wait_start = V2ProfileRecorder<EnableProfiler>::start();
+      unsigned long long wait_start = clock64();
       input_ready = !input_gin &&
         v2WaitReady(&input_slot->ready_step, input_step, input_cache, error, args.timeout_cycles);
-      V2ProfileRecorder<EnableProfiler>::inputWait(profile, wait_start);
-      wait_start = V2ProfileRecorder<EnableProfiler>::start();
+      profile->input_wait_cycles += clock64() - wait_start;
+      wait_start = clock64();
       output_ready = !output_gin &&
         v2WaitFree(output_slot, output_step, work.fifo_depth, output_cache, error, args.timeout_cycles);
-      V2ProfileRecorder<EnableProfiler>::outputWait(profile, wait_start);
+      profile->output_wait_cycles += clock64() - wait_start;
 #endif
       *ready = input_ready && output_ready;
     }
-    const unsigned long long copy_start = tid == 0 ? V2ProfileRecorder<EnableProfiler>::start() : 0;
+    const unsigned long long copy_start = tid == 0 ? clock64() : 0;
     v2GroupBarrier(barrier, nthreads);
 
     const std::uint8_t* input_payload = nullptr;
@@ -223,11 +220,11 @@ __device__ __forceinline__ void v2RunRelay(const V2KernelArgs& args, const V2Wor
 
     v2GroupBarrier(barrier, nthreads);
     if (tid == 0) {
-      V2ProfileRecorder<EnableProfiler>::copy(profile, copy_start);
-      V2ProfileRecorder<EnableProfiler>::slice(profile);
+      profile->copy_cycles += clock64() - copy_start;
+      ++profile->slice_count;
     }
     if ((roles & kRolePostRecv) && v2LoadError(error) == 0) {
-      const unsigned long long post_start = V2ProfileRecorder<EnableProfiler>::start();
+      const unsigned long long post_start = clock64();
 #if AWEX_NCCL_DEVICE_V2_HAS_GIN
       ncclGin gin{args.dev_comm, static_cast<int>(channel % args.dev_comm.ginContextCount)};
       const ncclTeam world = ncclTeamWorld(args.dev_comm);
@@ -265,7 +262,7 @@ __device__ __forceinline__ void v2RunRelay(const V2KernelArgs& args, const V2Wor
       output_slot->bytes = static_cast<std::uint32_t>(slice_bytes);
       v2Publish(&output_slot->ready_step, output_step);
 #endif
-      V2ProfileRecorder<EnableProfiler>::post(profile, post_start);
+      profile->post_cycles += clock64() - post_start;
     }
     if (v2LoadError(error) != 0) return;
     cursor += slice_bytes;
@@ -275,7 +272,7 @@ __device__ __forceinline__ void v2RunRelay(const V2KernelArgs& args, const V2Wor
 
   if (work.final && work.nbytes != 0) {
     if (roles & kRoleWaitRecv) {
-      const unsigned long long wait_start = V2ProfileRecorder<EnableProfiler>::start();
+      const unsigned long long wait_start = clock64();
 #if AWEX_NCCL_DEVICE_V2_HAS_GIN
       if (output_gin) {
         ncclGin gin{args.dev_comm, static_cast<int>(channel % args.dev_comm.ginContextCount)};
@@ -287,13 +284,12 @@ __device__ __forceinline__ void v2RunRelay(const V2KernelArgs& args, const V2Wor
           v2FifoSlot(args, args.local_rank, work.forward_peer, channel, output_step - 1, work.fifo_depth, true);
         *ready = v2WaitConsumed(final_slot, output_step - 1, output_cache, error, args.timeout_cycles);
       }
-      V2ProfileRecorder<EnableProfiler>::finalWait(profile, wait_start);
+      profile->final_wait_cycles += clock64() - wait_start;
     }
     v2GroupBarrier(barrier, nthreads);
   }
 }
 
-template <bool EnableProfiler>
 __device__ __forceinline__ void v2RunBatch(const V2KernelArgs& args, const V2WorkBatch& batch,
                                            std::uint32_t channel) {
   __shared__ V2BatchShared shared;
@@ -317,21 +313,18 @@ __device__ __forceinline__ void v2RunBatch(const V2KernelArgs& args, const V2Wor
     v2GroupBarrier(main_barrier, subthreads);
 
     const V2Work& work = args.works[batch.work_begin + group];
-    V2KernelProfile* profile = EnableProfiler
-      ? args.profiles + static_cast<std::size_t>(blockIdx.x) * kMaxWorksPerBatch + group
-      : nullptr;
+    V2KernelProfile* profile = args.profiles + static_cast<std::size_t>(blockIdx.x) * kMaxWorksPerBatch + group;
     const bool use_gin = args.peer_transports[work.peer] == static_cast<std::uint8_t>(V2Transport::kGin);
     if (work.forward_peer != kNoPeer) {
-      v2RunRelay<EnableProfiler>(args, work, channel, subtid, subthreads, main_barrier, &shared.ready[group],
-                                 &shared.step_cache[group], &shared.forward_step_cache[group], profile);
+      v2RunRelay(args, work, channel, subtid, subthreads, main_barrier, &shared.ready[group],
+                 &shared.step_cache[group], &shared.forward_step_cache[group], profile);
     } else if (use_gin) {
 #if AWEX_NCCL_DEVICE_V2_HAS_GIN
       if (args.direction == V2Direction::kSend) {
-        v2GinRunSend<EnableProfiler>(args, work, channel, subtid, subthreads, main_barrier, wait_barrier,
-                                     &shared.ready[group], profile);
+        v2GinRunSend(args, work, channel, subtid, subthreads, main_barrier, wait_barrier, &shared.ready[group],
+                     profile);
       } else {
-        v2GinRunRecv<EnableProfiler>(args, work, channel, subtid, subthreads, main_barrier, &shared.ready[group],
-                                     profile);
+        v2GinRunRecv(args, work, channel, subtid, subthreads, main_barrier, &shared.ready[group], profile);
       }
 #else
       if (subtid == 0) {
@@ -341,17 +334,16 @@ __device__ __forceinline__ void v2RunBatch(const V2KernelArgs& args, const V2Wor
       v2GroupBarrier(main_barrier, subthreads);
 #endif
     } else if (args.direction == V2Direction::kSend) {
-      v2RunSend<EnableProfiler>(args, work, channel, subtid, subthreads, main_barrier, wait_barrier,
-                                &shared.ready[group], &shared.step_cache[group], profile);
+      v2RunSend(args, work, channel, subtid, subthreads, main_barrier, wait_barrier, &shared.ready[group],
+                &shared.step_cache[group], profile);
     } else {
-      v2RunRecv<EnableProfiler>(args, work, channel, subtid, subthreads, main_barrier, &shared.ready[group],
-                                &shared.step_cache[group], profile);
+      v2RunRecv(args, work, channel, subtid, subthreads, main_barrier, &shared.ready[group],
+                &shared.step_cache[group], profile);
     }
   }
   __syncthreads();
 }
 
-template <bool EnableProfiler>
 __global__ void __launch_bounds__(kThreadsPerBlock, 1) device_v2_kernel(V2KernelArgs args) {
   auto* local_header = reinterpret_cast<V2WindowHeader*>(args.local_window);
   if (blockIdx.x == 0 && threadIdx.x == 0) v2Publish(&local_header->epoch, args.epoch);
@@ -375,16 +367,16 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 1) device_v2_kernel(V2Kernel
   const std::uint32_t channel = args.channel_ids[blockIdx.x];
   const V2ChannelQueue queue = args.channels[blockIdx.x];
   for (std::uint32_t index = 0; index < queue.batch_count; ++index) {
-    v2RunBatch<EnableProfiler>(args, args.batches[queue.first_batch + index], channel);
+    v2RunBatch(args, args.batches[queue.first_batch + index], channel);
   }
 #if AWEX_NCCL_DEVICE_V2_HAS_GIN
   if (args.gin_enabled != 0) {
     ncclGin gin{args.dev_comm, static_cast<int>(channel % args.dev_comm.ginContextCount)};
-    const unsigned long long flush_start = V2ProfileRecorder<EnableProfiler>::start();
+    const unsigned long long flush_start = clock64();
     gin.flush(ncclCoopCta());
     if (threadIdx.x == 0) {
       V2KernelProfile* profile = args.profiles + static_cast<std::size_t>(blockIdx.x) * kMaxWorksPerBatch;
-      V2ProfileRecorder<EnableProfiler>::flush(profile, flush_start);
+      profile->flush_cycles += clock64() - flush_start;
     }
   }
 #endif

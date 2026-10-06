@@ -658,14 +658,6 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
                 int64_t sequence) {
   using Clock = std::chrono::steady_clock;
   const auto launch_start = Clock::now();
-  const char* profile_env = std::getenv("AWEX_PROFILE_DEVICE_DETAILS");
-  if (profile_env == nullptr) {
-    profile_env = std::getenv("AWEX_PROFILE");
-  }
-  const bool collect_profile = profile_env != nullptr &&
-    (std::strcmp(profile_env, "1") == 0 ||
-     std::strcmp(profile_env, "true") == 0 ||
-     std::strcmp(profile_env, "True") == 0);
   auto* state = reinterpret_cast<DeviceState*>(handle);
   if (state == nullptr) {
     throw std::runtime_error("Invalid nccl_device_v2 state handle");
@@ -821,7 +813,6 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
   metrics["host_lowering_time_ms"] = host_lowering_time_ms;
   metrics["metadata_upload_time_ms"] = metadata_upload_time_ms;
   metrics["plan_initialization_time_ms"] = plan_initialization_time_ms;
-  metrics["device_profile_enabled"] = py::bool_(collect_profile);
 
   AWEX_CUDA_V2_CHECK(cudaMemsetAsync(state->local_base, 0, state->layout.payload_offset, stream));
   v2::V2KernelArgs args{};
@@ -847,18 +838,18 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
   args.timeout_cycles = state->timeout_cycles;
   const std::size_t profile_count =
     static_cast<std::size_t>(schedule.channel_count) * v2::kMaxWorksPerBatch;
-  if (collect_profile && profile_count != 0) {
+  if (profile_count != 0) {
     AWEX_CUDA_V2_CHECK(cudaMemsetAsync(state->buffers.profiles, 0,
                                        profile_count * sizeof(v2::V2KernelProfile), stream));
   }
   const auto kernel_start = Clock::now();
   AWEX_CUDA_V2_CHECK(v2::launchDeviceV2Reset(args, stream));
-  AWEX_CUDA_V2_CHECK(v2::launchDeviceV2(args, stream, collect_profile));
+  AWEX_CUDA_V2_CHECK(v2::launchDeviceV2(args, stream));
   AWEX_CUDA_V2_CHECK(cudaStreamSynchronize(stream));
   metrics["kernel_transfer_time_ms"] = std::chrono::duration<double, std::milli>(Clock::now() - kernel_start).count();
 
-  std::vector<v2::V2KernelProfile> profiles(collect_profile ? profile_count : 0);
-  if (collect_profile && profile_count != 0) {
+  std::vector<v2::V2KernelProfile> profiles(profile_count);
+  if (profile_count != 0) {
     AWEX_CUDA_V2_CHECK(cudaMemcpy(profiles.data(), state->buffers.profiles,
                                   profile_count * sizeof(v2::V2KernelProfile), cudaMemcpyDeviceToHost));
   }
@@ -872,16 +863,14 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
     profile_max.flush_cycles = std::max(profile_max.flush_cycles, profile.flush_cycles);
     profile_max.slice_count = std::max(profile_max.slice_count, profile.slice_count);
   }
-  if (collect_profile) {
-    const double cycles_per_millisecond = static_cast<double>(state->clock_rate_khz);
-    metrics["device_input_wait_time_ms"] = profile_max.input_wait_cycles / cycles_per_millisecond;
-    metrics["device_output_wait_time_ms"] = profile_max.output_wait_cycles / cycles_per_millisecond;
-    metrics["device_copy_time_ms"] = profile_max.copy_cycles / cycles_per_millisecond;
-    metrics["device_post_time_ms"] = profile_max.post_cycles / cycles_per_millisecond;
-    metrics["device_final_wait_time_ms"] = profile_max.final_wait_cycles / cycles_per_millisecond;
-    metrics["device_flush_time_ms"] = profile_max.flush_cycles / cycles_per_millisecond;
-    metrics["device_profile_max_slice_count"] = py::int_(profile_max.slice_count);
-  }
+  const double cycles_per_millisecond = static_cast<double>(state->clock_rate_khz);
+  metrics["device_input_wait_time_ms"] = profile_max.input_wait_cycles / cycles_per_millisecond;
+  metrics["device_output_wait_time_ms"] = profile_max.output_wait_cycles / cycles_per_millisecond;
+  metrics["device_copy_time_ms"] = profile_max.copy_cycles / cycles_per_millisecond;
+  metrics["device_post_time_ms"] = profile_max.post_cycles / cycles_per_millisecond;
+  metrics["device_final_wait_time_ms"] = profile_max.final_wait_cycles / cycles_per_millisecond;
+  metrics["device_flush_time_ms"] = profile_max.flush_cycles / cycles_per_millisecond;
+  metrics["device_profile_max_slice_count"] = py::int_(profile_max.slice_count);
 
   v2::V2WindowHeader header{};
   AWEX_CUDA_V2_CHECK(cudaMemcpy(&header, state->local_base, sizeof(header), cudaMemcpyDeviceToHost));

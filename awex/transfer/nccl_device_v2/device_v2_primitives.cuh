@@ -35,45 +35,6 @@ enum V2Role : std::uint32_t {
   kRolePostRecv = 1U << 4,
 };
 
-template <bool Enable>
-struct V2ProfileRecorder;
-
-template <>
-struct V2ProfileRecorder<true> {
-  __device__ __forceinline__ static unsigned long long start() { return clock64(); }
-  __device__ __forceinline__ static void inputWait(V2KernelProfile* profile, unsigned long long begin) {
-    profile->input_wait_cycles += clock64() - begin;
-  }
-  __device__ __forceinline__ static void outputWait(V2KernelProfile* profile, unsigned long long begin) {
-    profile->output_wait_cycles += clock64() - begin;
-  }
-  __device__ __forceinline__ static void copy(V2KernelProfile* profile, unsigned long long begin) {
-    profile->copy_cycles += clock64() - begin;
-  }
-  __device__ __forceinline__ static void post(V2KernelProfile* profile, unsigned long long begin) {
-    profile->post_cycles += clock64() - begin;
-  }
-  __device__ __forceinline__ static void finalWait(V2KernelProfile* profile, unsigned long long begin) {
-    profile->final_wait_cycles += clock64() - begin;
-  }
-  __device__ __forceinline__ static void flush(V2KernelProfile* profile, unsigned long long begin) {
-    profile->flush_cycles += clock64() - begin;
-  }
-  __device__ __forceinline__ static void slice(V2KernelProfile* profile) { ++profile->slice_count; }
-};
-
-template <>
-struct V2ProfileRecorder<false> {
-  __device__ __forceinline__ static unsigned long long start() { return 0; }
-  __device__ __forceinline__ static void inputWait(V2KernelProfile*, unsigned long long) {}
-  __device__ __forceinline__ static void outputWait(V2KernelProfile*, unsigned long long) {}
-  __device__ __forceinline__ static void copy(V2KernelProfile*, unsigned long long) {}
-  __device__ __forceinline__ static void post(V2KernelProfile*, unsigned long long) {}
-  __device__ __forceinline__ static void finalWait(V2KernelProfile*, unsigned long long) {}
-  __device__ __forceinline__ static void flush(V2KernelProfile*, unsigned long long) {}
-  __device__ __forceinline__ static void slice(V2KernelProfile*) {}
-};
-
 __device__ __forceinline__ unsigned long long v2LoadStep(const volatile unsigned long long* address) {
   unsigned long long value;
   asm volatile("ld.volatile.global.u64 %0, [%1];" : "=l"(value) : "l"(address) : "memory");
