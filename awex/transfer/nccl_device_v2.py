@@ -1009,7 +1009,6 @@ class NCCLDeviceV2Transport:
                 self.network_step_bytes,
                 self.gin_chunk_bytes,
                 self.gin_context_count,
-                max(1, self.infer_instance_world_size),
                 self._logical_to_communicator,
             )
         )

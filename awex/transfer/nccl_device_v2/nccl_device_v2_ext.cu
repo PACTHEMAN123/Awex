@@ -81,7 +81,6 @@ struct DeviceState {
   std::uint32_t gin_fifo_depth = v2::kDefaultFifoDepth;
   std::size_t gin_chunk_bytes = v2::kDefaultChunkBytes;
   std::size_t network_step_bytes = v2::kDefaultNetworkStepBytes;
-  std::uint32_t ring_instance_world_size = 1;
   bool plan_initialized = false;
   bool window_initialized = false;
   v2::V2Direction direction = v2::V2Direction::kSend;
@@ -140,7 +139,6 @@ std::unique_ptr<DeviceState> make_state(const std::string& unique_id_bytes, int 
                                         std::size_t step_bytes, std::size_t chunk_bytes,
                                         std::uint32_t gin_fifo_depth, std::size_t network_step_bytes,
                                         std::size_t gin_chunk_bytes, std::uint32_t gin_context_count,
-                                        std::uint32_t ring_instance_world_size,
                                         const std::vector<int64_t>& logical_to_communicator) {
   if (world_size < 2 || world_size > kMaxRanks) {
     throw std::runtime_error("nccl_device_v2 world_size must be in [2, 256]");
@@ -156,9 +154,6 @@ std::unique_ptr<DeviceState> make_state(const std::string& unique_id_bytes, int 
   }
   if (gin_context_count == 0 || gin_context_count > v2::kMaxChannels) {
     throw std::runtime_error("invalid nccl_device_v2 GIN context count");
-  }
-  if (ring_instance_world_size == 0 || ring_instance_world_size > static_cast<std::uint32_t>(world_size)) {
-    throw std::runtime_error("invalid nccl_device_v2 ring instance world size");
   }
   if (fifo_depth == 0 || gin_fifo_depth == 0 || step_bytes == 0 || network_step_bytes == 0 ||
       step_bytes > std::numeric_limits<std::uint32_t>::max() ||
@@ -196,7 +191,6 @@ std::unique_ptr<DeviceState> make_state(const std::string& unique_id_bytes, int 
   state->network_step_bytes = network_step_bytes;
   state->gin_chunk_bytes = gin_chunk_bytes;
   state->gin.context_count = gin_context_count;
-  state->ring_instance_world_size = ring_instance_world_size;
   AWEX_CUDA_V2_CHECK(cudaSetDevice(device));
   int multiprocessor_count = 0;
   AWEX_CUDA_V2_CHECK(cudaDeviceGetAttribute(&multiprocessor_count, cudaDevAttrMultiProcessorCount, device));
@@ -699,7 +693,6 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
     config.ring_channels = state->gin.context_count == 0
       ? 0
       : v2::v2PowerOfTwoUp(state->gin.context_count);
-    config.ring_instance_world_size = state->ring_instance_world_size;
     config.peer_channels = state->peer_channels;
     config.peer_transports = state->peer_transports;
     const auto lowering_start = Clock::now();
@@ -789,7 +782,6 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
   metrics["gin_enabled"] = py::bool_(state->gin.enabled);
   metrics["gin_signal_count"] = py::int_(state->gin.signal_count);
   metrics["gin_connection_count"] = py::int_(state->gin.connection_count);
-  metrics["ring_instance_world_size"] = py::int_(state->ring_instance_world_size);
   const std::uint32_t gin_credit_batch = v2::v2GinCreditBatch(active_gin_peers, state->gin_fifo_depth);
   metrics["gin_credit_batch"] = py::int_(gin_credit_batch);
   metrics["network_channels_per_peer"] = py::int_(state->gin.channels_per_peer);
@@ -905,13 +897,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
     "create",
     [](const py::bytes& id, int world_size, int rank, int device, int timeout_ms, int max_channels, int fifo_depth,
        int64_t step_bytes, int64_t chunk_bytes, int gin_fifo_depth, int64_t network_step_bytes,
-       int64_t gin_chunk_bytes, int gin_context_count, int ring_instance_world_size,
-       const std::vector<int64_t>& logical_to_communicator) {
+       int64_t gin_chunk_bytes, int gin_context_count, const std::vector<int64_t>& logical_to_communicator) {
       if (fifo_depth <= 0 || gin_fifo_depth <= 0 || step_bytes <= 0 || network_step_bytes <= 0 || chunk_bytes < 0 ||
           gin_chunk_bytes < 0) {
         throw std::runtime_error("invalid nccl_device_v2 step/chunk bytes");
       }
-      if (gin_context_count <= 0 || ring_instance_world_size <= 0) {
+      if (gin_context_count <= 0) {
         throw std::runtime_error("invalid nccl_device_v2 network parallelism");
       }
       const std::string unique_id = id;
@@ -921,15 +912,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
                               static_cast<std::uint32_t>(gin_fifo_depth),
                               static_cast<std::size_t>(network_step_bytes),
                               static_cast<std::size_t>(gin_chunk_bytes),
-                              static_cast<std::uint32_t>(gin_context_count),
-                              static_cast<std::uint32_t>(ring_instance_world_size), logical_to_communicator);
+                              static_cast<std::uint32_t>(gin_context_count), logical_to_communicator);
       return reinterpret_cast<int64_t>(state.release());
     },
     py::arg("id"), py::arg("world_size"), py::arg("rank"), py::arg("device"), py::arg("timeout_ms"),
     py::arg("max_channels"), py::arg("fifo_depth"), py::arg("step_bytes"), py::arg("chunk_bytes"),
     py::arg("gin_fifo_depth") = 16, py::arg("network_step_bytes") = 128 * 1024,
     py::arg("gin_chunk_bytes") = 4 * 1024 * 1024, py::arg("gin_context_count") = 1,
-    py::arg("ring_instance_world_size") = 1,
     py::arg("logical_to_communicator") = std::vector<int64_t>{});
   module.def("launch", &launch);
   module.def("destroy", [](int64_t handle) {

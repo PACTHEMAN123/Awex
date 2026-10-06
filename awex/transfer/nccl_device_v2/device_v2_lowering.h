@@ -43,9 +43,6 @@ struct V2LoweringConfig {
   // Ring lanes are derived from GIN queue multiplicity. Zero preserves the
   // legacy eight-lane fallback for transports without GIN topology data.
   std::uint32_t ring_channels = 0;
-  // Decodes ring_id into (training root, inference TP rank) so roots can be
-  // staggered without collapsing one root's independent TP stripes.
-  std::uint32_t ring_instance_world_size = 1;
   // Topology-derived upper bound for each peer, indexed by rank.
   std::vector<std::uint32_t> peer_channels;
   // Transport selection for each peer, indexed by rank.
@@ -186,17 +183,16 @@ inline std::uint32_t v2GinChannelBase(std::uint32_t local_rank, std::uint32_t pe
 }
 
 inline std::uint32_t v2RingChannelBase(std::uint32_t ring_id, std::uint32_t total_channels,
-                                       std::uint32_t ring_channels,
-                                       std::uint32_t ring_instance_world_size) {
-  const std::uint32_t ring_stride = std::max<std::uint32_t>(1, ring_channels / 2);
-  const std::uint32_t group_count = total_channels / ring_stride;
+                                       std::uint32_t ring_channels) {
+  const std::uint32_t group_count = total_channels / ring_channels;
   if (group_count <= 1) return 0;
-  const std::uint32_t instance_world_size = std::max<std::uint32_t>(1, ring_instance_world_size);
-  const std::uint32_t root = ring_id / instance_world_size;
-  const std::uint32_t logical_peer = ring_id % instance_world_size;
-  const std::uint32_t stripe_groups = std::max<std::uint32_t>(1, ring_channels / ring_stride);
-  const std::uint32_t group = (root + logical_peer * stripe_groups) % group_count;
-  return group * ring_stride;
+  std::uint32_t group = 0;
+  std::uint32_t value = ring_id;
+  while (value != 0) {
+    group ^= value % group_count;
+    value /= group_count;
+  }
+  return (group % group_count) * ring_channels;
 }
 
 struct V2StreamSpan {
@@ -359,8 +355,7 @@ inline V2Schedule lowerFixedTasks(const std::vector<V2LoweringTask>& tasks,
       v2ChannelsForBytes(stream_bytes, min_channels, max_channels, planning_step_bytes, network);
     schedule.peer_channel_counts[peer] = channel_count;
     const std::uint32_t channel_base = ring
-      ? v2RingChannelBase(route.ring_id, config.total_channels, channel_count,
-                          config.ring_instance_world_size)
+      ? v2RingChannelBase(route.ring_id, config.total_channels, channel_count)
       : network
       ? v2GinChannelBase(config.local_rank, peer, config.total_channels, channel_count)
       : v2LsaChannelBase(config.local_rank, peer, config.world_size, config.total_channels);
