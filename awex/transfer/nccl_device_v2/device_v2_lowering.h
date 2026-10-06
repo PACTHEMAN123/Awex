@@ -432,46 +432,13 @@ inline V2Schedule lowerFixedTasks(const std::vector<V2LoweringTask>& tasks,
                                                                                  const V2Work& right) {
         if (left.ring_id != right.ring_id) return left.ring_id < right.ring_id;
         if (left.chunk_ordinal != right.chunk_ordinal) return left.chunk_ordinal < right.chunk_ordinal;
-        if (left.peer != right.peer) return left.peer < right.peer;
-        return left.forward_peer < right.forward_peer;
+        return left.peer < right.peer;
       });
-
-      // Preserve the global ring order on every input and forward connection,
-      // but let independent routes share a CTA batch. Blocking both endpoints
-      // when a work cannot enter the current batch prevents a later work from
-      // overtaking it on either cumulative GIN signal/FIFO step stream.
-      std::vector<std::uint8_t> scheduled(colliding_ring_work.size(), 0);
-      std::size_t scheduled_count = 0;
-      while (scheduled_count != colliding_ring_work.size()) {
+      for (const V2Work& work : colliding_ring_work) {
         V2WorkBatch batch{};
         batch.work_begin = static_cast<std::uint32_t>(schedule.works.size());
-        std::vector<std::uint8_t> used_input_peers(config.world_size, 0);
-        std::vector<std::uint8_t> used_forward_peers(config.world_size, 0);
-        std::vector<std::uint8_t> blocked_input_peers(config.world_size, 0);
-        std::vector<std::uint8_t> blocked_forward_peers(config.world_size, 0);
-        for (std::size_t index = 0;
-             index < colliding_ring_work.size() && batch.work_count < kMaxWorksPerBatch; ++index) {
-          if (scheduled[index]) continue;
-          const V2Work& candidate = colliding_ring_work[index];
-          const bool has_forward = candidate.forward_peer != kNoPeer;
-          const bool input_blocked = used_input_peers[candidate.peer] || blocked_input_peers[candidate.peer];
-          const bool forward_blocked = has_forward &&
-            (used_forward_peers[candidate.forward_peer] || blocked_forward_peers[candidate.forward_peer]);
-          if (input_blocked || forward_blocked) {
-            blocked_input_peers[candidate.peer] = 1;
-            if (has_forward) blocked_forward_peers[candidate.forward_peer] = 1;
-            continue;
-          }
-          schedule.works.push_back(candidate);
-          scheduled[index] = 1;
-          ++scheduled_count;
-          used_input_peers[candidate.peer] = 1;
-          if (has_forward) used_forward_peers[candidate.forward_peer] = 1;
-          ++batch.work_count;
-        }
-        if (batch.work_count == 0) {
-          throw std::logic_error("v2 ring collision scheduler made no progress");
-        }
+        batch.work_count = 1;
+        schedule.works.push_back(work);
         schedule.batches.push_back(batch);
         ++channel_queue.batch_count;
       }
