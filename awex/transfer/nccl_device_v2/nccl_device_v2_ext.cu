@@ -580,7 +580,8 @@ std::vector<v2::V2LoweringTask> build_tasks(
         (forward_peer >= 0 && ring_id < 0)) {
       throw std::runtime_error("nccl_device_v2 forward peer is invalid");
     }
-    if (ring_id < -1 || static_cast<std::uint64_t>(ring_id) >= UINT32_MAX) {
+    if (ring_id < -1 ||
+        (ring_id >= 0 && static_cast<std::uint64_t>(ring_id) >= UINT32_MAX)) {
       throw std::runtime_error("nccl_device_v2 ring id is invalid");
     }
     if (lengths[index] < 0 || tensor_offsets[index] < 0 || tensor_row_bytes[index] <= 0 ||
