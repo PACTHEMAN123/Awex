@@ -22,6 +22,12 @@ LATENCY_METRICS = (
     "worker_update_time_ms",
     "update_body_time_ms",
     "flush_cache_time_ms",
+    "device_input_wait_time_ms",
+    "device_output_wait_time_ms",
+    "device_copy_time_ms",
+    "device_post_time_ms",
+    "device_final_wait_time_ms",
+    "device_flush_time_ms",
 )
 SHAPE_FIELDS = (
     "payload_bytes",

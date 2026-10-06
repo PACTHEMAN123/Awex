@@ -42,7 +42,7 @@ __device__ __forceinline__ std::uint32_t v2Roles(V2Direction direction, int tid,
 // writing consumed_step back into the sender's window.
 __device__ __forceinline__ void v2RunSend(const V2KernelArgs& args, const V2Work& work, std::uint32_t channel, int tid,
                                           int nthreads, int main_barrier, int wait_barrier, int* ready,
-                                          unsigned long long* step_cache) {
+                                          unsigned long long* step_cache, V2KernelProfile* profile) {
   int nworkers = 0;
   const std::uint32_t roles = v2Roles(V2Direction::kSend, tid, nthreads, &nworkers);
   auto* error = &reinterpret_cast<V2WindowHeader*>(args.local_window)->error;
@@ -53,8 +53,11 @@ __device__ __forceinline__ void v2RunSend(const V2KernelArgs& args, const V2Work
       work.step_bytes < work.nbytes - cursor ? work.step_bytes : work.nbytes - cursor;
     V2FifoSlot* slot = v2FifoSlot(args, args.local_rank, work.peer, channel, step, work.fifo_depth, true);
     if (roles & kRoleWaitSend) {
+      const unsigned long long wait_start = clock64();
       *ready = v2WaitFree(slot, step, work.fifo_depth, step_cache, error, args.timeout_cycles);
+      profile->output_wait_cycles += clock64() - wait_start;
     }
+    const unsigned long long copy_start = tid == 0 ? clock64() : 0;
     if (roles & kRoleWorker) {
       v2GroupBarrier(wait_barrier, nworkers);
       if (*ready) {
@@ -67,9 +70,15 @@ __device__ __forceinline__ void v2RunSend(const V2KernelArgs& args, const V2Work
     // Like NCCL SIMPLE send, a wide group reserves its final warp for Post.
     // Workers can begin the next step while Post fences and publishes this one.
     v2GroupBarrier(main_barrier, nthreads);
+    if (tid == 0) {
+      profile->copy_cycles += clock64() - copy_start;
+      ++profile->slice_count;
+    }
     if ((roles & kRolePostSend) && v2LoadError(error) == 0) {
+      const unsigned long long post_start = clock64();
       slot->bytes = static_cast<std::uint32_t>(slice_bytes);
       v2Publish(&slot->ready_step, step);
+      profile->post_cycles += clock64() - post_start;
     }
     if (v2LoadError(error) != 0) return;
     cursor += slice_bytes;
@@ -80,7 +89,9 @@ __device__ __forceinline__ void v2RunSend(const V2KernelArgs& args, const V2Work
     V2FifoSlot* slot =
       v2FifoSlot(args, args.local_rank, work.peer, channel, step - 1, work.fifo_depth, true);
     if (roles & kRoleWaitSend) {
+      const unsigned long long wait_start = clock64();
       *ready = v2WaitConsumed(slot, step - 1, step_cache, error, args.timeout_cycles);
+      profile->final_wait_cycles += clock64() - wait_start;
     }
     v2GroupBarrier(main_barrier, nthreads);
   }
@@ -88,7 +99,7 @@ __device__ __forceinline__ void v2RunSend(const V2KernelArgs& args, const V2Work
 
 __device__ __forceinline__ void v2RunRecv(const V2KernelArgs& args, const V2Work& work, std::uint32_t channel, int tid,
                                           int nthreads, int barrier, int* ready,
-                                          unsigned long long* step_cache) {
+                                          unsigned long long* step_cache, V2KernelProfile* profile) {
   int nworkers = 0;
   const std::uint32_t roles = v2Roles(V2Direction::kRecv, tid, nthreads, &nworkers);
   auto* error = &reinterpret_cast<V2WindowHeader*>(args.local_window)->error;
@@ -99,8 +110,11 @@ __device__ __forceinline__ void v2RunRecv(const V2KernelArgs& args, const V2Work
       work.step_bytes < work.nbytes - cursor ? work.step_bytes : work.nbytes - cursor;
     V2FifoSlot* slot = v2FifoSlot(args, work.peer, args.local_rank, channel, step, work.fifo_depth, false);
     if (roles & kRoleWaitRecv) {
+      const unsigned long long wait_start = clock64();
       *ready = v2WaitReady(&slot->ready_step, step, step_cache, error, args.timeout_cycles);
+      profile->input_wait_cycles += clock64() - wait_start;
     }
+    const unsigned long long copy_start = tid == 0 ? clock64() : 0;
     v2GroupBarrier(barrier, nthreads);
     if (*ready && (roles & kRoleWorker)) {
       const std::uint8_t* payload =
@@ -109,7 +123,15 @@ __device__ __forceinline__ void v2RunRecv(const V2KernelArgs& args, const V2Work
     }
 
     v2GroupBarrier(barrier, nthreads);
-    if ((roles & kRolePostRecv) && v2LoadError(error) == 0) v2Publish(&slot->consumed_step, step);
+    if (tid == 0) {
+      profile->copy_cycles += clock64() - copy_start;
+      ++profile->slice_count;
+    }
+    if ((roles & kRolePostRecv) && v2LoadError(error) == 0) {
+      const unsigned long long post_start = clock64();
+      v2Publish(&slot->consumed_step, step);
+      profile->post_cycles += clock64() - post_start;
+    }
     if (v2LoadError(error) != 0) return;
     cursor += slice_bytes;
     ++step;
@@ -122,7 +144,8 @@ __device__ __forceinline__ void v2RunRecv(const V2KernelArgs& args, const V2Work
 // retain NCCL broadcast's chunk-pipelined behavior.
 __device__ __forceinline__ void v2RunRelay(const V2KernelArgs& args, const V2Work& work, std::uint32_t channel,
                                            int tid, int nthreads, int barrier, int* ready,
-                                           unsigned long long* input_cache, unsigned long long* output_cache) {
+                                           unsigned long long* input_cache, unsigned long long* output_cache,
+                                           V2KernelProfile* profile) {
   int nworkers = 0;
   const std::uint32_t roles = v2Roles(V2Direction::kRecv, tid, nthreads, &nworkers);
   auto* error = &reinterpret_cast<V2WindowHeader*>(args.local_window)->error;
@@ -148,22 +171,31 @@ __device__ __forceinline__ void v2RunRelay(const V2KernelArgs& args, const V2Wor
       bool output_ready = false;
 #if AWEX_NCCL_DEVICE_V2_HAS_GIN
       ncclGin gin{args.dev_comm, static_cast<int>(channel % args.dev_comm.ginContextCount)};
+      unsigned long long wait_start = clock64();
       input_ready = input_gin
         ? v2GinWaitSignal(args, gin, v2GinReadySignal(args, work.peer, channel), input_step, 2U)
         : v2WaitReady(&input_slot->ready_step, input_step, input_cache, error, args.timeout_cycles);
+      profile->input_wait_cycles += clock64() - wait_start;
+      wait_start = clock64();
       output_ready = output_gin
         ? (output_step <= work.fifo_depth ||
            v2GinWaitSignal(args, gin, v2GinCreditSignal(args, work.forward_peer, channel),
                            output_step - work.fifo_depth, 3U))
         : v2WaitFree(output_slot, output_step, work.fifo_depth, output_cache, error, args.timeout_cycles);
+      profile->output_wait_cycles += clock64() - wait_start;
 #else
+      unsigned long long wait_start = clock64();
       input_ready = !input_gin &&
         v2WaitReady(&input_slot->ready_step, input_step, input_cache, error, args.timeout_cycles);
+      profile->input_wait_cycles += clock64() - wait_start;
+      wait_start = clock64();
       output_ready = !output_gin &&
         v2WaitFree(output_slot, output_step, work.fifo_depth, output_cache, error, args.timeout_cycles);
+      profile->output_wait_cycles += clock64() - wait_start;
 #endif
       *ready = input_ready && output_ready;
     }
+    const unsigned long long copy_start = tid == 0 ? clock64() : 0;
     v2GroupBarrier(barrier, nthreads);
 
     const std::uint8_t* input_payload = nullptr;
@@ -187,7 +219,12 @@ __device__ __forceinline__ void v2RunRelay(const V2KernelArgs& args, const V2Wor
     }
 
     v2GroupBarrier(barrier, nthreads);
+    if (tid == 0) {
+      profile->copy_cycles += clock64() - copy_start;
+      ++profile->slice_count;
+    }
     if ((roles & kRolePostRecv) && v2LoadError(error) == 0) {
+      const unsigned long long post_start = clock64();
 #if AWEX_NCCL_DEVICE_V2_HAS_GIN
       ncclGin gin{args.dev_comm, static_cast<int>(channel % args.dev_comm.ginContextCount)};
       const ncclTeam world = ncclTeamWorld(args.dev_comm);
@@ -221,6 +258,7 @@ __device__ __forceinline__ void v2RunRelay(const V2KernelArgs& args, const V2Wor
       } else {
         v2Publish(&input_slot->consumed_step, input_step);
       }
+      profile->post_cycles += clock64() - post_start;
     }
     if (v2LoadError(error) != 0) return;
     cursor += slice_bytes;
@@ -230,6 +268,7 @@ __device__ __forceinline__ void v2RunRelay(const V2KernelArgs& args, const V2Wor
 
   if (work.final && work.nbytes != 0) {
     if (roles & kRoleWaitRecv) {
+      const unsigned long long wait_start = clock64();
 #if AWEX_NCCL_DEVICE_V2_HAS_GIN
       if (output_gin) {
         ncclGin gin{args.dev_comm, static_cast<int>(channel % args.dev_comm.ginContextCount)};
@@ -241,6 +280,7 @@ __device__ __forceinline__ void v2RunRelay(const V2KernelArgs& args, const V2Wor
           v2FifoSlot(args, args.local_rank, work.forward_peer, channel, output_step - 1, work.fifo_depth, true);
         *ready = v2WaitConsumed(final_slot, output_step - 1, output_cache, error, args.timeout_cycles);
       }
+      profile->final_wait_cycles += clock64() - wait_start;
     }
     v2GroupBarrier(barrier, nthreads);
   }
@@ -269,16 +309,18 @@ __device__ __forceinline__ void v2RunBatch(const V2KernelArgs& args, const V2Wor
     v2GroupBarrier(main_barrier, subthreads);
 
     const V2Work& work = args.works[batch.work_begin + group];
+    V2KernelProfile* profile = args.profiles + static_cast<std::size_t>(blockIdx.x) * kMaxWorksPerBatch + group;
     const bool use_gin = args.peer_transports[work.peer] == static_cast<std::uint8_t>(V2Transport::kGin);
     if (work.forward_peer != kNoPeer) {
       v2RunRelay(args, work, channel, subtid, subthreads, main_barrier, &shared.ready[group],
-                 &shared.step_cache[group], &shared.forward_step_cache[group]);
+                 &shared.step_cache[group], &shared.forward_step_cache[group], profile);
     } else if (use_gin) {
 #if AWEX_NCCL_DEVICE_V2_HAS_GIN
       if (args.direction == V2Direction::kSend) {
-        v2GinRunSend(args, work, channel, subtid, subthreads, main_barrier, wait_barrier, &shared.ready[group]);
+        v2GinRunSend(args, work, channel, subtid, subthreads, main_barrier, wait_barrier, &shared.ready[group],
+                     profile);
       } else {
-        v2GinRunRecv(args, work, channel, subtid, subthreads, main_barrier, &shared.ready[group]);
+        v2GinRunRecv(args, work, channel, subtid, subthreads, main_barrier, &shared.ready[group], profile);
       }
 #else
       if (subtid == 0) {
@@ -289,10 +331,10 @@ __device__ __forceinline__ void v2RunBatch(const V2KernelArgs& args, const V2Wor
 #endif
     } else if (args.direction == V2Direction::kSend) {
       v2RunSend(args, work, channel, subtid, subthreads, main_barrier, wait_barrier, &shared.ready[group],
-                &shared.step_cache[group]);
+                &shared.step_cache[group], profile);
     } else {
       v2RunRecv(args, work, channel, subtid, subthreads, main_barrier, &shared.ready[group],
-                &shared.step_cache[group]);
+                &shared.step_cache[group], profile);
     }
   }
   __syncthreads();
@@ -326,7 +368,12 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 1) device_v2_kernel(V2Kernel
 #if AWEX_NCCL_DEVICE_V2_HAS_GIN
   if (args.gin_enabled != 0) {
     ncclGin gin{args.dev_comm, static_cast<int>(channel % args.dev_comm.ginContextCount)};
+    const unsigned long long flush_start = clock64();
     gin.flush(ncclCoopCta());
+    if (threadIdx.x == 0) {
+      V2KernelProfile* profile = args.profiles + static_cast<std::size_t>(blockIdx.x) * kMaxWorksPerBatch;
+      profile->flush_cycles += clock64() - flush_start;
+    }
   }
 #endif
 }

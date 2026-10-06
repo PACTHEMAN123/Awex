@@ -134,6 +134,16 @@ struct alignas(64) V2WindowHeader {
   unsigned int reserved;
 };
 
+struct alignas(64) V2KernelProfile {
+  unsigned long long input_wait_cycles;
+  unsigned long long output_wait_cycles;
+  unsigned long long copy_cycles;
+  unsigned long long post_cycles;
+  unsigned long long final_wait_cycles;
+  unsigned long long flush_cycles;
+  unsigned long long slice_count;
+};
+
 struct V2WindowLayout {
   std::size_t state_offset;
   std::size_t payload_offset;
@@ -153,6 +163,7 @@ struct V2KernelArgs {
   const std::uint32_t* channel_ids;
   const std::uint32_t* active_peers;
   const std::uint8_t* peer_transports;
+  V2KernelProfile* profiles;
   std::uint32_t channel_count;
   std::uint32_t active_peer_count;
   std::uint32_t local_rank;
