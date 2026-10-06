@@ -26,6 +26,7 @@ struct V2BatchShared {
   int ready[kMaxWorksPerBatch];
   unsigned long long step_cache[kMaxWorksPerBatch];
   unsigned long long forward_step_cache[kMaxWorksPerBatch];
+  V2KernelProfile profiles[kMaxWorksPerBatch];
 };
 
 __device__ __forceinline__ std::uint32_t v2Roles(V2Direction direction, int tid, int nthreads, int* nworkers) {
@@ -305,15 +306,18 @@ __device__ __forceinline__ void v2RunBatch(const V2KernelArgs& args, const V2Wor
     const int barrier_width = extra_send_barrier ? 2 : 1;
     const int main_barrier = 1 + group * barrier_width;
     const int wait_barrier = extra_send_barrier ? main_barrier + 1 : main_barrier;
+    V2KernelProfile* global_profile =
+      args.profiles + static_cast<std::size_t>(blockIdx.x) * kMaxWorksPerBatch + group;
     if (subtid == 0) {
       shared.ready[group] = 1;
       shared.step_cache[group] = 0;
       shared.forward_step_cache[group] = 0;
+      shared.profiles[group] = *global_profile;
     }
     v2GroupBarrier(main_barrier, subthreads);
 
     const V2Work& work = args.works[batch.work_begin + group];
-    V2KernelProfile* profile = args.profiles + static_cast<std::size_t>(blockIdx.x) * kMaxWorksPerBatch + group;
+    V2KernelProfile* profile = &shared.profiles[group];
     const bool use_gin = args.peer_transports[work.peer] == static_cast<std::uint8_t>(V2Transport::kGin);
     if (work.forward_peer != kNoPeer) {
       v2RunRelay(args, work, channel, subtid, subthreads, main_barrier, &shared.ready[group],
@@ -340,6 +344,8 @@ __device__ __forceinline__ void v2RunBatch(const V2KernelArgs& args, const V2Wor
       v2RunRecv(args, work, channel, subtid, subthreads, main_barrier, &shared.ready[group],
                 &shared.step_cache[group], profile);
     }
+    v2GroupBarrier(main_barrier, subthreads);
+    if (subtid == 0) *global_profile = shared.profiles[group];
   }
   __syncthreads();
 }
