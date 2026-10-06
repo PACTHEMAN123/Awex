@@ -17,6 +17,11 @@ def configure_device_v2_ray_locality(
     policy = env.get("AWEX_NCCL_DEVICE_V2_HCA_POLICY", "balanced")
     if policy.strip().lower() != "balanced":
         return
+    if worker_local_rank is not None:
+        try:
+            env["LOCAL_RANK"] = str(int(worker_local_rank))
+        except (TypeError, ValueError):
+            return
     if "AWEX_NODE_LOCAL_RANK_OFFSET" in env:
         return
 
@@ -39,7 +44,6 @@ def configure_device_v2_ray_locality(
             if not 0 <= worker_local_rank < len(visible_devices):
                 return
             physical_rank = int(visible_devices[worker_local_rank])
-            env.setdefault("LOCAL_RANK", str(worker_local_rank))
         local_rank = int(env.get("LOCAL_RANK", "0"))
         world_size = int(local_world_size or "")
     except (TypeError, ValueError):

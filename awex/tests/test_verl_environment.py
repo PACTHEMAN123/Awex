@@ -57,6 +57,22 @@ def test_explicit_local_rank_offset_is_preserved():
     assert env["AWEX_NODE_LOCAL_RANK_OFFSET"] == "3"
 
 
+def test_vllm_worker_updates_local_rank_with_explicit_engine_offset():
+    env = {
+        "AWEX_NCCL_DEVICE_V2_HCA_POLICY": "balanced",
+        "AWEX_NODE_LOCAL_RANK_OFFSET": "4",
+        "AWEX_NODE_LOCAL_WORLD_SIZE": "8",
+        "CUDA_VISIBLE_DEVICES": "4,5,6,7",
+        "LOCAL_RANK": "0",
+    }
+
+    configure_device_v2_ray_locality(env, worker_local_rank=2)
+
+    assert env["LOCAL_RANK"] == "2"
+    assert env["AWEX_NODE_LOCAL_RANK_OFFSET"] == "4"
+    assert env["AWEX_NODE_LOCAL_WORLD_SIZE"] == "8"
+
+
 def test_topology_policy_does_not_rewrite_ray_locality():
     env = {
         "AWEX_NCCL_DEVICE_V2_HCA_POLICY": "topology",
