@@ -27,9 +27,13 @@ import ray
 from verl.checkpoint_engine.base import CheckpointEngine, CheckpointEngineRegistry
 
 from awex.config import InferenceConfig
-from awex.engine.mcore import MegatronEngine as AwexMegatronEngine
-from awex.meta.meta_server import start_meta_server
-from awex.reader.weights_reader import get_weights_exchange_reader
+from awex.verl_environment import configure_device_v2_ray_locality
+
+configure_device_v2_ray_locality()
+
+from awex.engine.mcore import MegatronEngine as AwexMegatronEngine  # noqa: E402
+from awex.meta.meta_server import start_meta_server  # noqa: E402
+from awex.reader.weights_reader import get_weights_exchange_reader  # noqa: E402
 
 logger = logging.getLogger(__name__)
 

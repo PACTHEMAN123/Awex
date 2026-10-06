@@ -24,8 +24,12 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from awex.config import InferenceConfig
-from awex.publication.vllm_adapter import PublicationVLLMServerAdapter
-from awex.vllm_awex_adapter import AwexVLLMServerAdapter
+from awex.verl_environment import configure_device_v2_ray_locality
+
+configure_device_v2_ray_locality()
+
+from awex.publication.vllm_adapter import PublicationVLLMServerAdapter  # noqa: E402
+from awex.vllm_awex_adapter import AwexVLLMServerAdapter  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
