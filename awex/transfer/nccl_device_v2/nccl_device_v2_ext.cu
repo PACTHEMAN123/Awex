@@ -369,36 +369,6 @@ void initialize_sparse_window(DeviceState* state, const std::vector<std::uint32_
       local_payload_slots[peer] = payload_peer_count++;
     }
   }
-  if (state->lsa_team.nRanks > 1) {
-    const std::uint32_t local_lsa_size = static_cast<std::uint32_t>(state->lsa_team.nRanks);
-    const auto lsa_sizes =
-      v2::topology_detail::allGather(state->comm, &local_lsa_size, 1, state->world_size, stream);
-    if (state->world_size % state->lsa_team.nRanks != 0 ||
-        !std::all_of(lsa_sizes.begin(), lsa_sizes.end(),
-                     [local_lsa_size](std::uint32_t value) { return value == local_lsa_size; })) {
-      throw std::runtime_error("nccl_device_v2 rail GIN requires uniform LSA teams");
-    }
-    std::vector<std::uint8_t> local_send_peers(state->world_size, 0);
-    if (direction == v2::V2Direction::kSend) {
-      for (const std::uint32_t peer : active_peers) {
-        if (state->peer_transports[peer] == static_cast<std::uint8_t>(v2::V2Transport::kGin)) {
-          local_send_peers[peer] = 1;
-        }
-      }
-    }
-    const auto send_peer_matrix = v2::topology_detail::allGather(
-      state->comm, local_send_peers.data(), local_send_peers.size(), state->world_size, stream);
-    for (int source = 0; source < state->world_size; ++source) {
-      for (int destination = 0; destination < state->world_size; ++destination) {
-        if (send_peer_matrix[static_cast<std::size_t>(source) * state->world_size + destination] == 0) continue;
-        const int destination_proxy =
-          (destination / state->lsa_team.nRanks) * state->lsa_team.nRanks + source % state->lsa_team.nRanks;
-        if (destination_proxy == state->rank && local_payload_slots[source] == inactive) {
-          local_payload_slots[source] = payload_peer_count++;
-        }
-      }
-    }
-  }
   const auto payload_peer_slots = v2::topology_detail::allGather(
     state->comm, local_payload_slots.data(), local_payload_slots.size(), state->world_size, stream);
   std::uint32_t payload_peer_capacity = 0;
@@ -447,9 +417,8 @@ void initialize_sparse_window(DeviceState* state, const std::vector<std::uint32_
                                 .window_bytes;
   try {
     AWEX_NCCL_V2_CHECK(ncclMemAlloc(&state->local_base, state->window_bytes));
-    AWEX_NCCL_V2_CHECK(ncclCommWindowRegister(
-      state->comm, state->local_base, state->window_bytes, &state->window,
-      NCCL_WIN_COLL_SYMMETRIC | NCCL_WIN_STRICT_ORDERING));
+    AWEX_NCCL_V2_CHECK(ncclCommWindowRegister(state->comm, state->local_base, state->window_bytes, &state->window,
+                                              NCCL_WIN_COLL_SYMMETRIC));
 
     state->remote_bases.resize(state->world_size, nullptr);
     state->remote_bases[state->rank] = state->local_base;
@@ -730,7 +699,6 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
   metrics["lsa_peer_count"] = py::int_(active_lsa_peers);
   metrics["gin_peer_count"] = py::int_(active_gin_peers);
   metrics["gin_enabled"] = py::bool_(state->gin.enabled);
-  metrics["gin_railed"] = py::bool_(state->gin.railed);
   metrics["gin_signal_count"] = py::int_(state->gin.signal_count);
   metrics["gin_connection_count"] = py::int_(state->gin.connection_count);
   const std::uint32_t gin_credit_batch = v2::v2GinCreditBatch(active_gin_peers, state->gin_fifo_depth);

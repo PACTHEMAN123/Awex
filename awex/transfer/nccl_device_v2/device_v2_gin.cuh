@@ -70,52 +70,6 @@ __device__ __forceinline__ std::uint8_t* v2GinLocalPayload(const V2KernelArgs& a
   return args.local_window + v2GinPayloadOffset(args, args.local_rank, peer, channel, step, fifo_depth);
 }
 
-__device__ __forceinline__ std::uint8_t* v2GinProxyPayload(const V2KernelArgs& args,
-                                                           std::uint32_t proxy_rank,
-                                                           std::uint32_t connection_rank,
-                                                           std::uint32_t channel,
-                                                           unsigned long long step,
-                                                           std::uint32_t fifo_depth) {
-  auto* window = reinterpret_cast<std::uint8_t*>(args.peer_windows[proxy_rank]);
-  return window + v2GinPayloadOffset(
-    args, proxy_rank, connection_rank, channel, step, fifo_depth);
-}
-
-__device__ __forceinline__ std::size_t v2GinControlOffset(const V2KernelArgs& args,
-                                                          std::uint32_t connection_rank,
-                                                          std::uint32_t channel,
-                                                          std::size_t field_offset) {
-  const std::size_t connection =
-    static_cast<std::size_t>(connection_rank) * args.layout.channel_count + channel;
-  return args.layout.state_offset + connection * args.layout.fifo_depth * sizeof(V2FifoSlot) + field_offset;
-}
-
-__device__ __forceinline__ volatile unsigned long long* v2GinProxyControl(
-  const V2KernelArgs& args, std::uint32_t proxy_rank, std::uint32_t connection_rank,
-  std::uint32_t channel, std::size_t field_offset) {
-  auto* window = proxy_rank == args.local_rank
-    ? args.local_window
-    : reinterpret_cast<std::uint8_t*>(args.peer_windows[proxy_rank]);
-  return reinterpret_cast<volatile unsigned long long*>(
-    window + v2GinControlOffset(args, connection_rank, channel, field_offset));
-}
-
-__device__ __forceinline__ bool v2GinWaitControl(const V2KernelArgs& args,
-                                                 volatile unsigned long long* control,
-                                                 unsigned long long expected,
-                                                 unsigned int error_code) {
-  auto* error = &reinterpret_cast<V2WindowHeader*>(args.local_window)->error;
-  const unsigned long long start = clock64();
-  while (v2LoadStep(control) < expected) {
-    if (v2LoadError(error) != 0) return false;
-    if (clock64() - start > args.timeout_cycles) {
-      atomicCAS(error, 0U, error_code);
-      return false;
-    }
-  }
-  return true;
-}
-
 __device__ __forceinline__ bool v2GinWaitSignal(const V2KernelArgs& args, const ncclGin& gin, ncclGinSignal_t signal,
                                                 unsigned long long expected, unsigned int error_code) {
   auto* error = &reinterpret_cast<V2WindowHeader*>(args.local_window)->error;
@@ -146,13 +100,6 @@ __device__ __forceinline__ void v2GinRunSend(const V2KernelArgs& args, const V2W
   auto* error = &reinterpret_cast<V2WindowHeader*>(args.local_window)->error;
   ncclGin gin{args.dev_comm, static_cast<int>(channel % args.dev_comm.ginContextCount)};
   const ncclTeam world = ncclTeamWorld(args.dev_comm);
-  const ncclTeam rail = ncclTeamRail(args.dev_comm);
-  const std::uint32_t lsa_size = static_cast<std::uint32_t>(args.dev_comm.lsaSize);
-  const std::uint32_t destination_proxy =
-    (work.peer / lsa_size) * lsa_size + static_cast<std::uint32_t>(args.dev_comm.lsaRank);
-  const int rail_peer = ncclTeamRankToTeam(rail, world, static_cast<int>(destination_proxy));
-  const std::uint32_t ack_proxy =
-    (args.local_rank / lsa_size) * lsa_size + work.peer % lsa_size;
   const ncclGinSignal_t ready_signal = v2GinReadySignal(args, args.local_rank, channel);
   const ncclGinSignal_t credit_signal = v2GinCreditSignal(args, work.peer, channel);
   std::uint64_t cursor = 0;
@@ -161,12 +108,7 @@ __device__ __forceinline__ void v2GinRunSend(const V2KernelArgs& args, const V2W
     const std::uint64_t slice_bytes =
       work.step_bytes < work.nbytes - cursor ? work.step_bytes : work.nbytes - cursor;
     if ((roles & kRoleWaitSend) && step > work.fifo_depth) {
-      *ready = args.gin_railed != 0
-        ? v2GinWaitControl(
-            args,
-            v2GinProxyControl(args, ack_proxy, work.peer, channel, offsetof(V2FifoSlot, consumed_step)),
-            step - work.fifo_depth, 3U)
-        : v2GinWaitSignal(args, gin, credit_signal, step - work.fifo_depth, 3U);
+      *ready = v2GinWaitSignal(args, gin, credit_signal, step - work.fifo_depth, 3U);
     }
     if (roles & kRoleWorker) {
       v2GroupBarrier(wait_barrier, nworkers);
@@ -179,24 +121,13 @@ __device__ __forceinline__ void v2GinRunSend(const V2KernelArgs& args, const V2W
 
     v2GroupBarrier(main_barrier, nthreads);
     if ((roles & kRolePostSend) && v2LoadError(error) == 0) {
-      if (args.gin_railed != 0) {
-        gin.put(rail, rail_peer, args.window,
-                v2GinPayloadOffset(args, destination_proxy, args.local_rank, channel, step, work.fifo_depth),
-                args.window,
-                v2GinPayloadOffset(args, args.local_rank, work.peer, channel, step, work.fifo_depth),
-                slice_bytes);
-        gin.putValue(rail, rail_peer, args.window,
-                     v2GinControlOffset(args, args.local_rank, channel, offsetof(V2FifoSlot, ready_step)),
-                     step);
-      } else {
-        // The cumulative ready counter requires ordered completion so a later
-        // put cannot satisfy the wait for an earlier FIFO step.
-        gin.put(world, work.peer, args.window,
-                v2GinPayloadOffset(args, work.peer, args.local_rank, channel, step, work.fifo_depth), args.window,
-                v2GinPayloadOffset(args, args.local_rank, work.peer, channel, step, work.fifo_depth), slice_bytes,
-                V2GinReadySignalInc{ready_signal}, ncclGin_None{}, ncclCoopThread{}, ncclGin_None{},
-                cuda::thread_scope_thread, cuda::thread_scope_device, ncclGinOptFlagsDefault);
-      }
+      // The cumulative ready counter requires ordered completion so a later
+      // put cannot satisfy the wait for an earlier FIFO step.
+      gin.put(world, work.peer, args.window,
+              v2GinPayloadOffset(args, work.peer, args.local_rank, channel, step, work.fifo_depth), args.window,
+              v2GinPayloadOffset(args, args.local_rank, work.peer, channel, step, work.fifo_depth), slice_bytes,
+              V2GinReadySignalInc{ready_signal}, ncclGin_None{}, ncclCoopThread{}, ncclGin_None{},
+              cuda::thread_scope_thread, cuda::thread_scope_device, ncclGinOptFlagsDefault);
     }
     if (v2LoadError(error) != 0) return;
     cursor += slice_bytes;
@@ -205,12 +136,7 @@ __device__ __forceinline__ void v2GinRunSend(const V2KernelArgs& args, const V2W
 
   if (work.final && work.nbytes != 0) {
     if (roles & kRoleWaitSend) {
-      *ready = args.gin_railed != 0
-        ? v2GinWaitControl(
-            args,
-            v2GinProxyControl(args, ack_proxy, work.peer, channel, offsetof(V2FifoSlot, consumed_step)),
-            step - 1, 4U)
-        : v2GinWaitSignal(args, gin, credit_signal, step - 1, 4U);
+      *ready = v2GinWaitSignal(args, gin, credit_signal, step - 1, 4U);
     }
     v2GroupBarrier(main_barrier, nthreads);
   }
@@ -223,13 +149,6 @@ __device__ __forceinline__ void v2GinRunRecv(const V2KernelArgs& args, const V2W
   auto* error = &reinterpret_cast<V2WindowHeader*>(args.local_window)->error;
   ncclGin gin{args.dev_comm, static_cast<int>(channel % args.dev_comm.ginContextCount)};
   const ncclTeam world = ncclTeamWorld(args.dev_comm);
-  const ncclTeam rail = ncclTeamRail(args.dev_comm);
-  const std::uint32_t lsa_size = static_cast<std::uint32_t>(args.dev_comm.lsaSize);
-  const std::uint32_t ready_proxy =
-    (args.local_rank / lsa_size) * lsa_size + work.peer % lsa_size;
-  const std::uint32_t ack_proxy =
-    (work.peer / lsa_size) * lsa_size + args.local_rank % lsa_size;
-  const int rail_peer = ncclTeamRankToTeam(rail, world, static_cast<int>(ack_proxy));
   const ncclGinSignal_t ready_signal = v2GinReadySignal(args, work.peer, channel);
   const ncclGinSignal_t credit_signal = v2GinCreditSignal(args, args.local_rank, channel);
   const std::uint32_t credit_batch = args.gin_credit_batch;
@@ -239,19 +158,13 @@ __device__ __forceinline__ void v2GinRunRecv(const V2KernelArgs& args, const V2W
     const std::uint64_t slice_bytes =
       work.step_bytes < work.nbytes - cursor ? work.step_bytes : work.nbytes - cursor;
     if (roles & kRoleWaitRecv) {
-      *ready = args.gin_railed != 0
-        ? v2GinWaitControl(
-            args,
-            v2GinProxyControl(args, ready_proxy, work.peer, channel, offsetof(V2FifoSlot, ready_step)),
-            step, 2U)
-        : v2GinWaitSignal(args, gin, ready_signal, step, 2U);
+      *ready = v2GinWaitSignal(args, gin, ready_signal, step, 2U);
     }
     v2GroupBarrier(barrier, nthreads);
     if (*ready && (roles & kRoleWorker)) {
-      const std::uint8_t* payload = args.gin_railed != 0
-        ? v2GinProxyPayload(args, ready_proxy, work.peer, channel, step, work.fifo_depth)
-        : v2GinLocalPayload(args, work.peer, channel, step, work.fifo_depth);
-      v2CopyContiguousToFragments(args, work, payload, cursor, slice_bytes, tid, nworkers);
+      v2CopyContiguousToFragments(
+        args, work, v2GinLocalPayload(args, work.peer, channel, step, work.fifo_depth), cursor, slice_bytes, tid,
+        nworkers);
     }
 
     v2GroupBarrier(barrier, nthreads);
@@ -261,13 +174,7 @@ __device__ __forceinline__ void v2GinRunRecv(const V2KernelArgs& args, const V2W
       work_complete && work_step % credit_batch != 0 ? work_step % credit_batch : credit_batch);
     if ((roles & kRolePostRecv) && v2LoadError(error) == 0 &&
         (work_complete || work_step % credit_batch == 0)) {
-      if (args.gin_railed != 0) {
-        gin.putValue(rail, rail_peer, args.window,
-                     v2GinControlOffset(args, args.local_rank, channel, offsetof(V2FifoSlot, consumed_step)),
-                     step);
-      } else {
-        gin.signal(world, work.peer, V2GinCreditSignalAdd{credit_signal, returned_credits});
-      }
+      gin.signal(world, work.peer, V2GinCreditSignalAdd{credit_signal, returned_credits});
     }
     if (v2LoadError(error) != 0) return;
     cursor += slice_bytes;
@@ -277,17 +184,6 @@ __device__ __forceinline__ void v2GinRunRecv(const V2KernelArgs& args, const V2W
 
 __global__ void v2GinResetSignalsKernel(V2KernelArgs args) {
   ncclCoopCta coop;
-  ncclGin barrier_gin{args.dev_comm, 0};
-  if (args.gin_railed != 0) {
-    ncclBarrierSession<ncclCoopCta> barrier{coop, ncclTeamTagWorld(), barrier_gin, 0};
-    const ncclResult_t result =
-      barrier.sync(coop, cuda::memory_order_acq_rel, kV2GinNoFence, args.timeout_cycles);
-    if (threadIdx.x == 0 && result != ncclSuccess) {
-      auto* error = &reinterpret_cast<V2WindowHeader*>(args.local_window)->error;
-      atomicCAS(error, 0U, 1U);
-    }
-    return;
-  }
   for (std::uint32_t context = 0; context < args.dev_comm.ginContextCount; ++context) {
     ncclGin gin{args.dev_comm, static_cast<int>(context)};
     for (std::uint32_t signal = threadIdx.x; signal < args.gin_signal_count; signal += blockDim.x) {
@@ -295,6 +191,7 @@ __global__ void v2GinResetSignalsKernel(V2KernelArgs args) {
     }
     coop.sync();
   }
+  ncclGin barrier_gin{args.dev_comm, 0};
   ncclGinBarrierSession<ncclCoopCta> barrier{coop, barrier_gin, ncclTeamTagWorld(), 0};
   const ncclResult_t result =
     barrier.sync(coop, cuda::memory_order_acq_rel, kV2GinNoFence, args.timeout_cycles);
