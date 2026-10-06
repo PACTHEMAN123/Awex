@@ -96,6 +96,7 @@ struct alignas(16) V2Fragment {
 struct alignas(16) V2Work {
   std::uint32_t peer;
   std::uint32_t forward_peer;
+  std::uint32_t ring_id;
   std::uint32_t fragment_begin;
   std::uint32_t fragment_count;
   std::uint32_t chunk_ordinal;

@@ -655,6 +655,9 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
     config.gin_fifo_depth = state->gin_fifo_depth;
     config.gin_chunk_bytes = state->gin_chunk_bytes;
     config.network_step_bytes = state->network_step_bytes;
+    config.ring_channels = state->gin.connection_count == 0
+      ? 0
+      : v2::v2PowerOfTwoUp(state->gin.connection_count);
     config.peer_channels = state->peer_channels;
     config.peer_transports = state->peer_transports;
     const auto lowering_start = Clock::now();
@@ -692,6 +695,7 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
   metrics["chunk_count"] = py::int_(schedule.chunk_count);
   metrics["batch_count"] = py::int_(schedule.batches.size());
   metrics["channel_count"] = py::int_(schedule.channel_count);
+  metrics["ring_channel_collision_count"] = py::int_(schedule.ring_channel_collision_count);
   std::uint32_t min_work_step_bytes = std::numeric_limits<std::uint32_t>::max();
   std::uint32_t max_work_step_bytes = 0;
   for (const auto& work : schedule.works) {

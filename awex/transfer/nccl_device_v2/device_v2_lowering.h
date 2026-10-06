@@ -40,6 +40,9 @@ struct V2LoweringConfig {
   std::uint32_t gin_fifo_depth = kDefaultFifoDepth;
   std::size_t gin_chunk_bytes = kDefaultChunkBytes;
   std::size_t network_step_bytes = kDefaultNetworkStepBytes;
+  // Ring lanes track independent GIN connections. Zero preserves the legacy
+  // eight-lane fallback for transports without GIN topology information.
+  std::uint32_t ring_channels = 0;
   // Topology-derived upper bound for each peer, indexed by rank.
   std::vector<std::uint32_t> peer_channels;
   // Transport selection for each peer, indexed by rank.
@@ -69,6 +72,7 @@ struct V2Schedule {
   std::vector<std::uint32_t> peer_channel_counts;
   std::uint32_t channel_count = 0;
   std::uint32_t chunk_count = 0;
+  std::uint32_t ring_channel_collision_count = 0;
   std::uint64_t next_step = 1;
   std::vector<std::uint64_t> next_steps;
 };
@@ -302,6 +306,13 @@ inline V2Schedule lowerFixedTasks(const std::vector<V2LoweringTask>& tasks,
     }
     route->tasks.push_back(&task);
   }
+  if (std::any_of(routes.begin(), routes.end(), [](const RouteTasks& route) { return route.ring_id != kNoRing; })) {
+    std::stable_sort(routes.begin(), routes.end(), [](const RouteTasks& left, const RouteTasks& right) {
+      if (left.ring_id != right.ring_id) return left.ring_id < right.ring_id;
+      if (left.peer != right.peer) return left.peer < right.peer;
+      return left.forward_peer < right.forward_peer;
+    });
+  }
 
   using PeerWorkQueues = std::vector<std::vector<V2Work>>;
   std::vector<PeerWorkQueues> channel_work(config.total_channels, PeerWorkQueues(config.world_size));
@@ -329,11 +340,12 @@ inline V2Schedule lowerFixedTasks(const std::vector<V2LoweringTask>& tasks,
     const std::size_t transport_chunk_bytes = network ? config.gin_chunk_bytes : config.chunk_bytes;
     const std::uint32_t transport_fifo_depth = network ? config.gin_fifo_depth : config.fifo_depth;
     const std::size_t transfer_step_bytes = v2TransferStepBytes(stream_bytes, planning_step_bytes, network);
-    // Eight lanes recover network parallelism across the four H20 rails. The
-    // folded ring id keeps a root's logical streams and a receiver's source
-    // roots in separate lane groups, while remaining deterministic at every
-    // hop.
-    const std::uint32_t max_channels = ring ? std::min<std::uint32_t>(8, config.total_channels) :
+    // Match ring lanes to independent GIN connections. This gives each root a
+    // disjoint channel group until the global channel budget is exhausted.
+    const std::uint32_t ring_channels =
+      config.ring_channels == 0 ? 8 : config.ring_channels;
+    const std::uint32_t max_channels = ring ? std::max<std::uint32_t>(
+      1, std::min(ring_channels, config.total_channels)) :
       std::max<std::uint32_t>(1, std::min(config.peer_channels[peer], config.total_channels));
     std::uint32_t min_channels = max_channels;
     while (static_cast<std::uint64_t>(min_channels) * config.world_size > config.total_channels && min_channels > 1) {
@@ -366,6 +378,7 @@ inline V2Schedule lowerFixedTasks(const std::vector<V2LoweringTask>& tasks,
         V2Work work{};
         work.peer = peer;
         work.forward_peer = route.forward_peer;
+        work.ring_id = route.ring_id;
         work.chunk_ordinal = static_cast<std::uint32_t>(chunk);
         work.chunk_count = static_cast<std::uint32_t>(chunk_count);
         work.step_bytes = static_cast<std::uint32_t>(transfer_step_bytes);
@@ -402,6 +415,36 @@ inline V2Schedule lowerFixedTasks(const std::vector<V2LoweringTask>& tasks,
     schedule.channel_ids.push_back(channel);
     V2ChannelQueue channel_queue{};
     channel_queue.first_batch = static_cast<std::uint32_t>(schedule.batches.size());
+    std::vector<V2Work> colliding_ring_work;
+    std::vector<std::uint32_t> ring_ids;
+    for (const std::uint32_t peer : active_peers) {
+      for (const V2Work& work : channel_work[channel][peer]) {
+        if (work.ring_id == kNoRing) continue;
+        colliding_ring_work.push_back(work);
+        if (std::find(ring_ids.begin(), ring_ids.end(), work.ring_id) == ring_ids.end()) {
+          ring_ids.push_back(work.ring_id);
+        }
+      }
+    }
+    if (ring_ids.size() > 1 && colliding_ring_work.size() == remaining) {
+      schedule.ring_channel_collision_count += static_cast<std::uint32_t>(ring_ids.size() - 1);
+      std::stable_sort(colliding_ring_work.begin(), colliding_ring_work.end(), [](const V2Work& left,
+                                                                                 const V2Work& right) {
+        if (left.ring_id != right.ring_id) return left.ring_id < right.ring_id;
+        if (left.chunk_ordinal != right.chunk_ordinal) return left.chunk_ordinal < right.chunk_ordinal;
+        return left.peer < right.peer;
+      });
+      for (const V2Work& work : colliding_ring_work) {
+        V2WorkBatch batch{};
+        batch.work_begin = static_cast<std::uint32_t>(schedule.works.size());
+        batch.work_count = 1;
+        schedule.works.push_back(work);
+        schedule.batches.push_back(batch);
+        ++channel_queue.batch_count;
+      }
+      schedule.channels.push_back(channel_queue);
+      continue;
+    }
     std::size_t peer_cursor = 0;
     while (remaining != 0) {
       V2WorkBatch batch{};
