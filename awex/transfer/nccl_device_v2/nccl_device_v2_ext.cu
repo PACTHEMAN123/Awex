@@ -693,9 +693,6 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
     config.ring_channels = state->gin.context_count == 0
       ? 0
       : v2::v2PowerOfTwoUp(state->gin.context_count);
-    config.ring_channel_stride = state->gin.connection_count == 0
-      ? 0
-      : v2::v2PowerOfTwoUp(state->gin.connection_count);
     config.peer_channels = state->peer_channels;
     config.peer_transports = state->peer_transports;
     const auto lowering_start = Clock::now();

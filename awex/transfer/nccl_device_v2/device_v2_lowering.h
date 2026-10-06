@@ -43,9 +43,6 @@ struct V2LoweringConfig {
   // Ring lanes are derived from GIN queue multiplicity. Zero preserves the
   // legacy eight-lane fallback for transports without GIN topology data.
   std::uint32_t ring_channels = 0;
-  // Advance roots by the physical rail count so paired-context stripes only
-  // overlap by half instead of assigning two roots the same full stripe.
-  std::uint32_t ring_channel_stride = 0;
   // Topology-derived upper bound for each peer, indexed by rank.
   std::vector<std::uint32_t> peer_channels;
   // Transport selection for each peer, indexed by rank.
@@ -186,8 +183,8 @@ inline std::uint32_t v2GinChannelBase(std::uint32_t local_rank, std::uint32_t pe
 }
 
 inline std::uint32_t v2RingChannelBase(std::uint32_t ring_id, std::uint32_t total_channels,
-                                       std::uint32_t ring_channel_stride) {
-  const std::uint32_t group_count = total_channels / ring_channel_stride;
+                                       std::uint32_t ring_channels) {
+  const std::uint32_t group_count = total_channels / ring_channels;
   if (group_count <= 1) return 0;
   std::uint32_t group = 0;
   std::uint32_t value = ring_id;
@@ -195,7 +192,7 @@ inline std::uint32_t v2RingChannelBase(std::uint32_t ring_id, std::uint32_t tota
     group ^= value % group_count;
     value /= group_count;
   }
-  return (group % group_count) * ring_channel_stride;
+  return (group % group_count) * ring_channels;
 }
 
 struct V2StreamSpan {
@@ -347,9 +344,6 @@ inline V2Schedule lowerFixedTasks(const std::vector<V2LoweringTask>& tasks,
     // groups, the scheduler below globally orders colliding routes.
     const std::uint32_t ring_channels =
       config.ring_channels == 0 ? 8 : config.ring_channels;
-    const std::uint32_t ring_channel_stride = config.ring_channel_stride == 0
-      ? ring_channels
-      : std::min(config.ring_channel_stride, ring_channels);
     const std::uint32_t max_channels = ring ? std::max<std::uint32_t>(
       1, std::min(ring_channels, config.total_channels)) :
       std::max<std::uint32_t>(1, std::min(config.peer_channels[peer], config.total_channels));
@@ -361,7 +355,7 @@ inline V2Schedule lowerFixedTasks(const std::vector<V2LoweringTask>& tasks,
       v2ChannelsForBytes(stream_bytes, min_channels, max_channels, planning_step_bytes, network);
     schedule.peer_channel_counts[peer] = channel_count;
     const std::uint32_t channel_base = ring
-      ? v2RingChannelBase(route.ring_id, config.total_channels, ring_channel_stride)
+      ? v2RingChannelBase(route.ring_id, config.total_channels, channel_count)
       : network
       ? v2GinChannelBase(config.local_rank, peer, config.total_channels, channel_count)
       : v2LsaChannelBase(config.local_rank, peer, config.world_size, config.total_channels);
