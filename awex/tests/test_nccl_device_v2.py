@@ -22,7 +22,11 @@ import pytest
 import torch
 
 from awex.transfer import nccl_device_v2
-from awex.transfer.nccl_device_v2 import _build_recv_batch, _build_send_batch
+from awex.transfer.nccl_device_v2 import (
+    _build_recv_batch,
+    _build_send_batch,
+    _node_major_communicator_ranks,
+)
 from awex.transfer.nccl_device_v2_gin import (
     _active_rdma_endpoints,
     _configure_gin_hca_policy,
@@ -46,6 +50,18 @@ def _replica_operation(root: int, receiver: int) -> CommunicationOperation:
         train_slices=(slice(None),),
         inf_slices=(slice(None),),
     )
+
+
+def test_node_major_communicator_ranks_join_split_physical_nodes():
+    node_ids = [10] * 4 + [20] * 4 + [10] * 4 + [20] * 4 + [30] * 8 + [40] * 8
+
+    mapping = _node_major_communicator_ranks(node_ids)
+
+    assert [mapping[rank] for rank in range(0, 4)] == [0, 1, 2, 3]
+    assert [mapping[rank] for rank in range(8, 12)] == [4, 5, 6, 7]
+    assert [mapping[rank] for rank in range(4, 8)] == [8, 9, 10, 11]
+    assert [mapping[rank] for rank in range(12, 16)] == [12, 13, 14, 15]
+    assert sorted(mapping) == list(range(32))
 
 
 def test_v2_ring_broadcast_is_disabled_by_default(monkeypatch):

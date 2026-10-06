@@ -27,7 +27,9 @@ side while the draft is stabilized.
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import os
+import socket
 import threading
 import time
 from dataclasses import dataclass
@@ -114,6 +116,26 @@ _NO_RING = -1
 class _RingOrderStrategy(Enum):
     FIXED = "fixed"
     ROOT_SWIZZLE = "root_swizzle"
+
+
+def _node_major_communicator_ranks(node_ids: list[int]) -> list[int]:
+    """Map logical ranks to node-contiguous communicator ranks."""
+
+    ranks_by_node: dict[int, list[int]] = {}
+    for logical_rank, node_id in enumerate(node_ids):
+        ranks_by_node.setdefault(int(node_id), []).append(logical_rank)
+    logical_to_communicator = [0] * len(node_ids)
+    communicator_rank = 0
+    for logical_ranks in ranks_by_node.values():
+        for logical_rank in logical_ranks:
+            logical_to_communicator[logical_rank] = communicator_rank
+            communicator_rank += 1
+    return logical_to_communicator
+
+
+def _local_node_id() -> int:
+    hostname = socket.gethostname().encode("utf-8")
+    return int.from_bytes(hashlib.sha256(hostname).digest()[:8], "little", signed=True)
 
 
 def _candidate_include_paths() -> list[str]:
@@ -899,6 +921,7 @@ class NCCLDeviceV2Transport:
         self._logged_batch_shape = False
         self._prepared_send = None
         self._prepared_recv = None
+        self._logical_to_communicator = list(range(self.world_size))
         logger.info(
             "Configured nccl_device_v2 rank=%s chunk_bytes=%s max_channels=%s "
             "fifo_depth=%s step_bytes=%s gin_fifo_depth=%s "
@@ -942,6 +965,16 @@ class NCCLDeviceV2Transport:
                 f"ring_broadcast_sum={feature_sums[0]}, "
                 f"ring_swizzle_sum={feature_sums[1]}, world_size={self.world_size}"
             )
+        local_node_id = torch.tensor(
+            [_local_node_id()], dtype=torch.int64, device=device
+        )
+        gathered_node_ids = [
+            torch.empty_like(local_node_id) for _ in range(self.world_size)
+        ]
+        dist.all_gather(gathered_node_ids, local_node_id, group=self.group)
+        node_ids = [int(value.item()) for value in gathered_node_ids]
+        self._logical_to_communicator = _node_major_communicator_ranks(node_ids)
+        communicator_rank = self._logical_to_communicator[self.rank]
         unique_id_size = int(self._extension.unique_id_size())
         unique_id_tensor = torch.empty(unique_id_size, dtype=torch.uint8, device=device)
         if self.rank == 0:
@@ -970,6 +1003,7 @@ class NCCLDeviceV2Transport:
                 self.network_step_bytes,
                 self.gin_chunk_bytes,
                 self.gin_context_count,
+                self._logical_to_communicator,
             )
         )
         self._initialized = True
@@ -978,7 +1012,7 @@ class NCCLDeviceV2Transport:
             "channels:%s lsa_fifo:%s lsa_step_bytes:%s gin_fifo:%s "
             "network_step_bytes:%s "
             "gin_connections:%s gin_context_count:%s "
-            "gin_reliable_doorbell:%s",
+            "gin_reliable_doorbell:%s communicator_rank:%s node_count:%s",
             self.rank,
             self.world_size,
             self.max_channels,
@@ -989,6 +1023,8 @@ class NCCLDeviceV2Transport:
             self.gin_connections,
             self.gin_context_count,
             self.gin_reliable_doorbell,
+            communicator_rank,
+            len(set(node_ids)),
         )
         return (time.perf_counter() - start_time) * 1000.0
 

@@ -86,11 +86,13 @@ struct DeviceState {
   std::vector<std::uint32_t> active_peers;
   std::vector<std::uint32_t> window_active_peers;
   std::vector<std::uint8_t> peer_transports;
+  std::vector<std::uint32_t> logical_to_communicator;
   v2::V2Schedule schedule;
   LaunchBuffers buffers;
   ncclTeam_t world_team{};
   ncclTeam_t lsa_team{};
   int nccl_version = 0;
+  int logical_rank = 0;
   int rank = 0;
   int world_size = 0;
   int device = 0;
@@ -134,7 +136,8 @@ std::unique_ptr<DeviceState> make_state(const std::string& unique_id_bytes, int 
                                         int timeout_ms, std::uint32_t max_channels, std::uint32_t fifo_depth,
                                         std::size_t step_bytes, std::size_t chunk_bytes,
                                         std::uint32_t gin_fifo_depth, std::size_t network_step_bytes,
-                                        std::size_t gin_chunk_bytes, std::uint32_t gin_context_count) {
+                                        std::size_t gin_chunk_bytes, std::uint32_t gin_context_count,
+                                        const std::vector<int64_t>& logical_to_communicator) {
   if (world_size < 2 || world_size > kMaxRanks) {
     throw std::runtime_error("nccl_device_v2 world_size must be in [2, 256]");
   }
@@ -160,8 +163,24 @@ std::unique_ptr<DeviceState> make_state(const std::string& unique_id_bytes, int 
     throw std::runtime_error("nccl_device_v2 transport chunk_bytes must be zero or at least its step_bytes");
   }
   auto state = std::make_unique<DeviceState>();
-  state->rank = rank;
+  state->logical_rank = rank;
   state->world_size = world_size;
+  if (!logical_to_communicator.empty() && logical_to_communicator.size() != static_cast<std::size_t>(world_size)) {
+    throw std::runtime_error("nccl_device_v2 communicator rank mapping must match world_size");
+  }
+  state->logical_to_communicator.resize(world_size);
+  std::vector<std::uint8_t> communicator_rank_seen(world_size, 0);
+  for (int logical_rank = 0; logical_rank < world_size; ++logical_rank) {
+    const int64_t communicator_rank = logical_to_communicator.empty()
+      ? logical_rank
+      : logical_to_communicator[logical_rank];
+    if (communicator_rank < 0 || communicator_rank >= world_size || communicator_rank_seen[communicator_rank]) {
+      throw std::runtime_error("nccl_device_v2 communicator rank mapping must be a permutation");
+    }
+    state->logical_to_communicator[logical_rank] = static_cast<std::uint32_t>(communicator_rank);
+    communicator_rank_seen[communicator_rank] = 1;
+  }
+  state->rank = static_cast<int>(state->logical_to_communicator[rank]);
   state->device = device;
   state->fifo_depth = fifo_depth;
   state->step_bytes = step_bytes;
@@ -183,7 +202,7 @@ std::unique_ptr<DeviceState> make_state(const std::string& unique_id_bytes, int 
   ncclUniqueId unique_id;
   std::memcpy(&unique_id, unique_id_bytes.data(), sizeof(unique_id));
   try {
-    AWEX_NCCL_V2_CHECK(ncclCommInitRank(&state->comm, world_size, unique_id, rank));
+    AWEX_NCCL_V2_CHECK(ncclCommInitRank(&state->comm, world_size, unique_id, state->rank));
 
     ncclCommProperties_t properties = NCCL_COMM_PROPERTIES_INITIALIZER;
     AWEX_NCCL_V2_CHECK(ncclCommQueryProperties(state->comm, &properties));
@@ -550,11 +569,13 @@ std::vector<v2::V2LoweringTask> build_tasks(
   }
 
   std::vector<std::uint32_t> expected(state.world_size, 0);
-  for (int peer = 0; peer < state.world_size; ++peer) {
-    if (expected_counts[peer] < 0 || static_cast<std::uint64_t>(expected_counts[peer]) > UINT32_MAX) {
+  for (int logical_peer = 0; logical_peer < state.world_size; ++logical_peer) {
+    if (expected_counts[logical_peer] < 0 ||
+        static_cast<std::uint64_t>(expected_counts[logical_peer]) > UINT32_MAX) {
       throw std::runtime_error("nccl_device_v2 expected count is invalid");
     }
-    expected[peer] = static_cast<std::uint32_t>(expected_counts[peer]);
+    const std::uint32_t peer = state.logical_to_communicator[logical_peer];
+    expected[peer] = static_cast<std::uint32_t>(expected_counts[logical_peer]);
   }
 
   std::vector<std::uint8_t> peer_seen(state.world_size, 0);
@@ -566,20 +587,24 @@ std::vector<v2::V2LoweringTask> build_tasks(
     if (!tensor.is_cuda() || tensor.get_device() != state.device) {
       throw std::runtime_error("nccl_device_v2 tensors must be on the transport CUDA device");
     }
-    const int64_t peer = peers[index];
+    const int64_t logical_peer = peers[index];
     const int64_t ordinal = ordinals[index];
-    const int64_t forward_peer = forward_peers[index];
+    const int64_t logical_forward_peer = forward_peers[index];
     const int64_t ring_id = ring_ids[index];
-    if (peer < 0 || peer >= state.world_size || peer == state.rank) {
+    if (logical_peer < 0 || logical_peer >= state.world_size || logical_peer == state.logical_rank) {
       throw std::runtime_error("nccl_device_v2 task peer is invalid");
     }
+    const std::uint32_t peer = state.logical_to_communicator[logical_peer];
     if (ordinal < 0 || static_cast<std::uint64_t>(ordinal) >= expected[peer]) {
       throw std::runtime_error("nccl_device_v2 task ordinal is invalid");
     }
-    if (forward_peer < -1 || forward_peer >= state.world_size || forward_peer == state.rank ||
-        (forward_peer >= 0 && ring_id < 0)) {
+    if (logical_forward_peer < -1 || logical_forward_peer >= state.world_size ||
+        logical_forward_peer == state.logical_rank || (logical_forward_peer >= 0 && ring_id < 0)) {
       throw std::runtime_error("nccl_device_v2 forward peer is invalid");
     }
+    const std::uint32_t forward_peer = logical_forward_peer < 0
+      ? v2::kNoPeer
+      : state.logical_to_communicator[logical_forward_peer];
     if (ring_id < -1 ||
         (ring_id >= 0 && static_cast<std::uint64_t>(ring_id) >= UINT32_MAX)) {
       throw std::runtime_error("nccl_device_v2 ring id is invalid");
@@ -592,7 +617,7 @@ std::vector<v2::V2LoweringTask> build_tasks(
       peer_seen[peer] = 1;
       active_peers->push_back(static_cast<std::uint32_t>(peer));
     }
-    if (forward_peer >= 0 && !peer_seen[forward_peer]) {
+    if (forward_peer != v2::kNoPeer && !peer_seen[forward_peer]) {
       peer_seen[forward_peer] = 1;
       active_peers->push_back(static_cast<std::uint32_t>(forward_peer));
     }
@@ -602,9 +627,9 @@ std::vector<v2::V2LoweringTask> build_tasks(
       static_cast<std::uint64_t>(tensor_offsets[index]),
       static_cast<std::uint64_t>(tensor_row_bytes[index]),
       static_cast<std::uint64_t>(tensor_row_strides[index]),
-      static_cast<std::uint32_t>(peer),
+      peer,
       static_cast<std::uint32_t>(ordinal),
-      forward_peer < 0 ? v2::kNoPeer : static_cast<std::uint32_t>(forward_peer),
+      forward_peer,
       ring_id < 0 ? v2::kNoRing : static_cast<std::uint32_t>(ring_id),
     });
     ++actual[peer];
@@ -657,8 +682,7 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
     config.network_step_bytes = state->network_step_bytes;
     config.ring_channels = state->gin.connection_count == 0
       ? 0
-      : v2::v2PowerOfTwoUp(std::min<std::uint32_t>(
-          v2::kMaxChannels, 2U * state->gin.connection_count));
+      : v2::v2PowerOfTwoUp(state->gin.connection_count);
     config.peer_channels = state->peer_channels;
     config.peer_transports = state->peer_transports;
     const auto lowering_start = Clock::now();
@@ -691,6 +715,8 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
   const auto& cached_peers = state->active_peers;
 
   py::dict metrics;
+  metrics["communicator_rank"] = py::int_(state->rank);
+  metrics["lsa_team_size"] = py::int_(state->lsa_team.nRanks);
   metrics["work_count"] = py::int_(schedule.works.size());
   metrics["fragment_count"] = py::int_(schedule.fragments.size());
   metrics["chunk_count"] = py::int_(schedule.chunk_count);
@@ -830,7 +856,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
     "create",
     [](const py::bytes& id, int world_size, int rank, int device, int timeout_ms, int max_channels, int fifo_depth,
        int64_t step_bytes, int64_t chunk_bytes, int gin_fifo_depth, int64_t network_step_bytes,
-       int64_t gin_chunk_bytes, int gin_context_count) {
+       int64_t gin_chunk_bytes, int gin_context_count, const std::vector<int64_t>& logical_to_communicator) {
       if (fifo_depth <= 0 || gin_fifo_depth <= 0 || step_bytes <= 0 || network_step_bytes <= 0 || chunk_bytes < 0 ||
           gin_chunk_bytes < 0) {
         throw std::runtime_error("invalid nccl_device_v2 step/chunk bytes");
@@ -845,13 +871,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
                               static_cast<std::uint32_t>(gin_fifo_depth),
                               static_cast<std::size_t>(network_step_bytes),
                               static_cast<std::size_t>(gin_chunk_bytes),
-                              static_cast<std::uint32_t>(gin_context_count));
+                              static_cast<std::uint32_t>(gin_context_count), logical_to_communicator);
       return reinterpret_cast<int64_t>(state.release());
     },
     py::arg("id"), py::arg("world_size"), py::arg("rank"), py::arg("device"), py::arg("timeout_ms"),
     py::arg("max_channels"), py::arg("fifo_depth"), py::arg("step_bytes"), py::arg("chunk_bytes"),
     py::arg("gin_fifo_depth") = 16, py::arg("network_step_bytes") = 128 * 1024,
-    py::arg("gin_chunk_bytes") = 4 * 1024 * 1024, py::arg("gin_context_count") = 1);
+    py::arg("gin_chunk_bytes") = 4 * 1024 * 1024, py::arg("gin_context_count") = 1,
+    py::arg("logical_to_communicator") = std::vector<int64_t>{});
   module.def("launch", &launch);
   module.def("destroy", [](int64_t handle) {
     auto* state = reinterpret_cast<DeviceState*>(handle);
