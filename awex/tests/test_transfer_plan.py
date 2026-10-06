@@ -295,6 +295,54 @@ class TestTransferPlanBuilder:
             (3, 4),
         }
 
+    def test_ring_replica_assignment_balances_parameters_across_training_replicas(
+        self,
+    ):
+        builder = TransferPlanBuilder(
+            infer_world_size=4,
+            train_world_size=2,
+            num_infer_engines=4,
+            group_replicated_inference=True,
+        )
+        inference_meta = [
+            self._create_test_parameter_meta("param0"),
+            self._create_test_parameter_meta("param1"),
+        ]
+        training_meta = []
+        for name in ("param0", "param1"):
+            train0 = self._create_test_shard_meta(shape=(4, 4), global_rank=0)
+            train1 = self._create_test_shard_meta(shape=(4, 4), global_rank=1)
+            train0.name = name
+            train1.name = name
+            training_meta.append(
+                ParameterMeta(
+                    name=name,
+                    global_numel=16,
+                    global_shape=(4, 4),
+                    dtype=torch.float32,
+                    shards=[train0, train1],
+                    replicas=[
+                        ParameterReplicaMeta(shards=[train0]),
+                        ParameterReplicaMeta(shards=[train1]),
+                    ],
+                )
+            )
+
+        ops = builder.build_weights_mapping_operations(
+            inference_meta, training_meta
+        )
+
+        senders_by_parameter = {
+            name: {op.send_rank for op in ops if op.send_shard_meta.name == name}
+            for name in ("param0", "param1")
+        }
+        assert senders_by_parameter == {"param0": {4}, "param1": {5}}
+        assert all(
+            len({op.recv_rank for op in ops if op.send_shard_meta.name == name})
+            == 4
+            for name in ("param0", "param1")
+        )
+
     def test_build_parameter_plan_handles_lm_head_cp_replicas_without_special_checks(
         self,
     ):

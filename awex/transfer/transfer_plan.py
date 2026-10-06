@@ -293,10 +293,41 @@ class TransferPlanBuilder:
             )
 
         communication_plan = []
+        grouped_replica_loads: Dict[Tuple[int, ...], int] = {}
 
         for param_name in sorted(common_params):
             inference_meta = inference_meta_dict[param_name]
             training_meta = training_meta_dict[param_name]
+            grouped_train_replica_indices = None
+            if (
+                self.group_replicated_inference
+                and inference_meta.replicas
+                and training_meta.replicas
+            ):
+                replica_count = len(training_meta.replicas)
+                replica_keys = [
+                    tuple(sorted(int(shard.global_rank) for shard in replica.shards))
+                    for replica in training_meta.replicas
+                ]
+                parameter_bytes = (
+                    int(training_meta.global_numel)
+                    * _dtype_element_size(training_meta.dtype)
+                )
+                grouped_train_replica_indices = []
+                for _ in inference_meta.replicas:
+                    train_replica_idx = min(
+                        range(replica_count),
+                        key=lambda index: (
+                            grouped_replica_loads.get(replica_keys[index], 0),
+                            replica_keys[index],
+                            index,
+                        ),
+                    )
+                    grouped_train_replica_indices.append(train_replica_idx)
+                    replica_key = replica_keys[train_replica_idx]
+                    grouped_replica_loads[replica_key] = (
+                        grouped_replica_loads.get(replica_key, 0) + parameter_bytes
+                    )
 
             # Build communication plan for this parameter
             param_plan = self._build_parameter_communication_plan(
@@ -304,6 +335,7 @@ class TransferPlanBuilder:
                 inference_meta,
                 training_meta,
                 global_transfer_rank=global_transfer_rank,
+                grouped_train_replica_indices=grouped_train_replica_indices,
             )
             communication_plan.extend(param_plan)
 
@@ -319,6 +351,7 @@ class TransferPlanBuilder:
         inference_meta: ParameterMeta,
         training_meta: ParameterMeta,
         global_transfer_rank: int = None,
+        grouped_train_replica_indices: List[int] = None,
     ) -> List[CommunicationOperation]:
         """
         Build communication plan for a single parameter for a specific rank.
@@ -359,13 +392,31 @@ class TransferPlanBuilder:
         replica_assignments = []
 
         replicas_per_engine = len(inference_meta.replicas)
+        if grouped_train_replica_indices is not None:
+            if len(grouped_train_replica_indices) != replicas_per_engine:
+                raise ValueError(
+                    "grouped_train_replica_indices must have one entry per "
+                    "logical inference replica"
+                )
+            if any(
+                index < 0 or index >= num_training_replicas
+                for index in grouped_train_replica_indices
+            ):
+                raise ValueError(
+                    "grouped_train_replica_indices contains an invalid training "
+                    "replica index"
+                )
         for inf_replica_idx in range(num_inference_replicas):
             if self.group_replicated_inference:
                 # Equivalent logical replicas across inference engines must use
                 # the same source replica so Device v2 can lower one root
                 # injection followed by a replica ring.
                 logical_replica_idx = inf_replica_idx % replicas_per_engine
-                train_replica_idx = logical_replica_idx % num_training_replicas
+                train_replica_idx = (
+                    grouped_train_replica_indices[logical_replica_idx]
+                    if grouped_train_replica_indices is not None
+                    else logical_replica_idx % num_training_replicas
+                )
             else:
                 train_replica_idx = inf_replica_idx % num_training_replicas
             replica_assignments.append((inf_replica_idx, train_replica_idx))

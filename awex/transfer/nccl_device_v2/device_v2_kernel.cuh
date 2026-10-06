@@ -182,8 +182,8 @@ __device__ __forceinline__ void v2RunRelay(const V2KernelArgs& args, const V2Wor
         v2FifoPayload(args, args.local_rank, work.forward_peer, channel, output_step, work.fifo_depth, true);
     }
     if (*ready && (roles & kRoleWorker)) {
-      v2CopyContiguousToFragments(args, work, input_payload, cursor, slice_bytes, tid, nworkers);
-      v2CopyContiguous(output_payload, input_payload, slice_bytes, tid, nworkers);
+      v2CopyContiguousToFragmentsAndContiguous(args, work, output_payload, input_payload, cursor, slice_bytes, tid,
+                                               nworkers);
     }
 
     v2GroupBarrier(barrier, nthreads);

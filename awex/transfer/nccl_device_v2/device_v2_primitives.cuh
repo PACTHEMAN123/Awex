@@ -203,6 +203,53 @@ __device__ __forceinline__ void v2CopyContiguous(std::uint8_t* destination, cons
   }
 }
 
+__device__ __forceinline__ void v2CopyContiguousToTwoDestinations(std::uint8_t* first_destination,
+                                                                  std::uint8_t* second_destination,
+                                                                  const std::uint8_t* source,
+                                                                  std::uint64_t nbytes, int tid, int nthreads) {
+  const std::uintptr_t source_address = reinterpret_cast<std::uintptr_t>(source);
+  const std::uintptr_t first_address = reinterpret_cast<std::uintptr_t>(first_destination);
+  const std::uintptr_t second_address = reinterpret_cast<std::uintptr_t>(second_destination);
+  if ((source_address | first_address | second_address) % kCopyPackBytes == 0) {
+    const std::uint64_t pack_count = nbytes / kCopyPackBytes;
+    const std::uint64_t packs_per_hunk = static_cast<std::uint64_t>(nthreads) * kCopyUnroll;
+    const std::uint64_t unrolled_packs = (pack_count / packs_per_hunk) * packs_per_hunk;
+
+    for (std::uint64_t hunk = 0; hunk < unrolled_packs; hunk += packs_per_hunk) {
+      V2Pack128 values[kCopyUnroll];
+#pragma unroll
+      for (int unroll = 0; unroll < kCopyUnroll; ++unroll) {
+        const std::uint64_t pack = hunk + tid + static_cast<std::uint64_t>(unroll) * nthreads;
+        values[unroll] = v2Load128(source + pack * kCopyPackBytes);
+      }
+#pragma unroll
+      for (int unroll = 0; unroll < kCopyUnroll; ++unroll) {
+        const std::uint64_t pack = hunk + tid + static_cast<std::uint64_t>(unroll) * nthreads;
+        v2Store128(first_destination + pack * kCopyPackBytes, values[unroll]);
+        v2Store128(second_destination + pack * kCopyPackBytes, values[unroll]);
+      }
+    }
+    for (std::uint64_t pack = unrolled_packs + tid; pack < pack_count; pack += nthreads) {
+      const V2Pack128 value = v2Load128(source + pack * kCopyPackBytes);
+      v2Store128(first_destination + pack * kCopyPackBytes, value);
+      v2Store128(second_destination + pack * kCopyPackBytes, value);
+    }
+    const std::uint64_t vector_bytes = pack_count * kCopyPackBytes;
+    for (std::uint64_t byte = vector_bytes + tid; byte < nbytes; byte += nthreads) {
+      const std::uint8_t value = v2Load8(source + byte);
+      v2Store8(first_destination + byte, value);
+      v2Store8(second_destination + byte, value);
+    }
+    return;
+  }
+
+  for (std::uint64_t byte = tid; byte < nbytes; byte += nthreads) {
+    const std::uint8_t value = v2Load8(source + byte);
+    v2Store8(first_destination + byte, value);
+    v2Store8(second_destination + byte, value);
+  }
+}
+
 __device__ __forceinline__ void v2CopyTensorToContiguous(std::uint8_t* destination, const std::uint8_t* tensor,
                                                          std::uint64_t tensor_offset, std::uint64_t nbytes,
                                                          std::uint64_t row_bytes, std::uint64_t row_stride, int tid,
@@ -247,6 +294,29 @@ __device__ __forceinline__ void v2CopyContiguousToTensor(std::uint8_t* tensor, c
   }
 }
 
+__device__ __forceinline__ void v2CopyContiguousToTensorAndContiguous(
+  std::uint8_t* tensor, std::uint8_t* contiguous_destination, const std::uint8_t* source,
+  std::uint64_t tensor_offset, std::uint64_t nbytes, std::uint64_t row_bytes, std::uint64_t row_stride, int tid,
+  int nthreads) {
+  if (row_bytes == row_stride) {
+    v2CopyContiguousToTwoDestinations(tensor + tensor_offset, contiguous_destination, source, nbytes, tid, nthreads);
+    return;
+  }
+
+  std::uint64_t row = tensor_offset / row_bytes;
+  std::uint64_t column = tensor_offset % row_bytes;
+  std::uint64_t copied = 0;
+  while (copied < nbytes) {
+    const std::uint64_t row_remaining = row_bytes - column;
+    const std::uint64_t span = row_remaining < nbytes - copied ? row_remaining : nbytes - copied;
+    v2CopyContiguousToTwoDestinations(tensor + row * row_stride + column, contiguous_destination + copied,
+                                      source + copied, span, tid, nthreads);
+    copied += span;
+    ++row;
+    column = 0;
+  }
+}
+
 __device__ __forceinline__ void v2CopyFragmentsToContiguous(const V2KernelArgs& args, const V2Work& work,
                                                             std::uint8_t* destination, std::uint64_t work_offset,
                                                             std::uint64_t nbytes, int tid, int nthreads) {
@@ -278,6 +348,25 @@ __device__ __forceinline__ void v2CopyContiguousToFragments(const V2KernelArgs& 
     v2CopyContiguousToTensor(tensor, source + begin - work_offset,
                              fragment.tensor_offset + begin - fragment.work_offset, end - begin,
                              fragment.tensor_row_bytes, fragment.tensor_row_stride, tid, nthreads);
+  }
+}
+
+__device__ __forceinline__ void v2CopyContiguousToFragmentsAndContiguous(
+  const V2KernelArgs& args, const V2Work& work, std::uint8_t* contiguous_destination,
+  const std::uint8_t* source, std::uint64_t work_offset, std::uint64_t nbytes, int tid, int nthreads) {
+  const std::uint64_t copy_end = work_offset + nbytes;
+  for (std::uint32_t index = 0; index < work.fragment_count; ++index) {
+    const V2Fragment& fragment = args.fragments[work.fragment_begin + index];
+    const std::uint64_t fragment_end = fragment.work_offset + fragment.nbytes;
+    if (fragment_end <= work_offset || copy_end <= fragment.work_offset) continue;
+    const std::uint64_t begin = fragment.work_offset < work_offset ? work_offset : fragment.work_offset;
+    const std::uint64_t end = fragment_end < copy_end ? fragment_end : copy_end;
+    const std::uint64_t contiguous_offset = begin - work_offset;
+    auto* tensor = reinterpret_cast<std::uint8_t*>(fragment.tensor_ptr);
+    v2CopyContiguousToTensorAndContiguous(
+      tensor, contiguous_destination + contiguous_offset, source + contiguous_offset,
+      fragment.tensor_offset + begin - fragment.work_offset, end - begin, fragment.tensor_row_bytes,
+      fragment.tensor_row_stride, tid, nthreads);
   }
 }
 
