@@ -344,7 +344,7 @@ bool same_tasks(const std::vector<v2::V2LoweringTask>& left, const std::vector<v
     const auto& b = right[index];
     if (a.tensor_ptr != b.tensor_ptr || a.nbytes != b.nbytes || a.tensor_offset != b.tensor_offset ||
         a.tensor_row_bytes != b.tensor_row_bytes || a.tensor_row_stride != b.tensor_row_stride || a.peer != b.peer ||
-        a.ordinal != b.ordinal) {
+        a.ordinal != b.ordinal || a.forward_peer != b.forward_peer || a.ring_id != b.ring_id) {
       return false;
     }
   }
@@ -361,11 +361,21 @@ void initialize_sparse_window(DeviceState* state, const std::vector<std::uint32_
     return;
   }
   const std::uint32_t inactive = std::numeric_limits<std::uint32_t>::max();
+  std::vector<std::uint8_t> incoming(state->world_size, 0);
+  std::vector<std::uint8_t> outgoing(state->world_size, 0);
+  for (const auto& task : tasks) {
+    if (direction == v2::V2Direction::kSend) {
+      outgoing[task.peer] = 1;
+    } else {
+      incoming[task.peer] = 1;
+    }
+    if (task.forward_peer != v2::kNoPeer) outgoing[task.forward_peer] = 1;
+  }
   std::vector<std::uint32_t> local_payload_slots(state->world_size, inactive);
   std::uint32_t payload_peer_count = 0;
   for (const std::uint32_t peer : active_peers) {
     const bool gin = state->peer_transports[peer] == static_cast<std::uint8_t>(v2::V2Transport::kGin);
-    if (gin || direction == v2::V2Direction::kSend) {
+    if (gin || outgoing[peer]) {
       local_payload_slots[peer] = payload_peer_count++;
     }
   }
@@ -390,8 +400,8 @@ void initialize_sparse_window(DeviceState* state, const std::vector<std::uint32_
       if (!local_has_payload || !peer_has_payload) {
         throw std::runtime_error("nccl_device_v2 GIN peers must provide send and receive payload windows");
       }
-    } else if (local_has_payload != (direction == v2::V2Direction::kSend) ||
-               peer_has_payload != (direction == v2::V2Direction::kRecv)) {
+    } else if (local_has_payload != static_cast<bool>(outgoing[peer]) ||
+               peer_has_payload != static_cast<bool>(incoming[peer])) {
       throw std::runtime_error("nccl_device_v2 LSA peers must provide only the sender payload window");
     }
   }
@@ -463,6 +473,13 @@ void initialize_sparse_window(DeviceState* state, const std::vector<std::uint32_
           throw std::runtime_error("nccl_device_v2 peer payload size overflows");
         }
         peer_bytes += task.nbytes;
+        if (task.forward_peer != v2::kNoPeer) {
+          auto& forward_bytes = peer_payload_bytes[task.forward_peer];
+          if (task.nbytes > std::numeric_limits<std::uint64_t>::max() - forward_bytes) {
+            throw std::runtime_error("nccl_device_v2 forward peer payload size overflows");
+          }
+          forward_bytes += task.nbytes;
+        }
       }
       v2::v2InitializeGin(&state->gin, state->comm, state->world_size, state->total_channels,
                           state->gin_fifo_depth, state->network_step_bytes, state->gin.context_count,
@@ -520,10 +537,12 @@ std::vector<v2::V2LoweringTask> build_tasks(
   const std::vector<int64_t>& tensor_offsets, const std::vector<int64_t>& tensor_row_bytes,
   const std::vector<int64_t>& tensor_row_strides, const std::vector<int64_t>& peers,
   const std::vector<int64_t>& ordinals, const std::vector<int64_t>& expected_counts,
+  const std::vector<int64_t>& forward_peers, const std::vector<int64_t>& ring_ids,
   std::vector<std::uint32_t>* active_peers) {
   if (tensors.size() != lengths.size() || tensors.size() != tensor_offsets.size() ||
       tensors.size() != tensor_row_bytes.size() || tensors.size() != tensor_row_strides.size() ||
-      tensors.size() != peers.size() || tensors.size() != ordinals.size()) {
+      tensors.size() != peers.size() || tensors.size() != ordinals.size() ||
+      tensors.size() != forward_peers.size() || tensors.size() != ring_ids.size()) {
     throw std::runtime_error("nccl_device_v2 tensor/task descriptor lengths do not match");
   }
   if (expected_counts.size() != static_cast<std::size_t>(state.world_size)) {
@@ -549,11 +568,20 @@ std::vector<v2::V2LoweringTask> build_tasks(
     }
     const int64_t peer = peers[index];
     const int64_t ordinal = ordinals[index];
+    const int64_t forward_peer = forward_peers[index];
+    const int64_t ring_id = ring_ids[index];
     if (peer < 0 || peer >= state.world_size || peer == state.rank) {
       throw std::runtime_error("nccl_device_v2 task peer is invalid");
     }
     if (ordinal < 0 || static_cast<std::uint64_t>(ordinal) >= expected[peer]) {
       throw std::runtime_error("nccl_device_v2 task ordinal is invalid");
+    }
+    if (forward_peer < -1 || forward_peer >= state.world_size || forward_peer == state.rank ||
+        (forward_peer >= 0 && ring_id < 0)) {
+      throw std::runtime_error("nccl_device_v2 forward peer is invalid");
+    }
+    if (ring_id < -1 || static_cast<std::uint64_t>(ring_id) >= UINT32_MAX) {
+      throw std::runtime_error("nccl_device_v2 ring id is invalid");
     }
     if (lengths[index] < 0 || tensor_offsets[index] < 0 || tensor_row_bytes[index] <= 0 ||
         tensor_row_strides[index] < tensor_row_bytes[index]) {
@@ -563,6 +591,10 @@ std::vector<v2::V2LoweringTask> build_tasks(
       peer_seen[peer] = 1;
       active_peers->push_back(static_cast<std::uint32_t>(peer));
     }
+    if (forward_peer >= 0 && !peer_seen[forward_peer]) {
+      peer_seen[forward_peer] = 1;
+      active_peers->push_back(static_cast<std::uint32_t>(forward_peer));
+    }
     tasks.push_back(v2::V2LoweringTask{
       reinterpret_cast<uintptr_t>(tensor.data_ptr()),
       static_cast<std::uint64_t>(lengths[index]),
@@ -571,6 +603,8 @@ std::vector<v2::V2LoweringTask> build_tasks(
       static_cast<std::uint64_t>(tensor_row_strides[index]),
       static_cast<std::uint32_t>(peer),
       static_cast<std::uint32_t>(ordinal),
+      forward_peer < 0 ? v2::kNoPeer : static_cast<std::uint32_t>(forward_peer),
+      ring_id < 0 ? v2::kNoRing : static_cast<std::uint32_t>(ring_id),
     });
     ++actual[peer];
   }
@@ -583,7 +617,8 @@ std::vector<v2::V2LoweringTask> build_tasks(
 py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64_t>& lengths,
                 const std::vector<int64_t>& tensor_offsets, const std::vector<int64_t>& tensor_row_bytes,
                 const std::vector<int64_t>& tensor_row_strides, const std::vector<int64_t>& peers,
-                const std::vector<int64_t>& ordinals, const std::vector<int64_t>& expected_counts, bool sender,
+                const std::vector<int64_t>& ordinals, const std::vector<int64_t>& expected_counts,
+                const std::vector<int64_t>& forward_peers, const std::vector<int64_t>& ring_ids, bool sender,
                 int64_t sequence) {
   using Clock = std::chrono::steady_clock;
   const auto launch_start = Clock::now();
@@ -597,7 +632,7 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
 
   std::vector<std::uint32_t> active_peers;
   const auto tasks = build_tasks(*state, tensors, lengths, tensor_offsets, tensor_row_bytes, tensor_row_strides, peers,
-                                 ordinals, expected_counts, &active_peers);
+                                 ordinals, expected_counts, forward_peers, ring_ids, &active_peers);
   const v2::V2Direction direction = sender ? v2::V2Direction::kSend : v2::V2Direction::kRecv;
   AWEX_CUDA_V2_CHECK(cudaSetDevice(state->device));
   auto stream = at::cuda::getCurrentCUDAStream(state->device).stream();
@@ -666,6 +701,10 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
   metrics["min_work_step_bytes"] = py::int_(min_work_step_bytes);
   metrics["max_work_step_bytes"] = py::int_(max_work_step_bytes);
   metrics["active_peer_count"] = py::int_(cached_peers.size());
+  metrics["ring_broadcast"] = py::bool_(
+    std::any_of(tasks.begin(), tasks.end(), [](const v2::V2LoweringTask& task) { return task.ring_id != v2::kNoRing; }));
+  metrics["ring_relay_count"] = py::int_(std::count_if(
+    tasks.begin(), tasks.end(), [](const v2::V2LoweringTask& task) { return task.forward_peer != v2::kNoPeer; }));
   metrics["fifo_depth"] = py::int_(state->fifo_depth);
   metrics["gin_fifo_depth"] = py::int_(state->gin_fifo_depth);
   metrics["chunk_bytes"] = py::int_(state->chunk_bytes);

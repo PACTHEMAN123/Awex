@@ -16,7 +16,13 @@
 # under the License.
 
 import os
+from types import SimpleNamespace
 
+import pytest
+import torch
+
+from awex.transfer import nccl_device_v2
+from awex.transfer.nccl_device_v2 import _build_recv_batch, _build_send_batch
 from awex.transfer.nccl_device_v2_gin import (
     _active_rdma_endpoints,
     _configure_gin_hca_policy,
@@ -24,6 +30,158 @@ from awex.transfer.nccl_device_v2_gin import (
     _RdmaEndpoint,
     _weighted_hca_assignments,
 )
+from awex.transfer.transfer_plan import CommunicationOperation, TransferPlan
+
+
+def _replica_operation(root: int, receiver: int) -> CommunicationOperation:
+    shard = SimpleNamespace(name="weight", shape=(8,))
+    return CommunicationOperation(
+        send_rank=root,
+        send_shard_meta=shard,
+        send_offset=(0,),
+        recv_rank=receiver,
+        recv_shard_meta=shard,
+        recv_offset=(0,),
+        overlap_shape=(8,),
+        train_slices=(slice(None),),
+        inf_slices=(slice(None),),
+    )
+
+
+def test_v2_ring_broadcast_is_disabled_by_default(monkeypatch):
+    monkeypatch.setattr(nccl_device_v2, "_ensure_cuda_tensor", lambda *_: None)
+    tensor = torch.arange(8, dtype=torch.int32)
+    plan = TransferPlan(
+        operations={peer: [_replica_operation(4, peer)] for peer in range(4)}
+    )
+
+    batch = _build_send_batch(
+        {"weight": tensor},
+        plan,
+        rank=4,
+        world_size=5,
+        chunk_bytes=16,
+        infer_instance_world_size=1,
+        num_infer_engines=4,
+    )
+
+    assert batch.peers == [0, 1, 2, 3]
+    assert batch.ring_ids == [-1, -1, -1, -1]
+
+
+def test_v2_fixed_ring_injects_one_copy_and_relays_in_engine_order(monkeypatch):
+    monkeypatch.setattr(nccl_device_v2, "_ensure_cuda_tensor", lambda *_: None)
+    tensor = torch.arange(8, dtype=torch.int32)
+    send_plan = TransferPlan(
+        operations={peer: [_replica_operation(4, peer)] for peer in range(4)}
+    )
+    send_batch = _build_send_batch(
+        {"weight": tensor},
+        send_plan,
+        rank=4,
+        world_size=5,
+        chunk_bytes=16,
+        infer_instance_world_size=1,
+        num_infer_engines=4,
+        ring_broadcast=True,
+    )
+
+    assert send_batch.peers == [0]
+    assert send_batch.expected_counts == [1, 0, 0, 0, 0]
+    assert send_batch.ring_ids == [4]
+
+    recv_batch = _build_recv_batch(
+        {"weight": torch.empty_like(tensor)},
+        TransferPlan(operations={4: [_replica_operation(4, 1)]}),
+        rank=1,
+        world_size=5,
+        chunk_bytes=16,
+        infer_instance_world_size=1,
+        num_infer_engines=4,
+        ring_broadcast=True,
+    )
+    assert recv_batch.peers == [0]
+    assert recv_batch.forward_peers == [2]
+    assert recv_batch.ring_ids == [4]
+
+
+def test_v2_swizzle_rotates_ring_by_root(monkeypatch):
+    monkeypatch.setattr(nccl_device_v2, "_ensure_cuda_tensor", lambda *_: None)
+    tensor = torch.arange(8, dtype=torch.int32)
+    send_plan = TransferPlan(
+        operations={peer: [_replica_operation(5, peer)] for peer in range(4)}
+    )
+    send_batch = _build_send_batch(
+        {"weight": tensor},
+        send_plan,
+        rank=5,
+        world_size=6,
+        chunk_bytes=16,
+        infer_instance_world_size=1,
+        num_infer_engines=4,
+        ring_broadcast=True,
+        ring_swizzle=True,
+    )
+
+    assert send_batch.peers == [1]
+    assert send_batch.ring_ids == [5]
+
+    last_batch = _build_recv_batch(
+        {"weight": torch.empty_like(tensor)},
+        TransferPlan(operations={5: [_replica_operation(5, 0)]}),
+        rank=0,
+        world_size=6,
+        chunk_bytes=16,
+        infer_instance_world_size=1,
+        num_infer_engines=4,
+        ring_broadcast=True,
+        ring_swizzle=True,
+    )
+    assert last_batch.peers == [3]
+    assert last_batch.forward_peers == [-1]
+
+
+def test_v2_swizzle_switch_is_inert_when_ring_broadcast_is_off(monkeypatch):
+    monkeypatch.setattr(nccl_device_v2, "_ensure_cuda_tensor", lambda *_: None)
+    tensor = torch.arange(8, dtype=torch.int32)
+    batch = _build_send_batch(
+        {"weight": tensor},
+        TransferPlan(
+            operations={peer: [_replica_operation(5, peer)] for peer in range(4)}
+        ),
+        rank=5,
+        world_size=6,
+        chunk_bytes=16,
+        infer_instance_world_size=1,
+        num_infer_engines=4,
+        ring_broadcast=False,
+        ring_swizzle=True,
+    )
+
+    assert batch.peers == [0, 1, 2, 3]
+    assert batch.ring_ids == [-1, -1, -1, -1]
+
+
+def test_v2_ring_rejects_partial_replica_streams(monkeypatch):
+    monkeypatch.setattr(nccl_device_v2, "_ensure_cuda_tensor", lambda *_: None)
+    tensor = torch.arange(8, dtype=torch.int32)
+
+    with pytest.raises(
+        nccl_device_v2.NCCLDeviceV2UnavailableError,
+        match="present in all engines",
+    ):
+        _build_send_batch(
+            {"weight": tensor},
+            TransferPlan(
+                operations={peer: [_replica_operation(5, peer)] for peer in (0, 1)}
+            ),
+            rank=5,
+            world_size=6,
+            chunk_bytes=16,
+            infer_instance_world_size=1,
+            num_infer_engines=4,
+            ring_broadcast=True,
+        )
 
 
 def test_active_rdma_endpoints_read_active_port_capacity(tmp_path):

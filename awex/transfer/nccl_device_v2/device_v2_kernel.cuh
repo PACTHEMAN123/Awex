@@ -25,6 +25,7 @@ namespace nccl_device_v2 {
 struct V2BatchShared {
   int ready[kMaxWorksPerBatch];
   unsigned long long step_cache[kMaxWorksPerBatch];
+  unsigned long long forward_step_cache[kMaxWorksPerBatch];
 };
 
 __device__ __forceinline__ std::uint32_t v2Roles(V2Direction direction, int tid, int nthreads, int* nworkers) {
@@ -115,6 +116,136 @@ __device__ __forceinline__ void v2RunRecv(const V2KernelArgs& args, const V2Work
   }
 }
 
+// A ring receiver consumes one FIFO step and republishes that same step to its
+// successor before returning credit to its predecessor. Both LSA and GIN edges
+// use the same route channel and byte partition, so mixed intra/inter-node rings
+// retain NCCL broadcast's chunk-pipelined behavior.
+__device__ __forceinline__ void v2RunRelay(const V2KernelArgs& args, const V2Work& work, std::uint32_t channel,
+                                           int tid, int nthreads, int barrier, int* ready,
+                                           unsigned long long* input_cache, unsigned long long* output_cache) {
+  int nworkers = 0;
+  const std::uint32_t roles = v2Roles(V2Direction::kRecv, tid, nthreads, &nworkers);
+  auto* error = &reinterpret_cast<V2WindowHeader*>(args.local_window)->error;
+  const bool input_gin = args.peer_transports[work.peer] == static_cast<std::uint8_t>(V2Transport::kGin);
+  const bool output_gin =
+    args.peer_transports[work.forward_peer] == static_cast<std::uint8_t>(V2Transport::kGin);
+  std::uint64_t cursor = 0;
+  std::uint64_t input_step = work.step_begin;
+  std::uint64_t output_step = work.forward_step_begin;
+
+  while (cursor < work.nbytes) {
+    const std::uint64_t slice_bytes =
+      work.step_bytes < work.nbytes - cursor ? work.step_bytes : work.nbytes - cursor;
+    V2FifoSlot* input_slot = input_gin
+      ? nullptr
+      : v2FifoSlot(args, work.peer, args.local_rank, channel, input_step, work.fifo_depth, false);
+    V2FifoSlot* output_slot = output_gin
+      ? nullptr
+      : v2FifoSlot(args, args.local_rank, work.forward_peer, channel, output_step, work.fifo_depth, true);
+
+    if (roles & kRoleWaitRecv) {
+      bool input_ready = false;
+      bool output_ready = false;
+#if AWEX_NCCL_DEVICE_V2_HAS_GIN
+      ncclGin gin{args.dev_comm, static_cast<int>(channel % args.dev_comm.ginContextCount)};
+      input_ready = input_gin
+        ? v2GinWaitSignal(args, gin, v2GinReadySignal(args, work.peer, channel), input_step, 2U)
+        : v2WaitReady(&input_slot->ready_step, input_step, input_cache, error, args.timeout_cycles);
+      output_ready = output_gin
+        ? (output_step <= work.fifo_depth ||
+           v2GinWaitSignal(args, gin, v2GinCreditSignal(args, work.forward_peer, channel),
+                           output_step - work.fifo_depth, 3U))
+        : v2WaitFree(output_slot, output_step, work.fifo_depth, output_cache, error, args.timeout_cycles);
+#else
+      input_ready = !input_gin &&
+        v2WaitReady(&input_slot->ready_step, input_step, input_cache, error, args.timeout_cycles);
+      output_ready = !output_gin &&
+        v2WaitFree(output_slot, output_step, work.fifo_depth, output_cache, error, args.timeout_cycles);
+#endif
+      *ready = input_ready && output_ready;
+    }
+    v2GroupBarrier(barrier, nthreads);
+
+    const std::uint8_t* input_payload = nullptr;
+    std::uint8_t* output_payload = nullptr;
+#if AWEX_NCCL_DEVICE_V2_HAS_GIN
+    if (input_gin) input_payload = v2GinLocalPayload(args, work.peer, channel, input_step, work.fifo_depth);
+    if (output_gin) {
+      output_payload = v2GinLocalPayload(args, work.forward_peer, channel, output_step, work.fifo_depth);
+    }
+#endif
+    if (!input_gin) {
+      input_payload = v2FifoPayload(args, work.peer, args.local_rank, channel, input_step, work.fifo_depth, false);
+    }
+    if (!output_gin) {
+      output_payload =
+        v2FifoPayload(args, args.local_rank, work.forward_peer, channel, output_step, work.fifo_depth, true);
+    }
+    if (*ready && (roles & kRoleWorker)) {
+      v2CopyContiguousToFragments(args, work, input_payload, cursor, slice_bytes, tid, nworkers);
+      v2CopyContiguous(output_payload, input_payload, slice_bytes, tid, nworkers);
+    }
+
+    v2GroupBarrier(barrier, nthreads);
+    if ((roles & kRolePostRecv) && v2LoadError(error) == 0) {
+#if AWEX_NCCL_DEVICE_V2_HAS_GIN
+      ncclGin gin{args.dev_comm, static_cast<int>(channel % args.dev_comm.ginContextCount)};
+      const ncclTeam world = ncclTeamWorld(args.dev_comm);
+      if (output_gin) {
+        gin.put(world, work.forward_peer, args.window,
+                v2GinPayloadOffset(args, work.forward_peer, args.local_rank, channel, output_step, work.fifo_depth),
+                args.window,
+                v2GinPayloadOffset(args, args.local_rank, work.forward_peer, channel, output_step, work.fifo_depth),
+                slice_bytes, V2GinReadySignalInc{v2GinReadySignal(args, args.local_rank, channel)}, ncclGin_None{},
+                ncclCoopThread{}, ncclGin_None{}, cuda::thread_scope_thread, cuda::thread_scope_device,
+                ncclGinOptFlagsDefault);
+      } else
+#endif
+      {
+        output_slot->bytes = static_cast<std::uint32_t>(slice_bytes);
+        v2Publish(&output_slot->ready_step, output_step);
+      }
+
+      if (input_gin) {
+#if AWEX_NCCL_DEVICE_V2_HAS_GIN
+        const std::uint64_t work_step = input_step - work.step_begin + 1;
+        const bool work_complete = cursor + slice_bytes == work.nbytes;
+        const std::uint32_t returned_credits = static_cast<std::uint32_t>(
+          work_complete && work_step % args.gin_credit_batch != 0 ? work_step % args.gin_credit_batch
+                                                                  : args.gin_credit_batch);
+        if (work_complete || work_step % args.gin_credit_batch == 0) {
+          gin.signal(world, work.peer,
+                     V2GinCreditSignalAdd{v2GinCreditSignal(args, args.local_rank, channel), returned_credits});
+        }
+#endif
+      } else {
+        v2Publish(&input_slot->consumed_step, input_step);
+      }
+    }
+    if (v2LoadError(error) != 0) return;
+    cursor += slice_bytes;
+    ++input_step;
+    ++output_step;
+  }
+
+  if (work.final && work.nbytes != 0) {
+    if (roles & kRoleWaitRecv) {
+#if AWEX_NCCL_DEVICE_V2_HAS_GIN
+      if (output_gin) {
+        ncclGin gin{args.dev_comm, static_cast<int>(channel % args.dev_comm.ginContextCount)};
+        *ready = v2GinWaitSignal(args, gin, v2GinCreditSignal(args, work.forward_peer, channel), output_step - 1, 4U);
+      } else
+#endif
+      {
+        V2FifoSlot* final_slot =
+          v2FifoSlot(args, args.local_rank, work.forward_peer, channel, output_step - 1, work.fifo_depth, true);
+        *ready = v2WaitConsumed(final_slot, output_step - 1, output_cache, error, args.timeout_cycles);
+      }
+    }
+    v2GroupBarrier(barrier, nthreads);
+  }
+}
+
 __device__ __forceinline__ void v2RunBatch(const V2KernelArgs& args, const V2WorkBatch& batch,
                                            std::uint32_t channel) {
   __shared__ V2BatchShared shared;
@@ -133,12 +264,16 @@ __device__ __forceinline__ void v2RunBatch(const V2KernelArgs& args, const V2Wor
     if (subtid == 0) {
       shared.ready[group] = 1;
       shared.step_cache[group] = 0;
+      shared.forward_step_cache[group] = 0;
     }
     v2GroupBarrier(main_barrier, subthreads);
 
     const V2Work& work = args.works[batch.work_begin + group];
     const bool use_gin = args.peer_transports[work.peer] == static_cast<std::uint8_t>(V2Transport::kGin);
-    if (use_gin) {
+    if (work.forward_peer != kNoPeer) {
+      v2RunRelay(args, work, channel, subtid, subthreads, main_barrier, &shared.ready[group],
+                 &shared.step_cache[group], &shared.forward_step_cache[group]);
+    } else if (use_gin) {
 #if AWEX_NCCL_DEVICE_V2_HAS_GIN
       if (args.direction == V2Direction::kSend) {
         v2GinRunSend(args, work, channel, subtid, subthreads, main_barrier, wait_barrier, &shared.ready[group]);

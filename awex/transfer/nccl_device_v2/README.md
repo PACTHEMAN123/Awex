@@ -53,6 +53,37 @@ retain the original NVLink read path. LSA keeps its existing FIFO depth 8,
 step, FIFO, chunk, and channel settings, so enabling cross-node transfers cannot
 retune the local protocol.
 
+## Replicated rollout ring broadcast
+
+The default v2 behavior remains one point-to-point stream from a training rank
+to every rollout replica. Ring broadcast is opt-in:
+
+```bash
+export AWEX_NCCL_DEVICE_V2_RING_BROADCAST=1
+```
+
+When enabled, identical streams for the same TP/PP/DP coordinate across rollout
+instances are lowered as one root injection followed by a chunk-pipelined ring.
+An intermediate rollout rank scatters each received FIFO step into its model and
+forwards the same step to its successor before returning predecessor credit. The
+relay supports LSA-to-LSA, GIN-to-GIN, and mixed LSA/GIN edges. Ring mode
+requires each active logical rollout stream to be present and identical across
+all rollout instances; initialization rejects partial or divergent replicas.
+
+The default ring strategy uses the same ascending rollout-instance order for
+every root. A second switch enables load-balanced swizzling:
+
+```bash
+export AWEX_NCCL_DEVICE_V2_RING_BROADCAST=1
+export AWEX_NCCL_DEVICE_V2_RING_SWIZZLE=1
+```
+
+Swizzling rotates the rollout-instance order by the root transfer rank. This
+distributes first-hop injection and final-hop placement across instances while
+remaining deterministic on every rank. `RING_SWIZZLE` has no effect while the
+ring-broadcast switch is off. Launch metrics expose `ring_broadcast` and
+`ring_relay_count` for confirming which path was lowered.
+
 Before NCCL initialization, the default HCA policy discovers active RDMA ports,
 reads their link rates from sysfs, and combines them with `nvidia-smi topo -m`
 GPU-to-NIC distances. It keeps ranks on local NUMA rails where possible and

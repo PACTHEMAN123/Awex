@@ -56,6 +56,8 @@ struct V2LoweringTask {
   std::uint64_t tensor_row_stride = 0;
   std::uint32_t peer = 0;
   std::uint32_t ordinal = 0;
+  std::uint32_t forward_peer = kNoPeer;
+  std::uint32_t ring_id = kNoRing;
 };
 
 struct V2Schedule {
@@ -254,7 +256,14 @@ inline V2Schedule lowerFixedTasks(const std::vector<V2LoweringTask>& tasks,
     peer_index[peer] = static_cast<std::int32_t>(index);
   }
 
-  std::vector<std::vector<const V2LoweringTask*>> peer_tasks(config.world_size);
+  struct RouteTasks {
+    std::uint32_t peer;
+    std::uint32_t forward_peer;
+    std::uint32_t ring_id;
+    std::vector<const V2LoweringTask*> tasks;
+  };
+  std::vector<RouteTasks> routes;
+  std::vector<std::uint32_t> peer_task_counts(config.world_size, 0);
   for (const V2LoweringTask& task : tasks) {
     if (task.peer >= config.world_size || peer_index[task.peer] < 0) {
       throw std::invalid_argument("v2 task peer is not active");
@@ -262,18 +271,35 @@ inline V2Schedule lowerFixedTasks(const std::vector<V2LoweringTask>& tasks,
     if (task.tensor_row_bytes == 0 || task.tensor_row_stride < task.tensor_row_bytes) {
       throw std::invalid_argument("invalid v2 tensor row layout");
     }
-    if (task.ordinal != peer_tasks[task.peer].size()) {
+    if (task.ordinal != peer_task_counts[task.peer]++) {
       throw std::invalid_argument("v2 task order is not dense within its peer stream");
     }
-    peer_tasks[task.peer].push_back(&task);
+    if (task.forward_peer != kNoPeer &&
+        (task.ring_id == kNoRing || task.forward_peer >= config.world_size ||
+         task.forward_peer == config.local_rank || peer_index[task.forward_peer] < 0)) {
+      throw std::invalid_argument("v2 ring forward peer is invalid");
+    }
+    auto route = std::find_if(routes.begin(), routes.end(), [&](const RouteTasks& candidate) {
+      return candidate.peer == task.peer && candidate.forward_peer == task.forward_peer &&
+        candidate.ring_id == task.ring_id;
+    });
+    if (route == routes.end()) {
+      routes.push_back(RouteTasks{task.peer, task.forward_peer, task.ring_id, {}});
+      route = routes.end() - 1;
+    }
+    route->tasks.push_back(&task);
   }
 
   using PeerWorkQueues = std::vector<std::vector<V2Work>>;
   std::vector<PeerWorkQueues> channel_work(config.total_channels, PeerWorkQueues(config.world_size));
-  for (const std::uint32_t peer : active_peers) {
+  std::vector<std::uint64_t> send_steps(step_count, 1);
+  std::vector<std::uint64_t> recv_steps(step_count, 1);
+  for (const RouteTasks& route : routes) {
+    const std::uint32_t peer = route.peer;
+    const bool ring = route.ring_id != kNoRing;
     std::vector<V2StreamSpan> spans;
     std::uint64_t stream_bytes = 0;
-    for (const V2LoweringTask* task : peer_tasks[peer]) {
+    for (const V2LoweringTask* task : route.tasks) {
       if (task->nbytes > std::numeric_limits<std::uint64_t>::max() - stream_bytes) {
         throw std::invalid_argument("v2 peer stream size overflows");
       }
@@ -284,13 +310,13 @@ inline V2Schedule lowerFixedTasks(const std::vector<V2LoweringTask>& tasks,
     }
     if (stream_bytes == 0) continue;
 
-    const bool network =
+    const bool network = ring ||
       config.peer_transports[peer] == static_cast<std::uint8_t>(V2Transport::kGin);
     const std::size_t planning_step_bytes = network ? config.network_step_bytes : config.step_bytes;
     const std::size_t transport_chunk_bytes = network ? config.gin_chunk_bytes : config.chunk_bytes;
     const std::uint32_t transport_fifo_depth = network ? config.gin_fifo_depth : config.fifo_depth;
     const std::size_t transfer_step_bytes = v2TransferStepBytes(stream_bytes, planning_step_bytes, network);
-    const std::uint32_t max_channels =
+    const std::uint32_t max_channels = ring ? 1U :
       std::max<std::uint32_t>(1, std::min(config.peer_channels[peer], config.total_channels));
     std::uint32_t min_channels = max_channels;
     while (static_cast<std::uint64_t>(min_channels) * config.world_size > config.total_channels && min_channels > 1) {
@@ -299,7 +325,9 @@ inline V2Schedule lowerFixedTasks(const std::vector<V2LoweringTask>& tasks,
     const std::uint32_t channel_count =
       v2ChannelsForBytes(stream_bytes, min_channels, max_channels, planning_step_bytes, network);
     schedule.peer_channel_counts[peer] = channel_count;
-    const std::uint32_t channel_base = network
+    const std::uint32_t channel_base = ring
+      ? (route.ring_id & (config.total_channels - 1))
+      : network
       ? v2GinChannelBase(config.local_rank, peer, config.total_channels, channel_count)
       : v2LsaChannelBase(config.local_rank, peer, config.world_size, config.total_channels);
 
@@ -320,15 +348,24 @@ inline V2Schedule lowerFixedTasks(const std::vector<V2LoweringTask>& tasks,
         const std::uint64_t chunk_end = std::min<std::uint64_t>(chunk_begin + effective_chunk_bytes, bounds.second);
         V2Work work{};
         work.peer = peer;
+        work.forward_peer = route.forward_peer;
         work.chunk_ordinal = static_cast<std::uint32_t>(chunk);
         work.chunk_count = static_cast<std::uint32_t>(chunk_count);
         work.step_bytes = static_cast<std::uint32_t>(transfer_step_bytes);
         work.fifo_depth = transport_fifo_depth;
         work.stream_offset = chunk_begin;
         work.nbytes = chunk_end - chunk_begin;
+        const std::uint64_t work_steps = v2DivUp(work.nbytes, transfer_step_bytes);
         const std::size_t connection = static_cast<std::size_t>(peer) * config.total_channels + channel;
-        work.step_begin = schedule.next_steps[connection];
-        schedule.next_steps[connection] += v2DivUp(work.nbytes, transfer_step_bytes);
+        auto& input_steps = direction == V2Direction::kSend ? send_steps : recv_steps;
+        work.step_begin = input_steps[connection];
+        input_steps[connection] += work_steps;
+        if (route.forward_peer != kNoPeer) {
+          const std::size_t forward_connection =
+            static_cast<std::size_t>(route.forward_peer) * config.total_channels + channel;
+          work.forward_step_begin = send_steps[forward_connection];
+          send_steps[forward_connection] += work_steps;
+        }
         v2AppendFragments(spans, chunk_begin, chunk_end, &schedule, &work);
         queue.push_back(work);
         ++schedule.chunk_count;
@@ -337,8 +374,8 @@ inline V2Schedule lowerFixedTasks(const std::vector<V2LoweringTask>& tasks,
     }
   }
 
-  // Each batch contains at most one work per peer, so concurrent warp groups
-  // never race on the same (peer, channel) FIFO step stream.
+  // Each batch contains at most one work per input and forward peer, so
+  // concurrent warp groups never race on a (peer, channel) FIFO step stream.
   for (std::uint32_t channel = 0; channel < config.total_channels; ++channel) {
     std::size_t remaining = 0;
     std::vector<std::size_t> cursors(config.world_size, 0);
@@ -352,6 +389,7 @@ inline V2Schedule lowerFixedTasks(const std::vector<V2LoweringTask>& tasks,
     while (remaining != 0) {
       V2WorkBatch batch{};
       batch.work_begin = static_cast<std::uint32_t>(schedule.works.size());
+      std::vector<std::uint8_t> used_forward_peers(config.world_size, 0);
       const std::size_t batch_peer_begin = peer_cursor;
       std::size_t last_peer_index = batch_peer_begin;
       std::size_t scanned = 0;
@@ -360,7 +398,14 @@ inline V2Schedule lowerFixedTasks(const std::vector<V2LoweringTask>& tasks,
         const std::uint32_t peer = active_peers[index];
         auto& queue = channel_work[channel][peer];
         if (cursors[peer] < queue.size()) {
-          schedule.works.push_back(queue[cursors[peer]++]);
+          const V2Work& candidate = queue[cursors[peer]];
+          if (candidate.forward_peer != kNoPeer && used_forward_peers[candidate.forward_peer]) {
+            ++scanned;
+            continue;
+          }
+          schedule.works.push_back(candidate);
+          ++cursors[peer];
+          if (candidate.forward_peer != kNoPeer) used_forward_peers[candidate.forward_peer] = 1;
           ++batch.work_count;
           --remaining;
           last_peer_index = index;
@@ -378,6 +423,9 @@ inline V2Schedule lowerFixedTasks(const std::vector<V2LoweringTask>& tasks,
   }
 
   schedule.channel_count = static_cast<std::uint32_t>(schedule.channel_ids.size());
+  for (std::size_t index = 0; index < step_count; ++index) {
+    schedule.next_steps[index] = std::max(send_steps[index], recv_steps[index]);
+  }
   for (const std::uint64_t step : schedule.next_steps) schedule.next_step = std::max(schedule.next_step, step);
   (void)direction;
   return schedule;

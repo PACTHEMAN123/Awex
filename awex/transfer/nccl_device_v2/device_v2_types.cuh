@@ -51,6 +51,8 @@ constexpr std::size_t kDefaultStepBytes = 512 * 1024;
 constexpr std::size_t kDefaultNetworkStepBytes = 128 * 1024;
 constexpr std::size_t kWindowAlignment = 4096;
 constexpr std::size_t kFifoAlignment = 256;
+constexpr std::uint32_t kNoPeer = UINT32_MAX;
+constexpr std::uint32_t kNoRing = UINT32_MAX;
 
 static_assert(kThreadsPerBlock % kWarpSize == 0, "block must contain full warps");
 static_assert(kMaxWorksPerBatch <= 15, "work groups use CUDA named barriers 1-15");
@@ -93,6 +95,7 @@ struct alignas(16) V2Fragment {
 
 struct alignas(16) V2Work {
   std::uint32_t peer;
+  std::uint32_t forward_peer;
   std::uint32_t fragment_begin;
   std::uint32_t fragment_count;
   std::uint32_t chunk_ordinal;
@@ -103,6 +106,7 @@ struct alignas(16) V2Work {
   std::uint64_t stream_offset;
   std::uint64_t nbytes;
   std::uint64_t step_begin;
+  std::uint64_t forward_step_begin;
 };
 
 struct V2WorkBatch {

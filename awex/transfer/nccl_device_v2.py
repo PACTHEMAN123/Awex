@@ -31,6 +31,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any
 
 from awex.transfer.nccl_device_v2_gin import (
@@ -102,6 +103,17 @@ class _V2Batch:
     region_bytes: list[int]
     expected_counts: list[int]
     copybacks: list[tuple[torch.Tensor, torch.Tensor]]
+    forward_peers: list[int]
+    ring_ids: list[int]
+
+
+_NO_PEER = -1
+_NO_RING = -1
+
+
+class _RingOrderStrategy(Enum):
+    FIXED = "fixed"
+    ROOT_SWIZZLE = "root_swizzle"
 
 
 def _candidate_include_paths() -> list[str]:
@@ -197,6 +209,162 @@ def _resolve_network_step_bytes(network_step_bytes: int | None) -> int:
     return network_step_bytes
 
 
+def _resolve_bool(name: str, value: bool | None = None) -> bool:
+    if value is not None:
+        return bool(value)
+    configured = os.environ.get(name, "0").strip().lower()
+    if configured in {"0", "false", "no", "off"}:
+        return False
+    if configured in {"1", "true", "yes", "on"}:
+        return True
+    raise NCCLDeviceV2UnavailableError(
+        f"{name} must be one of 0/1, false/true, no/yes, or off/on"
+    )
+
+
+def _ring_order(root: int, peers: list[int], strategy: _RingOrderStrategy) -> list[int]:
+    ordered = sorted(peers)
+    if strategy is _RingOrderStrategy.FIXED or len(ordered) < 2:
+        return ordered
+    offset = int(root) % len(ordered)
+    return ordered[offset:] + ordered[:offset]
+
+
+def _ring_id(root: int, logical_peer: int, instance_world_size: int) -> int:
+    return int(root) * int(instance_world_size) + int(logical_peer)
+
+
+def _reindex_batch_streams(batch: _V2Batch) -> None:
+    next_ordinal = [0] * len(batch.expected_counts)
+    for index, peer in enumerate(batch.peers):
+        batch.ordinals[index] = next_ordinal[peer]
+        next_ordinal[peer] += 1
+    batch.expected_counts = next_ordinal
+
+
+def _apply_send_ring_routes(
+    batch: _V2Batch,
+    *,
+    root: int,
+    infer_instance_world_size: int,
+    num_infer_engines: int,
+    swizzle: bool,
+) -> None:
+    instance_world_size = int(infer_instance_world_size)
+    engine_count = int(num_infer_engines)
+    if engine_count < 2 or instance_world_size <= 0:
+        return
+    infer_world_size = engine_count * instance_world_size
+    if infer_world_size > len(batch.expected_counts):
+        raise NCCLDeviceV2UnavailableError(
+            "nccl_device_v2 ring inference topology exceeds transfer world size"
+        )
+
+    indices_by_peer: dict[int, list[int]] = {}
+    for index, peer in enumerate(batch.peers):
+        indices_by_peer.setdefault(peer, []).append(index)
+
+    suppressed: set[int] = set()
+    ring_by_index: dict[int, int] = {}
+    for logical_peer in range(instance_world_size):
+        targets = [
+            engine * instance_world_size + logical_peer
+            for engine in range(engine_count)
+        ]
+        present_targets = [target for target in targets if target in indices_by_peer]
+        if not present_targets:
+            continue
+        if present_targets != targets:
+            raise NCCLDeviceV2UnavailableError(
+                "nccl_device_v2 ring broadcast requires each active logical "
+                f"rollout peer to be present in all engines: root={root}, "
+                f"logical_peer={logical_peer}, present={present_targets}, "
+                f"expected={targets}"
+            )
+
+        def signature(index: int) -> tuple[int, ...]:
+            tensor = batch.tensors[index]
+            return (
+                int(tensor.data_ptr()),
+                int(batch.offsets[index]),
+                int(batch.lengths[index]),
+                int(batch.tensor_offsets[index]),
+                int(batch.tensor_row_bytes[index]),
+                int(batch.tensor_row_strides[index]),
+            )
+
+        strategy = (
+            _RingOrderStrategy.ROOT_SWIZZLE if swizzle else _RingOrderStrategy.FIXED
+        )
+        order = _ring_order(root, targets, strategy)
+        canonical = [signature(index) for index in indices_by_peer[order[0]]]
+        if not canonical or any(
+            [signature(index) for index in indices_by_peer[target]] != canonical
+            for target in order[1:]
+        ):
+            raise NCCLDeviceV2UnavailableError(
+                "nccl_device_v2 ring broadcast requires identical replicated "
+                f"streams: root={root}, logical_peer={logical_peer}"
+            )
+        route_id = _ring_id(root, logical_peer, instance_world_size)
+        for index in indices_by_peer[order[0]]:
+            ring_by_index[index] = route_id
+        suppressed.update(order[1:])
+
+    if not suppressed:
+        return
+    keep = [index for index, peer in enumerate(batch.peers) if peer not in suppressed]
+    for field in (
+        "tensors",
+        "offsets",
+        "lengths",
+        "tensor_offsets",
+        "tensor_row_bytes",
+        "tensor_row_strides",
+        "peers",
+        "ordinals",
+        "region_indices",
+        "forward_peers",
+        "ring_ids",
+    ):
+        values = getattr(batch, field)
+        setattr(batch, field, [values[index] for index in keep])
+    batch.ring_ids = [ring_by_index.get(index, _NO_RING) for index in keep]
+    _reindex_batch_streams(batch)
+
+
+def _apply_recv_ring_routes(
+    batch: _V2Batch,
+    *,
+    rank: int,
+    infer_instance_world_size: int,
+    num_infer_engines: int,
+    swizzle: bool,
+) -> None:
+    instance_world_size = int(infer_instance_world_size)
+    engine_count = int(num_infer_engines)
+    if (
+        engine_count < 2
+        or instance_world_size <= 0
+        or rank >= engine_count * instance_world_size
+    ):
+        return
+    logical_peer = int(rank) % instance_world_size
+    targets = [
+        engine * instance_world_size + logical_peer for engine in range(engine_count)
+    ]
+    strategy = _RingOrderStrategy.ROOT_SWIZZLE if swizzle else _RingOrderStrategy.FIXED
+    for index, root in enumerate(list(batch.peers)):
+        order = _ring_order(root, targets, strategy)
+        position = order.index(rank)
+        batch.peers[index] = root if position == 0 else order[position - 1]
+        batch.forward_peers[index] = (
+            order[position + 1] if position + 1 < len(order) else _NO_PEER
+        )
+        batch.ring_ids[index] = _ring_id(root, logical_peer, instance_world_size)
+    _reindex_batch_streams(batch)
+
+
 def _sequence_from_step(step_id: int) -> int:
     sequence = int(step_id) + 2
     if sequence <= 0:
@@ -284,6 +452,10 @@ def _build_send_batch(
     world_size: int,
     chunk_bytes: int,
     allow_staging: bool = True,
+    infer_instance_world_size: int = 0,
+    num_infer_engines: int = 1,
+    ring_broadcast: bool = False,
+    ring_swizzle: bool = False,
 ) -> _V2Batch:
     _resolve_chunk_bytes(chunk_bytes)
     tensors: list[torch.Tensor] = []
@@ -350,7 +522,7 @@ def _build_send_batch(
                 peer_offset += length
         expected_counts[peer] = ordinal
         region_bytes[rank] = max(region_bytes[rank], peer_offset)
-    return _V2Batch(
+    batch = _V2Batch(
         tensors=tensors,
         offsets=offsets,
         lengths=lengths,
@@ -363,7 +535,18 @@ def _build_send_batch(
         region_bytes=region_bytes,
         expected_counts=expected_counts,
         copybacks=[],
+        forward_peers=[_NO_PEER] * len(tensors),
+        ring_ids=[_NO_RING] * len(tensors),
     )
+    if ring_broadcast:
+        _apply_send_ring_routes(
+            batch,
+            root=rank,
+            infer_instance_world_size=infer_instance_world_size,
+            num_infer_engines=num_infer_engines,
+            swizzle=ring_swizzle,
+        )
+    return batch
 
 
 def _build_recv_batch(
@@ -373,6 +556,10 @@ def _build_recv_batch(
     world_size: int,
     chunk_bytes: int,
     allow_staging: bool = True,
+    infer_instance_world_size: int = 0,
+    num_infer_engines: int = 1,
+    ring_broadcast: bool = False,
+    ring_swizzle: bool = False,
 ) -> _V2Batch:
     _resolve_chunk_bytes(chunk_bytes)
     tensors: list[torch.Tensor] = []
@@ -448,7 +635,7 @@ def _build_recv_batch(
                 peer_offset += length
         expected_counts[peer] = ordinal
         region_bytes[peer] = max(region_bytes[peer], peer_offset)
-    return _V2Batch(
+    batch = _V2Batch(
         tensors=tensors,
         offsets=offsets,
         lengths=lengths,
@@ -461,7 +648,18 @@ def _build_recv_batch(
         region_bytes=region_bytes,
         expected_counts=expected_counts,
         copybacks=copybacks,
+        forward_peers=[_NO_PEER] * len(tensors),
+        ring_ids=[_NO_RING] * len(tensors),
     )
+    if ring_broadcast:
+        _apply_recv_ring_routes(
+            batch,
+            rank=rank,
+            infer_instance_world_size=infer_instance_world_size,
+            num_infer_engines=num_infer_engines,
+            swizzle=ring_swizzle,
+        )
+    return batch
 
 
 def _env_int(name: str, default: int, minimum: int = 0) -> int:
@@ -588,6 +786,8 @@ class NCCLDeviceV2Transport:
         network_step_bytes: int | None = None,
         gin_connections: int | None = None,
         gin_reliable_doorbell: int | None = None,
+        ring_broadcast: bool | None = None,
+        ring_swizzle: bool | None = None,
     ):
         if world_size < 2 or world_size > 256:
             raise NCCLDeviceV2UnavailableError(
@@ -631,6 +831,12 @@ class NCCLDeviceV2Transport:
             )
         self.infer_instance_world_size = int(infer_instance_world_size)
         self.num_infer_engines = int(num_infer_engines)
+        self.ring_broadcast = _resolve_bool(
+            "AWEX_NCCL_DEVICE_V2_RING_BROADCAST", ring_broadcast
+        )
+        self.ring_swizzle = _resolve_bool(
+            "AWEX_NCCL_DEVICE_V2_RING_SWIZZLE", ring_swizzle
+        )
         self._extension = None
         self._handle: int | None = None
         self._initialized = False
@@ -642,7 +848,8 @@ class NCCLDeviceV2Transport:
             "fifo_depth=%s step_bytes=%s gin_fifo_depth=%s "
             "network_step_bytes=%s gin_chunk_bytes=%s "
             "gin_connections=%s gin_context_count=%s "
-            "gin_reliable_doorbell=%s hca_policy=%s selected_hca=%s",
+            "gin_reliable_doorbell=%s ring_broadcast=%s ring_swizzle=%s "
+            "hca_policy=%s selected_hca=%s",
             self.rank,
             self.chunk_bytes,
             self.max_channels,
@@ -654,6 +861,8 @@ class NCCLDeviceV2Transport:
             self.gin_connections,
             self.gin_context_count,
             self.gin_reliable_doorbell,
+            self.ring_broadcast,
+            self.ring_swizzle,
             os.environ.get("AWEX_NCCL_DEVICE_V2_HCA_POLICY", "balanced"),
             os.environ.get("NCCL_IB_HCA", "topology"),
         )
@@ -664,6 +873,19 @@ class NCCLDeviceV2Transport:
         start_time = time.perf_counter()
         self._extension = _load_extension()
         device = torch.device(device_util.get_torch_device())
+        feature_sums = torch.tensor(
+            [int(self.ring_broadcast), int(self.ring_swizzle)],
+            dtype=torch.int32,
+            device=device,
+        )
+        dist.all_reduce(feature_sums, op=dist.ReduceOp.SUM, group=self.group)
+        feature_sums = [int(value) for value in feature_sums.cpu().tolist()]
+        if any(value not in (0, self.world_size) for value in feature_sums):
+            raise NCCLDeviceV2UnavailableError(
+                "nccl_device_v2 ring feature flags must match on every rank: "
+                f"ring_broadcast_sum={feature_sums[0]}, "
+                f"ring_swizzle_sum={feature_sums[1]}, world_size={self.world_size}"
+            )
         unique_id_size = int(self._extension.unique_id_size())
         unique_id_tensor = torch.empty(unique_id_size, dtype=torch.uint8, device=device)
         if self.rank == 0:
@@ -741,6 +963,8 @@ class NCCLDeviceV2Transport:
                 batch.peers,
                 batch.ordinals,
                 batch.expected_counts,
+                batch.forward_peers,
+                batch.ring_ids,
                 bool(sender),
                 int(sequence),
             )
@@ -749,6 +973,13 @@ class NCCLDeviceV2Transport:
             "AWEX_NCCL_DEVICE_V2_HCA_POLICY", "balanced"
         )
         extension_metrics["selected_hca"] = os.environ.get("NCCL_IB_HCA", "topology")
+        extension_metrics["ring_order_strategy"] = (
+            _RingOrderStrategy.ROOT_SWIZZLE.value
+            if self.ring_broadcast and self.ring_swizzle
+            else _RingOrderStrategy.FIXED.value
+            if self.ring_broadcast
+            else "disabled"
+        )
         selected_hca_bandwidth = os.environ.get(
             "AWEX_NCCL_DEVICE_V2_SELECTED_HCA_BANDWIDTH_GBPS"
         )
@@ -792,6 +1023,10 @@ class NCCLDeviceV2Transport:
                 self.rank,
                 self.world_size,
                 self.chunk_bytes,
+                infer_instance_world_size=self.infer_instance_world_size,
+                num_infer_engines=self.num_infer_engines,
+                ring_broadcast=self.ring_broadcast,
+                ring_swizzle=self.ring_swizzle,
             )
             build_batch_time_ms = (time.perf_counter() - build_start) * 1000.0
         metrics = self._run(batch, sender=True, sequence=_sequence_from_step(step_id))
@@ -813,6 +1048,10 @@ class NCCLDeviceV2Transport:
                 self.rank,
                 self.world_size,
                 self.chunk_bytes,
+                infer_instance_world_size=self.infer_instance_world_size,
+                num_infer_engines=self.num_infer_engines,
+                ring_broadcast=self.ring_broadcast,
+                ring_swizzle=self.ring_swizzle,
             )
             build_batch_time_ms = (time.perf_counter() - build_start) * 1000.0
         metrics = self._run(batch, sender=False, sequence=_sequence_from_step(step_id))
@@ -832,6 +1071,10 @@ class NCCLDeviceV2Transport:
             self.world_size,
             self.chunk_bytes,
             allow_staging=allow_staging,
+            infer_instance_world_size=self.infer_instance_world_size,
+            num_infer_engines=self.num_infer_engines,
+            ring_broadcast=self.ring_broadcast,
+            ring_swizzle=self.ring_swizzle,
         )
         self._prepared_send = (parameters, plan, batch)
 
@@ -848,6 +1091,10 @@ class NCCLDeviceV2Transport:
             self.world_size,
             self.chunk_bytes,
             allow_staging=allow_staging,
+            infer_instance_world_size=self.infer_instance_world_size,
+            num_infer_engines=self.num_infer_engines,
+            ring_broadcast=self.ring_broadcast,
+            ring_swizzle=self.ring_swizzle,
         )
         self._prepared_recv = (parameters, plan, batch)
 
