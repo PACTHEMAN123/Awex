@@ -620,6 +620,9 @@ class NCCLDeviceV2Transport:
         self.gin_reliable_doorbell = _resolve_gin_reliable_doorbell(
             gin_reliable_doorbell
         )
+        # NCCL discovers a GIN plugin during communicator setup but leaves the
+        # communicator's GIN capability disabled unless this opt-in is set.
+        os.environ.setdefault("NCCL_GIN_ENABLE", "1")
         if self.gin_connections:
             os.environ["NCCL_GIN_NCONNECTIONS"] = str(self.gin_connections)
         else:

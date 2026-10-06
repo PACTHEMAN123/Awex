@@ -17,6 +17,7 @@
 
 import os
 
+from awex.transfer.nccl_device_v2 import NCCLDeviceV2Transport
 from awex.transfer.nccl_device_v2_gin import (
     _active_rdma_endpoints,
     _configure_gin_hca_policy,
@@ -24,6 +25,19 @@ from awex.transfer.nccl_device_v2_gin import (
     _RdmaEndpoint,
     _weighted_hca_assignments,
 )
+
+
+def test_transport_enables_nccl_gin_by_default(monkeypatch):
+    monkeypatch.delenv("NCCL_GIN_ENABLE", raising=False)
+
+    NCCLDeviceV2Transport(
+        group=None,
+        rank=0,
+        world_size=2,
+        gin_connections=4,
+    )
+
+    assert os.environ["NCCL_GIN_ENABLE"] == "1"
 
 
 def test_active_rdma_endpoints_read_active_port_capacity(tmp_path):
