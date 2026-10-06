@@ -774,7 +774,6 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
   metrics["gin_connection_count"] = py::int_(state->gin.connection_count);
   const std::uint32_t gin_credit_batch = v2::v2GinCreditBatch(active_gin_peers, state->gin_fifo_depth);
   metrics["gin_credit_batch"] = py::int_(gin_credit_batch);
-  metrics["gin_request_batch"] = py::int_(v2::v2GinRequestBatch(state->gin_fifo_depth));
   metrics["network_channels_per_peer"] = py::int_(state->gin.channels_per_peer);
   metrics["network_channel_budget"] = py::int_(state->gin.channel_budget);
   py::list peer_channel_counts;

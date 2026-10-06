@@ -219,10 +219,6 @@ inline std::uint32_t v2GinCreditBatch(std::uint32_t active_gin_peers, std::uint3
   return active_gin_peers > 1 ? 1 : std::min<std::uint32_t>(4, std::max<std::uint32_t>(1, fifo_depth / 2));
 }
 
-inline std::uint32_t v2GinRequestBatch(std::uint32_t fifo_depth) {
-  return std::min<std::uint32_t>(4, std::max<std::uint32_t>(1, fifo_depth / 2));
-}
-
 inline int v2GinType(const V2GinState& state) {
 #if AWEX_NCCL_DEVICE_V2_HAS_GIN
   return static_cast<int>(state.type);
@@ -246,7 +242,6 @@ inline void v2SetGinKernelArgs(const V2GinState& state, ncclWindow_t window,
                                V2KernelArgs* args) {
   args->gin_enabled = state.enabled ? 1U : 0U;
   args->gin_credit_batch = v2GinCreditBatch(active_gin_peers, fifo_depth);
-  args->gin_request_batch = v2GinRequestBatch(fifo_depth);
   args->gin_signal_count = state.signal_count;
 #if AWEX_NCCL_DEVICE_V2_HAS_GIN
   args->window = window;
