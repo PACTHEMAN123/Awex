@@ -33,6 +33,7 @@ namespace nccl_device_v2 {
 
 struct V2GinState {
   bool enabled = false;
+  bool railed = false;
   std::uint32_t signal_count = 0;
   std::uint32_t connection_count = 0;
   std::uint32_t context_count = 0;
@@ -162,14 +163,21 @@ inline void v2InitializeGin(V2GinState* state, ncclComm_t comm, int world_size,
                             std::vector<std::uint32_t>* peer_channels) {
   if (!state->enabled) return;
 #if AWEX_NCCL_DEVICE_V2_HAS_GIN
-  state->signal_count = 2U * static_cast<std::uint32_t>(world_size) * total_channels;
+  const ncclTeam_t lsa = ncclTeamLsa(comm);
+  state->railed = lsa.nRanks > 1;
+  state->signal_count = state->railed ? 0U : 2U * static_cast<std::uint32_t>(world_size) * total_channels;
   ncclDevCommRequirements requirements = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
-  requirements.ginForceEnable = true;
+  requirements.ginForceEnable = !state->railed;
   requirements.ginContextCount = static_cast<int>(std::min(context_count, total_channels));
   requirements.ginSignalCount = static_cast<int>(state->signal_count);
-  requirements.ginConnectionType = NCCL_GIN_CONNECTION_FULL;
+  requirements.ginConnectionType =
+    state->railed ? NCCL_GIN_CONNECTION_RAIL : NCCL_GIN_CONNECTION_FULL;
   requirements.ginQueueDepth = 1024;
-  requirements.worldGinBarrierCount = 1;
+  if (state->railed) {
+    requirements.barrierCount = 1;
+  } else {
+    requirements.worldGinBarrierCount = 1;
+  }
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2, 30, 7)
   requirements.ginStrongSignalsRequired = true;
   requirements.ginVaSignalsRequired = false;
@@ -179,6 +187,7 @@ inline void v2InitializeGin(V2GinState* state, ncclComm_t comm, int world_size,
     throw std::runtime_error(std::string("ncclDevCommCreate failed: ") + ncclGetErrorString(result));
   }
   state->created = true;
+  state->railed = state->dev_comm.ginIsRailed != 0;
   state->context_count = static_cast<std::uint32_t>(state->dev_comm.ginContextCount);
   state->connection_count = static_cast<std::uint32_t>(state->dev_comm.ginConnectionCount);
   if (state->context_count == 0 || state->connection_count == 0) {
@@ -244,6 +253,7 @@ inline void v2SetGinKernelArgs(const V2GinState& state, ncclWindow_t window,
                                std::uint32_t active_gin_peers, std::uint32_t fifo_depth,
                                V2KernelArgs* args) {
   args->gin_enabled = state.enabled ? 1U : 0U;
+  args->gin_railed = state.railed ? 1U : 0U;
   args->gin_credit_batch = v2GinCreditBatch(active_gin_peers, fifo_depth);
   args->gin_signal_count = state.signal_count;
 #if AWEX_NCCL_DEVICE_V2_HAS_GIN

@@ -55,17 +55,29 @@ _WEIGHT_SPECS = {
 _STEP_VALUES = ((1.25, -2.5, 7.0), (3.5, 0.75, -4.0))
 
 
-def _make_plan(rank: int) -> TransferPlan:
+def _paired_ranks(rank: int, world_size: int) -> tuple[int, int]:
+    if world_size == 2:
+        return 0, 1
+    # Cross local GPU indices so a two-node/four-rank run exercises rail GIN
+    # through an LSA proxy instead of accidentally testing only aligned rails.
+    half = world_size // 2
+    if rank < half:
+        return rank, world_size - 1 - rank
+    return world_size - 1 - rank, rank
+
+
+def _make_plan(rank: int, world_size: int) -> TransferPlan:
+    send_rank, recv_rank = _paired_ranks(rank, world_size)
     operations = []
     for name, (shape, _) in _WEIGHT_SPECS.items():
         shard = SimpleNamespace(name=name, shape=shape)
         slices = tuple(slice(None) for _ in shape)
         operations.append(
             CommunicationOperation(
-                send_rank=0,
+                send_rank=send_rank,
                 send_shard_meta=shard,
                 send_offset=tuple(0 for _ in shape),
-                recv_rank=1,
+                recv_rank=recv_rank,
                 recv_shard_meta=shard,
                 recv_offset=tuple(0 for _ in shape),
                 overlap_shape=shape,
@@ -73,7 +85,8 @@ def _make_plan(rank: int) -> TransferPlan:
                 inf_slices=slices,
             )
         )
-    return TransferPlan(operations={1 - rank: operations})
+    peer = recv_rank if rank == send_rank else send_rank
+    return TransferPlan(operations={peer: operations})
 
 
 def _set_values(parameters: dict[str, torch.Tensor], values: tuple[float, ...]) -> None:
@@ -99,8 +112,9 @@ def main() -> None:
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
-    if world_size != 2:
-        raise RuntimeError("nccl_device_v2_multinode_e2e requires two ranks")
+    if world_size not in (2, 4):
+        raise RuntimeError("nccl_device_v2_multinode_e2e requires two or four ranks")
+    send_rank, recv_rank = _paired_ranks(rank, world_size)
 
     torch.cuda.set_device(local_rank)
     dist.init_process_group("nccl")
@@ -108,7 +122,7 @@ def main() -> None:
         name: torch.zeros(shape, dtype=dtype, device="cuda")
         for name, (shape, dtype) in _WEIGHT_SPECS.items()
     }
-    plan = _make_plan(rank)
+    plan = _make_plan(rank, world_size)
     transport = NCCLDeviceV2Transport(
         dist.group.WORLD,
         rank,
@@ -118,25 +132,25 @@ def main() -> None:
     )
 
     try:
-        if rank == 0:
+        if rank == send_rank:
             transport.prepare_send(parameters, plan, allow_staging=False)
         else:
             transport.prepare_recv(parameters, plan, allow_staging=False)
 
         launch_metrics = []
         for step_id, values in zip((-1, 0), _STEP_VALUES):
-            if rank == 0:
+            if rank == send_rank:
                 _set_values(parameters, values)
             else:
                 _set_values(parameters, (0.0, 0.0, 0.0))
             dist.barrier(device_ids=[local_rank])
-            if rank == 0:
+            if rank == send_rank:
                 metrics = transport.send(parameters, plan, step_id)
             else:
                 metrics = transport.recv(parameters, plan, step_id)
             launch_metrics.append(metrics)
             dist.barrier(device_ids=[local_rank])
-            if rank == 1:
+            if rank == recv_rank:
                 _verify_values(parameters, values)
 
         metrics = launch_metrics[-1]
@@ -146,6 +160,8 @@ def main() -> None:
             raise AssertionError(f"GIN was not initialized: {metrics}")
         if metrics["gin_connection_count"] <= 0:
             raise AssertionError(f"GIN has no network connections: {metrics}")
+        if world_size == 4 and not metrics["gin_railed"]:
+            raise AssertionError(f"multi-GPU nodes did not select rail GIN: {metrics}")
         if metrics["network_step_bytes"] != transport.network_step_bytes:
             raise AssertionError(f"expected NCCL network step size: {metrics}")
         if metrics["fifo_depth"] != 8 or metrics["gin_fifo_depth"] != 16:
