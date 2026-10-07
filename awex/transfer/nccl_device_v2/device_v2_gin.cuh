@@ -25,15 +25,17 @@ namespace nccl_device_v2 {
 #if AWEX_NCCL_DEVICE_V2_HAS_GIN
 
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2, 30, 7)
-using V2GinReadySignalInc = ncclGin_StrongSignalInc;
+using V2GinReadySignalAdd = ncclGin_StrongSignalAdd;
 using V2GinCreditSignalAdd = ncclGin_WeakSignalAdd;
 #else
-// NCCL 2.30.4 SignalInc has the strong ordering semantics later made
-// explicit by StrongSignalInc: the signal follows all earlier puts to the
-// same peer on the same context.
-using V2GinReadySignalInc = ncclGin_SignalInc;
+// NCCL 2.30.4 SignalAdd has the strong ordering semantics later made explicit
+// by StrongSignalAdd: the signal follows all earlier puts to the same peer on
+// the same context.
+using V2GinReadySignalAdd = ncclGin_SignalAdd;
 using V2GinCreditSignalAdd = ncclGin_SignalAdd;
 #endif
+
+constexpr std::uint32_t kV2GinReadyBatch = 4;
 
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2, 30, 7)
 constexpr ncclGinFenceLevel kV2GinNoFence = ncclGinFenceLevel::None;
@@ -130,13 +132,26 @@ __device__ __forceinline__ void v2GinRunSend(const V2KernelArgs& args, const V2W
     }
     if ((roles & kRolePostSend) && v2LoadError(error) == 0) {
       const unsigned long long post_start = clock64();
-      // The cumulative ready counter requires ordered completion so a later
-      // put cannot satisfy the wait for an earlier FIFO step.
-      gin.put(world, work.peer, args.window,
-              v2GinPayloadOffset(args, work.peer, args.local_rank, channel, step, work.fifo_depth), args.window,
-              v2GinPayloadOffset(args, args.local_rank, work.peer, channel, step, work.fifo_depth), slice_bytes,
-              V2GinReadySignalInc{ready_signal}, ncclGin_None{}, ncclCoopThread{}, ncclGin_None{},
-              cuda::thread_scope_thread, cuda::thread_scope_device, ncclGinOptFlagsDefault);
+      const std::uint64_t work_step = step - work.step_begin + 1;
+      const bool work_complete = cursor + slice_bytes == work.nbytes;
+      const bool publish_ready = work_complete || work_step % kV2GinReadyBatch == 0;
+      if (publish_ready) {
+        const std::uint64_t ready_count =
+          work_complete && work_step % kV2GinReadyBatch != 0 ? work_step % kV2GinReadyBatch : kV2GinReadyBatch;
+        // A strong cumulative signal makes every put in this batch visible
+        // before the receiver consumes any of its FIFO slots.
+        gin.put(world, work.peer, args.window,
+                v2GinPayloadOffset(args, work.peer, args.local_rank, channel, step, work.fifo_depth), args.window,
+                v2GinPayloadOffset(args, args.local_rank, work.peer, channel, step, work.fifo_depth), slice_bytes,
+                V2GinReadySignalAdd{ready_signal, ready_count}, ncclGin_None{}, ncclCoopThread{}, ncclGin_None{},
+                cuda::thread_scope_thread, cuda::thread_scope_device, ncclGinOptFlagsDefault);
+      } else {
+        gin.put(world, work.peer, args.window,
+                v2GinPayloadOffset(args, work.peer, args.local_rank, channel, step, work.fifo_depth), args.window,
+                v2GinPayloadOffset(args, args.local_rank, work.peer, channel, step, work.fifo_depth), slice_bytes,
+                ncclGin_None{}, ncclGin_None{}, ncclCoopThread{}, ncclGin_None{}, cuda::thread_scope_thread,
+                cuda::thread_scope_device, ncclGinOptFlagsDefault);
+      }
       profile->post_cycles += clock64() - post_start;
     }
     if (v2LoadError(error) != 0) return;
