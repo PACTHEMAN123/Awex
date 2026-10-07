@@ -74,8 +74,10 @@ __device__ __forceinline__ std::uint8_t* v2GinLocalPayload(const V2KernelArgs& a
 // that progression to adjacent existing FIFO slots, not a new receive buffer.
 // Keep at least half the window available for producer/consumer overlap and
 // batched credits. Padded slots and small windows retain single-slice puts.
-__device__ __forceinline__ std::uint32_t v2GinPutSteps(const V2KernelArgs& args, const V2Work& work) {
-  return work.ring_id != kNoRing && work.step_bytes == args.layout.slot_bytes && work.fifo_depth >= 4
+__device__ __forceinline__ std::uint32_t v2GinPutSteps(
+    const V2KernelArgs& args, const V2Work& work, bool quantized_source = false) {
+  return (work.ring_id != kNoRing || quantized_source) &&
+      work.step_bytes == args.layout.slot_bytes && work.fifo_depth >= 4
     ? work.fifo_depth / 2 : 1;
 }
 
@@ -89,7 +91,7 @@ struct V2GinFifoPut {
   __device__ __forceinline__ void append(const V2KernelArgs& args, const V2Work& work,
       const ncclGin& gin, std::uint32_t peer, std::uint32_t channel, std::uint32_t source_peer,
       std::uint64_t source, std::uint64_t destination, std::uint64_t slice_bytes,
-      std::uint64_t slice_index, bool complete, Coop coop) {
+      std::uint64_t slice_index, bool complete, Coop coop, bool quantized_source = false) {
     if (steps == 0) {
       source_step = source;
       destination_step = destination;
@@ -101,7 +103,7 @@ struct V2GinFifoPut {
     // Anchor groups to the work's logical slice index, not to the preceding
     // wrap flush. Otherwise a short wrap batch can shift the next publication
     // past the window boundary while the receiver is waiting to retire it.
-    if ((slice_index + 1) % v2GinPutSteps(args, work) != 0 && !complete &&
+    if ((slice_index + 1) % v2GinPutSteps(args, work, quantized_source) != 0 && !complete &&
         (source + 1) % work.fifo_depth != 0 && (destination + 1) % work.fifo_depth != 0) return;
     gin.put(ncclTeamWorld(args.dev_comm), peer, args.window,
             v2GinPayloadOffset(args, peer, args.local_rank, channel, destination_step, work.fifo_depth),
@@ -146,6 +148,13 @@ __device__ __forceinline__ void v2GinRunSend(const V2KernelArgs& args, const V2W
   auto* error = &reinterpret_cast<V2WindowHeader*>(args.local_window)->error;
   ncclGin gin{args.dev_comm, static_cast<int>(channel % args.dev_comm.ginContextCount)};
   const ncclGinSignal_t credit_signal = v2GinCreditSignal(args, work.peer, channel);
+  // Direct FP8 fanout also benefits from submitting adjacent existing FIFO
+  // slots as one put. Source stores complete before publication, and the
+  // cumulative ready signal covers every copied slot in the group. Keep the
+  // copy-only source's original single-step submission and all ring routes.
+  bool quantized_source = false;
+  for (std::uint32_t index = 0; index < work.fragment_count; ++index)
+    quantized_source |= args.fragments[work.fragment_begin + index].block_rows != 0;
   V2GinFifoPut fifo_put;
   std::uint64_t cursor = 0;
   std::uint64_t step = work.step_begin;
@@ -177,7 +186,8 @@ __device__ __forceinline__ void v2GinRunSend(const V2KernelArgs& args, const V2W
       // The cumulative ready counter requires ordered completion so a later
       // put cannot satisfy the wait for an earlier FIFO step.
       fifo_put.append(args, work, gin, work.peer, channel, work.peer, step, step, slice_bytes,
-                      cursor / work.step_bytes, cursor + slice_bytes == work.nbytes, ncclCoopThread{});
+                      cursor / work.step_bytes, cursor + slice_bytes == work.nbytes, ncclCoopThread{},
+                      quantized_source);
       profile->post_cycles += clock64() - post_start;
     }
     if (v2LoadError(error) != 0) return;
