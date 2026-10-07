@@ -32,7 +32,8 @@ import os
 import socket
 import threading
 import time
-from dataclasses import dataclass, field as dataclass_field
+from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from enum import Enum
 from typing import Any
 
@@ -594,6 +595,13 @@ def _build_send_batch(
                     tensor = tensor.contiguous()
                 fragments = [tensor]
             for fragment in fragments:
+                if (
+                    fp8_block_shape
+                    and isinstance(parameter, StaticTensorLayout)
+                    and str(op.recv_shard_meta.dtype).removeprefix("torch.")
+                    == "float8_e4m3fn"
+                ):
+                    fragment = fragment.view(-1, op.overlap_shape[-1])
                 _ensure_cuda_tensor(fragment, op.send_shard_meta.name)
                 length = int(fragment.numel()) * int(fragment.element_size())
                 row_bytes, row_stride = _tensor_copy_layout(
