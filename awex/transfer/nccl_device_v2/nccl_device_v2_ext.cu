@@ -470,25 +470,27 @@ void initialize_sparse_window(DeviceState* state, const std::vector<std::uint32_
   }) ? 1U : 0U;
   // Count source fanout rather than receiver fan-in: a receiver can have
   // many training peers even when each source publishes only a few replicas.
-  // Larger direct source fanouts retain the established FIFO/channel policy;
-  // eagerly assigning more compute lanes made their shared-rail credit waits
-  // substantially worse in the full-model qualification.
-  const std::uint32_t local_wide_source =
-    direction == v2::V2Direction::kSend && local_fp8 && active_peers.size() >= 8 ? 1U : 0U;
+  // The compute-aware compact policy is qualified for medium source fanout.
+  // Small and large fanouts retain the established transport progression:
+  // their full-model credit waits regressed with the compact direct policy.
+  const std::uint32_t local_source_peer_count =
+    direction == v2::V2Direction::kSend && local_fp8 ?
+      static_cast<std::uint32_t>(active_peers.size()) : 0U;
   const std::uint32_t local_flags[] = {
-    local_non_ring | local_ring, local_non_ring_lsa, local_fp8, local_wide_source};
+    local_non_ring | local_ring, local_non_ring_lsa, local_fp8, local_source_peer_count};
   const auto flags = v2::topology_detail::allGather(state->comm, local_flags, 4, state->world_size, stream);
   bool ring_only = true, has_ring = false, has_non_ring_lsa = false, has_fp8 = false;
-  bool has_wide_source = false;
+  std::uint32_t source_peer_count = 0;
   for (int rank = 0; rank < state->world_size; ++rank) {
     ring_only &= (flags[rank * 4] & 1U) == 0;
     has_ring |= (flags[rank * 4] & 2U) != 0;
     has_non_ring_lsa |= flags[rank * 4 + 1] != 0;
     has_fp8 |= flags[rank * 4 + 2] != 0;
-    has_wide_source |= flags[rank * 4 + 3] != 0;
+    source_peer_count = std::max(source_peer_count, flags[rank * 4 + 3]);
   }
+  const bool compute_aware_direct = source_peer_count >= 4 && source_peer_count < 8;
   const bool packed_fp8_gin =
-    state->gin.enabled && has_fp8 && !has_non_ring_lsa && (has_ring || !has_wide_source);
+    state->gin.enabled && has_fp8 && !has_non_ring_lsa && (has_ring || compute_aware_direct);
   const std::size_t slot_bytes = (ring_only || packed_fp8_gin) ? state->network_step_bytes :
     state->gin.enabled ? std::max(state->step_bytes, state->network_step_bytes) : state->step_bytes;
   state->payload_peer_count = payload_peer_count;
