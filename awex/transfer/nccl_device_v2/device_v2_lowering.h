@@ -431,13 +431,27 @@ inline V2Schedule lowerFixedTasks(const std::vector<V2LoweringTask>& tasks,
       // NCCL diversifies ring starting offsets across parallel lanes. Split
       // colliding roots' first-service priority across channels, so one entire
       // root group does not occupy every lane before another group can inject.
+      // NCCL topology selection mirrors low rank bits to group rail ownership.
+      // Ring IDs encode root * TP + shard: mirroring groups the low root bits
+      // that choose the first inference node. Ascending root order alternates
+      // that node on every root in a two-node swizzle; grouping avoids repeated
+      // direction changes while preserving the opposite channel priorities.
+      auto mirror_root = [](std::uint32_t value) {
+        value = ((value >> 1) & 0x55555555U) | ((value & 0x55555555U) << 1);
+        value = ((value >> 2) & 0x33333333U) | ((value & 0x33333333U) << 2);
+        value = ((value >> 4) & 0x0f0f0f0fU) | ((value & 0x0f0f0f0fU) << 4);
+        value = ((value >> 8) & 0x00ff00ffU) | ((value & 0x00ff00ffU) << 8);
+        return (value >> 16) | (value << 16);
+      };
       // Each channel keeps a global order, and drains whole roots as before;
       // no chunk-boundary flush, receive storage, or extra launch is needed.
       const bool reverse_roots = (channel & 1U) != 0;
-      std::stable_sort(colliding_ring_work.begin(), colliding_ring_work.end(), [reverse_roots](const V2Work& left,
+      std::stable_sort(colliding_ring_work.begin(), colliding_ring_work.end(), [reverse_roots, mirror_root](const V2Work& left,
                                                                                  const V2Work& right) {
         if (left.ring_id != right.ring_id) {
-          return reverse_roots ? left.ring_id > right.ring_id : left.ring_id < right.ring_id;
+          const auto left_root = mirror_root(left.ring_id);
+          const auto right_root = mirror_root(right.ring_id);
+          return reverse_roots ? left_root > right_root : left_root < right_root;
         }
         if (left.chunk_ordinal != right.chunk_ordinal) return left.chunk_ordinal < right.chunk_ordinal;
         return left.peer < right.peer;
