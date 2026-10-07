@@ -258,8 +258,8 @@ __device__ __forceinline__ void v2RunRelay(const V2KernelArgs& args, const V2Wor
         if (publish_ready) {
           const std::uint64_t ready_count =
             work_complete && work_step % kV2GinReadyBatch != 0 ? work_step % kV2GinReadyBatch : kV2GinReadyBatch;
-          gin.signal(world, work.forward_peer,
-                     V2GinReadySignalAdd{v2GinReadySignal(args, args.local_rank, channel), ready_count});
+          v2GinPublishReady(gin, world, work.forward_peer, v2GinReadySignal(args, args.local_rank, channel),
+                            ready_count);
         }
       } else {
         output_slot->bytes = static_cast<std::uint32_t>(slice_bytes);

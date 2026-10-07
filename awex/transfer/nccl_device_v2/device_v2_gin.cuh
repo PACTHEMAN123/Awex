@@ -55,6 +55,11 @@ __device__ __forceinline__ ncclGinSignal_t v2GinCreditSignal(const V2KernelArgs&
                                       channel);
 }
 
+__device__ __noinline__ void v2GinPublishReady(const ncclGin& gin, ncclTeam world, std::uint32_t peer,
+                                               ncclGinSignal_t signal, std::uint64_t count) {
+  gin.signal(world, peer, V2GinReadySignalAdd{signal, count});
+}
+
 __device__ __forceinline__ std::size_t v2GinPayloadOffset(const V2KernelArgs& args, std::uint32_t window_rank,
                                                           std::uint32_t peer, std::uint32_t channel,
                                                           unsigned long long step, std::uint32_t fifo_depth) {
@@ -145,7 +150,7 @@ __device__ __forceinline__ void v2GinRunSend(const V2KernelArgs& args, const V2W
           work_complete && work_step % kV2GinReadyBatch != 0 ? work_step % kV2GinReadyBatch : kV2GinReadyBatch;
         // A strong cumulative doorbell makes every put in this batch visible
         // before the receiver consumes any of its FIFO slots.
-        gin.signal(world, work.peer, V2GinReadySignalAdd{ready_signal, ready_count});
+        v2GinPublishReady(gin, world, work.peer, ready_signal, ready_count);
       }
       profile->post_cycles += clock64() - post_start;
     }
