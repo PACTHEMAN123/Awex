@@ -30,5 +30,5 @@ def fp8_server_args() -> list[str]:
         "--hf-overrides",
         json.dumps(overrides),
         "--kernel-config",
-        json.dumps({"moe_backend": "triton"}),
+        json.dumps({"moe_backend": "triton", "linear_backend": "triton"}),
     ]
