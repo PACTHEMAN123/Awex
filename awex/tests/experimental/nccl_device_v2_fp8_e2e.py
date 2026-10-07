@@ -54,7 +54,7 @@ def main():
     writer, readers = world - 1, list(range(world - 1))
     br = int(os.environ.get("AWEX_NCCL_DEVICE_V2_FP8_BLOCK_ROWS", "128"))
     bc = int(os.environ.get("AWEX_NCCL_DEVICE_V2_FP8_BLOCK_COLS", "128"))
-    shape = (4096, 1024)
+    shape = (4096, int(os.environ.get("AWEX_FP8_CHECK_COLUMNS", "1024")))
     dtype = torch.bfloat16 if rank == writer else torch.float8_e4m3fn
     padding = 0 if os.environ.get("AWEX_FP8_CHECK_CONTIGUOUS") == "1" else 128
     # Strided matrices test direct model writes without a staging tensor.
