@@ -15,8 +15,9 @@ from awex.transfer.transfer_plan import CommunicationOperation, TransferPlan
 def main():
     rank, world = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
     readers = 4 if os.environ.get("AWEX_RING_CHECK_COLLIDING_MIXED") == "1" else 2
-    if world != readers + 10:
-        raise ValueError(f"Use {readers} readers and 10 writers")
+    writers = 8 if readers == 4 else 10
+    if world != readers + writers:
+        raise ValueError(f"Use {readers} readers and {writers} writers")
     torch.cuda.set_device(0)
     dist.init_process_group("nccl")
     parameters, operations = {}, {}
