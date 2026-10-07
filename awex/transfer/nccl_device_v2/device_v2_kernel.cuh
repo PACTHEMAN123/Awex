@@ -156,7 +156,9 @@ __device__ __forceinline__ void v2GinRunDirectRelay(
   auto* error = &reinterpret_cast<V2WindowHeader*>(args.local_window)->error;
   const std::uint64_t slices = (work.nbytes + work.step_bytes - 1) / work.step_bytes;
   if (tid < kWarpSize) {
-    ncclCoopWarpSpan warps(threadIdx.x / kWarpSize, 1, threadIdx.x / kWarpSize);
+    // A single warp needs no named barrier. WarpSpan uses 1+id and would
+    // collide with this work group's existing main/copy barriers.
+    ncclCoopWarp warps;
     std::uint64_t retired = 0;
     // Retire an input slot only after both readers (local copy and outgoing
     // NIC) are finished. A successor credit proves the put's source was read.
