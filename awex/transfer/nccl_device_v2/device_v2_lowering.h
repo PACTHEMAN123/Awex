@@ -428,13 +428,31 @@ inline V2Schedule lowerFixedTasks(const std::vector<V2LoweringTask>& tasks,
     }
     if (ring_ids.size() > 1 && colliding_ring_work.size() == remaining) {
       schedule.ring_channel_collision_count += static_cast<std::uint32_t>(ring_ids.size() - 1);
-      std::stable_sort(colliding_ring_work.begin(), colliding_ring_work.end(), [](const V2Work& left,
+      // NCCL diversifies ring starting offsets across parallel lanes. Split
+      // colliding roots' first-service priority across channels, so one entire
+      // root group does not occupy every lane before another group can inject.
+      // Each channel keeps a global order, and drains whole roots as before;
+      // no chunk-boundary flush, receive storage, or extra launch is needed.
+      const bool reverse_roots = (channel & 1U) != 0;
+      std::stable_sort(colliding_ring_work.begin(), colliding_ring_work.end(), [reverse_roots](const V2Work& left,
                                                                                  const V2Work& right) {
-        if (left.ring_id != right.ring_id) return left.ring_id < right.ring_id;
+        if (left.ring_id != right.ring_id) {
+          return reverse_roots ? left.ring_id > right.ring_id : left.ring_id < right.ring_id;
+        }
         if (left.chunk_ordinal != right.chunk_ordinal) return left.chunk_ordinal < right.chunk_ordinal;
         return left.peer < right.peer;
       });
-      for (const V2Work& work : colliding_ring_work) {
+      std::vector<std::uint64_t> ordered_send_steps(config.world_size, 1);
+      std::vector<std::uint64_t> ordered_recv_steps(config.world_size, 1);
+      for (V2Work& work : colliding_ring_work) {
+        const std::uint64_t work_steps = v2DivUp(work.nbytes, work.step_bytes);
+        auto& input_steps = direction == V2Direction::kSend ? ordered_send_steps : ordered_recv_steps;
+        work.step_begin = input_steps[work.peer];
+        input_steps[work.peer] += work_steps;
+        if (work.forward_peer != kNoPeer) {
+          work.forward_step_begin = ordered_send_steps[work.forward_peer];
+          ordered_send_steps[work.forward_peer] += work_steps;
+        }
         V2WorkBatch batch{};
         batch.work_begin = static_cast<std::uint32_t>(schedule.works.size());
         batch.work_count = 1;
