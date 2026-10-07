@@ -210,7 +210,11 @@ __device__ __forceinline__ void v2GinRunDirectRelay(
       if (index >= work.fifo_depth && retired <= index - work.fifo_depth) {
         // Returning only one slot can deadlock a batched-credit predecessor:
         // it cannot supply our next input until an entire credit batch is sent.
-        const std::uint64_t credit_batch = input_gin ? args.gin_credit_batch : 1;
+        // A coalescing predecessor needs a full publication group available
+        // before its next ready signal. Retire that many existing input slots.
+        const std::uint64_t credit_batch = input_gin
+          ? (args.gin_credit_batch > v2GinPutSteps(args, work)
+              ? args.gin_credit_batch : v2GinPutSteps(args, work)) : 1;
         const std::uint64_t target = ((index - work.fifo_depth) / credit_batch + 1) * credit_batch;
         while (retired < target && retired < slices) {
           if (!retire(retired)) break;
@@ -261,7 +265,7 @@ __device__ __forceinline__ void v2GinRunDirectRelay(
               v2GinPayloadOffset(args, args.local_rank, direct_source ? work.peer : work.forward_peer, channel,
                                  direct_source ? work.step_begin + index : work.forward_step_begin + index,
                                  work.fifo_depth),
-              bytes, V2GinReadySignalInc{v2GinReadySignal(args, args.local_rank, channel)},
+              bytes, V2GinReadySignalAdd{v2GinReadySignal(args, args.local_rank, channel), 1},
               ncclGin_None{}, warps, ncclGin_None{}, cuda::thread_scope_thread,
               cuda::thread_scope_device, ncclGinOptFlagsDefault);
       else if (tid == 0) {
@@ -344,6 +348,9 @@ __device__ __forceinline__ void v2RunRelay(const V2KernelArgs& args, const V2Wor
   std::uint64_t cursor = 0;
   std::uint64_t input_step = work.step_begin;
   std::uint64_t output_step = work.forward_step_begin;
+#if AWEX_NCCL_DEVICE_V2_HAS_GIN
+  V2GinFifoPut fifo_put;
+#endif
 
   while (cursor < work.nbytes) {
     const std::uint64_t slice_bytes =
@@ -437,13 +444,12 @@ __device__ __forceinline__ void v2RunRelay(const V2KernelArgs& args, const V2Wor
       // before a potentially backpressured forward put so congestion on the
       // successor does not unnecessarily stall the predecessor.
       if (output_gin) {
-        gin.put(world, work.forward_peer, args.window,
-                v2GinPayloadOffset(args, work.forward_peer, args.local_rank, channel, output_step, work.fifo_depth),
-                args.window,
-                v2GinPayloadOffset(args, args.local_rank, work.forward_peer, channel, output_step, work.fifo_depth),
-                slice_bytes, V2GinReadySignalInc{v2GinReadySignal(args, args.local_rank, channel)}, ncclGin_None{},
-                ncclCoopThread{}, ncclGin_None{}, cuda::thread_scope_thread, cuda::thread_scope_device,
-                ncclGinOptFlagsDefault);
+        // Stage into existing send FIFO slots, then submit one contiguous put
+        // and strong ready increment for a bounded group. Input credits may
+        // advance independently: they no longer protect these copied sources.
+        fifo_put.append(args, work, gin, work.forward_peer, channel, work.forward_peer,
+                        output_step, output_step, slice_bytes, cursor / work.step_bytes,
+                        cursor + slice_bytes == work.nbytes, ncclCoopThread{});
       } else {
         output_slot->bytes = static_cast<std::uint32_t>(slice_bytes);
         v2Publish(&output_slot->ready_step, output_step);
