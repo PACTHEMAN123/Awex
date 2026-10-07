@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include <nccl_device/utility.h>
+
 #include "device_v2_types.cuh"
 
 namespace awex {
@@ -250,12 +252,63 @@ __device__ __forceinline__ void v2CopyContiguousToTwoDestinations(std::uint8_t* 
   }
 }
 
+// NCCL reduceCopyPacks (src/device/common_kernel.h, Apache-2.0) assigns
+// contiguous unrolled hunks to warps, rather than making a CTA visit each row.
+// Adapt its pack traversal to our strided model view; retain existing FIFO
+// storage and use NCCL's reciprocal division for the logical-to-physical map.
+__device__ __forceinline__ void v2CopyPackedRowsToContiguous(
+    std::uint8_t* destination, const std::uint8_t* tensor, std::uint64_t tensor_offset,
+    std::uint64_t nbytes, std::uint32_t row_bytes, std::uint64_t row_stride, int tid, int nthreads) {
+  const std::uint32_t reciprocal = nccl::utility::idivRcp32(row_bytes);
+  auto address = [&] __device__(std::uint64_t offset) {
+    const std::uint32_t logical = static_cast<std::uint32_t>(tensor_offset + offset);
+    const std::uint32_t row = nccl::utility::idivFast32(logical, row_bytes, reciprocal);
+    const std::uint32_t column = logical - row * row_bytes;
+    return tensor + static_cast<std::uint64_t>(row) * row_stride + column;
+  };
+  constexpr std::uint64_t packs_per_hunk = kWarpSize * kCopyUnroll;
+  const std::uint64_t pack_count = nbytes / kCopyPackBytes;
+  const std::uint64_t full_hunks = pack_count / packs_per_hunk;
+  const int warp = tid / kWarpSize;
+  const int lane = tid % kWarpSize;
+  const int nwarps = nthreads / kWarpSize;
+  for (std::uint64_t hunk = warp; hunk < full_hunks; hunk += nwarps) {
+    V2Pack128 values[kCopyUnroll];
+#pragma unroll
+    for (int u = 0; u < kCopyUnroll; ++u) {
+      const std::uint64_t offset = (hunk * packs_per_hunk + u * kWarpSize + lane) * kCopyPackBytes;
+      values[u] = v2Load128(address(offset));
+    }
+#pragma unroll
+    for (int u = 0; u < kCopyUnroll; ++u) {
+      const std::uint64_t offset = (hunk * packs_per_hunk + u * kWarpSize + lane) * kCopyPackBytes;
+      v2Store128(destination + offset, values[u]);
+    }
+  }
+  for (std::uint64_t pack = full_hunks * packs_per_hunk + tid; pack < pack_count; pack += nthreads) {
+    const std::uint64_t offset = pack * kCopyPackBytes;
+    v2Store128(destination + offset, v2Load128(address(offset)));
+  }
+  for (std::uint64_t offset = pack_count * kCopyPackBytes + tid; offset < nbytes; offset += nthreads) {
+    v2Store8(destination + offset, v2Load8(address(offset)));
+  }
+}
+
 __device__ __forceinline__ void v2CopyTensorToContiguous(std::uint8_t* destination, const std::uint8_t* tensor,
                                                          std::uint64_t tensor_offset, std::uint64_t nbytes,
                                                          std::uint64_t row_bytes, std::uint64_t row_stride, int tid,
                                                          int nthreads) {
   if (row_bytes == row_stride) {
     v2CopyContiguous(destination, tensor + tensor_offset, nbytes, tid, nthreads);
+    return;
+  }
+
+  const std::uintptr_t aligned = reinterpret_cast<std::uintptr_t>(destination) |
+    reinterpret_cast<std::uintptr_t>(tensor) | tensor_offset | row_bytes | row_stride;
+  if (aligned % kCopyPackBytes == 0 && tensor_offset <= UINT32_MAX &&
+      nbytes <= UINT32_MAX - tensor_offset && row_bytes <= UINT32_MAX) {
+    v2CopyPackedRowsToContiguous(destination, tensor, tensor_offset, nbytes,
+                                static_cast<std::uint32_t>(row_bytes), row_stride, tid, nthreads);
     return;
   }
 

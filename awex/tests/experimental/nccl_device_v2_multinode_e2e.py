@@ -116,16 +116,26 @@ def main() -> None:
         raise RuntimeError("nccl_device_v2_multinode_e2e requires two or four ranks")
     ring = world_size == 4
     mixed = os.environ.get("AWEX_RING_CHECK_MIXED") == "1"
+    strided = os.environ.get("AWEX_RING_CHECK_STRIDED") == "1"
     writer = world_size - 1 if ring else 0
     readers = list(range(world_size - 1)) if ring else [1]
-    if ring:
+    if ring and strided:
+        _WEIGHT_SPECS["model.dense.weight"] = ((32768, 96), torch.float32)
+        _WEIGHT_SPECS["model.expert.weight"] = ((65536, 192), torch.float16)
+    elif ring:
         _WEIGHT_SPECS["model.dense.weight"] = ((4096, 1024), torch.float32)
         _WEIGHT_SPECS["model.expert.weight"] = ((8192, 1024), torch.float16)
 
     torch.cuda.set_device(local_rank)
     dist.init_process_group("nccl")
     parameters = {
-        name: torch.zeros(shape, dtype=dtype, device="cuda")
+        name: (
+            torch.zeros((shape[0], shape[1] + 32), dtype=dtype, device="cuda")[
+                :, : shape[1]
+            ]
+            if strided and len(shape) == 2
+            else torch.zeros(shape, dtype=dtype, device="cuda")
+        )
         for name, (shape, dtype) in _WEIGHT_SPECS.items()
     }
     plan = _make_plan(rank, writer, readers)
