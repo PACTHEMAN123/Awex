@@ -430,11 +430,29 @@ inline V2Schedule lowerFixedTasks(const std::vector<V2LoweringTask>& tasks,
       schedule.ring_channel_collision_count += static_cast<std::uint32_t>(ring_ids.size() - 1);
       std::stable_sort(colliding_ring_work.begin(), colliding_ring_work.end(), [](const V2Work& left,
                                                                                  const V2Work& right) {
-        if (left.ring_id != right.ring_id) return left.ring_id < right.ring_id;
         if (left.chunk_ordinal != right.chunk_ordinal) return left.chunk_ordinal < right.chunk_ordinal;
+        if (left.ring_id != right.ring_id) return left.ring_id < right.ring_id;
         return left.peer < right.peer;
       });
-      for (const V2Work& work : colliding_ring_work) {
+      // Globally ordered chunk rounds let all roots inject concurrently rather
+      // than draining one complete root before admitting the next. Reassign
+      // steps in that order: relay roots share physical (peer, channel) FIFOs,
+      // and producer/consumer must agree on the new slot-reuse sequence.
+      std::vector<std::uint64_t> ordered_send_steps(config.world_size, 1);
+      std::vector<std::uint64_t> ordered_recv_steps(config.world_size, 1);
+      for (V2Work& work : colliding_ring_work) {
+        const std::uint64_t work_steps = v2DivUp(work.nbytes, work.step_bytes);
+        auto& input_steps = direction == V2Direction::kSend ? ordered_send_steps : ordered_recv_steps;
+        work.step_begin = input_steps[work.peer];
+        input_steps[work.peer] += work_steps;
+        if (work.forward_peer != kNoPeer) {
+          work.forward_step_begin = ordered_send_steps[work.forward_peer];
+          ordered_send_steps[work.forward_peer] += work_steps;
+        }
+        // A GIN peer's existing payload slots serve both receive storage and
+        // outgoing staging. A later root can reverse that edge, so retire all
+        // outgoing reads at each chunk boundary before allowing that reuse.
+        work.final = 1;
         V2WorkBatch batch{};
         batch.work_begin = static_cast<std::uint32_t>(schedule.works.size());
         batch.work_count = 1;
