@@ -534,6 +534,8 @@ def _fp8_wire_bytes(tensor, block_shape, dtype) -> int:
         tensor.dtype != dtype
         or tensor.ndim != 2
         or tensor.stride(1) != 1
+        or tensor.data_ptr() % 16
+        or (tensor.stride(0) * tensor.element_size()) % 16
         or tensor.shape[0] % br
         or tensor.shape[1] % bc
     ):
@@ -614,6 +616,8 @@ def _build_send_batch(
                     == "float8_e4m3fn"
                 ):
                     length = _fp8_wire_bytes(fragment, fp8_block_shape, torch.bfloat16)
+                    row_bytes = int(fragment.shape[1]) * 2
+                    row_stride = int(fragment.stride(0)) * 2
                     q = [*fp8_block_shape, 0, 0]
                 quantization.append(q)
                 ordinal = _append_tensor_range(
@@ -715,6 +719,10 @@ def _build_recv_batch(
                     target, op.recv_shard_meta.name
                 )
             _ensure_cuda_tensor(target, op.recv_shard_meta.name)
+            if fp8_block_shape and target.dtype == torch.float8_e4m3fn:
+                _fp8_wire_bytes(target, fp8_block_shape, torch.float8_e4m3fn)
+                row_bytes = int(target.shape[1])
+                row_stride = int(target.stride(0))
             fragment_numels = [int(target.numel())]
             if op.send_tensor_span_numels:
                 layout_fragments = slice_layout_fragments(

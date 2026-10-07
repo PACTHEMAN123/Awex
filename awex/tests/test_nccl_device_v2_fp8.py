@@ -59,6 +59,8 @@ def test_fp8_ring_preserves_block_records_and_scale_views(monkeypatch):
         fp8_block_shape=(128, 128),
     )
     assert send.lengths == recv.lengths == [4 * (128 * 128 + 16)] * 2
+    assert send.tensor_row_bytes == [512, 512]
+    assert send.tensor_row_strides == [512, 512]
     assert [tuple(t.shape) for t in send.tensors] == [(256, 256)] * 2
     assert send.expected_counts == [2, 0, 0, 0]
     assert recv.quantization[1][2] == scales[2:].data_ptr()

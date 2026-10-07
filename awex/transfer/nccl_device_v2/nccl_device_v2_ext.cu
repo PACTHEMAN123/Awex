@@ -668,6 +668,8 @@ std::vector<v2::V2LoweringTask> build_tasks(
             tensor.stride(1) != 1 || tensor.size(0) % q[0] != 0 || tensor.size(1) % q[1] != 0 ||
             (sender && tensor.scalar_type() != at::ScalarType::BFloat16) ||
             (!sender && tensor.scalar_type() != at::ScalarType::Float8_e4m3fn) ||
+            tensor_row_bytes[index] != tensor.size(1) * tensor.element_size() ||
+            tensor_row_strides[index] != tensor.stride(0) * tensor.element_size() ||
             tensor_offsets[index] != 0 ||
             lengths[index] != (tensor.numel() / (q[0] * q[1])) * (q[0] * q[1] + 16))
           throw std::runtime_error("invalid FP8 matrix/dtype/block/wire range");
