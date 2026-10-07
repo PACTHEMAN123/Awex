@@ -54,7 +54,7 @@ esac
 
 case "$backend" in
   verl-nccl-bucket)
-    publication=verl_nccl_broadcast
+    publication=verl_native_nccl
     comm_backend=nccl
     ;;
   awex-nccl)

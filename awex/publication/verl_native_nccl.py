@@ -1,0 +1,219 @@
+"""Run veRL's installed checkpoint engine in the standalone Awex harness.
+
+Only the Ray actor-context check is bridged: harness workers are independently
+launched processes, while veRL normally calls the same APIs from Ray actors.
+Packing, metadata PUB/SUB, double buffering, and NCCL broadcasts remain veRL's.
+"""
+
+import asyncio
+import hashlib
+import inspect
+import os
+from pathlib import Path
+from unittest.mock import patch
+
+import torch
+
+from awex import logging
+from awex.publication.registry import (
+    register_publication_mechanism,
+    register_vllm_publication_receiver,
+)
+from awex.publication.verl_nccl import (
+    McoreFullTensorExporter,
+    VerlNcclBroadcastPublicationMechanism,
+)
+
+logger = logging.getLogger(__name__)
+
+
+def _engine_class():
+    import ray
+    from verl.checkpoint_engine.nccl_checkpoint_engine import NCCLCheckpointEngine
+
+    source = Path(inspect.getfile(NCCLCheckpointEngine))
+    logger.info(
+        "Native veRL NCCLCheckpointEngine source=%s sha256=%s",
+        source,
+        hashlib.sha256(source.read_bytes()).hexdigest(),
+    )
+    if not ray.is_initialized():
+        ray.init(
+            address=os.environ.get("AWEX_NATIVE_VERL_RAY_ADDRESS", "11.18.56.89:6379"),
+            namespace="awex-native-verl",
+            logging_level="ERROR",
+        )
+    return NCCLCheckpointEngine
+
+
+def _standalone_context():
+    # Keep the original Ray collective implementation; allow this explicitly
+    # selected standalone integration harness to call it outside an actor.
+    return patch("ray.util.collective.collective._check_inside_actor", lambda: None)
+
+
+class _MetadataCounter:
+    """Observe native metadata without changing serialization or payloads."""
+
+    def __init__(self, socket):
+        self.socket = socket
+        self.reset()
+
+    def reset(self):
+        self.payload_bytes = 0
+        self.bucket_count = 0
+
+    def _record(self, metadata):
+        self.payload_bytes += int(metadata["length"])
+        self.bucket_count += 1
+
+    def send_pyobj(self, metadata, *args, **kwargs):
+        self._record(metadata)
+        return self.socket.send_pyobj(metadata, *args, **kwargs)
+
+    def recv_pyobj(self, *args, **kwargs):
+        metadata = self.socket.recv_pyobj(*args, **kwargs)
+        self._record(metadata)
+        return metadata
+
+    def __getattr__(self, name):
+        return getattr(self.socket, name)
+
+
+def _close_engine(engine):
+    import ray.util.collective as collective
+
+    with _standalone_context():
+        if collective.is_group_initialized(engine.group_name):
+            collective.destroy_collective_group(engine.group_name)
+    engine.finalize()
+    engine.socket.close(linger=0)
+
+
+class NativeVerlSender:
+    def __init__(self, *, world_size, group_id, bucket_size):
+        self.world_size = world_size
+        self.engine = _engine_class()(
+            bucket_size=bucket_size, group_name=group_id, is_master=True
+        )
+        self.metadata = self.engine.prepare()
+        self.host, self.port = self.metadata.zmq_ip, self.metadata.zmq_port
+        self.engine.socket = _MetadataCounter(self.engine.socket)
+
+    def initialize_process_group(self):
+        with _standalone_context():
+            self.engine.init_process_group(0, self.world_size, self.metadata)
+
+    def broadcast_weights(self, step_id, weights):
+        self.engine.socket.reset()
+        tensor_count = 0
+
+        def counted_weights():
+            nonlocal tensor_count
+            for name, tensor in weights:
+                tensor_count += 1
+                yield name, tensor
+
+        with _standalone_context():
+            asyncio.run(
+                self.engine.send_weights(counted_weights(), global_steps=step_id)
+            )
+        return {
+            "payload_bytes": self.engine.socket.payload_bytes,
+            "tensor_count": tensor_count,
+            "bucket_count": self.engine.socket.bucket_count,
+        }
+
+    def close(self):
+        _close_engine(self.engine)
+
+
+@register_vllm_publication_receiver("verl_native_nccl")
+class NativeVerlReceiver:
+    def __init__(self, config, worker_rank):
+        self.config = config
+        self.rank = int(config.get("rank_offset", 0)) + worker_rank + 1
+        self.engine = None
+
+    def initialize(self):
+        from verl.checkpoint_engine.nccl_checkpoint_engine import MasterMetadata
+
+        world_size = int(self.config["world_size"])
+        if not 1 <= self.rank < world_size:
+            raise ValueError(f"Invalid native veRL receiver rank {self.rank}")
+        self.engine = _engine_class()(
+            bucket_size=int(self.config["bucket_size"]),
+            group_name=self.config["group_id"],
+            is_master=False,
+        )
+        self.engine.prepare()
+        metadata = MasterMetadata(
+            zmq_ip=self.config["store_host"], zmq_port=int(self.config["store_port"])
+        )
+        with _standalone_context():
+            self.engine.init_process_group(self.rank, world_size, metadata)
+        self.engine.socket = _MetadataCounter(self.engine.socket)
+        return {"publication_rank": self.rank}
+
+    @torch.no_grad()
+    def update(self, model, step_id):
+        if self.engine is None:
+            raise RuntimeError("Native veRL receiver is not initialized")
+        self.engine.socket.reset()
+        tensor_count = 0
+
+        async def load():
+            nonlocal tensor_count
+            async for name, tensor in self.engine.receive_weights(global_steps=step_id):
+                model.load_weights(iter([(name, tensor)]))
+                tensor_count += 1
+            torch.cuda.synchronize()
+
+        with _standalone_context():
+            asyncio.run(load())
+        return {
+            "publication_rank": self.rank,
+            "payload_bytes": self.engine.socket.payload_bytes,
+            "received_tensors": tensor_count,
+            "bucket_count": self.engine.socket.bucket_count,
+        }
+
+    def close(self):
+        if self.engine is not None:
+            _close_engine(self.engine)
+            self.engine = None
+        return {"closed": True}
+
+
+@register_publication_mechanism("verl_native_nccl")
+class NativeVerlPublicationMechanism(VerlNcclBroadcastPublicationMechanism):
+    """Reuse harness orchestration, with the actual veRL checkpoint data path."""
+
+    def initialize_training(self):
+        harness = self.harness
+        self.exporter = McoreFullTensorExporter(
+            harness.megatron_engine,
+            inference_tp_size=harness.inference_config["tp_size"],
+        )
+        self.exporter.initialize()
+        if harness.is_driver:
+            self.sender = NativeVerlSender(
+                world_size=int(harness.inference_config["tp_size"])
+                * int(harness.inference_config.get("num_engines", 1))
+                + 1,
+                group_id=self.group_id,
+                bucket_size=self.bucket_size,
+            )
+
+    def close(self):
+        # The parent closes inference receivers through the HTTP harness. Its
+        # sender cleanup belongs to the reconstructed backend, so hide that
+        # sender temporarily and then use the native engine's own lifecycle.
+        sender = self.sender
+        self.sender = None
+        try:
+            super().close()
+        finally:
+            self.sender = sender
+            if sender is not None:
+                sender.close()

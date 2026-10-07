@@ -498,7 +498,10 @@ class MultiVLLMWeightsExchangeIT:
         loaded = megatron_model_from_hf(
             model_path=self.inference_config["model_path"],
             use_mbridge=self.use_mbridge,
-            return_bridge=(self.publication_mechanism_name == "verl_nccl_broadcast"),
+            return_bridge=(
+                self.publication_mechanism_name
+                in ("verl_nccl_broadcast", "verl_native_nccl")
+            ),
         )
         if len(loaded) == 3:
             model, hf_config, self.mcore_bridge = loaded

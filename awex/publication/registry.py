@@ -70,6 +70,7 @@ def _load_builtin_mechanisms() -> None:
         return
     importlib.import_module("awex.publication.awex")
     importlib.import_module("awex.publication.verl_nccl")
+    importlib.import_module("awex.publication.verl_native_nccl")
     _BUILTINS_LOADED = True
 
 
