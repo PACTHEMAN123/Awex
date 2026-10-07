@@ -33,6 +33,7 @@ namespace nccl_device_v2 {
 
 struct V2GinState {
   bool enabled = false;
+  bool fused_fp8_direct = false;
   std::uint32_t signal_count = 0;
   std::uint32_t connection_count = 0;
   std::uint32_t context_count = 0;
@@ -94,6 +95,7 @@ inline void v2ConfigureGinChannels(V2GinState* state, std::uint32_t total_channe
                                    const std::vector<std::uint8_t>& transports,
                                    std::vector<std::uint32_t>* peer_channels,
                                    bool fused_fp8_direct = false) {
+  state->fused_fp8_direct = fused_fp8_direct;
   const std::uint32_t base_channels =
     std::min(total_channels, v2PowerOfTwoUp(2 * state->connection_count));
   // Direct BF16->FP8 adds substantial copy-worker computation to each rail.
@@ -223,8 +225,14 @@ inline ncclResult_t v2DestroyGin(V2GinState* state, ncclComm_t comm) {
   return result;
 }
 
-inline std::uint32_t v2GinCreditBatch(std::uint32_t active_gin_peers, std::uint32_t fifo_depth) {
-  return active_gin_peers > 1 ? 1 : std::min<std::uint32_t>(4, std::max<std::uint32_t>(1, fifo_depth / 2));
+inline std::uint32_t v2GinCreditBatch(std::uint32_t active_gin_peers, std::uint32_t fifo_depth,
+                                    bool fused_fp8_direct = false) {
+  // FP8 direct puts already publish groups from the existing window. Returning
+  // credits in smaller groups amortizes remote atomics without delaying more
+  // than half a window. The receiver flushes partial groups at every work end;
+  // ring and copy-only communicators retain their original credit policy.
+  return active_gin_peers > 1 && !fused_fp8_direct ? 1 :
+    std::min<std::uint32_t>(4, std::max<std::uint32_t>(1, fifo_depth / 2));
 }
 
 inline int v2GinType(const V2GinState& state) {
@@ -249,7 +257,7 @@ inline void v2SetGinKernelArgs(const V2GinState& state, ncclWindow_t window,
                                std::uint32_t active_gin_peers, std::uint32_t fifo_depth,
                                V2KernelArgs* args) {
   args->gin_enabled = state.enabled ? 1U : 0U;
-  args->gin_credit_batch = v2GinCreditBatch(active_gin_peers, fifo_depth);
+  args->gin_credit_batch = v2GinCreditBatch(active_gin_peers, fifo_depth, state.fused_fp8_direct);
   args->gin_signal_count = state.signal_count;
 #if AWEX_NCCL_DEVICE_V2_HAS_GIN
   args->window = window;
