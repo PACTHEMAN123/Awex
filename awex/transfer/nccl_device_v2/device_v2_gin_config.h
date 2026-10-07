@@ -33,6 +33,7 @@ namespace nccl_device_v2 {
 
 struct V2GinState {
   bool enabled = false;
+  bool source_coop_warp = false;
   std::uint32_t signal_count = 0;
   std::uint32_t connection_count = 0;
   std::uint32_t context_count = 0;
@@ -251,6 +252,7 @@ inline void v2SetGinKernelArgs(const V2GinState& state, ncclWindow_t window,
   args->gin_enabled = state.enabled ? 1U : 0U;
   args->gin_credit_batch = v2GinCreditBatch(active_gin_peers, fifo_depth);
   args->gin_signal_count = state.signal_count;
+  args->gin_source_coop_warp = state.source_coop_warp ? 1U : 0U;
 #if AWEX_NCCL_DEVICE_V2_HAS_GIN
   args->window = window;
   if (state.created) args->dev_comm = state.dev_comm;

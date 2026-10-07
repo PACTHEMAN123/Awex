@@ -182,6 +182,7 @@ struct V2KernelArgs {
   std::uint32_t gin_enabled;
   std::uint32_t gin_credit_batch;
   std::uint32_t gin_signal_count;
+  std::uint32_t gin_source_coop_warp;
 #if AWEX_NCCL_DEVICE_V2_HAS_GIN
   ncclWindow_t window;
   ncclDevComm dev_comm;
