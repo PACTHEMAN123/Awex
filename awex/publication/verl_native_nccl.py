@@ -9,6 +9,7 @@ import asyncio
 import hashlib
 import inspect
 import os
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -23,6 +24,7 @@ from awex.publication.verl_nccl import (
     McoreFullTensorExporter,
     VerlNcclBroadcastPublicationMechanism,
 )
+from awex.util.profile import emit_profile, profile_phase
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +107,7 @@ class NativeVerlSender:
             self.engine.init_process_group(0, self.world_size, self.metadata)
 
     def broadcast_weights(self, step_id, weights):
+        started = time.perf_counter()
         self.engine.socket.reset()
         tensor_count = 0
 
@@ -118,11 +121,26 @@ class NativeVerlSender:
             asyncio.run(
                 self.engine.send_weights(counted_weights(), global_steps=step_id)
             )
-        return {
+        result = {
             "payload_bytes": self.engine.socket.payload_bytes,
             "tensor_count": tensor_count,
             "bucket_count": self.engine.socket.bucket_count,
         }
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        emit_profile(
+            logger,
+            event="weight_transfer",
+            role="writer",
+            rank=0,
+            backend="verl_native_nccl",
+            comm_backend="verl-nccl-bucket",
+            step_id=step_id,
+            phase=profile_phase(step_id),
+            backend_execute_time_ms=elapsed_ms,
+            native_pack_and_transfer_time_ms=elapsed_ms,
+            **result,
+        )
+        return result
 
     def close(self):
         _close_engine(self.engine)
@@ -159,6 +177,7 @@ class NativeVerlReceiver:
     def update(self, model, step_id):
         if self.engine is None:
             raise RuntimeError("Native veRL receiver is not initialized")
+        started = time.perf_counter()
         self.engine.socket.reset()
         tensor_count = 0
 
@@ -171,12 +190,27 @@ class NativeVerlReceiver:
 
         with _standalone_context():
             asyncio.run(load())
-        return {
+        result = {
             "publication_rank": self.rank,
             "payload_bytes": self.engine.socket.payload_bytes,
             "received_tensors": tensor_count,
             "bucket_count": self.engine.socket.bucket_count,
         }
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        emit_profile(
+            logger,
+            event="weight_transfer",
+            role="reader",
+            rank=self.rank,
+            backend="verl_native_nccl",
+            comm_backend="verl-nccl-bucket",
+            step_id=step_id,
+            phase=profile_phase(step_id),
+            backend_execute_time_ms=elapsed_ms,
+            native_receive_and_load_time_ms=elapsed_ms,
+            **result,
+        )
+        return result
 
     def close(self):
         if self.engine is not None:
