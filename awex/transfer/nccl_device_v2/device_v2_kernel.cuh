@@ -345,7 +345,9 @@ __device__ __forceinline__ void v2RunRelay(const V2KernelArgs& args, const V2Wor
   std::uint64_t input_step = work.step_begin;
   std::uint64_t output_step = work.forward_step_begin;
 
-  auto wait_peer = [&] __device__() {
+  while (cursor < work.nbytes) {
+    const std::uint64_t slice_bytes =
+      work.step_bytes < work.nbytes - cursor ? work.step_bytes : work.nbytes - cursor;
     V2FifoSlot* input_slot = input_gin
       ? nullptr
       : v2FifoSlot(args, work.peer, args.local_rank, channel, input_step, work.fifo_depth, false);
@@ -384,8 +386,9 @@ __device__ __forceinline__ void v2RunRelay(const V2KernelArgs& args, const V2Wor
         profile->input_wait_cycles += clock64() - wait_start;
       }
     }
-  };
-  auto copy_slice = [&] __device__(std::uint64_t slice_bytes) {
+    const unsigned long long copy_start = tid == 0 ? clock64() : 0;
+    if (roles & kRoleWorker) v2GroupBarrier(wait_barrier, nworkers);
+
     const std::uint8_t* input_payload = nullptr;
     std::uint8_t* output_payload = nullptr;
 #if AWEX_NCCL_DEVICE_V2_HAS_GIN
@@ -401,20 +404,18 @@ __device__ __forceinline__ void v2RunRelay(const V2KernelArgs& args, const V2Wor
       output_payload =
         v2FifoPayload(args, args.local_rank, work.forward_peer, channel, output_step, work.fifo_depth, true);
     }
-    if (*ready && *forward_ready) {
+    if ((roles & kRoleWorker) && *ready && *forward_ready) {
       v2CopyContiguousToFragmentsAndContiguous(args, work, output_payload, input_payload, cursor, slice_bytes, tid,
                                                nworkers);
     }
-  };
-  auto post_peer = [&] __device__(std::uint64_t slice_bytes) {
+
+    v2GroupBarrier(barrier, nthreads);
+    if (tid == 0) {
+      profile->copy_cycles += clock64() - copy_start;
+      ++profile->slice_count;
+    }
     if ((roles & kRolePostRecv) && v2LoadError(error) == 0) {
       const unsigned long long post_start = clock64();
-      V2FifoSlot* input_slot = input_gin
-        ? nullptr
-        : v2FifoSlot(args, work.peer, args.local_rank, channel, input_step, work.fifo_depth, false);
-      V2FifoSlot* output_slot = output_gin
-        ? nullptr
-        : v2FifoSlot(args, args.local_rank, work.forward_peer, channel, output_step, work.fifo_depth, true);
 #if AWEX_NCCL_DEVICE_V2_HAS_GIN
       ncclGin gin{args.dev_comm, static_cast<int>(channel % args.dev_comm.ginContextCount)};
       const ncclTeam world = ncclTeamWorld(args.dev_comm);
@@ -454,43 +455,10 @@ __device__ __forceinline__ void v2RunRelay(const V2KernelArgs& args, const V2Wor
 #endif
       profile->post_cycles += clock64() - post_start;
     }
-  };
-
-  // NCCL SIMPLE genericOp's two loops: workers stay in the wait/copy loop;
-  // the reserved post warp goes directly to its matching barrier/post loop.
-  // No per-slice worker branch or FIFO address setup on the post-only path.
-  // GIN still requires an ordered put and batched credit rather than NCCL's
-  // connection head/tail stores; input credit follows the fused FIFO copy.
-  if (tid < nworkers) {
-    while (cursor < work.nbytes) {
-      const std::uint64_t slice_bytes =
-        work.step_bytes < work.nbytes - cursor ? work.step_bytes : work.nbytes - cursor;
-      wait_peer();
-      const unsigned long long copy_start = tid == 0 ? clock64() : 0;
-      v2GroupBarrier(wait_barrier, nworkers);
-      copy_slice(slice_bytes);
-      v2GroupBarrier(barrier, nthreads);
-      if (tid == 0) {
-        profile->copy_cycles += clock64() - copy_start;
-        ++profile->slice_count;
-      }
-      post_peer(slice_bytes);
-      if (v2LoadError(error) != 0) return;
-      cursor += slice_bytes;
-      ++input_step;
-      ++output_step;
-    }
-  } else {
-    while (cursor < work.nbytes) {
-      const std::uint64_t slice_bytes =
-        work.step_bytes < work.nbytes - cursor ? work.step_bytes : work.nbytes - cursor;
-      v2GroupBarrier(barrier, nthreads);
-      post_peer(slice_bytes);
-      if (v2LoadError(error) != 0) return;
-      cursor += slice_bytes;
-      ++input_step;
-      ++output_step;
-    }
+    if (v2LoadError(error) != 0) return;
+    cursor += slice_bytes;
+    ++input_step;
+    ++output_step;
   }
 
   if (work.final && work.nbytes != 0) {
@@ -541,11 +509,18 @@ __device__ __forceinline__ void v2RunBatch(const V2KernelArgs& args, const V2Wor
     V2KernelProfile* profile = args.profiles + static_cast<std::size_t>(blockIdx.x) * kMaxWorksPerBatch + group;
     const bool use_gin = args.peer_transports[work.peer] == static_cast<std::uint8_t>(V2Transport::kGin);
     if (work.forward_peer != kNoPeer) {
-      // Use NCCL SIMPLE's fused FIFO path on mixed and GIN edges as well:
-      // release the input after copying, protect output reuse independently.
+#if AWEX_NCCL_DEVICE_V2_HAS_GIN
+      const bool forward_gin = args.peer_transports[work.forward_peer] == static_cast<std::uint8_t>(V2Transport::kGin);
+      if ((use_gin || forward_gin) && extra_send_barrier) {
+        v2GinRunDirectRelay(args, work, channel, subtid, subthreads, main_barrier, wait_barrier,
+                            &shared.ready[group], &shared.copy_completed[group], profile);
+      } else
+#endif
+      {
       v2RunRelay(args, work, channel, subtid, subthreads, main_barrier, wait_barrier, &shared.ready[group],
                  &shared.forward_ready[group],
                  &shared.step_cache[group], &shared.forward_step_cache[group], profile);
+      }
     } else if (use_gin) {
 #if AWEX_NCCL_DEVICE_V2_HAS_GIN
       if (args.direction == V2Direction::kSend) {
