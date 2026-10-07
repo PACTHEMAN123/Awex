@@ -73,23 +73,15 @@ __device__ __forceinline__ std::uint8_t* v2GinLocalPayload(const V2KernelArgs& a
 __device__ __forceinline__ bool v2GinWaitSignal(const V2KernelArgs& args, const ncclGin& gin, ncclGinSignal_t signal,
                                                 unsigned long long expected, unsigned int error_code) {
   auto* error = &reinterpret_cast<V2WindowHeader*>(args.local_window)->error;
-  const auto signal_ref = ncclGinCall<ncclGinApi_GetSignalPtr>(gin._makeCtx(), signal);
   const unsigned long long start = clock64();
-  while (true) {
-#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 30, 7)
-    const unsigned long long observed =
-      cuda::atomic_ref<std::uint64_t>{*signal_ref.ptr}.load(cuda::memory_order_acquire) - signal_ref.offset;
-#else
-    const unsigned long long observed =
-      cuda::atomic_ref<std::uint64_t>{*signal_ref}.load(cuda::memory_order_acquire);
-#endif
-    if (observed >= expected) return v2LoadError(error) == 0;
+  while (gin.readSignal(signal) < expected) {
     if (v2LoadError(error) != 0) return false;
     if (clock64() - start > args.timeout_cycles) {
       atomicCAS(error, 0U, error_code);
       return false;
     }
   }
+  return true;
 }
 
 __device__ __forceinline__ std::uint32_t v2GinRoles(V2Direction direction, int tid, int nthreads, int* nworkers) {
