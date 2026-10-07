@@ -158,8 +158,15 @@ __device__ __forceinline__ void v2GinRunSend(const V2KernelArgs& args, const V2W
   // cumulative ready signal covers every copied slot in the group. Keep the
   // copy-only source's original single-step submission and all ring routes.
   bool quantized_source = false;
-  for (std::uint32_t index = 0; index < work.fragment_count; ++index)
-    quantized_source |= args.fragments[work.fragment_begin + index].block_rows != 0;
+  // Only the publishing thread needs this classification, and only where
+  // direct coalescing can actually be enabled. Large model works contain
+  // thousands of descriptors; walking them in every copy thread wastes
+  // bandwidth even for legacy padded slots and already-classified rings.
+  if ((roles & kRolePostSend) && work.ring_id == kNoRing && args.active_peer_count < 8 &&
+      work.step_bytes == args.layout.slot_bytes && work.fifo_depth >= 4) {
+    for (std::uint32_t index = 0; index < work.fragment_count && !quantized_source; ++index)
+      quantized_source = args.fragments[work.fragment_begin + index].block_rows != 0;
+  }
   V2GinFifoPut fifo_put;
   std::uint64_t cursor = 0;
   std::uint64_t step = work.step_begin;
