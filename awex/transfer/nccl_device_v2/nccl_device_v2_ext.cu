@@ -491,6 +491,14 @@ void initialize_sparse_window(DeviceState* state, const std::vector<std::uint32_
   const bool compute_aware_direct = source_peer_count >= 4 && source_peer_count < 8;
   const bool packed_fp8_gin =
     state->gin.enabled && has_fp8 && !has_non_ring_lsa && (has_ring || compute_aware_direct);
+  // Small direct fanout retains padded slots and single-slice puts, but
+  // slightly more lanes prevent low-payload training peers from receiving
+  // half as many copy workers as their larger peers. This spends existing
+  // channel registration only; connections, signals and credits are unchanged.
+  const bool small_fp8_direct = has_fp8 && !has_ring && !has_non_ring_lsa &&
+    source_peer_count >= 2 && source_peer_count < 4;
+  const std::uint32_t gin_channel_budget_factor = small_fp8_direct ? 8U :
+    packed_fp8_gin && !has_ring ? 12U : 6U;
   const std::size_t slot_bytes = (ring_only || packed_fp8_gin) ? state->network_step_bytes :
     state->gin.enabled ? std::max(state->step_bytes, state->network_step_bytes) : state->step_bytes;
   state->payload_peer_count = payload_peer_count;
@@ -559,7 +567,7 @@ void initialize_sparse_window(DeviceState* state, const std::vector<std::uint32_
       v2::v2InitializeGin(&state->gin, state->comm, state->world_size, state->total_channels,
                           state->gin_fifo_depth, state->network_step_bytes, state->gin.context_count,
                           active_peers, state->peer_transports, std::move(peer_payload_bytes),
-                          &state->peer_channels, packed_fp8_gin && !has_ring);
+                          &state->peer_channels, gin_channel_budget_factor);
       const auto peer_channel_matrix = v2::topology_detail::allGather(
         state->comm, state->peer_channels.data(), state->peer_channels.size(), state->world_size, stream);
       state->gin.channels_per_peer = 1;

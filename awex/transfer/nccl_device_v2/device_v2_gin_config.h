@@ -93,7 +93,7 @@ inline void v2ConfigureGinChannels(V2GinState* state, std::uint32_t total_channe
                                    const std::vector<std::uint32_t>& active_peers,
                                    const std::vector<std::uint8_t>& transports,
                                    std::vector<std::uint32_t>* peer_channels,
-                                   bool fused_fp8_direct = false) {
+                                   std::uint32_t channel_budget_factor = 6) {
   const std::uint32_t base_channels =
     std::min(total_channels, v2PowerOfTwoUp(2 * state->connection_count));
   // Direct BF16->FP8 adds substantial copy-worker computation to each rail.
@@ -101,7 +101,7 @@ inline void v2ConfigureGinChannels(V2GinState* state, std::uint32_t total_channe
   // the copy-only and ring budgets stay unchanged. In a many-sender receiver,
   // the network-only budget otherwise negotiates just one or two CTAs per
   // pair, even while most SMs and already registered slots remain unused.
-  state->channel_budget = std::min(total_channels, (fused_fp8_direct ? 12U : 6U) * state->connection_count);
+  state->channel_budget = std::min(total_channels, channel_budget_factor * state->connection_count);
 
   std::vector<std::uint32_t> gin_peers;
   for (const std::uint32_t peer : active_peers) {
@@ -169,7 +169,7 @@ inline void v2InitializeGin(V2GinState* state, ncclComm_t comm, int world_size,
                             const std::vector<std::uint8_t>& transports,
                             std::vector<std::uint64_t> peer_payload_bytes,
                             std::vector<std::uint32_t>* peer_channels,
-                            bool fused_fp8_direct = false) {
+                            std::uint32_t channel_budget_factor = 6) {
   if (!state->enabled) return;
 #if AWEX_NCCL_DEVICE_V2_HAS_GIN
   state->signal_count = 2U * static_cast<std::uint32_t>(world_size) * total_channels;
@@ -194,7 +194,7 @@ inline void v2InitializeGin(V2GinState* state, ncclComm_t comm, int world_size,
   }
   state->peer_payload_bytes = std::move(peer_payload_bytes);
   v2ConfigureGinChannels(state, total_channels, gin_fifo_depth, network_step_bytes, active_peers,
-                         transports, peer_channels, fused_fp8_direct);
+                         transports, peer_channels, channel_budget_factor);
 #else
   (void)comm;
   (void)world_size;
@@ -206,7 +206,7 @@ inline void v2InitializeGin(V2GinState* state, ncclComm_t comm, int world_size,
   (void)transports;
   (void)peer_payload_bytes;
   (void)peer_channels;
-  (void)fused_fp8_direct;
+  (void)channel_budget_factor;
 #endif
 }
 
