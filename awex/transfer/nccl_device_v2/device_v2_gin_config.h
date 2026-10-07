@@ -96,8 +96,14 @@ inline void v2ConfigureGinChannels(V2GinState* state, std::uint32_t total_channe
                                    std::vector<std::uint32_t>* peer_channels,
                                    bool fused_fp8_direct = false) {
   state->fused_fp8_direct = fused_fp8_direct;
+  // Keep direct FP8 lanes on separate peer groups in the two-node fanout.
+  // Eight lanes per pair folds peers separated by eight communicator ranks
+  // onto the same channel group at total_channels=64. With eight replicas,
+  // that leaves 48 negotiated lanes on only 32 persistent CTAs, which can
+  // serialize peers behind each other's credit waits. One lane per GIN
+  // connection keeps four-lane pairs disjoint in the 16-rank receiver domain.
   const std::uint32_t base_channels =
-    std::min(total_channels, v2PowerOfTwoUp(2 * state->connection_count));
+    std::min(total_channels, v2PowerOfTwoUp((fused_fp8_direct ? 1U : 2U) * state->connection_count));
   // Direct BF16->FP8 adds substantial copy-worker computation to each rail.
   // Use more of the existing channel/FIFO registration to overlap that work;
   // the copy-only and ring budgets stay unchanged. In a many-sender receiver,
