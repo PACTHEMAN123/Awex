@@ -103,6 +103,11 @@ def main():
         if rank == writer:
             tensor.copy_(source)
         dist.barrier(device_ids=[torch.cuda.current_device()])
+        # A fast first receiver must not let the sender overwrite bytes still
+        # needed by a slower duplicate. Keep this fault injection test-only.
+        delay = int(os.environ.get("AWEX_FP8_CHECK_READER_DELAY_CYCLES", "0"))
+        if delay and rank == writer - 1:
+            torch.cuda._sleep(delay)
         result = (
             transport.send(params, plan, step)
             if rank == writer
