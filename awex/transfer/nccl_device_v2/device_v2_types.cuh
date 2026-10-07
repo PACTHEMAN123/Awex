@@ -142,6 +142,7 @@ struct alignas(64) V2KernelProfile {
   unsigned long long final_wait_cycles;
   unsigned long long flush_cycles;
   unsigned long long slice_count;
+  unsigned long long post_recv_cycles;
 };
 
 struct V2WindowLayout {

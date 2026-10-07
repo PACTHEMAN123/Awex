@@ -139,8 +139,8 @@ __device__ __forceinline__ void v2RunRecv(const V2KernelArgs& args, const V2Work
   }
 }
 
-// A ring receiver consumes one FIFO step and republishes that same step to its
-// successor before returning credit to its predecessor. Both LSA and GIN edges
+// A ring receiver consumes one FIFO step, returns input credit and republishes
+// that same step to its successor. Both LSA and GIN edges
 // use the same route channel and byte partition, so mixed intra/inter-node rings
 // retain NCCL broadcast's chunk-pipelined behavior.
 __device__ __forceinline__ void v2RunRelay(const V2KernelArgs& args, const V2Work& work, std::uint32_t channel,
@@ -153,7 +153,12 @@ __device__ __forceinline__ void v2RunRelay(const V2KernelArgs& args, const V2Wor
   // worker-only pre-copy synchronization, then the all-thread post barrier.
   // Source: NVIDIA NCCL src/device/prims_simple.h (Apache-2.0).
   std::uint32_t roles = v2Roles(V2Direction::kRecv, tid, nthreads, &nworkers);
+  roles &= ~kRolePostRecv;
   if (tid == 1) roles |= kRoleWaitSend;
+  // NCCL SIMPLE constructor: one receive and one send connection assign
+  // PostRecv to the penultimate thread and PostSend to the last thread.
+  if (tid == nthreads - 2) roles |= kRolePostRecv;
+  if (tid == nthreads - 1) roles |= kRolePostSend;
   auto* error = &reinterpret_cast<V2WindowHeader*>(args.local_window)->error;
   const bool input_gin = args.peer_transports[work.peer] == static_cast<std::uint8_t>(V2Transport::kGin);
   const bool output_gin =
@@ -249,10 +254,17 @@ __device__ __forceinline__ void v2RunRelay(const V2KernelArgs& args, const V2Wor
       } else {
         v2Publish(&input_slot->consumed_step, input_step);
       }
-
-      // The input is no longer needed after the fused local copy. Release it
-      // before a potentially backpressured forward put so congestion on the
-      // successor does not unnecessarily stall the predecessor.
+#else
+      v2Publish(&input_slot->consumed_step, input_step);
+#endif
+      // Separate counters keep each role's profiling writes single-owner.
+      profile->post_recv_cycles += clock64() - post_start;
+    }
+    if ((roles & kRolePostSend) && v2LoadError(error) == 0) {
+      const unsigned long long post_start = clock64();
+#if AWEX_NCCL_DEVICE_V2_HAS_GIN
+      ncclGin gin{args.dev_comm, static_cast<int>(channel % args.dev_comm.ginContextCount)};
+      const ncclTeam world = ncclTeamWorld(args.dev_comm);
       if (output_gin) {
         gin.put(world, work.forward_peer, args.window,
                 v2GinPayloadOffset(args, work.forward_peer, args.local_rank, channel, output_step, work.fifo_depth),
@@ -266,7 +278,6 @@ __device__ __forceinline__ void v2RunRelay(const V2KernelArgs& args, const V2Wor
         v2Publish(&output_slot->ready_step, output_step);
       }
 #else
-      v2Publish(&input_slot->consumed_step, input_step);
       output_slot->bytes = static_cast<std::uint32_t>(slice_bytes);
       v2Publish(&output_slot->ready_step, output_step);
 #endif

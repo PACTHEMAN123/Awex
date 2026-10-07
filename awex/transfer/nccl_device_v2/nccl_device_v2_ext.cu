@@ -858,7 +858,8 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
     profile_max.input_wait_cycles = std::max(profile_max.input_wait_cycles, profile.input_wait_cycles);
     profile_max.output_wait_cycles = std::max(profile_max.output_wait_cycles, profile.output_wait_cycles);
     profile_max.copy_cycles = std::max(profile_max.copy_cycles, profile.copy_cycles);
-    profile_max.post_cycles = std::max(profile_max.post_cycles, profile.post_cycles);
+    profile_max.post_cycles = std::max(profile_max.post_cycles, profile.post_cycles + profile.post_recv_cycles);
+    profile_max.post_recv_cycles = std::max(profile_max.post_recv_cycles, profile.post_recv_cycles);
     profile_max.final_wait_cycles = std::max(profile_max.final_wait_cycles, profile.final_wait_cycles);
     profile_max.flush_cycles = std::max(profile_max.flush_cycles, profile.flush_cycles);
     profile_max.slice_count = std::max(profile_max.slice_count, profile.slice_count);
@@ -868,6 +869,7 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
   metrics["device_output_wait_time_ms"] = profile_max.output_wait_cycles / cycles_per_millisecond;
   metrics["device_copy_time_ms"] = profile_max.copy_cycles / cycles_per_millisecond;
   metrics["device_post_time_ms"] = profile_max.post_cycles / cycles_per_millisecond;
+  metrics["device_post_recv_time_ms"] = profile_max.post_recv_cycles / cycles_per_millisecond;
   metrics["device_final_wait_time_ms"] = profile_max.final_wait_cycles / cycles_per_millisecond;
   metrics["device_flush_time_ms"] = profile_max.flush_cycles / cycles_per_millisecond;
   metrics["device_profile_max_slice_count"] = py::int_(profile_max.slice_count);
