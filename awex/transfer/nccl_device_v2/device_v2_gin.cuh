@@ -135,22 +135,17 @@ __device__ __forceinline__ void v2GinRunSend(const V2KernelArgs& args, const V2W
       const std::uint64_t work_step = step - work.step_begin + 1;
       const bool work_complete = cursor + slice_bytes == work.nbytes;
       const bool publish_ready = work_complete || work_step % kV2GinReadyBatch == 0;
+      gin.put(world, work.peer, args.window,
+              v2GinPayloadOffset(args, work.peer, args.local_rank, channel, step, work.fifo_depth), args.window,
+              v2GinPayloadOffset(args, args.local_rank, work.peer, channel, step, work.fifo_depth), slice_bytes,
+              ncclGin_None{}, ncclGin_None{}, ncclCoopThread{}, ncclGin_None{}, cuda::thread_scope_thread,
+              cuda::thread_scope_device, ncclGinOptFlagsDefault);
       if (publish_ready) {
         const std::uint64_t ready_count =
           work_complete && work_step % kV2GinReadyBatch != 0 ? work_step % kV2GinReadyBatch : kV2GinReadyBatch;
-        // A strong cumulative signal makes every put in this batch visible
+        // A strong cumulative doorbell makes every put in this batch visible
         // before the receiver consumes any of its FIFO slots.
-        gin.put(world, work.peer, args.window,
-                v2GinPayloadOffset(args, work.peer, args.local_rank, channel, step, work.fifo_depth), args.window,
-                v2GinPayloadOffset(args, args.local_rank, work.peer, channel, step, work.fifo_depth), slice_bytes,
-                V2GinReadySignalAdd{ready_signal, ready_count}, ncclGin_None{}, ncclCoopThread{}, ncclGin_None{},
-                cuda::thread_scope_thread, cuda::thread_scope_device, ncclGinOptFlagsDefault);
-      } else {
-        gin.put(world, work.peer, args.window,
-                v2GinPayloadOffset(args, work.peer, args.local_rank, channel, step, work.fifo_depth), args.window,
-                v2GinPayloadOffset(args, args.local_rank, work.peer, channel, step, work.fifo_depth), slice_bytes,
-                ncclGin_None{}, ncclGin_None{}, ncclCoopThread{}, ncclGin_None{}, cuda::thread_scope_thread,
-                cuda::thread_scope_device, ncclGinOptFlagsDefault);
+        gin.signal(world, work.peer, V2GinReadySignalAdd{ready_signal, ready_count});
       }
       profile->post_cycles += clock64() - post_start;
     }

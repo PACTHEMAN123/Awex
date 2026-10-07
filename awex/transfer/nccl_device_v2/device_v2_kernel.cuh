@@ -249,23 +249,17 @@ __device__ __forceinline__ void v2RunRelay(const V2KernelArgs& args, const V2Wor
         const std::uint64_t work_step = output_step - work.forward_step_begin + 1;
         const bool work_complete = cursor + slice_bytes == work.nbytes;
         const bool publish_ready = work_complete || work_step % kV2GinReadyBatch == 0;
+        gin.put(world, work.forward_peer, args.window,
+                v2GinPayloadOffset(args, work.forward_peer, args.local_rank, channel, output_step, work.fifo_depth),
+                args.window,
+                v2GinPayloadOffset(args, args.local_rank, work.forward_peer, channel, output_step, work.fifo_depth),
+                slice_bytes, ncclGin_None{}, ncclGin_None{}, ncclCoopThread{}, ncclGin_None{},
+                cuda::thread_scope_thread, cuda::thread_scope_device, ncclGinOptFlagsDefault);
         if (publish_ready) {
           const std::uint64_t ready_count =
             work_complete && work_step % kV2GinReadyBatch != 0 ? work_step % kV2GinReadyBatch : kV2GinReadyBatch;
-          gin.put(world, work.forward_peer, args.window,
-                  v2GinPayloadOffset(args, work.forward_peer, args.local_rank, channel, output_step, work.fifo_depth),
-                  args.window,
-                  v2GinPayloadOffset(args, args.local_rank, work.forward_peer, channel, output_step, work.fifo_depth),
-                  slice_bytes, V2GinReadySignalAdd{v2GinReadySignal(args, args.local_rank, channel), ready_count},
-                  ncclGin_None{}, ncclCoopThread{}, ncclGin_None{}, cuda::thread_scope_thread,
-                  cuda::thread_scope_device, ncclGinOptFlagsDefault);
-        } else {
-          gin.put(world, work.forward_peer, args.window,
-                  v2GinPayloadOffset(args, work.forward_peer, args.local_rank, channel, output_step, work.fifo_depth),
-                  args.window,
-                  v2GinPayloadOffset(args, args.local_rank, work.forward_peer, channel, output_step, work.fifo_depth),
-                  slice_bytes, ncclGin_None{}, ncclGin_None{}, ncclCoopThread{}, ncclGin_None{},
-                  cuda::thread_scope_thread, cuda::thread_scope_device, ncclGinOptFlagsDefault);
+          gin.signal(world, work.forward_peer,
+                     V2GinReadySignalAdd{v2GinReadySignal(args, args.local_rank, channel), ready_count});
         }
       } else {
         output_slot->bytes = static_cast<std::uint32_t>(slice_bytes);
