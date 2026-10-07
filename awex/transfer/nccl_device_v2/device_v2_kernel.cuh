@@ -331,17 +331,28 @@ __device__ __forceinline__ void v2GinRunDirectRelay(
 // copy barrier. Receiver credits protect outgoing-slot reuse; input credits
 // need only wait for the fused copy, never for downstream consumption.
 #if AWEX_NCCL_DEVICE_V2_HAS_GIN
-__device__ __forceinline__ void v2GinRunStagedRelay(
+// Reuse the relay's NCCL network/copy split at an FP8 source. Workers may fill
+// every free existing FIFO slot while the network warp progresses its puts;
+// there is no per-slice barrier involving that warp, nor another data buffer.
+__device__ __forceinline__ void v2GinRunPipelinedSend(
     const V2KernelArgs& args, const V2Work& work, std::uint32_t channel, int tid, int nthreads,
     int barrier, int copy_barrier, int* copy_ready, unsigned long long* copy_completed,
     V2KernelProfile* profile) {
   ncclGin gin{args.dev_comm, static_cast<int>(channel % args.dev_comm.ginContextCount)};
   const ncclTeam world = ncclTeamWorld(args.dev_comm);
   auto* error = &reinterpret_cast<V2WindowHeader*>(args.local_window)->error;
+  const bool from_model = work.forward_peer == kNoPeer;
+  const std::uint32_t output_peer = from_model ? work.peer : work.forward_peer;
+  const std::uint64_t output_begin = from_model ? work.step_begin : work.forward_step_begin;
   const std::uint64_t slices = (work.nbytes + work.step_bytes - 1) / work.step_bytes;
   if (tid < kWarpSize) {
     ncclCoopWarp warp;
     V2GinFifoPut fifo_put;
+    bool quantized_source = false;
+    if (from_model && work.step_bytes == args.layout.slot_bytes && work.fifo_depth >= 4) {
+      for (std::uint32_t index = 0; index < work.fragment_count && !quantized_source; ++index)
+        quantized_source = args.fragments[work.fragment_begin + index].block_rows != 0;
+    }
     for (std::uint64_t index = 0; index < slices; ++index) {
       int success = 1;
       if (tid == 0) {
@@ -360,9 +371,9 @@ __device__ __forceinline__ void v2GinRunStagedRelay(
       const std::uint64_t offset = index * work.step_bytes;
       const std::uint64_t bytes = work.step_bytes < work.nbytes - offset
         ? work.step_bytes : work.nbytes - offset;
-      const std::uint64_t output_step = work.forward_step_begin + index;
+      const std::uint64_t output_step = output_begin + index;
       const unsigned long long post_start = tid == 0 ? clock64() : 0;
-      if (tid == 0 && (index + 1 == slices || (index + 1) % args.gin_credit_batch == 0)) {
+      if (!from_model && tid == 0 && (index + 1 == slices || (index + 1) % args.gin_credit_batch == 0)) {
         const std::uint32_t credits = index + 1 == slices && (index + 1) % args.gin_credit_batch != 0
           ? (index + 1) % args.gin_credit_batch : args.gin_credit_batch;
         gin.signal(world, work.peer,
@@ -370,14 +381,14 @@ __device__ __forceinline__ void v2GinRunStagedRelay(
       }
       // Workers can fill the next existing slots while this warp submits a
       // contiguous group. Coalescing no longer delays their per-slice barrier.
-      fifo_put.append(args, work, gin, work.forward_peer, channel, work.forward_peer,
-        output_step, output_step, bytes, index, index + 1 == slices, warp);
+      fifo_put.append(args, work, gin, output_peer, channel, output_peer,
+        output_step, output_step, bytes, index, index + 1 == slices, warp, quantized_source);
       if (tid == 0) profile->post_cycles += clock64() - post_start;
     }
     if (work.final && slices != 0 && tid == 0 && v2LoadError(error) == 0) {
       const unsigned long long start = clock64();
-      v2GinWaitSignal(args, gin, v2GinCreditSignal(args, work.forward_peer, channel),
-        work.forward_step_begin + slices - 1, 4U);
+      v2GinWaitSignal(args, gin, v2GinCreditSignal(args, output_peer, channel),
+        output_begin + slices - 1, 4U);
       profile->final_wait_cycles += clock64() - start;
     }
   } else {
@@ -385,13 +396,13 @@ __device__ __forceinline__ void v2GinRunStagedRelay(
     const int copy_threads = nthreads - kWarpSize;
     for (std::uint64_t index = 0; index < slices; ++index) {
       const std::uint64_t input_step = work.step_begin + index;
-      const std::uint64_t output_step = work.forward_step_begin + index;
+      const std::uint64_t output_step = output_begin + index;
       if (copy_tid == 0) {
         const unsigned long long start = clock64();
         *copy_ready = output_step <= work.fifo_depth ||
-          v2GinWaitSignal(args, gin, v2GinCreditSignal(args, work.forward_peer, channel),
+          v2GinWaitSignal(args, gin, v2GinCreditSignal(args, output_peer, channel),
             output_step - work.fifo_depth, 3U);
-        if (*copy_ready) *copy_ready = v2GinWaitSignal(args, gin,
+        if (*copy_ready && !from_model) *copy_ready = v2GinWaitSignal(args, gin,
           v2GinReadySignal(args, work.peer, channel), input_step, 2U);
         profile->output_wait_cycles += clock64() - start;
       }
@@ -401,10 +412,14 @@ __device__ __forceinline__ void v2GinRunStagedRelay(
       const std::uint64_t bytes = work.step_bytes < work.nbytes - offset
         ? work.step_bytes : work.nbytes - offset;
       const unsigned long long start = copy_tid == 0 ? clock64() : 0;
-      v2CopyContiguousToFragmentsAndContiguous(args, work,
-        v2GinLocalPayload(args, work.forward_peer, channel, output_step, work.fifo_depth),
-        v2GinLocalPayload(args, work.peer, channel, input_step, work.fifo_depth),
-        offset, bytes, copy_tid, copy_threads);
+      auto* output = v2GinLocalPayload(args, output_peer, channel, output_step, work.fifo_depth);
+      if (from_model) {
+        v2CopyFragmentsToContiguous(args, work, output, offset, bytes, copy_tid, copy_threads);
+      } else {
+        v2CopyContiguousToFragmentsAndContiguous(args, work, output,
+          v2GinLocalPayload(args, work.peer, channel, input_step, work.fifo_depth),
+          offset, bytes, copy_tid, copy_threads);
+      }
       v2GroupBarrier(copy_barrier, copy_threads);
       if (copy_tid == 0) {
         // All workers finished their writes before publishing to the NIC warp.
@@ -611,7 +626,7 @@ __device__ __forceinline__ void v2RunBatch(const V2KernelArgs& args, const V2Wor
       // Fuse model placement and the copy into the existing send FIFO for
       // GIN-to-GIN; preserve the network/local split on mixed GIN/LSA routes.
       if (use_gin && forward_gin && extra_send_barrier) {
-        v2GinRunStagedRelay(args, work, channel, subtid, subthreads, main_barrier, wait_barrier,
+        v2GinRunPipelinedSend(args, work, channel, subtid, subthreads, main_barrier, wait_barrier,
                             &shared.ready[group], &shared.copy_completed[group], profile);
       } else if ((use_gin != forward_gin) && extra_send_barrier) {
         v2GinRunDirectRelay(args, work, channel, subtid, subthreads, main_barrier, wait_barrier,
@@ -626,8 +641,13 @@ __device__ __forceinline__ void v2RunBatch(const V2KernelArgs& args, const V2Wor
     } else if (use_gin) {
 #if AWEX_NCCL_DEVICE_V2_HAS_GIN
       if (args.direction == V2Direction::kSend) {
-        v2GinRunSend(args, work, channel, subtid, subthreads, main_barrier, wait_barrier, &shared.ready[group],
-                     profile);
+        if (args.gin_fp8_source_pipeline != 0 && extra_send_barrier) {
+          v2GinRunPipelinedSend(args, work, channel, subtid, subthreads, main_barrier, wait_barrier,
+                               &shared.ready[group], &shared.copy_completed[group], profile);
+        } else {
+          v2GinRunSend(args, work, channel, subtid, subthreads, main_barrier, wait_barrier, &shared.ready[group],
+                       profile);
+        }
       } else {
         v2GinRunRecv(args, work, channel, subtid, subthreads, main_barrier, &shared.ready[group], profile);
       }

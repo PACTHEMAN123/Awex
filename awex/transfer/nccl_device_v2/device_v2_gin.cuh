@@ -136,14 +136,12 @@ __device__ __forceinline__ bool v2GinWaitSignal(const V2KernelArgs& args, const 
   return true;
 }
 
-__device__ __forceinline__ std::uint32_t v2GinRoles(V2Direction direction, int tid, int nthreads, int* nworkers,
-                                                  bool source_coop_warp = false) {
+__device__ __forceinline__ std::uint32_t v2GinRoles(V2Direction direction, int tid, int nthreads, int* nworkers) {
   const bool send = direction == V2Direction::kSend;
   *nworkers = nthreads - (nthreads >= 3 * kWarpSize ? kWarpSize : 0);
   std::uint32_t roles = tid < *nworkers ? kRoleWorker : 0;
   if (tid == 0) roles |= send ? kRoleWaitSend : kRoleWaitRecv;
-  if (send && source_coop_warp && tid >= *nworkers) roles |= kRolePostSend;
-  else if (tid == nthreads - 1) roles |= send ? kRolePostSend : kRolePostRecv;
+  if (tid == nthreads - 1) roles |= send ? kRolePostSend : kRolePostRecv;
   return roles;
 }
 
@@ -151,11 +149,7 @@ __device__ __forceinline__ void v2GinRunSend(const V2KernelArgs& args, const V2W
                                              int tid, int nthreads, int main_barrier, int wait_barrier, int* ready,
                                              V2KernelProfile* profile) {
   int nworkers = 0;
-  // NCCL's rail ring cooperatively constructs the put with one warp. Reuse
-  // the already reserved Post warp at small FP8 direct sources; worker/FIFO
-  // barriers, credit progression and quantization ownership stay unchanged.
-  const bool source_coop_warp = args.gin_source_coop_warp != 0 && nthreads >= 3 * kWarpSize;
-  const std::uint32_t roles = v2GinRoles(V2Direction::kSend, tid, nthreads, &nworkers, source_coop_warp);
+  const std::uint32_t roles = v2GinRoles(V2Direction::kSend, tid, nthreads, &nworkers);
   auto* error = &reinterpret_cast<V2WindowHeader*>(args.local_window)->error;
   ncclGin gin{args.dev_comm, static_cast<int>(channel % args.dev_comm.ginContextCount)};
   const ncclGinSignal_t credit_signal = v2GinCreditSignal(args, work.peer, channel);
@@ -200,19 +194,13 @@ __device__ __forceinline__ void v2GinRunSend(const V2KernelArgs& args, const V2W
       ++profile->slice_count;
     }
     if ((roles & kRolePostSend) && v2LoadError(error) == 0) {
-      const unsigned long long post_start = tid == nthreads - 1 ? clock64() : 0;
+      const unsigned long long post_start = clock64();
       // The cumulative ready counter requires ordered completion so a later
       // put cannot satisfy the wait for an earlier FIFO step.
-      if (source_coop_warp) {
-        fifo_put.append(args, work, gin, work.peer, channel, work.peer, step, step, slice_bytes,
-                        cursor / work.step_bytes, cursor + slice_bytes == work.nbytes, ncclCoopWarp{},
-                        quantized_source);
-      } else {
-        fifo_put.append(args, work, gin, work.peer, channel, work.peer, step, step, slice_bytes,
-                        cursor / work.step_bytes, cursor + slice_bytes == work.nbytes, ncclCoopThread{},
-                        quantized_source);
-      }
-      if (tid == nthreads - 1) profile->post_cycles += clock64() - post_start;
+      fifo_put.append(args, work, gin, work.peer, channel, work.peer, step, step, slice_bytes,
+                      cursor / work.step_bytes, cursor + slice_bytes == work.nbytes, ncclCoopThread{},
+                      quantized_source);
+      profile->post_cycles += clock64() - post_start;
     }
     if (v2LoadError(error) != 0) return;
     cursor += slice_bytes;

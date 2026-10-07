@@ -568,7 +568,7 @@ void initialize_sparse_window(DeviceState* state, const std::vector<std::uint32_
                           state->gin_fifo_depth, state->network_step_bytes, state->gin.context_count,
                           active_peers, state->peer_transports, std::move(peer_payload_bytes),
                           &state->peer_channels, gin_channel_budget_factor);
-      state->gin.source_coop_warp = small_fp8_direct;
+      state->gin.fp8_source_pipeline = small_fp8_direct;
       const auto peer_channel_matrix = v2::topology_detail::allGather(
         state->comm, state->peer_channels.data(), state->peer_channels.size(), state->world_size, stream);
       state->gin.channels_per_peer = 1;
@@ -864,7 +864,7 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
   metrics["gin_connection_count"] = py::int_(state->gin.connection_count);
   const std::uint32_t gin_credit_batch = v2::v2GinCreditBatch(active_gin_peers, state->gin_fifo_depth);
   metrics["gin_credit_batch"] = py::int_(gin_credit_batch);
-  metrics["gin_source_coop_warp"] = py::bool_(state->gin.source_coop_warp);
+  metrics["gin_fp8_source_pipeline"] = py::bool_(state->gin.fp8_source_pipeline);
   metrics["network_channels_per_peer"] = py::int_(state->gin.channels_per_peer);
   metrics["network_channel_budget"] = py::int_(state->gin.channel_budget);
   py::list peer_channel_counts;
