@@ -115,6 +115,7 @@ def main() -> None:
     if world_size not in (2, 4):
         raise RuntimeError("nccl_device_v2_multinode_e2e requires two or four ranks")
     ring = world_size == 4
+    mixed = os.environ.get("AWEX_RING_CHECK_MIXED") == "1"
     writer = world_size - 1 if ring else 0
     readers = list(range(world_size - 1)) if ring else [1]
     if ring:
@@ -167,11 +168,17 @@ def main() -> None:
 
         metrics = launch_metrics[-1]
         expected_peers = 2 if ring and metrics.get("ring_relay_count", 0) else 1
-        if (
+        if not mixed and (
             metrics["lsa_peer_count"] != 0
             or metrics["gin_peer_count"] != expected_peers
         ):
             raise AssertionError(f"expected the GIN path, got {metrics}")
+        if (
+            mixed
+            and rank in (0, 1)
+            and (metrics["lsa_peer_count"], metrics["gin_peer_count"]) != (1, 1)
+        ):
+            raise AssertionError(f"expected mixed GIN/LSA relay, got {metrics}")
         if not metrics["gin_enabled"] or metrics["gin_context_count"] <= 0:
             raise AssertionError(f"GIN was not initialized: {metrics}")
         if metrics["gin_connection_count"] <= 0:
@@ -182,7 +189,10 @@ def main() -> None:
             raise AssertionError(
                 f"LSA and GIN FIFO settings were not isolated: {metrics}"
             )
-        if not ring and metrics["channel_count"] != metrics["network_channels_per_peer"]:
+        if (
+            not ring
+            and metrics["channel_count"] != metrics["network_channels_per_peer"]
+        ):
             raise AssertionError(f"GIN did not use its network channels: {metrics}")
         if launch_metrics[0]["plan_cache_hit"]:
             raise AssertionError(f"first update unexpectedly hit cache: {metrics}")
