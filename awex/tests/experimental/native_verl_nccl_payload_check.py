@@ -13,7 +13,8 @@ from awex.publication.verl_native_nccl import NativeVerlReceiver, NativeVerlSend
 def main():
     rank = int(os.environ["RANK"])
     world = int(os.environ["WORLD_SIZE"])
-    torch.cuda.set_device(0)
+    device = int(os.environ.get("AWEX_NATIVE_TEST_DEVICE", "0"))
+    torch.cuda.set_device(device)
     store = dist.TCPStore(
         os.environ["MASTER_ADDR"],
         int(os.environ["MASTER_PORT"]),
@@ -79,7 +80,10 @@ def main():
                 raise AssertionError(result)
             store.set(f"done/{step}/{rank}", "1")
             store.wait([f"done/{step}/{peer}" for peer in range(world)])
-        print(f"NATIVE_VERL_NCCL_PAYLOAD_PASS rank={rank} updates=10", flush=True)
+        print(
+            f"NATIVE_VERL_NCCL_PAYLOAD_PASS rank={rank} device={device} updates=10",
+            flush=True,
+        )
     finally:
         if sender is not None:
             sender.close()

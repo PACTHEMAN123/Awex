@@ -10,6 +10,7 @@ import hashlib
 import inspect
 import os
 import time
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
@@ -48,10 +49,28 @@ def _engine_class():
     return NCCLCheckpointEngine
 
 
+@contextmanager
 def _standalone_context():
     # Keep the original Ray collective implementation; allow this explicitly
     # selected standalone integration harness to call it outside an actor.
-    return patch("ray.util.collective.collective._check_inside_actor", lambda: None)
+    from ray.util.collective.collective_group.nccl_collective_group import NCCLGroup
+
+    original_barrier = NCCLGroup.barrier
+
+    def current_device_barrier(group, *args, **kwargs):
+        # veRL Ray actors normally see one GPU. Harness workers see the node's
+        # GPU list, but each owns only its current device. Ray's first barrier
+        # otherwise creates a communicator across every visible GPU per rank.
+        if not group._used_gpu_indices:
+            group._used_gpu_indices.add(torch.cuda.current_device())
+        return original_barrier(group, *args, **kwargs)
+
+    with ExitStack() as stack:
+        stack.enter_context(
+            patch("ray.util.collective.collective._check_inside_actor", lambda: None)
+        )
+        stack.enter_context(patch.object(NCCLGroup, "barrier", current_device_barrier))
+        yield
 
 
 class _MetadataCounter:
