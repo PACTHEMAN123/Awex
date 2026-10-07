@@ -2,6 +2,10 @@
 designed to enable **second-level parameter updates** from training to inference in RL workflows.
 It minimizes iteration latency, ensuring rollout phases consistently use the latest model.
 
+The experimental device-v2 path supports [fused BF16-to-block-FP8 weight
+transfer](device-v2-fp8-blockwise.md), independently of naive/swizzle ring
+broadcast, with direct native vLLM FP8 placement.
+
 ## Architecture
 
 The Awex weight exchange framework consists primarily of three components:
