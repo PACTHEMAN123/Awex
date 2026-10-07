@@ -23,6 +23,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <map>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -79,6 +80,7 @@ struct V2Schedule {
   std::uint32_t ring_channel_collision_count = 0;
   std::uint64_t next_step = 1;
   std::vector<std::uint64_t> next_steps;
+  std::uint64_t fp8_reused_source_bytes = 0;
 };
 
 inline V2WindowLayout makeV2WindowLayout(std::uint32_t world_size, std::uint32_t channel_count,
@@ -515,6 +517,90 @@ inline V2Schedule lowerFixedTasks(const std::vector<V2LoweringTask>& tasks,
   for (const std::uint64_t step : schedule.next_steps) schedule.next_step = std::max(schedule.next_step, step);
   (void)direction;
   return schedule;
+}
+
+// Fold only complete, byte-identical two-replica source streams. Receiver
+// plans, channel addresses, steps and registered windows remain unchanged.
+// Reject the entire fold on any shape/partition mismatch: partial sharing
+// must never introduce a second publisher on a credited receiver stream.
+inline void reuseIdenticalFp8Source(V2Schedule* schedule, const V2LoweringConfig& config,
+                                   const std::vector<std::uint32_t>& peers, V2Direction direction) {
+  if (direction != V2Direction::kSend || peers.size() != 2) return;
+  for (const auto peer : peers)
+    if (config.peer_transports[peer] != static_cast<std::uint8_t>(V2Transport::kGin)) return;
+  using Key = std::pair<std::uint64_t, std::uint64_t>;
+  std::map<Key, std::size_t> originals, duplicates;
+  bool quantized = false;
+  std::vector<std::uint32_t> channels(schedule->works.size());
+  for (std::size_t c = 0; c < schedule->channels.size(); ++c) {
+    const auto& queue = schedule->channels[c];
+    for (std::uint32_t b = 0; b < queue.batch_count; ++b) {
+      const auto& batch = schedule->batches[queue.first_batch + b];
+      for (std::uint32_t w = 0; w < batch.work_count; ++w)
+        channels[batch.work_begin + w] = schedule->channel_ids[c];
+    }
+  }
+  for (std::size_t i = 0; i < schedule->works.size(); ++i) {
+    const auto& w = schedule->works[i];
+    if (w.forward_peer != kNoPeer || w.ring_id != kNoRing) return;
+    if (w.peer != peers[0] && w.peer != peers[1]) return;
+    auto& table = w.peer == peers[0] ? originals : duplicates;
+    if (!table.emplace(Key{w.stream_offset, w.nbytes}, i).second) return;
+    for (std::uint32_t f = 0; f < w.fragment_count; ++f)
+      quantized |= schedule->fragments[w.fragment_begin + f].block_rows != 0;
+  }
+  if (!quantized || originals.empty() || originals.size() != duplicates.size()) return;
+  for (const auto& entry : originals) {
+    const auto found = duplicates.find(entry.first);
+    if (found == duplicates.end()) return;
+    const auto& a = schedule->works[entry.second];
+    const auto& b = schedule->works[found->second];
+    if (a.fragment_count != b.fragment_count || a.step_bytes != b.step_bytes ||
+        a.fifo_depth != b.fifo_depth || a.final != b.final || a.step_begin != b.step_begin) return;
+    for (std::uint32_t f = 0; f < a.fragment_count; ++f) {
+      const auto& x = schedule->fragments[a.fragment_begin + f];
+      const auto& y = schedule->fragments[b.fragment_begin + f];
+      if (x.tensor_ptr != y.tensor_ptr || x.nbytes != y.nbytes || x.tensor_offset != y.tensor_offset ||
+          x.tensor_row_bytes != y.tensor_row_bytes || x.tensor_row_stride != y.tensor_row_stride ||
+          x.work_offset != y.work_offset || x.scale_ptr != y.scale_ptr ||
+          x.scale_row_stride != y.scale_row_stride || x.block_rows != y.block_rows || x.block_cols != y.block_cols)
+        return;
+    }
+  }
+  for (const auto& entry : originals) {
+    auto& a = schedule->works[entry.second];
+    const auto index = duplicates.at(entry.first);
+    const auto& b = schedule->works[index];
+    a.duplicate_peer = b.peer;
+    a.duplicate_channel = channels[index];
+    a.duplicate_step_begin = b.step_begin;
+    schedule->fp8_reused_source_bytes += b.nbytes;
+  }
+  std::vector<V2Work> works;
+  std::vector<V2WorkBatch> batches;
+  std::vector<V2ChannelQueue> queues;
+  std::vector<std::uint32_t> ids;
+  for (std::size_t c = 0; c < schedule->channels.size(); ++c) {
+    const auto& old_queue = schedule->channels[c];
+    V2ChannelQueue queue{static_cast<std::uint32_t>(batches.size()), 0};
+    for (std::uint32_t b = 0; b < old_queue.batch_count; ++b) {
+      const auto& old_batch = schedule->batches[old_queue.first_batch + b];
+      V2WorkBatch batch{static_cast<std::uint32_t>(works.size()), 0};
+      for (std::uint32_t w = 0; w < old_batch.work_count; ++w) {
+        const auto& work = schedule->works[old_batch.work_begin + w];
+        if (work.peer != peers[0]) continue;
+        works.push_back(work);
+        ++batch.work_count;
+      }
+      if (batch.work_count != 0) { batches.push_back(batch); ++queue.batch_count; }
+    }
+    if (queue.batch_count != 0) { queues.push_back(queue); ids.push_back(schedule->channel_ids[c]); }
+  }
+  schedule->works = std::move(works);
+  schedule->batches = std::move(batches);
+  schedule->channels = std::move(queues);
+  schedule->channel_ids = std::move(ids);
+  schedule->channel_count = static_cast<std::uint32_t>(schedule->channel_ids.size());
 }
 
 }  // namespace nccl_device_v2

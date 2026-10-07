@@ -153,6 +153,9 @@ __device__ __forceinline__ void v2GinRunSend(const V2KernelArgs& args, const V2W
   auto* error = &reinterpret_cast<V2WindowHeader*>(args.local_window)->error;
   ncclGin gin{args.dev_comm, static_cast<int>(channel % args.dev_comm.ginContextCount)};
   const ncclGinSignal_t credit_signal = v2GinCreditSignal(args, work.peer, channel);
+  const bool duplicate = work.duplicate_peer != kNoPeer;
+  ncclGin duplicate_gin{args.dev_comm,
+    static_cast<int>(work.duplicate_channel % args.dev_comm.ginContextCount)};
   // Direct FP8 fanout also benefits from submitting adjacent existing FIFO
   // slots as one put. Source stores complete before publication, and the
   // cumulative ready signal covers every copied slot in the group. Keep the
@@ -176,6 +179,10 @@ __device__ __forceinline__ void v2GinRunSend(const V2KernelArgs& args, const V2W
     if ((roles & kRoleWaitSend) && step > work.fifo_depth) {
       const unsigned long long wait_start = clock64();
       *ready = v2GinWaitSignal(args, gin, credit_signal, step - work.fifo_depth, 3U);
+      if (*ready && duplicate)
+        *ready = v2GinWaitSignal(args, duplicate_gin,
+          v2GinCreditSignal(args, work.duplicate_peer, work.duplicate_channel),
+          work.duplicate_step_begin + cursor / work.step_bytes - work.fifo_depth, 3U);
       profile->output_wait_cycles += clock64() - wait_start;
     }
     const unsigned long long copy_start = tid == 0 ? clock64() : 0;
@@ -200,6 +207,18 @@ __device__ __forceinline__ void v2GinRunSend(const V2KernelArgs& args, const V2W
       fifo_put.append(args, work, gin, work.peer, channel, work.peer, step, step, slice_bytes,
                       cursor / work.step_bytes, cursor + slice_bytes == work.nbytes, ncclCoopThread{},
                       quantized_source);
+      if (duplicate) {
+        // Reuse only the producer-owned registered bytes. The duplicate has
+        // its original channel/ready counter and returns its own credit; both
+        // credits above must arrive before this shared physical slot changes.
+        duplicate_gin.put(ncclTeamWorld(args.dev_comm), work.duplicate_peer, args.window,
+          v2GinPayloadOffset(args, work.duplicate_peer, args.local_rank, work.duplicate_channel,
+                             work.duplicate_step_begin + cursor / work.step_bytes, work.fifo_depth),
+          args.window, v2GinPayloadOffset(args, args.local_rank, work.peer, channel, step, work.fifo_depth),
+          slice_bytes, V2GinReadySignalAdd{v2GinReadySignal(args, args.local_rank, work.duplicate_channel), 1},
+          ncclGin_None{}, ncclCoopThread{}, ncclGin_None{}, cuda::thread_scope_thread,
+          cuda::thread_scope_device, ncclGinOptFlagsDefault);
+      }
       profile->post_cycles += clock64() - post_start;
     }
     if (v2LoadError(error) != 0) return;
@@ -211,9 +230,18 @@ __device__ __forceinline__ void v2GinRunSend(const V2KernelArgs& args, const V2W
     if (roles & kRoleWaitSend) {
       const unsigned long long wait_start = clock64();
       *ready = v2GinWaitSignal(args, gin, credit_signal, step - 1, 4U);
+      if (*ready && duplicate)
+        *ready = v2GinWaitSignal(args, duplicate_gin,
+          v2GinCreditSignal(args, work.duplicate_peer, work.duplicate_channel),
+          work.duplicate_step_begin + (work.nbytes + work.step_bytes - 1) / work.step_bytes - 1, 4U);
       profile->final_wait_cycles += clock64() - wait_start;
     }
     v2GroupBarrier(main_barrier, nthreads);
+    if (duplicate && (roles & kRolePostSend)) {
+      const unsigned long long flush_start = clock64();
+      duplicate_gin.flush(ncclCoopThread{});
+      profile->flush_cycles += clock64() - flush_start;
+    }
   }
 }
 

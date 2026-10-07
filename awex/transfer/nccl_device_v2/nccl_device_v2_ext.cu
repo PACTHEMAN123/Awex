@@ -776,6 +776,11 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
     config.peer_transports = state->peer_transports;
     const auto lowering_start = Clock::now();
     auto schedule = v2::lowerFixedTasks(tasks, active_peers, direction, config);
+    // The source is still the registered producer FIFO; quantization and
+    // copy-only tails are produced once for an exactly matched replica pair.
+    const char* reuse_source = std::getenv("AWEX_NCCL_DEVICE_V2_FP8_REUSE_SOURCE");
+    if (reuse_source == nullptr || std::strcmp(reuse_source, "0") != 0)
+      v2::reuseIdenticalFp8Source(&schedule, config, active_peers, direction);
     host_lowering_time_ms = std::chrono::duration<double, std::milli>(Clock::now() - lowering_start).count();
 
     LaunchBuffers buffers;
@@ -807,6 +812,7 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
   metrics["communicator_rank"] = py::int_(state->rank);
   metrics["lsa_team_size"] = py::int_(state->lsa_team.nRanks);
   metrics["work_count"] = py::int_(schedule.works.size());
+  metrics["fp8_reused_source_bytes"] = py::int_(schedule.fp8_reused_source_bytes);
   metrics["fragment_count"] = py::int_(schedule.fragments.size());
   metrics["chunk_count"] = py::int_(schedule.chunk_count);
   metrics["batch_count"] = py::int_(schedule.batches.size());
