@@ -39,8 +39,9 @@ def main():
     bc = int(os.environ.get("AWEX_NCCL_DEVICE_V2_FP8_BLOCK_COLS", "128"))
     shape = (4096, 1024)
     dtype = torch.bfloat16 if rank == writer else torch.float8_e4m3fn
+    padding = 0 if os.environ.get("AWEX_FP8_CHECK_CONTIGUOUS") == "1" else 128
     # Strided matrices test direct model writes without a staging tensor.
-    storage = torch.zeros((shape[0], shape[1] + 128), dtype=dtype, device="cuda")
+    storage = torch.zeros((shape[0], shape[1] + padding), dtype=dtype, device="cuda")
     tensor = storage[:, : shape[1]]
     name = "model.expert.weight"
     params = {name: tensor}
