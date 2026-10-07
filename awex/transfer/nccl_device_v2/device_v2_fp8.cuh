@@ -28,18 +28,22 @@ __device__ __forceinline__ void v2QuantizeToFifoImpl(
   for (std::uint64_t tile = first + warp; tile < last; tile += warps) {
     const auto* matrix = base + (static_cast<std::uint32_t>(tile) / block_columns) * BlockRows * f.tensor_row_stride
                              + (static_cast<std::uint32_t>(tile) % block_columns) * BlockCols * 2;
-    float maximum = 0.0f;
+    // Finite BF16 magnitudes preserve unsigned-bit ordering. Accumulate two
+    // lanes at once instead of converting all 16K inputs to FP32 for amax.
+    unsigned int packed_maximum = 0;
     for (std::uint32_t i = lane * 8; i < elements; i += kWarpSize * 8) {
       const auto* address = matrix + (i / BlockCols) * f.tensor_row_stride + (i % BlockCols) * 2;
       const uint4 packed = *reinterpret_cast<const uint4*>(address);
-      const auto* values = reinterpret_cast<const __nv_bfloat16*>(&packed);
-      #pragma unroll
-      for (int j = 0; j < 8; ++j)
-        maximum = fmaxf(maximum, fabsf(__bfloat162float(values[j])));
+      packed_maximum = __vmaxu2(packed_maximum, packed.x & 0x7fff7fffU);
+      packed_maximum = __vmaxu2(packed_maximum, packed.y & 0x7fff7fffU);
+      packed_maximum = __vmaxu2(packed_maximum, packed.z & 0x7fff7fffU);
+      packed_maximum = __vmaxu2(packed_maximum, packed.w & 0x7fff7fffU);
     }
+    unsigned int maximum_bits = max(packed_maximum & 0xffffU, packed_maximum >> 16);
     #pragma unroll
     for (int delta = 16; delta > 0; delta >>= 1)
-      maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, delta));
+      maximum_bits = max(maximum_bits, __shfl_xor_sync(0xffffffff, maximum_bits, delta));
+    const float maximum = __uint_as_float(maximum_bits << 16);
     // Match the finite E4M3 block reference (epsilon prevents zero/denormal
     // scale division). The receiver consumes this scale without recomputing it.
     const float scale = fmaxf(maximum, 1.0e-12f) / 448.0f;

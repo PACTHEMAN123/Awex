@@ -139,6 +139,41 @@ def _expected_hf_names(expert_ids):
     return names
 
 
+def test_fp8_block_scales_keep_canonical_names_and_storage_views():
+    converter = _make_converter(tp_size=2)
+    # Eight local Q block rows and two K/V block rows each.
+    attention = torch.arange(24, dtype=torch.float32).reshape(12, 2)
+    converted = dict(
+        converter.convert_param(
+            "model.layers.0.self_attn.qkv_proj.weight_scale_inv", attention
+        )
+    )
+    assert converted["model.layers.0.self_attn.q_proj.weight_scale_inv"].shape == (8, 2)
+    assert (
+        converted["model.layers.0.self_attn.k_proj.weight_scale_inv"].data_ptr()
+        == attention[8:].data_ptr()
+    )
+    assert (
+        converted["model.layers.0.self_attn.v_proj.weight_scale_inv"].data_ptr()
+        == attention[10:].data_ptr()
+    )
+    experts = torch.arange(4 * 6 * 16, dtype=torch.float32).reshape(4, 6, 16)
+    converted = dict(
+        converter.convert_param(
+            "model.layers.0.mlp.experts.routed_experts.w13_weight_scale_inv", experts
+        )
+    )
+    assert len(converted) == 8
+    assert (
+        converted["model.layers.0.mlp.experts.2.gate_proj.weight_scale_inv"].data_ptr()
+        == experts[2].data_ptr()
+    )
+    assert (
+        converted["model.layers.0.mlp.experts.2.up_proj.weight_scale_inv"].data_ptr()
+        == experts[2, 3:].data_ptr()
+    )
+
+
 @pytest.mark.parametrize("engine_name", ["sglang", "vllm"])
 def test_registry_resolves_qwen3_moe_converter(engine_name):
     converter = get_infer_weights_converter(
@@ -194,9 +229,7 @@ def test_qkv_split_is_gqa_aware():
         (4, NUM_HEADS // 4, 1),
     ],
 )
-def test_qkv_split_uses_local_tp_head_counts(
-    tp_size, local_q_heads, local_kv_heads
-):
+def test_qkv_split_uses_local_tp_head_counts(tp_size, local_q_heads, local_kv_heads):
     converter = _make_converter(tp_size=tp_size)
     q = torch.randn(local_q_heads * HEAD_DIM, HIDDEN)
     k = torch.randn(local_kv_heads * HEAD_DIM, HIDDEN)
@@ -245,12 +278,16 @@ def test_kv_sharding_reports_logical_heads_when_tp_replicates():
         hf_config=_model_config(),
     )
 
-    assert strategy.get_sharding_strategy(
-        "model.layers.0.self_attn.k_proj.weight"
-    ) == (ShardingType.TP_SHARDING, 0, NUM_KV_HEADS)
-    assert strategy.get_sharding_strategy(
-        "model.layers.0.self_attn.q_proj.weight"
-    ) == (ShardingType.TP_SHARDING, 0, 4)
+    assert strategy.get_sharding_strategy("model.layers.0.self_attn.k_proj.weight") == (
+        ShardingType.TP_SHARDING,
+        0,
+        NUM_KV_HEADS,
+    )
+    assert strategy.get_sharding_strategy("model.layers.0.self_attn.q_proj.weight") == (
+        ShardingType.TP_SHARDING,
+        0,
+        4,
+    )
 
 
 def test_mcore_qkv_device_layout_uses_stable_source_spans():
@@ -280,8 +317,7 @@ def test_mcore_qkv_device_layout_uses_stable_source_spans():
     for layout in converted.values():
         assert isinstance(layout, StaticTensorLayout)
         assert all(
-            span.untyped_storage().data_ptr() == source_storage
-            for span in layout.spans
+            span.untyped_storage().data_ptr() == source_storage for span in layout.spans
         )
 
 
