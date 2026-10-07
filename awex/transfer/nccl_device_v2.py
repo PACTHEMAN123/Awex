@@ -577,6 +577,14 @@ def _build_send_batch(
         peer_offset = 0
         ordinal = 0
         for op in operations:
+            if (
+                str(getattr(op.recv_shard_meta, "dtype", None)).removeprefix("torch.")
+                == "float8_e4m3fn"
+                and not fp8_block_shape
+            ):
+                raise NCCLDeviceV2UnavailableError(
+                    "BF16-to-FP8 transfer requires the blockwise feature on every rank"
+                )
             parameter = parameters[op.send_shard_meta.name]
             if isinstance(parameter, StaticTensorLayout):
                 if (
@@ -704,6 +712,10 @@ def _build_recv_batch(
         ordinal = 0
         for op in operations:
             parameter = parameters[op.recv_shard_meta.name]
+            if parameter.dtype == torch.float8_e4m3fn and not fp8_block_shape:
+                raise NCCLDeviceV2UnavailableError(
+                    "Native FP8 parameters require the blockwise transfer feature"
+                )
             view = parameter[op.inf_slices]
             target = view
             try:

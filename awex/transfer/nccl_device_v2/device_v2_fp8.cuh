@@ -93,19 +93,30 @@ __device__ __forceinline__ void v2ScatterFp8FromFifoImpl(
       reinterpret_cast<std::uintptr_t>(source) % 16 == 0 &&
       reinterpret_cast<std::uintptr_t>(base) % 16 == 0 && f.tensor_row_stride % 16 == 0 &&
       (forward == nullptr || reinterpret_cast<std::uintptr_t>(forward) % 16 == 0)) {
-    for (std::uint64_t i = tid * 16; i < nbytes; i += nthreads * 16) {
-      const std::uint64_t wire = offset + i;
-      const std::uint32_t tile = wire / record;
-      const std::uint32_t within = wire % record;
-      const uint4 value = *reinterpret_cast<const uint4*>(source + i);
-      if (forward != nullptr) *reinterpret_cast<uint4*>(forward + i) = value;
-      if (within == 0) {
-        *reinterpret_cast<unsigned int*>(scales + (tile / block_columns) * f.scale_row_stride
-                                         + (tile % block_columns) * 4) = value.x;
-      } else {
-        const std::uint32_t element = within - 16;
-        auto* address = base + ((tile / block_columns) * BlockRows + element / BlockCols) * f.tensor_row_stride
-                              + (tile % block_columns) * BlockCols + element % BlockCols;
+    // Assign a tile to a warp, calculating its matrix/scale address once.
+    // The byte-striped scatter paid a runtime block-column division for every
+    // 16-byte vector. All row/column arithmetic below is compile-time shifts.
+    const int lane = tid % kWarpSize;
+    const int warp = tid / kWarpSize;
+    const int warps = nthreads / kWarpSize;
+    const std::uint32_t first = offset / record;
+    const std::uint32_t last = (offset + nbytes + record - 1) / record;
+    for (std::uint32_t tile = first + warp; tile < last; tile += warps) {
+      const std::uint32_t tile_row = tile / block_columns;
+      const std::uint32_t tile_column = tile % block_columns;
+      auto* matrix = base + tile_row * BlockRows * f.tensor_row_stride + tile_column * BlockCols;
+      const std::uint64_t record_begin = static_cast<std::uint64_t>(tile) * record;
+      if (lane == 0 && record_begin >= offset && record_begin + 16 <= offset + nbytes) {
+        const uint4 header = *reinterpret_cast<const uint4*>(source + record_begin - offset);
+        if (forward != nullptr) *reinterpret_cast<uint4*>(forward + record_begin - offset) = header;
+        *reinterpret_cast<unsigned int*>(scales + tile_row * f.scale_row_stride + tile_column * 4) = header.x;
+      }
+      for (std::uint32_t i = lane * 16; i < elements; i += kWarpSize * 16) {
+        const std::uint64_t wire = record_begin + 16 + i;
+        if (wire < offset || wire + 16 > offset + nbytes) continue;
+        const uint4 value = *reinterpret_cast<const uint4*>(source + wire - offset);
+        if (forward != nullptr) *reinterpret_cast<uint4*>(forward + wire - offset) = value;
+        auto* address = matrix + (i / BlockCols) * f.tensor_row_stride + i % BlockCols;
         *reinterpret_cast<uint4*>(address) = value;
       }
     }

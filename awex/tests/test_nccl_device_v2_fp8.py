@@ -83,3 +83,18 @@ def test_fp8_rejects_non_block_aligned_shard(monkeypatch):
             0,
             fp8_block_shape=(128, 128),
         )
+
+
+def test_fp8_target_requires_matching_feature_before_launch(monkeypatch):
+    monkeypatch.setattr(nccl_device_v2, "_ensure_cuda_tensor", lambda *_: None)
+    shape = (128, 128)
+    with pytest.raises(
+        nccl_device_v2.NCCLDeviceV2UnavailableError, match="requires the blockwise"
+    ):
+        _build_send_batch(
+            {"weight": torch.empty(shape, dtype=torch.bfloat16)},
+            TransferPlan(operations={0: [operation(1, 0, shape)]}),
+            1,
+            2,
+            0,
+        )
