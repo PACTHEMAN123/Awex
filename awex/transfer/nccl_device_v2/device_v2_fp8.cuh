@@ -47,20 +47,18 @@ __device__ __forceinline__ void v2QuantizeToFifoImpl(
                              + (static_cast<std::uint32_t>(tile) % block_columns) * BlockCols * 2;
     // Finite BF16 magnitudes preserve unsigned-bit ordering. Accumulate two
     // lanes at once instead of converting all 16K inputs to FP32 for amax.
-    // Independent accumulators expose integer-ALU parallelism even when a
-    // FIFO step has too few tiles to occupy every copy warp. A serial chain
-    // of four dependent vmax operations otherwise stalls each vector load.
-    unsigned int maximum_x = 0, maximum_y = 0, maximum_z = 0, maximum_w = 0;
+    // Keep the original compact reduction's register lifetime. Additional
+    // independent accumulators can slow the fused ring kernel despite
+    // exposing more integer-ALU parallelism in the isolated reduction.
+    unsigned int packed_maximum = 0;
     for (std::uint32_t i = lane * 8; i < elements; i += kWarpSize * 8) {
       const auto* address = matrix + (i / BlockCols) * f.tensor_row_stride + (i % BlockCols) * 2;
       const uint4 packed = *reinterpret_cast<const uint4*>(address);
-      maximum_x = __vmaxu2(maximum_x, packed.x & 0x7fff7fffU);
-      maximum_y = __vmaxu2(maximum_y, packed.y & 0x7fff7fffU);
-      maximum_z = __vmaxu2(maximum_z, packed.z & 0x7fff7fffU);
-      maximum_w = __vmaxu2(maximum_w, packed.w & 0x7fff7fffU);
+      packed_maximum = __vmaxu2(packed_maximum, packed.x & 0x7fff7fffU);
+      packed_maximum = __vmaxu2(packed_maximum, packed.y & 0x7fff7fffU);
+      packed_maximum = __vmaxu2(packed_maximum, packed.z & 0x7fff7fffU);
+      packed_maximum = __vmaxu2(packed_maximum, packed.w & 0x7fff7fffU);
     }
-    const unsigned int packed_maximum = __vmaxu2(
-      __vmaxu2(maximum_x, maximum_y), __vmaxu2(maximum_z, maximum_w));
     unsigned int maximum_bits = max(packed_maximum & 0xffffU, packed_maximum >> 16);
     #pragma unroll
     for (int delta = 16; delta > 0; delta >>= 1)
