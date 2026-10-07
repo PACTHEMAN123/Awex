@@ -1,7 +1,7 @@
 """Run veRL's installed checkpoint engine in the standalone Awex harness.
 
-Only the Ray actor-context check is bridged: harness workers are independently
-launched processes, while veRL normally calls the same APIs from Ray actors.
+Ray actor context, single-worker GPU identity and collective teardown are
+bridged: harness workers are independent processes rather than Ray actors.
 Packing, metadata PUB/SUB, double buffering, and NCCL broadcasts remain veRL's.
 """
 
@@ -10,10 +10,12 @@ import hashlib
 import inspect
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
+import requests
 import torch
 
 from awex import logging
@@ -24,6 +26,7 @@ from awex.publication.registry import (
 from awex.publication.verl_nccl import (
     McoreFullTensorExporter,
     VerlNcclBroadcastPublicationMechanism,
+    publication_endpoints,
 )
 from awex.util.profile import emit_profile, profile_phase
 
@@ -272,14 +275,34 @@ class NativeVerlPublicationMechanism(VerlNcclBroadcastPublicationMechanism):
             )
 
     def close(self):
-        # The parent closes inference receivers through the HTTP harness. Its
-        # sender cleanup belongs to the reconstructed backend, so hide that
-        # sender temporarily and then use the native engine's own lifecycle.
-        sender = self.sender
-        self.sender = None
-        try:
-            super().close()
-        finally:
-            self.sender = sender
-            if sender is not None:
-                sender.close()
+        # ncclCommDestroy can wait for peers. All receivers and the sender
+        # must join teardown together, rather than sequential HTTP requests.
+        # Keep sender CUDA calls on this thread's already selected device.
+        def close_receiver(endpoint):
+            engine_rank, host, port = endpoint
+            try:
+                response = requests.post(
+                    f"http://{host}:{port}/publication_close",
+                    timeout=min(self.timeout_seconds, 60),
+                )
+                if response.status_code != 200:
+                    logger.warning(
+                        "Native publication close failed for engine %s: %s",
+                        engine_rank,
+                        response.text,
+                    )
+            except requests.RequestException as exc:
+                logger.warning(
+                    "Native publication close request failed for engine %s: %s",
+                    engine_rank,
+                    exc,
+                )
+
+        endpoints = list(publication_endpoints(self.harness))
+        with ThreadPoolExecutor(max_workers=max(1, len(endpoints))) as executor:
+            futures = [executor.submit(close_receiver, item) for item in endpoints]
+            if self.sender is not None:
+                self.sender.close()
+                self.sender = None
+            for future in futures:
+                future.result()
