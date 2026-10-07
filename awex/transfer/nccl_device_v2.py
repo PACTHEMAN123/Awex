@@ -264,8 +264,7 @@ def _ring_order(
     engine_count = int(num_infer_engines)
     engines_per_node = (
         local_world_size // instance_world_size
-        if instance_world_size > 0
-        and local_world_size % instance_world_size == 0
+        if instance_world_size > 0 and local_world_size % instance_world_size == 0
         else 0
     )
     node_count = (
@@ -1037,15 +1036,26 @@ class NCCLDeviceV2Transport:
     def _run(self, batch: _V2Batch, sender: bool, sequence: int) -> dict[str, float]:
         run_start = time.perf_counter()
         if not self._logged_batch_shape:
+            strided_spans = [
+                (length, row_bytes)
+                for length, row_bytes, row_stride in zip(
+                    batch.lengths, batch.tensor_row_bytes, batch.tensor_row_strides
+                )
+                if row_bytes != row_stride
+            ]
             logger.info(
                 "Lowered nccl_device_v2 plan rank=%s sender=%s spans=%s "
-                "payload_bytes=%s chunk_bytes=%s expected_counts=%s",
+                "payload_bytes=%s chunk_bytes=%s expected_counts=%s "
+                "strided_span_count=%s strided_payload_bytes=%s strided_row_bytes=%s",
                 self.rank,
                 sender,
                 len(batch.tensors),
                 sum(batch.lengths),
                 self.chunk_bytes,
                 batch.expected_counts,
+                len(strided_spans),
+                sum(length for length, _ in strided_spans),
+                sorted({row_bytes for _, row_bytes in strided_spans}),
             )
             self._logged_batch_shape = True
         init_time_ms = self._ensure_initialized()
