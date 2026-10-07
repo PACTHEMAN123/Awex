@@ -492,12 +492,12 @@ void initialize_sparse_window(DeviceState* state, const std::vector<std::uint32_
   const bool packed_fp8_gin =
     state->gin.enabled && has_fp8 && !has_non_ring_lsa && (has_ring || compute_aware_direct);
   // Small direct fanout retains padded slots and single-slice puts, but
-  // slightly more lanes prevent low-payload training peers from receiving
-  // half as many copy workers as their larger peers. This spends existing
+  // a full budget prevents the last receiver peer from receiving half as
+  // many copy workers as the preceding peers. This spends existing
   // channel registration only; connections, signals and credits are unchanged.
   const bool small_fp8_direct = has_fp8 && !has_ring && !has_non_ring_lsa &&
     source_peer_count >= 2 && source_peer_count < 4;
-  const std::uint32_t gin_channel_budget_factor = small_fp8_direct ? 8U :
+  const std::uint32_t gin_channel_budget_factor = small_fp8_direct ? 16U :
     packed_fp8_gin && !has_ring ? 12U : 6U;
   const std::size_t slot_bytes = (ring_only || packed_fp8_gin) ? state->network_step_bytes :
     state->gin.enabled ? std::max(state->step_bytes, state->network_step_bytes) : state->step_bytes;
