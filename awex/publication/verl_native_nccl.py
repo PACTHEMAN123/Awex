@@ -56,6 +56,7 @@ def _standalone_context():
     from ray.util.collective.collective_group.nccl_collective_group import NCCLGroup
 
     original_barrier = NCCLGroup.barrier
+    original_group_key = NCCLGroup._generate_group_key
 
     def current_device_barrier(group, *args, **kwargs):
         # veRL Ray actors normally see one GPU. Harness workers see the node's
@@ -65,11 +66,23 @@ def _standalone_context():
             group._used_gpu_indices.add(torch.cuda.current_device())
         return original_barrier(group, *args, **kwargs)
 
+    def worker_group_key(group, comm_key):
+        # Ray keys the shared rendezvous by local CUDA ordinals. A one-GPU
+        # actor always sees ordinal 0; standalone workers can own different
+        # physical ordinals. Normalize only this single-device shared key,
+        # keeping the original local cache keys, devices and communicators.
+        if comm_key == str(torch.cuda.current_device()):
+            comm_key = "0"
+        return original_group_key(group, comm_key)
+
     with ExitStack() as stack:
         stack.enter_context(
             patch("ray.util.collective.collective._check_inside_actor", lambda: None)
         )
         stack.enter_context(patch.object(NCCLGroup, "barrier", current_device_barrier))
+        stack.enter_context(
+            patch.object(NCCLGroup, "_generate_group_key", worker_group_key)
+        )
         yield
 
 
