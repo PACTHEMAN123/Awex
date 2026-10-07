@@ -511,10 +511,11 @@ __device__ __forceinline__ void v2RunBatch(const V2KernelArgs& args, const V2Wor
     if (work.forward_peer != kNoPeer) {
 #if AWEX_NCCL_DEVICE_V2_HAS_GIN
       const bool forward_gin = args.peer_transports[work.forward_peer] == static_cast<std::uint8_t>(V2Transport::kGin);
-      // NCCL SIMPLE recvCopySend isolates receive and send FIFO lifetimes.
-      // Fuse model placement and the copy into the existing send FIFO for
-      // GIN-to-GIN; preserve the network/local split on mixed GIN/LSA routes.
-      if ((use_gin != forward_gin) && extra_send_barrier) {
+      // NCCL's rail-ring dedicates one warp to forwarding while the remaining
+      // warps place local weights independently. For GIN-to-GIN forward from
+      // the existing input FIFO; retirement waits for both downstream credits
+      // and local copy completion, so no extra receive buffer is required.
+      if ((use_gin || forward_gin) && extra_send_barrier) {
         v2GinRunDirectRelay(args, work, channel, subtid, subthreads, main_barrier, wait_barrier,
                             &shared.ready[group], &shared.copy_completed[group], profile);
       } else
