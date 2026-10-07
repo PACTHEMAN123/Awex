@@ -84,14 +84,12 @@ struct V2GinFifoPut {
   std::uint64_t destination_step = 0;
   std::uint64_t bytes = 0;
   std::uint32_t steps = 0;
-  std::uint32_t submitted_steps = 0;
 
   template <typename Coop>
   __device__ __forceinline__ void append(const V2KernelArgs& args, const V2Work& work,
       const ncclGin& gin, std::uint32_t peer, std::uint32_t channel, std::uint32_t source_peer,
       std::uint64_t source, std::uint64_t destination, std::uint64_t slice_bytes,
       std::uint64_t slice_index, bool complete, Coop coop) {
-    submitted_steps = 0;
     if (steps == 0) {
       source_step = source;
       destination_step = destination;
@@ -112,7 +110,6 @@ struct V2GinFifoPut {
             bytes, V2GinReadySignalAdd{v2GinReadySignal(args, args.local_rank, channel), steps},
             ncclGin_None{}, coop, ncclGin_None{}, cuda::thread_scope_thread,
             cuda::thread_scope_device, ncclGinOptFlagsDefault);
-    submitted_steps = steps;
     steps = 0;
     bytes = 0;
   }
