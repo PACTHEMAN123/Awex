@@ -210,11 +210,7 @@ __device__ __forceinline__ void v2GinRunDirectRelay(
       if (index >= work.fifo_depth && retired <= index - work.fifo_depth) {
         // Returning only one slot can deadlock a batched-credit predecessor:
         // it cannot supply our next input until an entire credit batch is sent.
-        // A coalescing predecessor needs a full publication group available
-        // before its next ready signal. Retire that many existing input slots.
-        const std::uint64_t credit_batch = input_gin
-          ? (args.gin_credit_batch > v2GinPutSteps(args, work)
-              ? args.gin_credit_batch : v2GinPutSteps(args, work)) : 1;
+        const std::uint64_t credit_batch = input_gin ? args.gin_credit_batch : 1;
         const std::uint64_t target = ((index - work.fifo_depth) / credit_batch + 1) * credit_batch;
         while (retired < target && retired < slices) {
           if (!retire(retired)) break;
@@ -265,7 +261,7 @@ __device__ __forceinline__ void v2GinRunDirectRelay(
               v2GinPayloadOffset(args, args.local_rank, direct_source ? work.peer : work.forward_peer, channel,
                                  direct_source ? work.step_begin + index : work.forward_step_begin + index,
                                  work.fifo_depth),
-              bytes, V2GinReadySignalAdd{v2GinReadySignal(args, args.local_rank, channel), 1},
+              bytes, V2GinReadySignalInc{v2GinReadySignal(args, args.local_rank, channel)},
               ncclGin_None{}, warps, ncclGin_None{}, cuda::thread_scope_thread,
               cuda::thread_scope_device, ncclGinOptFlagsDefault);
       else if (tid == 0) {
@@ -326,6 +322,103 @@ __device__ __forceinline__ void v2GinRunDirectRelay(
 }
 #endif
 
+// NCCL RailRing reserves a network warp while the other warps distribute data.
+// Adapt that split to the existing outgoing FIFO: copy workers stage and place
+// each input once, then publish a CTA-local watermark. The network warp sends
+// staged bytes independently, so its submission latency cannot hold the next
+// copy barrier. Receiver credits protect outgoing-slot reuse; input credits
+// need only wait for the fused copy, never for downstream consumption.
+#if AWEX_NCCL_DEVICE_V2_HAS_GIN
+__device__ __forceinline__ void v2GinRunStagedRelay(
+    const V2KernelArgs& args, const V2Work& work, std::uint32_t channel, int tid, int nthreads,
+    int barrier, int copy_barrier, int* copy_ready, unsigned long long* copy_completed,
+    V2KernelProfile* profile) {
+  ncclGin gin{args.dev_comm, static_cast<int>(channel % args.dev_comm.ginContextCount)};
+  const ncclTeam world = ncclTeamWorld(args.dev_comm);
+  auto* error = &reinterpret_cast<V2WindowHeader*>(args.local_window)->error;
+  const std::uint64_t slices = (work.nbytes + work.step_bytes - 1) / work.step_bytes;
+  if (tid < kWarpSize) {
+    ncclCoopWarp warp;
+    for (std::uint64_t index = 0; index < slices; ++index) {
+      int success = 1;
+      if (tid == 0) {
+        const unsigned long long start = clock64();
+        while (atomicAdd(copy_completed, 0ULL) < work.step_begin + index) {
+          if (v2LoadError(error) != 0) { success = 0; break; }
+          if (clock64() - start > args.timeout_cycles) {
+            atomicCAS(error, 0U, 4U); success = 0; break;
+          }
+        }
+        // Pair with the copying leader's fence before its shared watermark.
+        __threadfence_block();
+        profile->input_wait_cycles += clock64() - start;
+      }
+      if (__shfl_sync(0xffffffffU, success, 0) == 0) break;
+      const std::uint64_t offset = index * work.step_bytes;
+      const std::uint64_t bytes = work.step_bytes < work.nbytes - offset
+        ? work.step_bytes : work.nbytes - offset;
+      const std::uint64_t output_step = work.forward_step_begin + index;
+      const unsigned long long post_start = tid == 0 ? clock64() : 0;
+      if (tid == 0 && (index + 1 == slices || (index + 1) % args.gin_credit_batch == 0)) {
+        const std::uint32_t credits = index + 1 == slices && (index + 1) % args.gin_credit_batch != 0
+          ? (index + 1) % args.gin_credit_batch : args.gin_credit_batch;
+        gin.signal(world, work.peer,
+          V2GinCreditSignalAdd{v2GinCreditSignal(args, args.local_rank, channel), credits});
+      }
+      gin.put(world, work.forward_peer, args.window,
+        v2GinPayloadOffset(args, work.forward_peer, args.local_rank, channel, output_step, work.fifo_depth),
+        args.window,
+        v2GinPayloadOffset(args, args.local_rank, work.forward_peer, channel, output_step, work.fifo_depth),
+        bytes, V2GinReadySignalInc{v2GinReadySignal(args, args.local_rank, channel)},
+        ncclGin_None{}, warp, ncclGin_None{}, cuda::thread_scope_thread,
+        cuda::thread_scope_device, ncclGinOptFlagsDefault);
+      if (tid == 0) profile->post_cycles += clock64() - post_start;
+    }
+    if (work.final && slices != 0 && tid == 0 && v2LoadError(error) == 0) {
+      const unsigned long long start = clock64();
+      v2GinWaitSignal(args, gin, v2GinCreditSignal(args, work.forward_peer, channel),
+        work.forward_step_begin + slices - 1, 4U);
+      profile->final_wait_cycles += clock64() - start;
+    }
+  } else {
+    const int copy_tid = tid - kWarpSize;
+    const int copy_threads = nthreads - kWarpSize;
+    for (std::uint64_t index = 0; index < slices; ++index) {
+      const std::uint64_t input_step = work.step_begin + index;
+      const std::uint64_t output_step = work.forward_step_begin + index;
+      if (copy_tid == 0) {
+        const unsigned long long start = clock64();
+        *copy_ready = output_step <= work.fifo_depth ||
+          v2GinWaitSignal(args, gin, v2GinCreditSignal(args, work.forward_peer, channel),
+            output_step - work.fifo_depth, 3U);
+        if (*copy_ready) *copy_ready = v2GinWaitSignal(args, gin,
+          v2GinReadySignal(args, work.peer, channel), input_step, 2U);
+        profile->output_wait_cycles += clock64() - start;
+      }
+      v2GroupBarrier(copy_barrier, copy_threads);
+      if (!*copy_ready) break;
+      const std::uint64_t offset = index * work.step_bytes;
+      const std::uint64_t bytes = work.step_bytes < work.nbytes - offset
+        ? work.step_bytes : work.nbytes - offset;
+      const unsigned long long start = copy_tid == 0 ? clock64() : 0;
+      v2CopyContiguousToFragmentsAndContiguous(args, work,
+        v2GinLocalPayload(args, work.forward_peer, channel, output_step, work.fifo_depth),
+        v2GinLocalPayload(args, work.peer, channel, input_step, work.fifo_depth),
+        offset, bytes, copy_tid, copy_threads);
+      v2GroupBarrier(copy_barrier, copy_threads);
+      if (copy_tid == 0) {
+        // All workers finished their writes before publishing to the NIC warp.
+        __threadfence();
+        atomicExch(copy_completed, input_step);
+        profile->copy_cycles += clock64() - start;
+        ++profile->slice_count;
+      }
+    }
+  }
+  v2GroupBarrier(barrier, nthreads);
+}
+#endif
+
 // A ring receiver consumes one FIFO step and republishes that same step to its
 // successor before returning credit to its predecessor. Both LSA and GIN edges
 // use the same route channel and byte partition, so mixed intra/inter-node rings
@@ -348,9 +441,6 @@ __device__ __forceinline__ void v2RunRelay(const V2KernelArgs& args, const V2Wor
   std::uint64_t cursor = 0;
   std::uint64_t input_step = work.step_begin;
   std::uint64_t output_step = work.forward_step_begin;
-#if AWEX_NCCL_DEVICE_V2_HAS_GIN
-  V2GinFifoPut fifo_put;
-#endif
 
   while (cursor < work.nbytes) {
     const std::uint64_t slice_bytes =
@@ -444,12 +534,13 @@ __device__ __forceinline__ void v2RunRelay(const V2KernelArgs& args, const V2Wor
       // before a potentially backpressured forward put so congestion on the
       // successor does not unnecessarily stall the predecessor.
       if (output_gin) {
-        // Stage into existing send FIFO slots, then submit one contiguous put
-        // and strong ready increment for a bounded group. Input credits may
-        // advance independently: they no longer protect these copied sources.
-        fifo_put.append(args, work, gin, work.forward_peer, channel, work.forward_peer,
-                        output_step, output_step, slice_bytes, cursor / work.step_bytes,
-                        cursor + slice_bytes == work.nbytes, ncclCoopThread{});
+        gin.put(world, work.forward_peer, args.window,
+                v2GinPayloadOffset(args, work.forward_peer, args.local_rank, channel, output_step, work.fifo_depth),
+                args.window,
+                v2GinPayloadOffset(args, args.local_rank, work.forward_peer, channel, output_step, work.fifo_depth),
+                slice_bytes, V2GinReadySignalInc{v2GinReadySignal(args, args.local_rank, channel)}, ncclGin_None{},
+                ncclCoopThread{}, ncclGin_None{}, cuda::thread_scope_thread, cuda::thread_scope_device,
+                ncclGinOptFlagsDefault);
       } else {
         output_slot->bytes = static_cast<std::uint32_t>(slice_bytes);
         v2Publish(&output_slot->ready_step, output_step);
@@ -520,7 +611,10 @@ __device__ __forceinline__ void v2RunBatch(const V2KernelArgs& args, const V2Wor
       // NCCL SIMPLE recvCopySend isolates receive and send FIFO lifetimes.
       // Fuse model placement and the copy into the existing send FIFO for
       // GIN-to-GIN; preserve the network/local split on mixed GIN/LSA routes.
-      if ((use_gin != forward_gin) && extra_send_barrier) {
+      if (use_gin && forward_gin && extra_send_barrier) {
+        v2GinRunStagedRelay(args, work, channel, subtid, subthreads, main_barrier, wait_barrier,
+                            &shared.ready[group], &shared.copy_completed[group], profile);
+      } else if ((use_gin != forward_gin) && extra_send_barrier) {
         v2GinRunDirectRelay(args, work, channel, subtid, subthreads, main_barrier, wait_barrier,
                             &shared.ready[group], &shared.copy_completed[group], profile);
       } else
