@@ -272,12 +272,21 @@ def pretty_bytes(size_bytes):
 
 
 def stripped_env_vars():
-    vars = {}
-    for k, v in os.environ.items():
-        if "secret" not in k.lower():
-            vars[k] = v
-    vars.pop("LS_COLORS", None)
-    return vars
+    # Log the bindings needed to reproduce weight-transfer experiments.
+    # An environment dump can include unrelated authentication material.
+    keys = (
+        "RANK", "LOCAL_RANK", "WORLD_SIZE", "LOCAL_WORLD_SIZE",
+        "CUDA_VISIBLE_DEVICES", "CUDA_DEVICE_MAX_CONNECTIONS",
+        "AWEX_NODE_LOCAL_RANK_OFFSET", "AWEX_NODE_LOCAL_WORLD_SIZE",
+        "AWEX_NODE_LOCAL_GPU_IDS", "AWEX_NCCL_DEVICE_V2_HCA_POLICY",
+        "AWEX_NCCL_DEVICE_V2_SELECTED_HCA_BANDWIDTH_GBPS",
+        "NCCL_IB_HCA", "NCCL_IB_GID_INDEX", "NCCL_IB_DISABLE", "NCCL_NET",
+        "NCCL_SOCKET_IFNAME", "NCCL_CROSS_NIC", "NCCL_IGNORE_CPU_AFFINITY",
+    )
+    bindings = {key: os.environ[key] for key in keys if key in os.environ}
+    if hasattr(os, "sched_getaffinity"):
+        bindings["process_cpu_affinity"] = sorted(os.sched_getaffinity(0))
+    return bindings
 
 
 class AttrDict(dict):
