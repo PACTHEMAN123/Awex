@@ -195,6 +195,81 @@ __device__ __forceinline__ void v2GinRunSend(const V2KernelArgs& args, const V2W
   }
 }
 
+// Reuse the ring relay's network/copy split at the quantizing source. A
+// completed-slot watermark replaces the source's per-step all-thread barrier:
+// the NIC warp can publish one group while producer warps quantize the next.
+// Both halves use the original FIFO and downstream credit lifetime.
+__device__ __forceinline__ void v2GinRunQuantizedSend(
+    const V2KernelArgs& args, const V2Work& work, std::uint32_t channel, int tid, int nthreads,
+    int barrier, int copy_barrier, int* copy_ready, unsigned long long* copy_completed,
+    V2KernelProfile* profile) {
+  ncclGin gin{args.dev_comm, static_cast<int>(channel % args.dev_comm.ginContextCount)};
+  auto* error = &reinterpret_cast<V2WindowHeader*>(args.local_window)->error;
+  const ncclGinSignal_t credit_signal = v2GinCreditSignal(args, work.peer, channel);
+  const std::uint64_t slices = (work.nbytes + work.step_bytes - 1) / work.step_bytes;
+  if (tid < kWarpSize) {
+    ncclCoopWarp warp;
+    V2GinFifoPut fifo_put;
+    for (std::uint64_t index = 0; index < slices; ++index) {
+      int success = 1;
+      if (tid == 0) {
+        const unsigned long long start = clock64();
+        while (atomicAdd(copy_completed, 0ULL) < work.step_begin + index) {
+          if (v2LoadError(error) != 0) { success = 0; break; }
+          if (clock64() - start > args.timeout_cycles) {
+            atomicCAS(error, 0U, 4U); success = 0; break;
+          }
+        }
+        __threadfence_block();
+        profile->input_wait_cycles += clock64() - start;
+      }
+      if (__shfl_sync(0xffffffffU, success, 0) == 0) break;
+      const std::uint64_t offset = index * work.step_bytes;
+      const std::uint64_t bytes = work.step_bytes < work.nbytes - offset
+          ? work.step_bytes : work.nbytes - offset;
+      const std::uint64_t step = work.step_begin + index;
+      const unsigned long long start = tid == 0 ? clock64() : 0;
+      fifo_put.append(args, work, gin, work.peer, channel, work.peer, step, step,
+                      bytes, index, index + 1 == slices, warp);
+      if (tid == 0) profile->post_cycles += clock64() - start;
+    }
+    if (work.final && slices != 0 && tid == 0 && v2LoadError(error) == 0) {
+      const unsigned long long start = clock64();
+      v2GinWaitSignal(args, gin, credit_signal, work.step_begin + slices - 1, 4U);
+      profile->final_wait_cycles += clock64() - start;
+    }
+  } else {
+    const int copy_tid = tid - kWarpSize;
+    const int copy_threads = nthreads - kWarpSize;
+    for (std::uint64_t index = 0; index < slices; ++index) {
+      const std::uint64_t step = work.step_begin + index;
+      if (copy_tid == 0) {
+        const unsigned long long start = clock64();
+        *copy_ready = step <= work.fifo_depth ||
+          v2GinWaitSignal(args, gin, credit_signal, step - work.fifo_depth, 3U);
+        profile->output_wait_cycles += clock64() - start;
+      }
+      v2GroupBarrier(copy_barrier, copy_threads);
+      if (!*copy_ready) break;
+      const std::uint64_t offset = index * work.step_bytes;
+      const std::uint64_t bytes = work.step_bytes < work.nbytes - offset
+          ? work.step_bytes : work.nbytes - offset;
+      const unsigned long long start = copy_tid == 0 ? clock64() : 0;
+      v2CopyFragmentsToContiguous(args, work,
+          v2GinLocalPayload(args, work.peer, channel, step, work.fifo_depth),
+          offset, bytes, copy_tid, copy_threads);
+      v2GroupBarrier(copy_barrier, copy_threads);
+      if (copy_tid == 0) {
+        __threadfence();
+        atomicExch(copy_completed, step);
+        profile->copy_cycles += clock64() - start;
+        ++profile->slice_count;
+      }
+    }
+  }
+  v2GroupBarrier(barrier, nthreads);
+}
+
 __device__ __forceinline__ void v2GinRunRecv(const V2KernelArgs& args, const V2Work& work, std::uint32_t channel,
                                              int tid, int nthreads, int barrier, int* ready,
                                              V2KernelProfile* profile) {

@@ -626,8 +626,16 @@ __device__ __forceinline__ void v2RunBatch(const V2KernelArgs& args, const V2Wor
     } else if (use_gin) {
 #if AWEX_NCCL_DEVICE_V2_HAS_GIN
       if (args.direction == V2Direction::kSend) {
+        bool quantized = false;
+        for (std::uint32_t index = 0; index < work.fragment_count; ++index)
+          quantized |= args.fragments[work.fragment_begin + index].block_rows != 0;
+        if (quantized && extra_send_barrier) {
+          v2GinRunQuantizedSend(args, work, channel, subtid, subthreads, main_barrier, wait_barrier,
+                               &shared.ready[group], &shared.copy_completed[group], profile);
+        } else {
         v2GinRunSend(args, work, channel, subtid, subthreads, main_barrier, wait_barrier, &shared.ready[group],
                      profile);
+        }
       } else {
         v2GinRunRecv(args, work, channel, subtid, subthreads, main_barrier, &shared.ready[group], profile);
       }
