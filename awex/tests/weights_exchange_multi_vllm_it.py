@@ -381,6 +381,9 @@ class MultiVLLMWeightsExchangeIT:
             ]
             if self.inference_config.get("enable_expert_parallel"):
                 cmd.append("--enable-expert-parallel")
+            from awex.tests.experimental.fp8_transfer_config import fp8_server_args
+
+            cmd.extend(fp8_server_args())
             gpu_memory_utilization = self.inference_config.get("gpu_memory_utilization")
             if gpu_memory_utilization is not None:
                 cmd.extend(

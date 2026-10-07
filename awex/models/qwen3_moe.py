@@ -21,6 +21,7 @@ import torch
 
 from awex import logging
 from awex.converter.sglang_converter import SGlangToHFWeightConverter
+from awex.converter.weights_converter import append_scale_inv, normalize_scale_inv_name
 from awex.sharding.param_sharding import ShardingStrategy
 
 logger = logging.getLogger(__name__)
@@ -77,7 +78,11 @@ class SGlangToHFWeightConverterQwen3Moe(SGlangToHFWeightConverter):
         # to every "experts" token, so leaving that segment in place produces
         # mlp.experts.<id>.routed_experts.<id> instead of the HF contract.
         name = name.replace(".experts.routed_experts.", ".experts.")
-        return super().convert_param(name, parameter)
+        base_name, has_scale_inv = normalize_scale_inv_name(name)
+        return [
+            (append_scale_inv(converted_name, has_scale_inv), tensor)
+            for converted_name, tensor in super().convert_param(base_name, parameter)
+        ]
 
     def _convert_layer_norm_param(
         self, name: str, parameter: torch.Tensor, layer_number: str

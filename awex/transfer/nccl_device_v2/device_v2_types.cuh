@@ -91,6 +91,12 @@ struct alignas(16) V2Fragment {
   std::uint64_t tensor_row_bytes;
   std::uint64_t tensor_row_stride;
   std::uint64_t work_offset;
+  // Zero block dimensions preserve the copy-only path. tensor_offset is a
+  // wire offset for quantized fragments; the tensor pointer is matrix-local.
+  std::uintptr_t scale_ptr = 0;
+  std::uint64_t scale_row_stride = 0;
+  std::uint32_t block_rows = 0;
+  std::uint32_t block_cols = 0;
 };
 
 struct alignas(16) V2Work {

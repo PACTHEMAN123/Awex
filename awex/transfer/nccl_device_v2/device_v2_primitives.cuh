@@ -20,6 +20,7 @@
 #include <nccl_device/utility.h>
 
 #include "device_v2_types.cuh"
+#include "device_v2_fp8.cuh"
 
 namespace awex {
 namespace nccl_device_v2 {
@@ -381,6 +382,12 @@ __device__ __forceinline__ void v2CopyFragmentsToContiguous(const V2KernelArgs& 
     const std::uint64_t begin = fragment.work_offset < work_offset ? work_offset : fragment.work_offset;
     const std::uint64_t end = fragment_end < copy_end ? fragment_end : copy_end;
     const auto* tensor = reinterpret_cast<const std::uint8_t*>(fragment.tensor_ptr);
+    if (fragment.block_rows != 0) {
+      v2QuantizeToFifo(fragment, destination + begin - work_offset,
+                       fragment.tensor_offset + begin - fragment.work_offset,
+                       end - begin, tid, nthreads);
+      continue;
+    }
     v2CopyTensorToContiguous(destination + begin - work_offset, tensor,
                              fragment.tensor_offset + begin - fragment.work_offset, end - begin,
                              fragment.tensor_row_bytes, fragment.tensor_row_stride, tid, nthreads);
@@ -398,6 +405,12 @@ __device__ __forceinline__ void v2CopyContiguousToFragments(const V2KernelArgs& 
     const std::uint64_t begin = fragment.work_offset < work_offset ? work_offset : fragment.work_offset;
     const std::uint64_t end = fragment_end < copy_end ? fragment_end : copy_end;
     auto* tensor = reinterpret_cast<std::uint8_t*>(fragment.tensor_ptr);
+    if (fragment.block_rows != 0) {
+      v2ScatterFp8FromFifo(fragment, source + begin - work_offset, nullptr,
+                          fragment.tensor_offset + begin - fragment.work_offset,
+                          end - begin, tid, nthreads);
+      continue;
+    }
     v2CopyContiguousToTensor(tensor, source + begin - work_offset,
                              fragment.tensor_offset + begin - fragment.work_offset, end - begin,
                              fragment.tensor_row_bytes, fragment.tensor_row_stride, tid, nthreads);
@@ -415,6 +428,13 @@ __device__ __forceinline__ void v2CopyContiguousToFragmentsAndContiguous(
     const std::uint64_t begin = fragment.work_offset < work_offset ? work_offset : fragment.work_offset;
     const std::uint64_t end = fragment_end < copy_end ? fragment_end : copy_end;
     const std::uint64_t contiguous_offset = begin - work_offset;
+    if (fragment.block_rows != 0) {
+      v2ScatterFp8FromFifo(fragment, source + contiguous_offset,
+                          contiguous_destination + contiguous_offset,
+                          fragment.tensor_offset + begin - fragment.work_offset,
+                          end - begin, tid, nthreads);
+      continue;
+    }
     auto* tensor = reinterpret_cast<std::uint8_t*>(fragment.tensor_ptr);
     v2CopyContiguousToTensorAndContiguous(
       tensor, contiguous_destination + contiguous_offset, source + contiguous_offset,

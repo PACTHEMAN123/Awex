@@ -61,6 +61,10 @@ struct V2LoweringTask {
   std::uint32_t ordinal = 0;
   std::uint32_t forward_peer = kNoPeer;
   std::uint32_t ring_id = kNoRing;
+  std::uintptr_t scale_ptr = 0;
+  std::uint64_t scale_row_stride = 0;
+  std::uint32_t block_rows = 0;
+  std::uint32_t block_cols = 0;
 };
 
 struct V2Schedule {
@@ -216,6 +220,10 @@ inline void v2AppendFragments(const std::vector<V2StreamSpan>& spans, std::uint6
       task.tensor_row_bytes,
       task.tensor_row_stride,
       begin - work_begin,
+      task.scale_ptr,
+      task.scale_row_stride,
+      task.block_rows,
+      task.block_cols,
     });
   }
   const std::size_t fragment_count = schedule->fragments.size() - work->fragment_begin;

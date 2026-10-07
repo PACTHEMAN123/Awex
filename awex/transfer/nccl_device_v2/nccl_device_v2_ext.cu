@@ -373,7 +373,9 @@ bool same_tasks(const std::vector<v2::V2LoweringTask>& left, const std::vector<v
     const auto& b = right[index];
     if (a.tensor_ptr != b.tensor_ptr || a.nbytes != b.nbytes || a.tensor_offset != b.tensor_offset ||
         a.tensor_row_bytes != b.tensor_row_bytes || a.tensor_row_stride != b.tensor_row_stride || a.peer != b.peer ||
-        a.ordinal != b.ordinal || a.forward_peer != b.forward_peer || a.ring_id != b.ring_id) {
+        a.ordinal != b.ordinal || a.forward_peer != b.forward_peer || a.ring_id != b.ring_id ||
+        a.scale_ptr != b.scale_ptr || a.scale_row_stride != b.scale_row_stride ||
+        a.block_rows != b.block_rows || a.block_cols != b.block_cols) {
       return false;
     }
   }
@@ -579,7 +581,8 @@ std::vector<v2::V2LoweringTask> build_tasks(
   const std::vector<int64_t>& tensor_row_strides, const std::vector<int64_t>& peers,
   const std::vector<int64_t>& ordinals, const std::vector<int64_t>& expected_counts,
   const std::vector<int64_t>& forward_peers, const std::vector<int64_t>& ring_ids,
-  std::vector<std::uint32_t>* active_peers) {
+  std::vector<std::uint32_t>* active_peers,
+  const std::vector<std::vector<int64_t>>& quantization, bool sender) {
   if (tensors.size() != lengths.size() || tensors.size() != tensor_offsets.size() ||
       tensors.size() != tensor_row_bytes.size() || tensors.size() != tensor_row_strides.size() ||
       tensors.size() != peers.size() || tensors.size() != ordinals.size() ||
@@ -589,6 +592,8 @@ std::vector<v2::V2LoweringTask> build_tasks(
   if (expected_counts.size() != static_cast<std::size_t>(state.world_size)) {
     throw std::runtime_error("nccl_device_v2 expected-count vector does not match world_size");
   }
+  if (!quantization.empty() && quantization.size() != tensors.size())
+    throw std::runtime_error("FP8 descriptor count does not match tasks");
 
   std::vector<std::uint32_t> expected(state.world_size, 0);
   for (int logical_peer = 0; logical_peer < state.world_size; ++logical_peer) {
@@ -654,6 +659,25 @@ std::vector<v2::V2LoweringTask> build_tasks(
       forward_peer,
       ring_id < 0 ? v2::kNoRing : static_cast<std::uint32_t>(ring_id),
     });
+    if (!quantization.empty()) {
+      const auto& q = quantization[index];
+      if (q.size() != 4) throw std::runtime_error("invalid FP8 descriptor");
+      if (q[0] != 0) {
+        if ((q[0] != 64 && q[0] != 128) || (q[1] != 64 && q[1] != 128) ||
+            q[2] < 0 || q[3] < 0 || (!sender && q[2] == 0) || tensor.dim() != 2 ||
+            tensor.stride(1) != 1 || tensor.size(0) % q[0] != 0 || tensor.size(1) % q[1] != 0 ||
+            (sender && tensor.scalar_type() != at::ScalarType::BFloat16) ||
+            (!sender && tensor.scalar_type() != at::ScalarType::Float8_e4m3fn) ||
+            tensor_offsets[index] != 0 ||
+            lengths[index] != (tensor.numel() / (q[0] * q[1])) * (q[0] * q[1] + 16))
+          throw std::runtime_error("invalid FP8 matrix/dtype/block/wire range");
+        auto& task = tasks.back();
+        task.block_rows = static_cast<std::uint32_t>(q[0]);
+        task.block_cols = static_cast<std::uint32_t>(q[1]);
+        task.scale_ptr = static_cast<std::uintptr_t>(q[2]);
+        task.scale_row_stride = static_cast<std::uint64_t>(q[3]);
+      }
+    }
     ++actual[peer];
   }
   if (actual != expected) {
@@ -667,7 +691,7 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
                 const std::vector<int64_t>& tensor_row_strides, const std::vector<int64_t>& peers,
                 const std::vector<int64_t>& ordinals, const std::vector<int64_t>& expected_counts,
                 const std::vector<int64_t>& forward_peers, const std::vector<int64_t>& ring_ids, bool sender,
-                int64_t sequence) {
+                int64_t sequence, const std::vector<std::vector<int64_t>>& quantization = {}) {
   using Clock = std::chrono::steady_clock;
   const auto launch_start = Clock::now();
   auto* state = reinterpret_cast<DeviceState*>(handle);
@@ -680,7 +704,8 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
 
   std::vector<std::uint32_t> active_peers;
   const auto tasks = build_tasks(*state, tensors, lengths, tensor_offsets, tensor_row_bytes, tensor_row_strides, peers,
-                                 ordinals, expected_counts, forward_peers, ring_ids, &active_peers);
+                                 ordinals, expected_counts, forward_peers, ring_ids, &active_peers,
+                                 quantization, sender);
   const v2::V2Direction direction = sender ? v2::V2Direction::kSend : v2::V2Direction::kRecv;
   AWEX_CUDA_V2_CHECK(cudaSetDevice(state->device));
   auto stream = at::cuda::getCurrentCUDAStream(state->device).stream();
@@ -932,7 +957,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
     py::arg("gin_fifo_depth") = 16, py::arg("network_step_bytes") = 128 * 1024,
     py::arg("gin_chunk_bytes") = 4 * 1024 * 1024, py::arg("gin_context_count") = 1,
     py::arg("logical_to_communicator") = std::vector<int64_t>{});
-  module.def("launch", &launch);
+  module.def("launch", &launch, py::arg("handle"), py::arg("tensors"), py::arg("lengths"),
+             py::arg("tensor_offsets"), py::arg("tensor_row_bytes"), py::arg("tensor_row_strides"),
+             py::arg("peers"), py::arg("ordinals"), py::arg("expected_counts"), py::arg("forward_peers"),
+             py::arg("ring_ids"), py::arg("sender"), py::arg("sequence"),
+             py::arg("quantization") = std::vector<std::vector<int64_t>>{});
   module.def("destroy", [](int64_t handle) {
     auto* state = reinterpret_cast<DeviceState*>(handle);
     if (state == nullptr) {

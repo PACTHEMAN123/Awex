@@ -32,7 +32,7 @@ import os
 import socket
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dataclass_field
 from enum import Enum
 from typing import Any
 
@@ -107,6 +107,8 @@ class _V2Batch:
     copybacks: list[tuple[torch.Tensor, torch.Tensor]]
     forward_peers: list[int]
     ring_ids: list[int]
+    quantization: list[list[int]] = dataclass_field(default_factory=list)
+    scale_tensors: list[torch.Tensor] = dataclass_field(default_factory=list)
 
 
 _NO_PEER = -1
@@ -356,6 +358,7 @@ def _apply_send_ring_routes(
                 int(batch.tensor_offsets[index]),
                 int(batch.tensor_row_bytes[index]),
                 int(batch.tensor_row_strides[index]),
+                *(batch.quantization[index][:2] if batch.quantization else []),
             )
 
         strategy = (
@@ -400,6 +403,8 @@ def _apply_send_ring_routes(
     ):
         values = getattr(batch, field)
         setattr(batch, field, [values[index] for index in keep])
+    if batch.quantization:
+        batch.quantization = [batch.quantization[index] for index in keep]
     batch.ring_ids = [ring_by_index.get(index, _NO_RING) for index in keep]
     _reindex_batch_streams(batch)
 
@@ -522,6 +527,22 @@ def _append_tensor_range(
     return ordinal + 1
 
 
+def _fp8_wire_bytes(tensor, block_shape, dtype) -> int:
+    br, bc = block_shape
+    if (
+        tensor.dtype != dtype
+        or tensor.ndim != 2
+        or tensor.stride(1) != 1
+        or tensor.shape[0] % br
+        or tensor.shape[1] % bc
+    ):
+        raise NCCLDeviceV2UnavailableError(
+            f"FP8 transfer requires block-aligned 2D {dtype} matrices: "
+            f"shape={tuple(tensor.shape)}, block={block_shape}, dtype={tensor.dtype}"
+        )
+    return tensor.numel() // (br * bc) * (br * bc + 16)
+
+
 def _build_send_batch(
     parameters: dict,
     plan: TransferPlan,
@@ -533,6 +554,7 @@ def _build_send_batch(
     num_infer_engines: int = 1,
     ring_broadcast: bool = False,
     ring_swizzle: bool = False,
+    fp8_block_shape: tuple[int, int] | None = None,
 ) -> _V2Batch:
     _resolve_chunk_bytes(chunk_bytes)
     tensors: list[torch.Tensor] = []
@@ -547,6 +569,7 @@ def _build_send_batch(
     region_bytes = [0] * world_size
     expected_counts = [0] * world_size
     context = {}
+    quantization = []
     for peer, operations in _operation_groups(plan, rank, world_size):
         peer_offset = 0
         ordinal = 0
@@ -576,6 +599,15 @@ def _build_send_batch(
                 row_bytes, row_stride = _tensor_copy_layout(
                     fragment, op.send_shard_meta.name
                 )
+                q = [0, 0, 0, 0]
+                if (
+                    fp8_block_shape
+                    and str(op.recv_shard_meta.dtype).removeprefix("torch.")
+                    == "float8_e4m3fn"
+                ):
+                    length = _fp8_wire_bytes(fragment, fp8_block_shape, torch.bfloat16)
+                    q = [*fp8_block_shape, 0, 0]
+                quantization.append(q)
                 ordinal = _append_tensor_range(
                     tensors=tensors,
                     tensor_offsets=tensor_offsets,
@@ -614,6 +646,7 @@ def _build_send_batch(
         copybacks=[],
         forward_peers=[_NO_PEER] * len(tensors),
         ring_ids=[_NO_RING] * len(tensors),
+        quantization=quantization if fp8_block_shape else [],
     )
     if ring_broadcast:
         _apply_send_ring_routes(
@@ -637,6 +670,7 @@ def _build_recv_batch(
     num_infer_engines: int = 1,
     ring_broadcast: bool = False,
     ring_swizzle: bool = False,
+    fp8_block_shape: tuple[int, int] | None = None,
 ) -> _V2Batch:
     _resolve_chunk_bytes(chunk_bytes)
     tensors: list[torch.Tensor] = []
@@ -651,6 +685,8 @@ def _build_recv_batch(
     region_bytes = [0] * world_size
     expected_counts = [0] * world_size
     copybacks: list[tuple[torch.Tensor, torch.Tensor]] = []
+    quantization = []
+    scale_tensors = []
     for peer, operations in _operation_groups(plan, rank, world_size):
         peer_offset = 0
         ordinal = 0
@@ -687,7 +723,48 @@ def _build_recv_batch(
             target_offset = 0
             element_size = int(target.element_size())
             for fragment_numel in fragment_numels:
+                fragment_target = target
+                fragment_offset = target_offset
                 length = int(fragment_numel) * element_size
+                q = [0, 0, 0, 0]
+                if fp8_block_shape and target.dtype == torch.float8_e4m3fn:
+                    br, bc = fp8_block_shape
+                    if (
+                        target.ndim != 2
+                        or fragment_numel % target.shape[1]
+                        or target_offset % row_bytes
+                    ):
+                        raise NCCLDeviceV2UnavailableError(
+                            "FP8 source spans must contain complete matrix rows"
+                        )
+                    row_start = target_offset // row_bytes
+                    row_count = fragment_numel // target.shape[1]
+                    fragment_target = target.narrow(0, row_start, row_count)
+                    length = _fp8_wire_bytes(
+                        fragment_target, fp8_block_shape, torch.float8_e4m3fn
+                    )
+                    scale = parameters[op.recv_shard_meta.name + "_scale_inv"]
+                    scale_slices = []
+                    for dim, block in enumerate((br, bc)):
+                        start, stop, step = op.inf_slices[dim].indices(
+                            parameter.shape[dim]
+                        )
+                        if step != 1 or start % block or stop % block:
+                            raise NCCLDeviceV2UnavailableError(
+                                "FP8 resharding must align to quantization blocks"
+                            )
+                        scale_slices.append(slice(start // block, stop // block))
+                    scale = scale[tuple(scale_slices)].narrow(
+                        0, row_start // br, row_count // br
+                    )
+                    if scale.dtype != torch.float32 or scale.stride(-1) != 1:
+                        raise NCCLDeviceV2UnavailableError(
+                            "FP8 scales require row-major FP32 storage"
+                        )
+                    scale_tensors.append(scale)
+                    q = [br, bc, int(scale.data_ptr()), int(scale.stride(0)) * 4]
+                    fragment_offset = 0
+                quantization.append(q)
                 ordinal = _append_tensor_range(
                     tensors=tensors,
                     tensor_offsets=tensor_offsets,
@@ -698,8 +775,8 @@ def _build_recv_batch(
                     peers=peers,
                     ordinals=ordinals,
                     region_indices=region_indices,
-                    tensor=target,
-                    tensor_offset=target_offset,
+                    tensor=fragment_target,
+                    tensor_offset=fragment_offset,
                     nbytes=length,
                     row_bytes=row_bytes,
                     row_stride=row_stride,
@@ -708,7 +785,7 @@ def _build_recv_batch(
                     ordinal=ordinal,
                     region_index=peer,
                 )
-                target_offset += length
+                target_offset += int(fragment_numel) * element_size
                 peer_offset += length
         expected_counts[peer] = ordinal
         region_bytes[peer] = max(region_bytes[peer], peer_offset)
@@ -727,6 +804,8 @@ def _build_recv_batch(
         copybacks=copybacks,
         forward_peers=[_NO_PEER] * len(tensors),
         ring_ids=[_NO_RING] * len(tensors),
+        quantization=quantization if fp8_block_shape else [],
+        scale_tensors=scale_tensors,
     )
     if ring_broadcast:
         _apply_recv_ring_routes(
@@ -920,6 +999,15 @@ class NCCLDeviceV2Transport:
         self.ring_swizzle = _resolve_bool(
             "AWEX_NCCL_DEVICE_V2_RING_SWIZZLE", ring_swizzle
         )
+        self.fp8_block_shape = None
+        if _resolve_bool("AWEX_NCCL_DEVICE_V2_FP8_BLOCKWISE", None):
+            br = _env_int("AWEX_NCCL_DEVICE_V2_FP8_BLOCK_ROWS", 128, 1)
+            bc = _env_int("AWEX_NCCL_DEVICE_V2_FP8_BLOCK_COLS", 128, 1)
+            if br not in (64, 128) or bc not in (64, 128):
+                raise NCCLDeviceV2UnavailableError(
+                    "FP8 block dimensions must be 64 or 128"
+                )
+            self.fp8_block_shape = (br, bc)
         self._extension = None
         self._handle: int | None = None
         self._initialized = False
@@ -958,7 +1046,11 @@ class NCCLDeviceV2Transport:
         self._extension = _load_extension()
         device = torch.device(device_util.get_torch_device())
         feature_sums = torch.tensor(
-            [int(self.ring_broadcast), int(self.ring_swizzle)],
+            [
+                int(self.ring_broadcast),
+                int(self.ring_swizzle),
+                int(self.fp8_block_shape is not None),
+            ],
             dtype=torch.int32,
             device=device,
         )
@@ -970,6 +1062,16 @@ class NCCLDeviceV2Transport:
                 f"ring_broadcast_sum={feature_sums[0]}, "
                 f"ring_swizzle_sum={feature_sums[1]}, world_size={self.world_size}"
             )
+        if self.fp8_block_shape:
+            block_shape = torch.tensor(
+                self.fp8_block_shape, dtype=torch.int32, device=device
+            )
+            shapes = [torch.empty_like(block_shape) for _ in range(self.world_size)]
+            dist.all_gather(shapes, block_shape, group=self.group)
+            if any(not torch.equal(block_shape, other) for other in shapes):
+                raise NCCLDeviceV2UnavailableError(
+                    "FP8 block shape must match on every rank"
+                )
         local_node_id = torch.tensor(
             [_local_node_id()], dtype=torch.int64, device=device
         )
@@ -1075,10 +1177,18 @@ class NCCLDeviceV2Transport:
                 batch.ring_ids,
                 bool(sender),
                 int(sequence),
+                *([batch.quantization] if self.fp8_block_shape else []),
             )
         )
         extension_metrics["hca_policy"] = os.environ.get(
             "AWEX_NCCL_DEVICE_V2_HCA_POLICY", "balanced"
+        )
+        extension_metrics["fp8_blockwise"] = self.fp8_block_shape is not None
+        extension_metrics["fp8_quantized_span_count"] = sum(
+            bool(q[0]) for q in batch.quantization
+        )
+        extension_metrics["fp8_wire_bytes"] = sum(
+            length for length, q in zip(batch.lengths, batch.quantization) if q[0]
         )
         extension_metrics["selected_hca"] = os.environ.get("NCCL_IB_HCA", "topology")
         extension_metrics["ring_order_strategy"] = (
@@ -1135,6 +1245,7 @@ class NCCLDeviceV2Transport:
                 num_infer_engines=self.num_infer_engines,
                 ring_broadcast=self.ring_broadcast,
                 ring_swizzle=self.ring_swizzle,
+                fp8_block_shape=self.fp8_block_shape,
             )
             build_batch_time_ms = (time.perf_counter() - build_start) * 1000.0
         metrics = self._run(batch, sender=True, sequence=_sequence_from_step(step_id))
@@ -1160,6 +1271,7 @@ class NCCLDeviceV2Transport:
                 num_infer_engines=self.num_infer_engines,
                 ring_broadcast=self.ring_broadcast,
                 ring_swizzle=self.ring_swizzle,
+                fp8_block_shape=self.fp8_block_shape,
             )
             build_batch_time_ms = (time.perf_counter() - build_start) * 1000.0
         metrics = self._run(batch, sender=False, sequence=_sequence_from_step(step_id))
@@ -1183,6 +1295,7 @@ class NCCLDeviceV2Transport:
             num_infer_engines=self.num_infer_engines,
             ring_broadcast=self.ring_broadcast,
             ring_swizzle=self.ring_swizzle,
+            fp8_block_shape=self.fp8_block_shape,
         )
         self._prepared_send = (parameters, plan, batch)
 
@@ -1203,6 +1316,7 @@ class NCCLDeviceV2Transport:
             num_infer_engines=self.num_infer_engines,
             ring_broadcast=self.ring_broadcast,
             ring_swizzle=self.ring_swizzle,
+            fp8_block_shape=self.fp8_block_shape,
         )
         self._prepared_recv = (parameters, plan, batch)
 

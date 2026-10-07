@@ -47,6 +47,13 @@ def _is_allowed_infer_only_alias(
         )
     if extra_key == "model.embed_tokens.weight":
         return "lm_head.weight" in infer_keys and "lm_head.weight" in train_keys
+    if os.environ.get(
+        "AWEX_NCCL_DEVICE_V2_FP8_BLOCKWISE", "0"
+    ) == "1" and extra_key.endswith(".weight_scale_inv"):
+        # The fused FIFO path generates/transfers these scales with the weight;
+        # BF16 training metadata deliberately contains no separate scale tensor.
+        weight_key = extra_key.removesuffix("_scale_inv")
+        return weight_key in infer_keys and weight_key in train_keys
     return False
 
 
@@ -238,7 +245,12 @@ def check_train_infer_params_meta(
                 raise ValueError(error_msg)
             else:
                 logger.error(error_msg)
-        if infer_param_meta.dtype != train_param_meta.dtype:
+        fused_fp8 = (
+            os.environ.get("AWEX_NCCL_DEVICE_V2_FP8_BLOCKWISE", "0") == "1"
+            and str(infer_param_meta.dtype).removeprefix("torch.") == "float8_e4m3fn"
+            and str(train_param_meta.dtype).removeprefix("torch.") == "bfloat16"
+        )
+        if infer_param_meta.dtype != train_param_meta.dtype and not fused_fp8:
             error_msg = f"Inconsistent dtype for parameter {param_name}: {infer_param_meta.dtype} != {train_param_meta.dtype}"
             if raise_exception:
                 raise ValueError(error_msg)
@@ -275,13 +287,24 @@ def stripped_env_vars():
     # Log the bindings needed to reproduce weight-transfer experiments.
     # An environment dump can include unrelated authentication material.
     keys = (
-        "RANK", "LOCAL_RANK", "WORLD_SIZE", "LOCAL_WORLD_SIZE",
-        "CUDA_VISIBLE_DEVICES", "CUDA_DEVICE_MAX_CONNECTIONS",
-        "AWEX_NODE_LOCAL_RANK_OFFSET", "AWEX_NODE_LOCAL_WORLD_SIZE",
-        "AWEX_NODE_LOCAL_GPU_IDS", "AWEX_NCCL_DEVICE_V2_HCA_POLICY",
+        "RANK",
+        "LOCAL_RANK",
+        "WORLD_SIZE",
+        "LOCAL_WORLD_SIZE",
+        "CUDA_VISIBLE_DEVICES",
+        "CUDA_DEVICE_MAX_CONNECTIONS",
+        "AWEX_NODE_LOCAL_RANK_OFFSET",
+        "AWEX_NODE_LOCAL_WORLD_SIZE",
+        "AWEX_NODE_LOCAL_GPU_IDS",
+        "AWEX_NCCL_DEVICE_V2_HCA_POLICY",
         "AWEX_NCCL_DEVICE_V2_SELECTED_HCA_BANDWIDTH_GBPS",
-        "NCCL_IB_HCA", "NCCL_IB_GID_INDEX", "NCCL_IB_DISABLE", "NCCL_NET",
-        "NCCL_SOCKET_IFNAME", "NCCL_CROSS_NIC", "NCCL_IGNORE_CPU_AFFINITY",
+        "NCCL_IB_HCA",
+        "NCCL_IB_GID_INDEX",
+        "NCCL_IB_DISABLE",
+        "NCCL_NET",
+        "NCCL_SOCKET_IFNAME",
+        "NCCL_CROSS_NIC",
+        "NCCL_IGNORE_CPU_AFFINITY",
     )
     bindings = {key: os.environ[key] for key in keys if key in os.environ}
     if hasattr(os, "sched_getaffinity"):

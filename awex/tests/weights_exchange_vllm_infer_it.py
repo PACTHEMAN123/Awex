@@ -111,6 +111,9 @@ def _start_vllm_server(
     ]
     if args.vllm_enable_expert_parallel:
         cmd.append("--enable-expert-parallel")
+    from awex.tests.experimental.fp8_transfer_config import fp8_server_args
+
+    cmd.extend(fp8_server_args())
     node_devices = [
         device.strip()
         for device in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
