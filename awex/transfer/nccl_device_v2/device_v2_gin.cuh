@@ -76,6 +76,11 @@ __device__ __forceinline__ std::uint8_t* v2GinLocalPayload(const V2KernelArgs& a
 // batched credits. Padded slots and small windows retain single-slice puts.
 __device__ __forceinline__ std::uint32_t v2GinPutSteps(
     const V2KernelArgs& args, const V2Work& work, bool quantized_source = false) {
+  // Large direct fanouts share each rail across many independently credited
+  // receivers. Publish each completed slice promptly instead of reserving
+  // half every FIFO before making any of those receivers runnable. Relay
+  // rings retain their contiguous half-window puts.
+  if (work.ring_id == kNoRing && quantized_source && args.active_peer_count >= 8) return 1;
   return (work.ring_id != kNoRing || quantized_source) &&
       work.step_bytes == args.layout.slot_bytes && work.fifo_depth >= 4
     ? work.fifo_depth / 2 : 1;
