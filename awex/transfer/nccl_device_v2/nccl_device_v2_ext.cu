@@ -542,7 +542,7 @@ void initialize_sparse_window(DeviceState* state, const std::vector<std::uint32_
       v2::v2InitializeGin(&state->gin, state->comm, state->world_size, state->total_channels,
                           state->gin_fifo_depth, state->network_step_bytes, state->gin.context_count,
                           active_peers, state->peer_transports, std::move(peer_payload_bytes),
-                          &state->peer_channels);
+                          &state->peer_channels, packed_fp8_gin && !ring_only);
       const auto peer_channel_matrix = v2::topology_detail::allGather(
         state->comm, state->peer_channels.data(), state->peer_channels.size(), state->world_size, stream);
       state->gin.channels_per_peer = 1;
