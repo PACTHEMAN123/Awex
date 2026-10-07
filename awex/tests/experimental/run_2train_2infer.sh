@@ -3,7 +3,7 @@
 set -euo pipefail
 
 role="${1:?usage: $0 train|infer FANOUT BACKEND}"
-fanout="${2:?fanout must be 1, 2, or 4}"
+fanout="${2:?fanout must be 1, 2, 4, or 8}"
 backend="${3:?backend must be verl-nccl-bucket, awex-nccl, or awex-nccl-device-v2-gin}"
 
 : "${MODEL_PATH:?set MODEL_PATH}"
@@ -12,16 +12,26 @@ base_port="${BASE_PORT:-18000}"
 num_updates="${NUM_UPDATES:-10}"
 warmup_updates="${WARMUP_UPDATES:-3}"
 gpu_memory_utilization="${VLLM_GPU_MEMORY_UTILIZATION:-0.9}"
-infer_tp=4
+infer_tp="${INFERENCE_TP_SIZE:-4}"
 ring_mode="${RING_MODE:-off}"
 
 case "$fanout" in
-  1|2|4) ;;
+  1|2|4|8) ;;
   *)
-    printf 'Invalid fanout: %s (expected 1, 2, or 4)\n' "$fanout" >&2
+    printf 'Invalid fanout: %s (expected 1, 2, 4, or 8)\n' "$fanout" >&2
     exit 2
     ;;
 esac
+
+case "$infer_tp" in
+  2|4) ;;
+  *) printf 'Invalid INFERENCE_TP_SIZE: %s\n' "$infer_tp" >&2; exit 2 ;;
+esac
+local_engines=$(((fanout + 1) / 2))
+if ((local_engines * infer_tp > 8)); then
+  printf 'Requested topology exceeds eight GPUs per inference node\n' >&2
+  exit 2
+fi
 
 case "$ring_mode" in
   off)
@@ -65,7 +75,7 @@ case "$backend" in
     ;;
 esac
 
-# The integration harness launches TP4 engines on eight-GPU inference nodes.
+# Engines are spread evenly over the same two eight-GPU inference nodes.
 # Keep the logical placement identical to veRL's round-robin engine mapping.
 export AWEX_NODE_LOCAL_WORLD_SIZE="${AWEX_NODE_LOCAL_WORLD_SIZE:-8}"
 
@@ -76,14 +86,12 @@ if [[ "$role" == infer ]]; then
   : "${INFERENCE_NODE_INDEX:?set INFERENCE_NODE_INDEX to 0 or 1}"
   case "$INFERENCE_NODE_INDEX" in
     0)
-      local_engines=$((fanout == 4 ? 2 : 1))
       ;;
     1)
       if [[ "$fanout" == 1 ]]; then
         printf 'fanout=1 uses only inference node 0\n' >&2
         exit 2
       fi
-      local_engines=$((fanout == 4 ? 2 : 1))
       ;;
     *)
       printf 'Invalid INFERENCE_NODE_INDEX: %s\n' "$INFERENCE_NODE_INDEX" >&2
@@ -117,16 +125,15 @@ fi
 : "${INFERENCE_HOST_0:?set INFERENCE_HOST_0 to inference node 0 container IP}"
 : "${INFERENCE_HOST_1:?set INFERENCE_HOST_1 to inference node 1 container IP}"
 
-endpoint_args=(--inference-endpoint "0,${INFERENCE_HOST_0},${base_port}")
-if ((fanout >= 2)); then
-  endpoint_args+=(--inference-endpoint "1,${INFERENCE_HOST_1},${base_port}")
-fi
-if ((fanout == 4)); then
-  endpoint_args+=(
-    --inference-endpoint "2,${INFERENCE_HOST_0},$((base_port + 1))"
-    --inference-endpoint "3,${INFERENCE_HOST_1},$((base_port + 1))"
-  )
-fi
+endpoint_args=()
+for ((engine=0; engine<fanout; engine++)); do
+  if ((engine % 2 == 0)); then
+    engine_host="$INFERENCE_HOST_0"
+  else
+    engine_host="$INFERENCE_HOST_1"
+  fi
+  endpoint_args+=(--inference-endpoint "${engine},${engine_host},$((base_port + engine / 2))")
+done
 
 exec python -m torch.distributed.run \
   --nnodes=2 \

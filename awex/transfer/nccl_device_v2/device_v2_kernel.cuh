@@ -145,8 +145,9 @@ __device__ __forceinline__ void v2RunRecv(const V2KernelArgs& args, const V2Work
 // Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES, Apache-2.0).
 // One warp advances the network directly from received storage; the remaining
 // warps independently place the same bytes into the local model. Unlike NCCL's
-// final registered output, our source is a reusable FIFO. Downstream consumption
-// and local copy completion must therefore precede returning input credit.
+// final registered output, our source is a reusable FIFO. Use NCCL's outbox
+// request progression to protect source lifetime, independently of downstream
+// receive-slot credit. Local copy must also finish before returning input credit.
 __device__ __forceinline__ void v2GinRunDirectRelay(
     const V2KernelArgs& args, const V2Work& work, std::uint32_t channel, int tid, int nthreads,
     int barrier, int copy_barrier, int* copy_ready, unsigned long long* copy_completed,
@@ -171,15 +172,22 @@ __device__ __forceinline__ void v2GinRunDirectRelay(
     std::uint64_t retired = 0;
     V2GinFifoPut fifo_put;
     // Retire an input slot only after both readers (local copy and outgoing
-    // NIC) are finished. A successor credit proves the put's source was read.
+    // NIC) are finished. As in ncclGinOutboxSession::waitBufs, wait for the
+    // request associated with this put before reusing its source slots.
     auto retire = [&] __device__(std::uint64_t index) {
       int success = 1;
       if (tid == 0) {
         const unsigned long long wait_start = clock64();
         const unsigned long long input_step = work.step_begin + index;
         if (direct_source) {
-          success = v2GinWaitSignal(args, gin, v2GinCreditSignal(args, work.forward_peer, channel),
-                                   work.forward_step_begin + index, 4U);
+          V2FifoSlot* state = v2FifoSlot(args, args.local_rank, work.peer, channel,
+                                        input_step, work.fifo_depth, true);
+          // Only the first slot of a submitted group owns a request. Waiting
+          // once protects all of that put's source slots. GIN never uses the
+          // LSA ready/consumed fields, so no new request/receive allocation.
+          if (state->reserved) {
+            gin.wait(*reinterpret_cast<ncclGinRequest_t*>(state), ncclCoopThread());
+          }
         }
         const unsigned long long copy_wait_start = clock64();
         while (success && atomicAdd(copy_completed, 0ULL) < input_step) {
@@ -259,11 +267,29 @@ __device__ __forceinline__ void v2GinRunDirectRelay(
         v2CopyContiguous(staging, source(work.step_begin + index), bytes, tid, kWarpSize);
         warps.sync();
       }
-      if (output_gin) fifo_put.append(args, work, gin, work.forward_peer, channel,
+      if (output_gin) {
+        fifo_put.append(args, work, gin, work.forward_peer, channel,
               direct_source ? work.peer : work.forward_peer,
               direct_source ? work.step_begin + index : work.forward_step_begin + index,
               work.forward_step_begin + index, bytes, index, index + 1 == slices, warps);
-      else if (tid == 0) {
+        if (direct_source && fifo_put.submitted_steps != 0 && tid == 0) {
+          static_assert(sizeof(ncclGinRequest_t) <= offsetof(V2FifoSlot, bytes),
+                        "GIN request must fit unused LSA state fields");
+          static_assert(alignof(V2FifoSlot) >= alignof(ncclGinRequest_t),
+                        "FIFO state must align GIN request");
+          for (std::uint32_t i = 0; i < fifo_put.submitted_steps; ++i) {
+            V2FifoSlot* state = v2FifoSlot(args, args.local_rank, work.peer, channel,
+                fifo_put.source_step + i, work.fifo_depth, true);
+            state->reserved = i == 0;
+          }
+          V2FifoSlot* state = v2FifoSlot(args, args.local_rank, work.peer, channel,
+              fifo_put.source_step, work.fifo_depth, true);
+          // Literal NCCL outbox recordRequest sequence. This tracks NIC source
+          // completion, not the successor's later local model copy.
+          gin.flushAsync(world, work.forward_peer,
+                         reinterpret_cast<ncclGinRequest_t*>(state), ncclCoopThread());
+        }
+      } else if (tid == 0) {
         V2FifoSlot* slot = v2FifoSlot(args, args.local_rank, work.forward_peer, channel,
                                      work.forward_step_begin + index, work.fifo_depth, true);
         slot->bytes = static_cast<std::uint32_t>(bytes);
@@ -277,7 +303,7 @@ __device__ __forceinline__ void v2GinRunDirectRelay(
     }
     // Staging sources may be reused by the next work. Its output wait protects
     // each slot; the final work must additionally drain downstream consumption.
-    if (!direct_source && work.final && slices != 0 && tid == 0 && v2LoadError(error) == 0) {
+    if (work.final && slices != 0 && tid == 0 && v2LoadError(error) == 0) {
       const unsigned long long wait_start = clock64();
       const std::uint64_t last_step = work.forward_step_begin + slices - 1;
       if (output_gin) v2GinWaitSignal(args, gin, v2GinCreditSignal(args, work.forward_peer, channel), last_step, 4U);
