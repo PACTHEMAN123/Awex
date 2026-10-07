@@ -456,6 +456,9 @@ void initialize_sparse_window(DeviceState* state, const std::vector<std::uint32_
   const std::uint32_t local_non_ring = std::any_of(tasks.begin(), tasks.end(), [](const auto& task) {
     return task.ring_id == v2::kNoRing;
   }) ? 1U : 0U;
+  const std::uint32_t local_ring = std::any_of(tasks.begin(), tasks.end(), [](const auto& task) {
+    return task.ring_id != v2::kNoRing;
+  }) ? 2U : 0U;
   const std::uint32_t local_non_ring_lsa = std::any_of(tasks.begin(), tasks.end(), [&](const auto& task) {
     return task.ring_id == v2::kNoRing &&
       (state->peer_transports[task.peer] != static_cast<std::uint8_t>(v2::V2Transport::kGin) ||
@@ -465,11 +468,12 @@ void initialize_sparse_window(DeviceState* state, const std::vector<std::uint32_
   const std::uint32_t local_fp8 = std::any_of(tasks.begin(), tasks.end(), [](const auto& task) {
     return task.block_rows != 0;
   }) ? 1U : 0U;
-  const std::uint32_t local_flags[] = {local_non_ring, local_non_ring_lsa, local_fp8};
+  const std::uint32_t local_flags[] = {local_non_ring | local_ring, local_non_ring_lsa, local_fp8};
   const auto flags = v2::topology_detail::allGather(state->comm, local_flags, 3, state->world_size, stream);
-  bool ring_only = true, has_non_ring_lsa = false, has_fp8 = false;
+  bool ring_only = true, has_ring = false, has_non_ring_lsa = false, has_fp8 = false;
   for (int rank = 0; rank < state->world_size; ++rank) {
-    ring_only &= flags[rank * 3] == 0;
+    ring_only &= (flags[rank * 3] & 1U) == 0;
+    has_ring |= (flags[rank * 3] & 2U) != 0;
     has_non_ring_lsa |= flags[rank * 3 + 1] != 0;
     has_fp8 |= flags[rank * 3 + 2] != 0;
   }
@@ -542,7 +546,7 @@ void initialize_sparse_window(DeviceState* state, const std::vector<std::uint32_
       v2::v2InitializeGin(&state->gin, state->comm, state->world_size, state->total_channels,
                           state->gin_fifo_depth, state->network_step_bytes, state->gin.context_count,
                           active_peers, state->peer_transports, std::move(peer_payload_bytes),
-                          &state->peer_channels, packed_fp8_gin && !ring_only);
+                          &state->peer_channels, packed_fp8_gin && !has_ring);
       const auto peer_channel_matrix = v2::topology_detail::allGather(
         state->comm, state->peer_channels.data(), state->peer_channels.size(), state->world_size, stream);
       state->gin.channels_per_peer = 1;
