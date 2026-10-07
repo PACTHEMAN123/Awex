@@ -25,6 +25,15 @@
 namespace awex {
 namespace nccl_device_v2 {
 
+__device__ __forceinline__ __nv_fp8x2_storage_t v2EncodeBf16Pair(unsigned int packed, float inverse) {
+  // BF16-to-FP32 is an exact bit expansion. Keep the loaded words in registers
+  // instead of taking an addressable view of a local BF16 vector aggregate.
+  return __nv_cvt_float2_to_fp8x2(
+    make_float2(__uint_as_float(packed << 16) * inverse,
+                __uint_as_float(packed & 0xffff0000U) * inverse),
+    __NV_SATFINITE, __NV_E4M3);
+}
+
 // Each record is [FP32 dequantization scale, 12 zero bytes, E4M3 tile].
 // It lives only in the existing FIFO. A single warp owns one quantization
 // block, even when lowering/FIFO steps split the record. No CTA barrier,
@@ -70,26 +79,24 @@ __device__ __forceinline__ void v2QuantizeToFifoImpl(
     // scale division). The receiver consumes this scale without recomputing it.
     const float scale = fmaxf(maximum, 1.0e-12f) / 448.0f;
     const float inverse = 1.0f / scale;
+    const unsigned int scale_bits = __float_as_uint(scale);
     const std::uint64_t record_begin = tile * record;
     for (int i = lane; i < 16; i += kWarpSize) {
       const std::uint64_t wire = record_begin + i;
       if (wire >= offset && wire < offset + nbytes)
-        destination[wire - offset] = i < 4 ? reinterpret_cast<const std::uint8_t*>(&scale)[i] : 0;
+        destination[wire - offset] = i < 4 ? static_cast<std::uint8_t>(scale_bits >> (i * 8)) : 0;
     }
     for (std::uint32_t i = lane * 8; i < elements; i += kWarpSize * 8) {
       const std::uint64_t wire = record_begin + 16 + i;
       if (wire + 8 <= offset || wire >= offset + nbytes) continue;
       const auto* address = matrix + (i / BlockCols) * f.tensor_row_stride + (i % BlockCols) * 2;
       const uint4 packed = *reinterpret_cast<const uint4*>(address);
-      const auto* values = reinterpret_cast<const __nv_bfloat16*>(&packed);
-      unsigned long long encoded = 0;
-      #pragma unroll
-      for (int pair = 0; pair < 4; ++pair) {
-        const float2 scaled = make_float2(__bfloat162float(values[pair * 2]) * inverse,
-                                          __bfloat162float(values[pair * 2 + 1]) * inverse);
-        encoded |= static_cast<unsigned long long>(__nv_cvt_float2_to_fp8x2(scaled, __NV_SATFINITE, __NV_E4M3))
-                   << (pair * 16);
-      }
+      const unsigned int low = static_cast<unsigned int>(v2EncodeBf16Pair(packed.x, inverse)) |
+                               (static_cast<unsigned int>(v2EncodeBf16Pair(packed.y, inverse)) << 16);
+      const unsigned int high = static_cast<unsigned int>(v2EncodeBf16Pair(packed.z, inverse)) |
+                                (static_cast<unsigned int>(v2EncodeBf16Pair(packed.w, inverse)) << 16);
+      const unsigned long long encoded = static_cast<unsigned long long>(low) |
+                                         (static_cast<unsigned long long>(high) << 32);
       if (wire >= offset && wire + 8 <= offset + nbytes && (wire - offset) % 8 == 0) {
         *reinterpret_cast<unsigned long long*>(destination + wire - offset) = encoded;
       } else {
