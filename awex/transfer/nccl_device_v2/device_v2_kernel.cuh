@@ -169,7 +169,6 @@ __device__ __forceinline__ void v2GinRunDirectRelay(
     unsigned long long input_cache = 0;
     unsigned long long output_cache = 0;
     std::uint64_t retired = 0;
-    V2GinFifoPut fifo_put;
     // Retire an input slot only after both readers (local copy and outgoing
     // NIC) are finished. A successor credit proves the put's source was read.
     auto retire = [&] __device__(std::uint64_t index) {
@@ -211,11 +210,7 @@ __device__ __forceinline__ void v2GinRunDirectRelay(
       if (index >= work.fifo_depth && retired <= index - work.fifo_depth) {
         // Returning only one slot can deadlock a batched-credit predecessor:
         // it cannot supply our next input until an entire credit batch is sent.
-        // A coalescing predecessor cannot publish its next group with only
-        // one returned slot. Retire a whole put group as well as credit batch.
-        const std::uint64_t credit_batch = input_gin
-          ? (args.gin_credit_batch > v2GinPutSteps(args, work)
-              ? args.gin_credit_batch : v2GinPutSteps(args, work)) : 1;
+        const std::uint64_t credit_batch = input_gin ? args.gin_credit_batch : 1;
         const std::uint64_t target = ((index - work.fifo_depth) / credit_batch + 1) * credit_batch;
         while (retired < target && retired < slices) {
           if (!retire(retired)) break;
@@ -259,10 +254,16 @@ __device__ __forceinline__ void v2GinRunDirectRelay(
         v2CopyContiguous(staging, source(work.step_begin + index), bytes, tid, kWarpSize);
         warps.sync();
       }
-      if (output_gin) fifo_put.append(args, work, gin, work.forward_peer, channel,
-              direct_source ? work.peer : work.forward_peer,
-              direct_source ? work.step_begin + index : work.forward_step_begin + index,
-              work.forward_step_begin + index, bytes, index, index + 1 == slices, warps);
+      if (output_gin) gin.put(world, work.forward_peer, args.window,
+              v2GinPayloadOffset(args, work.forward_peer, args.local_rank, channel,
+                                 work.forward_step_begin + index, work.fifo_depth),
+              args.window,
+              v2GinPayloadOffset(args, args.local_rank, direct_source ? work.peer : work.forward_peer, channel,
+                                 direct_source ? work.step_begin + index : work.forward_step_begin + index,
+                                 work.fifo_depth),
+              bytes, V2GinReadySignalInc{v2GinReadySignal(args, args.local_rank, channel)},
+              ncclGin_None{}, warps, ncclGin_None{}, cuda::thread_scope_thread,
+              cuda::thread_scope_device, ncclGinOptFlagsDefault);
       else if (tid == 0) {
         V2FifoSlot* slot = v2FifoSlot(args, args.local_rank, work.forward_peer, channel,
                                      work.forward_step_begin + index, work.fifo_depth, true);
@@ -440,7 +441,7 @@ __device__ __forceinline__ void v2RunRelay(const V2KernelArgs& args, const V2Wor
                 v2GinPayloadOffset(args, work.forward_peer, args.local_rank, channel, output_step, work.fifo_depth),
                 args.window,
                 v2GinPayloadOffset(args, args.local_rank, work.forward_peer, channel, output_step, work.fifo_depth),
-                slice_bytes, V2GinReadySignalAdd{v2GinReadySignal(args, args.local_rank, channel), 1}, ncclGin_None{},
+                slice_bytes, V2GinReadySignalInc{v2GinReadySignal(args, args.local_rank, channel)}, ncclGin_None{},
                 ncclCoopThread{}, ncclGin_None{}, cuda::thread_scope_thread, cuda::thread_scope_device,
                 ncclGinOptFlagsDefault);
       } else {
@@ -510,10 +511,9 @@ __device__ __forceinline__ void v2RunBatch(const V2KernelArgs& args, const V2Wor
     if (work.forward_peer != kNoPeer) {
 #if AWEX_NCCL_DEVICE_V2_HAS_GIN
       const bool forward_gin = args.peer_transports[work.forward_peer] == static_cast<std::uint8_t>(V2Transport::kGin);
-      // NCCL SIMPLE recvCopySend uses independent input/output FIFOs. For
-      // GIN-to-GIN, fuse model placement and the copy into the already allocated
-      // send FIFO, then return input credit without waiting for NIC forwarding.
-      // Preserve the network/local split on mixed GIN/LSA routes.
+      // NCCL SIMPLE recvCopySend isolates receive and send FIFO lifetimes.
+      // Fuse model placement and the copy into the existing send FIFO for
+      // GIN-to-GIN; preserve the network/local split on mixed GIN/LSA routes.
       if ((use_gin != forward_gin) && extra_send_barrier) {
         v2GinRunDirectRelay(args, work, channel, subtid, subthreads, main_barrier, wait_barrier,
                             &shared.ready[group], &shared.copy_completed[group], profile);
