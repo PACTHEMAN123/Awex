@@ -492,12 +492,13 @@ void initialize_sparse_window(DeviceState* state, const std::vector<std::uint32_
   const bool packed_fp8_gin =
     state->gin.enabled && has_fp8 && !has_non_ring_lsa && (has_ring || compute_aware_direct);
   // Small direct fanout retains padded slots and single-slice puts, but
-  // a conservative budget balances copy workers without saturating every
-  // receiver rail. This spends existing
+  // A 32-channel receiver budget can leave the final equally-sized source
+  // at two lanes while its peers receive four. Spend only one more lane per
+  // GIN connection to cover that rounding gap. This spends existing
   // channel registration only; connections, signals and credits are unchanged.
   const bool small_fp8_direct = has_fp8 && !has_ring && !has_non_ring_lsa &&
     source_peer_count >= 2 && source_peer_count < 4;
-  const std::uint32_t gin_channel_budget_factor = small_fp8_direct ? 8U :
+  const std::uint32_t gin_channel_budget_factor = small_fp8_direct ? 9U :
     packed_fp8_gin && !has_ring ? 12U : 6U;
   const std::size_t slot_bytes = (ring_only || packed_fp8_gin) ? state->network_step_bytes :
     state->gin.enabled ? std::max(state->step_bytes, state->network_step_bytes) : state->step_bytes;
@@ -776,11 +777,6 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
     config.peer_transports = state->peer_transports;
     const auto lowering_start = Clock::now();
     auto schedule = v2::lowerFixedTasks(tasks, active_peers, direction, config);
-    // The source is still the registered producer FIFO; quantization and
-    // copy-only tails are produced once for an exactly matched replica pair.
-    const char* reuse_source = std::getenv("AWEX_NCCL_DEVICE_V2_FP8_REUSE_SOURCE");
-    if (reuse_source == nullptr || std::strcmp(reuse_source, "0") != 0)
-      v2::reuseIdenticalFp8Source(&schedule, config, active_peers, direction);
     host_lowering_time_ms = std::chrono::duration<double, std::milli>(Clock::now() - lowering_start).count();
 
     LaunchBuffers buffers;
@@ -812,7 +808,6 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
   metrics["communicator_rank"] = py::int_(state->rank);
   metrics["lsa_team_size"] = py::int_(state->lsa_team.nRanks);
   metrics["work_count"] = py::int_(schedule.works.size());
-  metrics["fp8_reused_source_bytes"] = py::int_(schedule.fp8_reused_source_bytes);
   metrics["fragment_count"] = py::int_(schedule.fragments.size());
   metrics["chunk_count"] = py::int_(schedule.chunk_count);
   metrics["batch_count"] = py::int_(schedule.batches.size());

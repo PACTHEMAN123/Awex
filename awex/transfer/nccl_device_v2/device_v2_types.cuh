@@ -114,11 +114,6 @@ struct alignas(16) V2Work {
   std::uint64_t nbytes;
   std::uint64_t step_begin;
   std::uint64_t forward_step_begin;
-  // Identical direct FP8 replica streams can read the same existing source
-  // FIFO. Both independently addressed receiver credits protect its reuse.
-  std::uint32_t duplicate_peer = kNoPeer;
-  std::uint32_t duplicate_channel = 0;
-  std::uint64_t duplicate_step_begin = 0;
 };
 
 struct V2WorkBatch {
