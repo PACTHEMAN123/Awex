@@ -139,7 +139,13 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
                 infer_instance_world_size=self.infer_instance_world_size,
                 num_infer_engines=self.num_engines,
             )
-            if self.model_arch_name == "Qwen3ForCausalLM":
+            # Both Qwen3 variants retain this parameter dictionary and transfer
+            # plan across updates. Reuse the prepared receive batch for MoE as
+            # the writer already does; rebuilding it costs O(all plan spans).
+            if self.model_arch_name in (
+                "Qwen3ForCausalLM",
+                "Qwen3MoeForCausalLM",
+            ):
                 self.device_transport.prepare_recv(
                     self.parameters,
                     self.transfer_plan,
@@ -436,15 +442,11 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
                 group=self.weights_update_group,
                 device_ids=[device_util.current_device()],
             )
-            sync_start_barrier_time_ms = (
-                time.perf_counter() - sync_start
-            ) * 1000.0
+            sync_start_barrier_time_ms = (time.perf_counter() - sync_start) * 1000.0
         backend_execute_start = time.perf_counter()
         if self.device_transport is not None:
             profile_metrics.update(
-                self.device_transport.recv(
-                    self.parameters, self.transfer_plan, step_id
-                )
+                self.device_transport.recv(self.parameters, self.transfer_plan, step_id)
             )
         else:
             transfer_start = time.perf_counter()
@@ -501,14 +503,12 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
             effective_gbps = profile_metrics.get("payload_bytes", 0.0) / (
                 kernel_transfer_time_ms * 1_000_000.0
             )
-        backend_execute_time_ms = profile_metrics.get(
-            "backend_execute_time_ms", 0.0
-        )
+        backend_execute_time_ms = profile_metrics.get("backend_execute_time_ms", 0.0)
         backend_effective_gbps = 0.0
         if backend_execute_time_ms > 0:
-            backend_effective_gbps = profile_metrics.get(
-                "payload_bytes", 0.0
-            ) / (backend_execute_time_ms * 1_000_000.0)
+            backend_effective_gbps = profile_metrics.get("payload_bytes", 0.0) / (
+                backend_execute_time_ms * 1_000_000.0
+            )
         emit_profile(
             logger,
             event="weight_transfer",
@@ -540,9 +540,7 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
         if should_collect_garbage:
             gc_collect_start = time.perf_counter()
             gc.collect()
-            gc_collect_time_ms = (
-                time.perf_counter() - gc_collect_start
-            ) * 1000.0
+            gc_collect_time_ms = (time.perf_counter() - gc_collect_start) * 1000.0
         emit_profile(
             logger,
             event="weight_transfer_cleanup",
