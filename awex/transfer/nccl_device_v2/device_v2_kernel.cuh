@@ -207,9 +207,16 @@ __device__ __forceinline__ void v2GinRunDirectRelay(
       return __shfl_sync(0xffffffffU, success, 0) != 0;
     };
     for (std::uint64_t index = 0; index < slices; ++index) {
-      if (index >= work.fifo_depth) {
-        if (!retire(retired)) break;
-        ++retired;
+      if (index >= work.fifo_depth && retired <= index - work.fifo_depth) {
+        // Returning only one slot can deadlock a batched-credit predecessor:
+        // it cannot supply our next input until an entire credit batch is sent.
+        const std::uint64_t credit_batch = input_gin ? args.gin_credit_batch : 1;
+        const std::uint64_t target = ((index - work.fifo_depth) / credit_batch + 1) * credit_batch;
+        while (retired < target && retired < slices) {
+          if (!retire(retired)) break;
+          ++retired;
+        }
+        if (v2LoadError(error) != 0) break;
       }
       int success = 1;
       if (tid == 0) {
