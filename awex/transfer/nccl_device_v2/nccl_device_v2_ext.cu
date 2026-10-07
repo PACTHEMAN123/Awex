@@ -449,17 +449,32 @@ void initialize_sparse_window(DeviceState* state, const std::vector<std::uint32_
     state->gin.enabled ? std::max(state->fifo_depth, state->gin_fifo_depth) : state->fifo_depth;
   // Ring lowering uses the network step on every edge, including LSA. Keep
   // those FIFO slices adjacent rather than padding each to an unused LSA step.
-  // All ranks must choose the same symmetric registration geometry; a mixed
-  // ring/non-ring communicator keeps the larger legacy slot size.
+  // All ranks must choose the same symmetric registration geometry. Direct
+  // FP8 GIN fanout can also use adjacent network-sized slots: its data edges
+  // never use the larger legacy LSA step. Retain that legacy geometry whenever
+  // any non-ring LSA edge exists, and for every copy-only communicator.
   const std::uint32_t local_non_ring = std::any_of(tasks.begin(), tasks.end(), [](const auto& task) {
     return task.ring_id == v2::kNoRing;
   }) ? 1U : 0U;
-  const auto non_ring_flags =
-    v2::topology_detail::allGather(state->comm, &local_non_ring, 1, state->world_size, stream);
-  const bool ring_only = std::all_of(non_ring_flags.begin(), non_ring_flags.end(), [](auto flag) {
-    return flag == 0;
-  });
-  const std::size_t slot_bytes = ring_only ? state->network_step_bytes :
+  const std::uint32_t local_non_ring_lsa = std::any_of(tasks.begin(), tasks.end(), [&](const auto& task) {
+    return task.ring_id == v2::kNoRing &&
+      (state->peer_transports[task.peer] != static_cast<std::uint8_t>(v2::V2Transport::kGin) ||
+       (task.forward_peer != v2::kNoPeer &&
+        state->peer_transports[task.forward_peer] != static_cast<std::uint8_t>(v2::V2Transport::kGin)));
+  }) ? 1U : 0U;
+  const std::uint32_t local_fp8 = std::any_of(tasks.begin(), tasks.end(), [](const auto& task) {
+    return task.block_rows != 0;
+  }) ? 1U : 0U;
+  const std::uint32_t local_flags[] = {local_non_ring, local_non_ring_lsa, local_fp8};
+  const auto flags = v2::topology_detail::allGather(state->comm, local_flags, 3, state->world_size, stream);
+  bool ring_only = true, has_non_ring_lsa = false, has_fp8 = false;
+  for (int rank = 0; rank < state->world_size; ++rank) {
+    ring_only &= flags[rank * 3] == 0;
+    has_non_ring_lsa |= flags[rank * 3 + 1] != 0;
+    has_fp8 |= flags[rank * 3 + 2] != 0;
+  }
+  const bool packed_fp8_gin = state->gin.enabled && has_fp8 && !has_non_ring_lsa;
+  const std::size_t slot_bytes = (ring_only || packed_fp8_gin) ? state->network_step_bytes :
     state->gin.enabled ? std::max(state->step_bytes, state->network_step_bytes) : state->step_bytes;
   state->payload_peer_count = payload_peer_count;
   state->layout = v2::makeV2WindowLayout(state->world_size, state->total_channels, layout_fifo_depth, slot_bytes,
