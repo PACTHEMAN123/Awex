@@ -174,26 +174,19 @@ __device__ __forceinline__ void v2CopyContiguous(std::uint8_t* destination, cons
   const std::uintptr_t destination_address = reinterpret_cast<std::uintptr_t>(destination);
   if ((source_address | destination_address) % kCopyPackBytes == 0) {
     const std::uint64_t pack_count = nbytes / kCopyPackBytes;
-    // NCCL reduceCopyPacks assigns a full unrolled hunk to each warp. A
-    // CTA-sized hunk leaves up to ~80 KiB in the serial pack tail at 608
-    // threads; warp hunks limit that tail to less than 4 KiB.
-    const std::uint64_t packs_per_hunk = kWarpSize * kCopyUnroll;
+    const std::uint64_t packs_per_hunk = static_cast<std::uint64_t>(nthreads) * kCopyUnroll;
     const std::uint64_t unrolled_packs = (pack_count / packs_per_hunk) * packs_per_hunk;
-    const int warp = tid / kWarpSize;
-    const int lane = tid % kWarpSize;
-    const int nwarps = nthreads / kWarpSize;
 
-    for (std::uint64_t hunk = warp * packs_per_hunk; hunk < unrolled_packs;
-         hunk += nwarps * packs_per_hunk) {
+    for (std::uint64_t hunk = 0; hunk < unrolled_packs; hunk += packs_per_hunk) {
       V2Pack128 values[kCopyUnroll];
 #pragma unroll
       for (int unroll = 0; unroll < kCopyUnroll; ++unroll) {
-        const std::uint64_t pack = hunk + lane + static_cast<std::uint64_t>(unroll) * kWarpSize;
+        const std::uint64_t pack = hunk + tid + static_cast<std::uint64_t>(unroll) * nthreads;
         values[unroll] = v2Load128(source + pack * kCopyPackBytes);
       }
 #pragma unroll
       for (int unroll = 0; unroll < kCopyUnroll; ++unroll) {
-        const std::uint64_t pack = hunk + lane + static_cast<std::uint64_t>(unroll) * kWarpSize;
+        const std::uint64_t pack = hunk + tid + static_cast<std::uint64_t>(unroll) * nthreads;
         v2Store128(destination + pack * kCopyPackBytes, values[unroll]);
       }
     }
@@ -221,23 +214,19 @@ __device__ __forceinline__ void v2CopyContiguousToTwoDestinations(std::uint8_t* 
   const std::uintptr_t second_address = reinterpret_cast<std::uintptr_t>(second_destination);
   if ((source_address | first_address | second_address) % kCopyPackBytes == 0) {
     const std::uint64_t pack_count = nbytes / kCopyPackBytes;
-    const std::uint64_t packs_per_hunk = kWarpSize * kCopyUnroll;
+    const std::uint64_t packs_per_hunk = static_cast<std::uint64_t>(nthreads) * kCopyUnroll;
     const std::uint64_t unrolled_packs = (pack_count / packs_per_hunk) * packs_per_hunk;
-    const int warp = tid / kWarpSize;
-    const int lane = tid % kWarpSize;
-    const int nwarps = nthreads / kWarpSize;
 
-    for (std::uint64_t hunk = warp * packs_per_hunk; hunk < unrolled_packs;
-         hunk += nwarps * packs_per_hunk) {
+    for (std::uint64_t hunk = 0; hunk < unrolled_packs; hunk += packs_per_hunk) {
       V2Pack128 values[kCopyUnroll];
 #pragma unroll
       for (int unroll = 0; unroll < kCopyUnroll; ++unroll) {
-        const std::uint64_t pack = hunk + lane + static_cast<std::uint64_t>(unroll) * kWarpSize;
+        const std::uint64_t pack = hunk + tid + static_cast<std::uint64_t>(unroll) * nthreads;
         values[unroll] = v2Load128(source + pack * kCopyPackBytes);
       }
 #pragma unroll
       for (int unroll = 0; unroll < kCopyUnroll; ++unroll) {
-        const std::uint64_t pack = hunk + lane + static_cast<std::uint64_t>(unroll) * kWarpSize;
+        const std::uint64_t pack = hunk + tid + static_cast<std::uint64_t>(unroll) * nthreads;
         v2Store128(first_destination + pack * kCopyPackBytes, values[unroll]);
         v2Store128(second_destination + pack * kCopyPackBytes, values[unroll]);
       }

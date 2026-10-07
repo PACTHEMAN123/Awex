@@ -39,9 +39,9 @@ from awex.util.common import (
     get_ip_address,
 )
 from awex.util.gpu import get_gpu_status, print_current_gpu_status
+from awex.util.profile import emit_profile, profile_phase
 from awex.util.system_util import count_open_fds
 from awex.util.tensor_util import reconstruct_ipc_weights
-from awex.util.profile import emit_profile, profile_phase
 
 logger = logging.getLogger(__name__)
 
