@@ -470,9 +470,10 @@ void initialize_sparse_window(DeviceState* state, const std::vector<std::uint32_
   }) ? 1U : 0U;
   // Count source fanout rather than receiver fan-in: a receiver can have
   // many training peers even when each source publishes only a few replicas.
-  // The compute-aware compact policy is qualified for medium source fanout.
-  // Small and large fanouts retain the established transport progression:
-  // their full-model credit waits regressed with the compact direct policy.
+  // Small source fanout uses a bounded budget covering receiver lane rounding;
+  // medium fanout uses the qualified compute-aware budget. Compact slots let
+  // both submit contiguous groups from the same existing credited FIFO.
+  // Large fanout retains the established single-slice transport progression.
   const std::uint32_t local_source_peer_count =
     direction == v2::V2Direction::kSend && local_fp8 ?
       static_cast<std::uint32_t>(active_peers.size()) : 0U;
@@ -488,11 +489,10 @@ void initialize_sparse_window(DeviceState* state, const std::vector<std::uint32_
     has_fp8 |= flags[rank * 4 + 2] != 0;
     source_peer_count = std::max(source_peer_count, flags[rank * 4 + 3]);
   }
-  const bool compute_aware_direct = source_peer_count >= 4 && source_peer_count < 8;
+  const bool compute_aware_direct = source_peer_count >= 2 && source_peer_count < 8;
   const bool packed_fp8_gin =
     state->gin.enabled && has_fp8 && !has_non_ring_lsa && (has_ring || compute_aware_direct);
-  // Small direct fanout retains padded slots and single-slice puts, but
-  // A 32-channel receiver budget can leave the final equally-sized source
+  // A 32-channel small receiver budget can leave the final equally-sized source
   // at two lanes while its peers receive four. Spend only one more lane per
   // GIN connection to cover that rounding gap. This spends existing
   // channel registration only; connections, signals and credits are unchanged.
