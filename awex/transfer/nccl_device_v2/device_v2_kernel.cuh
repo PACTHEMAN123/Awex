@@ -24,6 +24,7 @@ namespace nccl_device_v2 {
 
 struct V2BatchShared {
   int ready[kMaxWorksPerBatch];
+  int forward_ready[kMaxWorksPerBatch];
   unsigned long long step_cache[kMaxWorksPerBatch];
   unsigned long long forward_step_cache[kMaxWorksPerBatch];
 };
@@ -143,11 +144,16 @@ __device__ __forceinline__ void v2RunRecv(const V2KernelArgs& args, const V2Work
 // use the same route channel and byte partition, so mixed intra/inter-node rings
 // retain NCCL broadcast's chunk-pipelined behavior.
 __device__ __forceinline__ void v2RunRelay(const V2KernelArgs& args, const V2Work& work, std::uint32_t channel,
-                                           int tid, int nthreads, int barrier, int* ready,
+                                           int tid, int nthreads, int barrier, int wait_barrier, int* ready,
+                                           int* forward_ready,
                                            unsigned long long* input_cache, unsigned long long* output_cache,
                                            V2KernelProfile* profile) {
   int nworkers = 0;
-  const std::uint32_t roles = v2Roles(V2Direction::kRecv, tid, nthreads, &nworkers);
+  // NCCL SIMPLE's waitPeer/genericOp: separate receive/send wait owners,
+  // worker-only pre-copy synchronization, then the all-thread post barrier.
+  // Source: NVIDIA NCCL src/device/prims_simple.h (Apache-2.0).
+  std::uint32_t roles = v2Roles(V2Direction::kRecv, tid, nthreads, &nworkers);
+  if (tid == 1) roles |= kRoleWaitSend;
   auto* error = &reinterpret_cast<V2WindowHeader*>(args.local_window)->error;
   const bool input_gin = args.peer_transports[work.peer] == static_cast<std::uint8_t>(V2Transport::kGin);
   const bool output_gin =
@@ -166,37 +172,39 @@ __device__ __forceinline__ void v2RunRelay(const V2KernelArgs& args, const V2Wor
       ? nullptr
       : v2FifoSlot(args, args.local_rank, work.forward_peer, channel, output_step, work.fifo_depth, true);
 
-    if (roles & kRoleWaitRecv) {
-      bool input_ready = false;
-      bool output_ready = false;
+    if (roles & (kRoleWaitRecv | kRoleWaitSend)) {
+      const bool wait_send = (roles & kRoleWaitSend) != 0;
+      bool peer_ready = false;
+      const unsigned long long wait_start = clock64();
 #if AWEX_NCCL_DEVICE_V2_HAS_GIN
       ncclGin gin{args.dev_comm, static_cast<int>(channel % args.dev_comm.ginContextCount)};
-      unsigned long long wait_start = clock64();
-      input_ready = input_gin
-        ? v2GinWaitSignal(args, gin, v2GinReadySignal(args, work.peer, channel), input_step, 2U)
-        : v2WaitReady(&input_slot->ready_step, input_step, input_cache, error, args.timeout_cycles);
-      profile->input_wait_cycles += clock64() - wait_start;
-      wait_start = clock64();
-      output_ready = output_gin
-        ? (output_step <= work.fifo_depth ||
-           v2GinWaitSignal(args, gin, v2GinCreditSignal(args, work.forward_peer, channel),
-                           output_step - work.fifo_depth, 3U))
-        : v2WaitFree(output_slot, output_step, work.fifo_depth, output_cache, error, args.timeout_cycles);
-      profile->output_wait_cycles += clock64() - wait_start;
-#else
-      unsigned long long wait_start = clock64();
-      input_ready = !input_gin &&
-        v2WaitReady(&input_slot->ready_step, input_step, input_cache, error, args.timeout_cycles);
-      profile->input_wait_cycles += clock64() - wait_start;
-      wait_start = clock64();
-      output_ready = !output_gin &&
-        v2WaitFree(output_slot, output_step, work.fifo_depth, output_cache, error, args.timeout_cycles);
-      profile->output_wait_cycles += clock64() - wait_start;
+      if (wait_send ? output_gin : input_gin) {
+        const ncclGinSignal_t signal = wait_send
+          ? v2GinCreditSignal(args, work.forward_peer, channel)
+          : v2GinReadySignal(args, work.peer, channel);
+        const unsigned long long expected = wait_send
+          ? (output_step > work.fifo_depth ? output_step - work.fifo_depth : 0)
+          : input_step;
+        peer_ready = expected == 0 || v2GinWaitSignal(args, gin, signal, expected, wait_send ? 3U : 2U);
+      } else
 #endif
-      *ready = input_ready && output_ready;
+      {
+        if (!(wait_send ? output_gin : input_gin)) {
+          peer_ready = wait_send
+            ? v2WaitFree(output_slot, output_step, work.fifo_depth, output_cache, error, args.timeout_cycles)
+            : v2WaitReady(&input_slot->ready_step, input_step, input_cache, error, args.timeout_cycles);
+        }
+      }
+      if (wait_send) {
+        *forward_ready = peer_ready;
+        profile->output_wait_cycles += clock64() - wait_start;
+      } else {
+        *ready = peer_ready;
+        profile->input_wait_cycles += clock64() - wait_start;
+      }
     }
     const unsigned long long copy_start = tid == 0 ? clock64() : 0;
-    v2GroupBarrier(barrier, nthreads);
+    if (roles & kRoleWorker) v2GroupBarrier(wait_barrier, nworkers);
 
     const std::uint8_t* input_payload = nullptr;
     std::uint8_t* output_payload = nullptr;
@@ -213,7 +221,7 @@ __device__ __forceinline__ void v2RunRelay(const V2KernelArgs& args, const V2Wor
       output_payload =
         v2FifoPayload(args, args.local_rank, work.forward_peer, channel, output_step, work.fifo_depth, true);
     }
-    if (*ready && (roles & kRoleWorker)) {
+    if ((roles & kRoleWorker) && *ready && *forward_ready) {
       v2CopyContiguousToFragmentsAndContiguous(args, work, output_payload, input_payload, cursor, slice_bytes, tid,
                                                nworkers);
     }
@@ -301,12 +309,13 @@ __device__ __forceinline__ void v2RunBatch(const V2KernelArgs& args, const V2Wor
   if (group < batch.work_count) {
     const int subtid = (wid - group * warps_per_work) * kWarpSize + lane;
     const int subthreads = warps_per_work * kWarpSize;
-    const bool extra_send_barrier = args.direction == V2Direction::kSend && subthreads >= 3 * kWarpSize;
+    const bool extra_send_barrier = subthreads >= 3 * kWarpSize;
     const int barrier_width = extra_send_barrier ? 2 : 1;
     const int main_barrier = 1 + group * barrier_width;
     const int wait_barrier = extra_send_barrier ? main_barrier + 1 : main_barrier;
     if (subtid == 0) {
       shared.ready[group] = 1;
+      shared.forward_ready[group] = 1;
       shared.step_cache[group] = 0;
       shared.forward_step_cache[group] = 0;
     }
@@ -316,7 +325,8 @@ __device__ __forceinline__ void v2RunBatch(const V2KernelArgs& args, const V2Wor
     V2KernelProfile* profile = args.profiles + static_cast<std::size_t>(blockIdx.x) * kMaxWorksPerBatch + group;
     const bool use_gin = args.peer_transports[work.peer] == static_cast<std::uint8_t>(V2Transport::kGin);
     if (work.forward_peer != kNoPeer) {
-      v2RunRelay(args, work, channel, subtid, subthreads, main_barrier, &shared.ready[group],
+      v2RunRelay(args, work, channel, subtid, subthreads, main_barrier, wait_barrier, &shared.ready[group],
+                 &shared.forward_ready[group],
                  &shared.step_cache[group], &shared.forward_step_cache[group], profile);
     } else if (use_gin) {
 #if AWEX_NCCL_DEVICE_V2_HAS_GIN
