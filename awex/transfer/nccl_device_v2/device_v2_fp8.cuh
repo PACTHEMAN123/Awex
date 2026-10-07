@@ -28,9 +28,13 @@ __device__ __forceinline__ void v2QuantizeToFifo(
     const auto* matrix = base + (tile / block_columns) * f.block_rows * f.tensor_row_stride
                              + (tile % block_columns) * f.block_cols * 2;
     float maximum = 0.0f;
-    for (std::uint64_t i = lane; i < elements; i += kWarpSize) {
-      const auto* row = reinterpret_cast<const __nv_bfloat16*>(matrix + (i / f.block_cols) * f.tensor_row_stride);
-      maximum = fmaxf(maximum, fabsf(__bfloat162float(row[i % f.block_cols])));
+    for (std::uint32_t i = lane * 8; i < elements; i += kWarpSize * 8) {
+      const auto* address = matrix + (i / f.block_cols) * f.tensor_row_stride + (i % f.block_cols) * 2;
+      const uint4 packed = *reinterpret_cast<const uint4*>(address);
+      const auto* values = reinterpret_cast<const __nv_bfloat16*>(&packed);
+      #pragma unroll
+      for (int j = 0; j < 8; ++j)
+        maximum = fmaxf(maximum, fabsf(__bfloat162float(values[j])));
     }
     #pragma unroll
     for (int delta = 16; delta > 0; delta >>= 1)
@@ -45,12 +49,28 @@ __device__ __forceinline__ void v2QuantizeToFifo(
       if (wire >= offset && wire < offset + nbytes)
         destination[wire - offset] = i < 4 ? reinterpret_cast<const std::uint8_t*>(&scale)[i] : 0;
     }
-    for (std::uint64_t i = lane; i < elements; i += kWarpSize) {
+    for (std::uint32_t i = lane * 8; i < elements; i += kWarpSize * 8) {
       const std::uint64_t wire = record_begin + 16 + i;
-      if (wire < offset || wire >= offset + nbytes) continue;
-      const auto* row = reinterpret_cast<const __nv_bfloat16*>(matrix + (i / f.block_cols) * f.tensor_row_stride);
-      destination[wire - offset] = __nv_cvt_float_to_fp8(
-        __bfloat162float(row[i % f.block_cols]) * inverse, __NV_SATFINITE, __NV_E4M3);
+      if (wire + 8 <= offset || wire >= offset + nbytes) continue;
+      const auto* address = matrix + (i / f.block_cols) * f.tensor_row_stride + (i % f.block_cols) * 2;
+      const uint4 packed = *reinterpret_cast<const uint4*>(address);
+      const auto* values = reinterpret_cast<const __nv_bfloat16*>(&packed);
+      unsigned long long encoded = 0;
+      #pragma unroll
+      for (int pair = 0; pair < 4; ++pair) {
+        const float2 scaled = make_float2(__bfloat162float(values[pair * 2]) * inverse,
+                                          __bfloat162float(values[pair * 2 + 1]) * inverse);
+        encoded |= static_cast<unsigned long long>(__nv_cvt_float2_to_fp8x2(scaled, __NV_SATFINITE, __NV_E4M3))
+                   << (pair * 16);
+      }
+      if (wire >= offset && wire + 8 <= offset + nbytes && (wire - offset) % 8 == 0) {
+        *reinterpret_cast<unsigned long long*>(destination + wire - offset) = encoded;
+      } else {
+        #pragma unroll
+        for (int j = 0; j < 8; ++j)
+          if (wire + j >= offset && wire + j < offset + nbytes)
+            destination[wire + j - offset] = static_cast<std::uint8_t>(encoded >> (j * 8));
+      }
     }
   }
 }
@@ -63,6 +83,28 @@ __device__ __forceinline__ void v2ScatterFp8FromFifo(
   const std::uint64_t block_columns = f.tensor_row_bytes / f.block_cols;
   auto* base = reinterpret_cast<std::uint8_t*>(f.tensor_ptr);
   auto* scales = reinterpret_cast<std::uint8_t*>(f.scale_ptr);
+  if (offset % 16 == 0 && nbytes % 16 == 0 &&
+      reinterpret_cast<std::uintptr_t>(source) % 16 == 0 &&
+      reinterpret_cast<std::uintptr_t>(base) % 16 == 0 && f.tensor_row_stride % 16 == 0 &&
+      (forward == nullptr || reinterpret_cast<std::uintptr_t>(forward) % 16 == 0)) {
+    for (std::uint64_t i = tid * 16; i < nbytes; i += nthreads * 16) {
+      const std::uint64_t wire = offset + i;
+      const std::uint64_t tile = wire / record;
+      const std::uint32_t within = wire % record;
+      const uint4 value = *reinterpret_cast<const uint4*>(source + i);
+      if (forward != nullptr) *reinterpret_cast<uint4*>(forward + i) = value;
+      if (within == 0) {
+        *reinterpret_cast<unsigned int*>(scales + (tile / block_columns) * f.scale_row_stride
+                                         + (tile % block_columns) * 4) = value.x;
+      } else {
+        const std::uint32_t element = within - 16;
+        auto* address = base + ((tile / block_columns) * f.block_rows + element / f.block_cols) * f.tensor_row_stride
+                              + (tile % block_columns) * f.block_cols + element % f.block_cols;
+        *reinterpret_cast<uint4*>(address) = value;
+      }
+    }
+    return;
+  }
   // The relay forwards the exact FIFO bytes, including scales, before giving
   // the existing credit back; it never dequantizes or requantizes the payload.
   for (std::uint64_t i = tid; i < nbytes; i += nthreads) {
