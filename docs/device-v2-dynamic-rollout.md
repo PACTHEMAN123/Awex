@@ -162,10 +162,13 @@ seven steady samples after excluding three warmups; first post-join updates
 are still measured and shown individually.
 
 Experiment runtime revision: `f0514dc9360def1071982544b06f3e4b7791defd`.
-Durable artifacts on the Ray head are under
-`/mnt/fuse/oss/xiaopac.xjy/awex-elastic-model-performance-20261009`: the
-four-node raw logs, complete model profile, native transfer records, audited
-join timeline (PNG/PDF), per-update latency figure, Chrome trace, historical
-baseline provenance, source bundle, and `RESULTS.md`. The background compute
+The four-node raw logs, complete model profile, native transfer records,
+audited join timeline (PNG/PDF), per-update latency figure, Chrome trace,
+historical baseline provenance, full source bundle, and `RESULTS.md` are saved
+in the user's local `results/awex-elastic-model-performance-20261009` directory.
+Copies also remain in the head's node-local run directory. The designated OSS
+mount failed readback: writes returned a length but left zero-size entries,
+reads returned EIO, and fsync returned EPERM. It is not a verified durable
+archive; the local copy is authoritative. The background compute
 is the BF16 GEMM workload described above; live serving and optimizer-step
 overlap remain outside this experiment.
