@@ -73,6 +73,7 @@ def audit(summary: dict, warmup: int = 2) -> dict:
         ]
         end_to_end = [r["end_to_end_update_ms"] for r in cohort]
         steady = kernels[warmup:]
+        steady_end_to_end = end_to_end[warmup:]
         assert len(steady) >= 5
         median = statistics.median(steady)
         cohorts.append(
@@ -88,7 +89,13 @@ def audit(summary: dict, warmup: int = 2) -> dict:
                 "steady_kernel_median_ms": median,
                 "steady_kernel_p95_ms": percentile(steady, 0.95),
                 "steady_kernel_cv": statistics.pstdev(steady) / statistics.mean(steady),
-                "steady_end_to_end_median_ms": statistics.median(end_to_end[warmup:]),
+                "first_end_to_end_ms": end_to_end[0],
+                "first_end_to_end_to_steady_ratio": end_to_end[0]
+                / statistics.median(steady_end_to_end),
+                "steady_end_to_end_median_ms": statistics.median(steady_end_to_end),
+                "steady_end_to_end_p95_ms": percentile(steady_end_to_end, 0.95),
+                "steady_end_to_end_cv": statistics.pstdev(steady_end_to_end)
+                / statistics.mean(steady_end_to_end),
             }
         )
     joins, training_identities = [], {}
@@ -180,7 +187,8 @@ def audit(summary: dict, warmup: int = 2) -> dict:
         "publications": len(publications),
         "model_bytes_per_engine": sum(
             r["model_bytes"] for _, r in readers(publications[0])
-        ),
+        )
+        // publications[0]["num_engines"],
         "cohorts": cohorts,
         "joins": joins,
     }
@@ -333,12 +341,28 @@ def figures(summary: dict, result: dict, output: Path):
     fig, axes = plt.subplots(1, 2, figsize=(13, 4))
     for cohort in result["cohorts"]:
         for ax, metric in zip(axes, ("kernel_ms", "end_to_end_ms")):
+            # Show every post-initial update, including the first after each join.
+            samples = [
+                (version, duration)
+                for version, duration in zip(cohort["versions"], cohort[metric])
+                if version >= 0
+            ]
             ax.plot(
-                cohort["versions"],
-                cohort[metric],
+                [version for version, _ in samples],
+                [duration for _, duration in samples],
                 "o-",
                 label=f"{cohort['engines']} engines",
             )
+            if cohort["versions"][0] >= 0:
+                ax.axvline(cohort["versions"][0], color="#64748b", alpha=0.5, ls="--")
+                ax.scatter(
+                    cohort["versions"][0],
+                    cohort[metric][0],
+                    marker="*",
+                    s=150,
+                    color="#111827",
+                    zorder=5,
+                )
     for ax in axes:
         ax.set_xlabel("Weight version")
         ax.set_ylabel("Milliseconds")
@@ -346,9 +370,15 @@ def figures(summary: dict, result: dict, output: Path):
         ax.legend()
     axes[0].set_title("Slowest reader: device weight kernel")
     axes[1].set_title("Publication end to end (validation excluded)")
-    axes[0].set_yscale("log")
-    axes[1].set_yscale("log")
-    fig.tight_layout()
+    fig.text(
+        0.5,
+        0.01,
+        f"Stars: first update after join. Initial cold update (version -1): "
+        f"{result['cohorts'][0]['first_end_to_end_ms'] / 1000:.2f} s; excluded from this view.",
+        ha="center",
+        fontsize=9,
+    )
+    fig.tight_layout(rect=(0, 0.06, 1, 1))
     for suffix in ("png", "pdf"):
         fig.savefig(output / f"model-sync-latency.{suffix}", dpi=180)
     plt.close(fig)

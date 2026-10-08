@@ -127,3 +127,45 @@ participant. Swizzle groups rollout engines by these epoch-specific identities,
 so local relays stay on LSA even when the active cohort differs from the node's
 GPU capacity or the final planned cohort. Static transport users retain the
 existing environment-based topology fallback.
+
+## Model-loaded H20 validation (2026-10-09)
+
+The real `weights_exchange_multi_vllm_it` ran Qwen3-30B-A3B in BF16 on four
+H20 nodes managed by Ray. Training used 16 GPUs (TP2/PP1/CP2/EP8/expert-TP1),
+and rollout TP2 expanded from 2 to 4 to 8 loaded vLLM models. Thirty full
+publications passed 280 complete TP-worker parameter checks. Each engine
+received 61,089,832,960 bytes of actual BF16 model parameters per publication.
+
+| Join | Total join | Launch/model startup/reader init | Collective preparation | First complete update | Steady complete update p50 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 2 → 4 | 84.456 s | 59.503 s | 24.857 s | 631.635 ms | 625.689 ms |
+| 4 → 8 | 104.066 s | 64.534 s | 39.504 s | 529.922 ms | 529.115 ms |
+
+All 740 post-initial reader/writer transfer records hit the prepared cache,
+with zero transport initialization, batch build, host lowering, plan
+initialization, and metadata upload time. All 20 and 24 surviving workers,
+respectively, completed CUDA compute batches wholly inside their own native
+preparation interval. They completed 32,705,024 and 63,070,720 BF16 GEMMs in
+those intervals. Existing process IDs and native model parameter pointers
+stayed unchanged.
+
+The earlier elastic run regressed to 1,222.751 ms for four engines because
+`AWEX_NODE_LOCAL_WORLD_SIZE=8` described capacity rather than the active
+cohort. Ring routing consequently lost its node grouping. Gathering actual
+epoch topology restored local LSA relays while retaining that environment
+setting. Four-engine performance returned to 625.689 ms, versus historical
+BF16 baselines of 608.893–620.464 ms with matching model, placement, swizzle,
+128 KiB network step, and FIFO depth 16. Eight engines measured 529.115 ms,
+versus a historical matching BF16 baseline of 575.642 ms. Historical source
+and binary revisions differ and are recorded separately. Each cohort has
+seven steady samples after excluding three warmups; first post-join updates
+are still measured and shown individually.
+
+Experiment runtime revision: `f0514dc9360def1071982544b06f3e4b7791defd`.
+Durable artifacts on the Ray head are under
+`/mnt/fuse/oss/xiaopac.xjy/awex-elastic-model-performance-20261009`: the
+four-node raw logs, complete model profile, native transfer records, audited
+join timeline (PNG/PDF), per-update latency figure, Chrome trace, historical
+baseline provenance, source bundle, and `RESULTS.md`. The background compute
+is the BF16 GEMM workload described above; live serving and optimizer-step
+overlap remain outside this experiment.
