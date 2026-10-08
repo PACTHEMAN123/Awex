@@ -25,12 +25,12 @@ from awex.tests import weights_exchange_vllm_infer_it
 from awex.tests.experimental.compare_megatron_vllm_weights_multi import (
     _should_include_name,
 )
+from awex.tests.weights_exchange_multi_vllm_it import (
+    MultiVLLMWeightsExchangeIT,
+)
 from awex.tests.weights_exchange_vllm_it import (
     VLLMWeightsExchangeIT,
     vllm_inference_config,
-)
-from awex.tests.weights_exchange_multi_vllm_it import (
-    MultiVLLMWeightsExchangeIT,
 )
 from awex.util import device as device_util
 

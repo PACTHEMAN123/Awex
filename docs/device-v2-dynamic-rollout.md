@@ -63,7 +63,66 @@ Plan validation failures before resource release leave the old transport
 intact. A distributed caller must handle deadlines/failure on **all** workers;
 an in-process lock is not a distributed publication barrier.
 
-## Mock end-to-end acceptance benchmark
+## Model-loaded weight exchange end to end
+
+`awex.tests.weights_exchange_multi_vllm_it` now supports joining actual loaded
+vLLM models to a running Megatron weight publisher. Use non-colocated
+`nccl_device_v2`, homogeneous rollout TP, and Qwen3 dense/MoE models. Existing
+model objects, parameter storage, and the training default process group stay
+alive. Only the transfer group and its epoch-bound plan/cache are replaced.
+
+The training entrypoint accepts `--join-after 10 20 --target-engines 2 4`,
+`--elastic-model-profile`, and `--elastic-output model-profile.json`. Provide
+`--inference-endpoint ENGINE,HOST,PORT` for every final engine and start only the
+initial `--num-engines` cohort before launching training. An external controller
+owns late vLLM process launch and GPU placement:
+
+1. Poll the existing metadata server for `elastic/launch/EPOCH`. Its payload
+   contains the target `num_engines`.
+2. Start the additional real model servers on their reserved devices, then put
+   `{"started": true}` under `elastic/launched/EPOCH`. The harness waits for
+   model health and initializes only the new reader adapters.
+3. The harness collectively calls writers' `prepare_membership` and readers'
+   `/areal_awex_prepare_membership`, with `epoch` and `num_engines`. Each worker
+   returns a phase profile only after its device cache and readiness barrier
+   complete. The next publication uses the prepared cohort directly.
+
+The optional model profile clears **every real destination model parameter**
+before each publication and compares every BF16 parameter with a complete
+HF-loaded reference afterward. A changing final norm identifies the exact
+weight version. Reference clones consume an additional full TP model shard
+per inference GPU; this memory is benchmark-only. Verification and destination
+clearing are excluded from publication timing. Initial static publication can
+build its cache on demand; all following publications, including each first
+post-join update, must hit the cache.
+
+During joining, each training and surviving inference worker continuously
+executes BF16 GEMMs on a separate CUDA stream. GEMMs use a small private
+snapshot derived from its loaded model; the **weight transfer is the complete
+Megatron-to-vLLM model**, not that small snapshot. Phase records and completed
+compute batches support same-worker overlap checks. This proves overlap with
+mock computation; it does not measure live token generation, optimizer steps,
+or production scheduling. CUDA events measure elapsed stream time, and host
+spans bound submission/completion, not kernel occupancy. Native preparation
+releases the Python GIL during communicator/FIFO/cache setup.
+
+If `--sync-transfer-start` is used, set `AWEX_PROFILE_SYNC_START=1` on both
+training and all inference servers before starting them. A mismatched setting
+would make their first collective operations disagree.
+
+Export an audited timeline, per-update latency plot, and Chrome trace with:
+
+```bash
+python -m awex.tests.experimental.model_weight_profile_report \
+  model-profile.json --output model-profile-report --warmup 2
+```
+
+The auditor rejects incomplete full-model checks, replaced worker/storage,
+post-initial cache misses, preparation work inside publications, and compute
+batches crossing the preparation bounds. Figures use one worker's clock;
+the multi-worker trace labels host clocks as uncalibrated.
+
+## Synthetic transport acceptance benchmark
 
 Run from the checkout using an environment with PyTorch. This benchmark uses
 small synthetic TP shards so it needs no model/vLLM dependencies. It launches
@@ -88,9 +147,9 @@ every subsequent update. The acceptance commands use BF16 throughout;
 native communicator/cache initialization and replace the CUDA launch with Gloo
 broadcast and reference quantization.
 It does not exercise GIN, device FIFO forwarding, relay kernels, or fused FP8,
-and its timings must not be used as device v2 performance results. Full
-`weights_exchange_multi_vllm_it.py`, 30B vLLM, and veRL integration have not
-been wired to dynamic membership in this first transport-focused stage.
+and its timings must not be used as device v2 performance results. For actual
+model weights, use the model-loaded entrypoint above. veRL integration remains
+outside these benchmarks.
 
 ## Device v2 GPU acceptance
 
@@ -212,4 +271,5 @@ whose depth or step size exceeds the registered geometry. The benchmark checks
 `max_work_step_bytes <= slot_bytes` before accepting preparation.
 
 This acceptance uses real CUDA/device-v2 execution with synthetic model tensors.
-Full-model vLLM/Megatron and veRL dynamic membership remain outside this harness.
+Full-model vLLM/Megatron now has its separate entrypoint above; veRL dynamic
+membership remains outside this harness.
