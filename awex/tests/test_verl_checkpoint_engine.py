@@ -15,6 +15,9 @@
 # specific language governing permissions and limitations
 # under the License.
 
+import asyncio
+from types import SimpleNamespace
+
 import pytest
 
 pytest.importorskip("verl")
@@ -49,3 +52,37 @@ def test_build_topology_rejects_duplicate_replica_leaders():
 
     with pytest.raises(ValueError, match="exactly one"):
         AwexCheckpointEngine.build_topology(1, 2, metadata)
+
+
+@pytest.mark.parametrize("transfer_fails", [False, True])
+def test_direct_receive_publishes_version_only_after_success(transfer_fails):
+    calls = []
+
+    def transfer(step):
+        calls.append(("transfer", step))
+        if transfer_fails:
+            raise RuntimeError("transfer failed")
+
+    async def clear_cache():
+        calls.append(("clear_cache",))
+
+    async def stamp_version(step):
+        calls.append(("version", step))
+
+    engine = AwexCheckpointEngine(256, comm_backend="nccl_device_v2")
+    engine.role = "rollout"
+    engine._awex_inference_engine = SimpleNamespace(update_weights=transfer)
+    engine.server_adapter = SimpleNamespace(
+        _has_server=True,
+        server_handle=SimpleNamespace(
+            clear_kv_cache=SimpleNamespace(remote=clear_cache),
+            set_global_steps=SimpleNamespace(remote=stamp_version),
+        ),
+    )
+    if transfer_fails:
+        with pytest.raises(RuntimeError, match="transfer failed"):
+            asyncio.run(engine.receive_weights(global_steps=7))
+        assert calls == [("transfer", 7)]
+    else:
+        asyncio.run(engine.receive_weights(global_steps=7))
+        assert calls == [("transfer", 7), ("clear_cache",), ("version", 7)]

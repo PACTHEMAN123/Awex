@@ -340,6 +340,13 @@ class AwexCheckpointEngine(CheckpointEngine):
             )
             self._awex_inference_engine.initialize()
         self._awex_inference_engine.update_weights(int(global_steps))
+        # Match veRL's named-tensor update contract after direct writes finish:
+        # invalidate prefix/KV caches and stamp generated responses with the
+        # new policy version before the checkpoint manager resumes generation.
+        await self.server_adapter.server_handle.clear_kv_cache.remote()
+        await self.server_adapter.server_handle.set_global_steps.remote(
+            int(global_steps)
+        )
         return None
 
 
