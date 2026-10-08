@@ -35,6 +35,7 @@ import time
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from enum import Enum
+from functools import wraps
 from typing import Any
 
 from awex.transfer.nccl_device_v2_gin import (
@@ -75,6 +76,10 @@ import torch  # noqa: E402
 import torch.distributed as dist  # noqa: E402
 
 from awex import logging  # noqa: E402
+from awex.transfer.rollout_membership import (  # noqa: E402
+    Participant,
+    RolloutMembership,
+)
 from awex.transfer.tensor_layout import (  # noqa: E402
     StaticTensorLayout,
     slice_layout_fragments,
@@ -955,6 +960,15 @@ def _load_extension() -> Any:
         return _extension
 
 
+def _serialized_transport_call(method):
+    @wraps(method)
+    def call(self, *args, **kwargs):
+        with self._operation_lock:
+            return method(self, *args, **kwargs)
+
+    return call
+
+
 class NCCLDeviceV2Transport:
     """NCCL-style channel/work/FIFO transport for a fixed TransferPlan."""
 
@@ -972,7 +986,14 @@ class NCCLDeviceV2Transport:
         gin_reliable_doorbell: int | None = None,
         ring_broadcast: bool | None = None,
         ring_swizzle: bool | None = None,
+        membership_epoch: int = 0,
     ):
+        self._operation_lock = threading.RLock()
+        if membership_epoch < 0:
+            raise NCCLDeviceV2UnavailableError("membership_epoch must be nonnegative")
+        self.membership_epoch = int(membership_epoch)
+        self._membership_binding = None
+        self._reconfiguration_failed = False
         if world_size < 2 or world_size > 256:
             raise NCCLDeviceV2UnavailableError(
                 f"nccl_device_v2 supports world_size in [2, 256], got {world_size}."
@@ -1068,6 +1089,10 @@ class NCCLDeviceV2Transport:
         )
 
     def _ensure_initialized(self) -> float:
+        if self._reconfiguration_failed:
+            raise NCCLDeviceV2UnavailableError(
+                "A failed membership rebuild must be recovered explicitly"
+            )
         if self._initialized:
             return 0.0
         start_time = time.perf_counter()
@@ -1101,13 +1126,25 @@ class NCCLDeviceV2Transport:
                     "FP8 block shape must match on every rank"
                 )
         local_node_id = torch.tensor(
-            [_local_node_id()], dtype=torch.int64, device=device
+            [
+                _local_node_id(),
+                self.membership_epoch,
+                self.infer_instance_world_size,
+                self.num_infer_engines,
+            ],
+            dtype=torch.int64,
+            device=device,
         )
         gathered_node_ids = [
             torch.empty_like(local_node_id) for _ in range(self.world_size)
         ]
         dist.all_gather(gathered_node_ids, local_node_id, group=self.group)
-        node_ids = [int(value.item()) for value in gathered_node_ids]
+        identities = [value.cpu().tolist() for value in gathered_node_ids]
+        if any(value[1:] != identities[0][1:] for value in identities):
+            raise NCCLDeviceV2UnavailableError(
+                "Membership epoch and inference geometry must match on every rank"
+            )
+        node_ids = [int(value[0]) for value in identities]
         self._logical_to_communicator = _node_major_communicator_ranks(node_ids)
         communicator_rank = self._logical_to_communicator[self.rank]
         unique_id_size = int(self._extension.unique_id_size())
@@ -1254,9 +1291,11 @@ class NCCLDeviceV2Transport:
         )
         return extension_metrics
 
+    @_serialized_transport_call
     def send(
         self, parameters: dict, plan: TransferPlan, step_id: int
     ) -> dict[str, float]:
+        self._check_membership_binding(parameters, plan, True)
         build_batch_time_ms = 0.0
         prepared = self._prepared_send
         if prepared is not None and prepared[0] is parameters and prepared[1] is plan:
@@ -1278,11 +1317,14 @@ class NCCLDeviceV2Transport:
             build_batch_time_ms = (time.perf_counter() - build_start) * 1000.0
         metrics = self._run(batch, sender=True, sequence=_sequence_from_step(step_id))
         metrics["build_batch_time_ms"] = build_batch_time_ms
+        metrics["membership_epoch"] = self.membership_epoch
         return metrics
 
+    @_serialized_transport_call
     def recv(
         self, parameters: dict, plan: TransferPlan, step_id: int
     ) -> dict[str, float]:
+        self._check_membership_binding(parameters, plan, False)
         build_batch_time_ms = 0.0
         prepared = self._prepared_recv
         if prepared is not None and prepared[0] is parameters and prepared[1] is plan:
@@ -1304,8 +1346,10 @@ class NCCLDeviceV2Transport:
             build_batch_time_ms = (time.perf_counter() - build_start) * 1000.0
         metrics = self._run(batch, sender=False, sequence=_sequence_from_step(step_id))
         metrics["build_batch_time_ms"] = build_batch_time_ms
+        metrics["membership_epoch"] = self.membership_epoch
         return metrics
 
+    @_serialized_transport_call
     def prepare_send(
         self,
         parameters: dict,
@@ -1327,6 +1371,7 @@ class NCCLDeviceV2Transport:
         )
         self._prepared_send = (parameters, plan, batch)
 
+    @_serialized_transport_call
     def prepare_recv(
         self,
         parameters: dict,
@@ -1348,6 +1393,107 @@ class NCCLDeviceV2Transport:
         )
         self._prepared_recv = (parameters, plan, batch)
 
+    def _check_membership_binding(self, parameters, plan, sender):
+        if self._reconfiguration_failed:
+            raise NCCLDeviceV2UnavailableError(
+                "Membership rebuild failed; cannot publish weights"
+            )
+        if self._membership_binding is not None:
+            params, bound_plan, bound_sender = self._membership_binding
+            if (
+                params is not parameters
+                or bound_plan is not plan
+                or bound_sender != sender
+            ):
+                raise NCCLDeviceV2UnavailableError(
+                    "Stale parameters, plan or role after membership change"
+                )
+
+    @_serialized_transport_call
+    def reconfigure(
+        self,
+        group: Any,
+        membership: RolloutMembership,
+        participant: Participant,
+        parameters: dict[str, torch.Tensor],
+        plan: TransferPlan,
+    ) -> None:
+        """Bind an expanded epoch without replacing model tensors or the kernel.
+
+        All old participants must first finish their previous publication. The
+        application creates a new process group containing old and new ranks,
+        calls this method on surviving ranks, and creates fresh transports on
+        new ranks. Process groups are borrowed and remain caller-owned.
+        """
+        rank = membership.rank(participant)
+        sender = participant[0] == "training"
+        training_size = (
+            self.world_size - self.infer_instance_world_size * self.num_infer_engines
+        )
+        if membership.epoch != self.membership_epoch + 1:
+            raise NCCLDeviceV2UnavailableError(
+                "Membership epochs must advance exactly once"
+            )
+        if (
+            membership.training_world_size != training_size
+            or membership.inference_tp_size != self.infer_instance_world_size
+        ):
+            raise NCCLDeviceV2UnavailableError(
+                "Changing training size or inference TP is not supported"
+            )
+        if len(membership.engine_ids) <= self.num_infer_engines:
+            raise NCCLDeviceV2UnavailableError(
+                "Dynamic reconfiguration only supports adding engines"
+            )
+        # Custom transfer groups are independent of the training default group;
+        # dist.get_rank(group) may map the default rank instead of this PG rank.
+        if group.rank() != rank or group.size() != membership.world_size:
+            raise NCCLDeviceV2UnavailableError(
+                "New process group does not match the membership"
+            )
+        for peer, operations in plan.operations.items():
+            if not 0 <= peer < membership.world_size:
+                raise NCCLDeviceV2UnavailableError(
+                    "Plan has a peer outside the new membership"
+                )
+            for op in operations:
+                if (op.send_rank if sender else op.recv_rank) != rank:
+                    raise NCCLDeviceV2UnavailableError(
+                        "Plan uses the previous epoch's local rank"
+                    )
+                if (
+                    (op.recv_rank if sender else op.send_rank) != peer
+                    or not membership.inference_world_size
+                    <= op.send_rank
+                    < membership.world_size
+                    or not 0 <= op.recv_rank < membership.inference_world_size
+                ):
+                    raise NCCLDeviceV2UnavailableError(
+                        "Plan peers do not match the new training/rollout partition"
+                    )
+        # Release the old FIFO and registrations before preparing the new plan.
+        self._reconfiguration_failed = True
+        try:
+            self.close()
+            self.group = group
+            self.rank = rank
+            self.world_size = membership.world_size
+            self.infer_instance_world_size = membership.inference_tp_size
+            self.num_infer_engines = len(membership.engine_ids)
+            self._logical_to_communicator = list(range(self.world_size))
+            self._logged_batch_shape = False
+            if sender:
+                self.prepare_send(parameters, plan, allow_staging=False)
+            else:
+                self.prepare_recv(parameters, plan, allow_staging=False)
+            self.membership_epoch = membership.epoch
+            self._membership_binding = (parameters, plan, sender)
+            self._reconfiguration_failed = False
+        except Exception:
+            self.close()
+            raise
+
+    @_serialized_transport_call
     def close(self) -> None:
         try:
             if self._handle is not None and self._extension is not None:
