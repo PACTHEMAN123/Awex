@@ -76,13 +76,13 @@ and unchanged-precision norm weights.
 python -m awex.tests.experimental.nccl_device_v2_dynamic_e2e \
   --backend cpu-mock --tp 2 --initial-engines 1 \
   --join-after 3 6 --target-engines 2 3 --updates 10 \
-  --ring swizzle --fp8 --output dynamic-fp8.json
+  --ring swizzle --output dynamic-bf16.json
 ```
 
 After updates 3 and 6, the active cohort grows 1 → 2 → 3 engines. Each addition
 receives the immediately following update (zero-based versions 3 and 6), then
-every subsequent update. `--ring off|naive|swizzle` and removing `--fp8` cover
-the feature combinations.
+every subsequent update. The acceptance commands use BF16 throughout;
+`--ring off|naive|swizzle` covers all three communication modes.
 
 **CPU mock is control-plane/plan-lowering validation only.** Its hooks mock
 native communicator/cache initialization and replace the CUDA launch with Gloo
@@ -100,7 +100,7 @@ On one host with 8 free GPUs, the same benchmark can execute the actual kernel:
 python -m awex.tests.experimental.nccl_device_v2_dynamic_e2e \
   --backend device-v2 --tp 2 --initial-engines 1 \
   --join-after 3 6 --target-engines 2 3 --updates 10 \
-  --ring swizzle --fp8 --timeout 300 --output dynamic-device-fp8.json
+  --rows 4096 --cols 1024 --ring swizzle --timeout 300 --output dynamic-device-bf16.json
 ```
 
 Local workers bind training to GPUs 0–1 and rollout engines to GPUs 2–3,
@@ -139,7 +139,7 @@ python -m awex.tests.experimental.nccl_device_v2_dynamic_e2e \
   --backend cpu-mock --local-agents \
   --placements awex/tests/experimental/dynamic_rollout_placements.example.json \
   --tp 2 --join-after 3 6 --target-engines 2 4 --updates 10 \
-  --ring swizzle --fp8 --output dynamic-agent-mock.json
+  --ring swizzle --output dynamic-agent-mock.json
 ```
 
 For real GPUs, replace `DRIVER_ADDRESS` below with the current verified driver
@@ -164,7 +164,7 @@ python -m awex.tests.experimental.nccl_device_v2_dynamic_e2e \
   --placements awex/tests/experimental/dynamic_rollout_placements.example.json \
   --control-address DRIVER_ADDRESS --control-port 19170 --timeout 300 \
   --tp 2 --join-after 3 6 --target-engines 2 4 --updates 10 \
-  --rows 4096 --cols 1024 --ring swizzle --fp8 --output dynamic-agent-gpu.json
+  --rows 4096 --cols 1024 --ring swizzle --output dynamic-agent-gpu.json
 ```
 
 The example requires node-a GPUs 0–3 and node-b GPUs 0–5 to be free. Adjust
@@ -182,3 +182,34 @@ and report zero communicator initialization, host batch construction, native
 plan initialization, host lowering, and metadata upload time. The benchmark
 fails if any of that work leaks into publication. Preparation time is recorded
 separately; do not count validation/reference construction as transfer time.
+
+## BF16 H20 acceptance (2026-10-09)
+
+The synthetic weight-exchange harness passed all nine combinations of
+single-host, two-host, and four-host placement with ring off, naive, and swizzle.
+All weights were BF16. Each case ran ten changing snapshots at TP2, using a
+4096 × 1024 matrix and a norm tensor per training shard. Single-host membership
+grew 1 → 2 → 3 rollout instances; multi-host membership grew 1 → 2 → 4. New
+processes started after rounds 3 and 6 and received the immediately following
+snapshot. Existing PIDs, tensor addresses, and training weights survived both
+joins. Hardware acceptance used code revision `8a34ea3`, PyTorch 2.13.0+cu132,
+CUDA 13.2, and NCCL 2.30.4; Ray controlled the four selected H20 containers.
+
+Preparation initialized communicator, sparse FIFO, native schedule, and device
+cache without launching the weight kernel or changing model storage. Every
+publication hit the cache and reported zero transport initialization, batch
+construction, native plan initialization, host lowering, and metadata upload
+time. This qualifies the explicit preparation boundary; overlapping its latency
+with an actual training/rollout workload remains a subsequent integration step.
+
+The hardware run found and fixed a pure-LSA ring allocation bug: ring works use
+the network FIFO depth (16 by default), but a communicator without GIN peers
+had allocated only the local depth (8). The first post-join BF16 snapshot crossed
+that depth and overwrote adjacent channel slots. Symmetric registration now
+includes ring depth on every host, and native preparation rejects schedules
+whose depth or step size exceeds the registered geometry. The benchmark checks
+`max_work_fifo_depth <= registered_fifo_depth` and
+`max_work_step_bytes <= slot_bytes` before accepting preparation.
+
+This acceptance uses real CUDA/device-v2 execution with synthetic model tensors.
+Full-model vLLM/Megatron and veRL dynamic membership remain outside this harness.
