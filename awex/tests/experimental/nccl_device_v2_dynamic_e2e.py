@@ -305,6 +305,15 @@ def worker(args) -> None:
                     assert transport.is_device_plan_ready(
                         parameters, plan, args.role == "training"
                     )
+                    if device == "cuda":
+                        assert (
+                            preparation_metrics["max_work_fifo_depth"]
+                            <= preparation_metrics["registered_fifo_depth"]
+                        )
+                        assert (
+                            preparation_metrics["max_work_step_bytes"]
+                            <= preparation_metrics["slot_bytes"]
+                        )
                     if not all(
                         torch.equal(tensor.view(torch.uint8), before[name])
                         for name, tensor in parameters.items()

@@ -445,8 +445,6 @@ void initialize_sparse_window(DeviceState* state, const std::vector<std::uint32_
     std::any_of(gin_flags.begin(), gin_flags.end(), [](std::uint32_t value) { return value != 0; });
   v2::v2ValidateGinSupport(state->gin, state->nccl_version);
 
-  const std::uint32_t layout_fifo_depth =
-    state->gin.enabled ? std::max(state->fifo_depth, state->gin_fifo_depth) : state->fifo_depth;
   // Ring lowering uses the network step on every edge, including LSA. Keep
   // those FIFO slices adjacent rather than padding each to an unused LSA step.
   // All ranks must choose the same symmetric registration geometry. Direct
@@ -489,6 +487,12 @@ void initialize_sparse_window(DeviceState* state, const std::vector<std::uint32_
     has_fp8 |= flags[rank * 4 + 2] != 0;
     source_peer_count = std::max(source_peer_count, flags[rank * 4 + 3]);
   }
+  // Ring routes use the network FIFO depth on LSA edges too. The initial
+  // one-engine epoch may have only direct LSA routes; after a join those
+  // routes become rings, even when no GIN peer exists. Allocate the global
+  // maximum depth before registering the symmetric window.
+  const std::uint32_t layout_fifo_depth =
+    (state->gin.enabled || has_ring) ? std::max(state->fifo_depth, state->gin_fifo_depth) : state->fifo_depth;
   const bool compute_aware_direct = source_peer_count >= 2 && source_peer_count < 8;
   const bool packed_fp8_gin =
     state->gin.enabled && has_fp8 && !has_non_ring_lsa && (has_ring || compute_aware_direct);
@@ -778,6 +782,11 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
     config.peer_transports = state->peer_transports;
     const auto lowering_start = Clock::now();
     auto schedule = v2::lowerFixedTasks(tasks, active_peers, direction, config);
+    for (const auto& work : schedule.works) {
+      if (work.fifo_depth > state->layout.fifo_depth || work.step_bytes > state->layout.slot_bytes) {
+        throw std::runtime_error("nccl_device_v2 schedule exceeds registered FIFO geometry");
+      }
+    }
     host_lowering_time_ms = std::chrono::duration<double, std::milli>(Clock::now() - lowering_start).count();
 
     LaunchBuffers buffers;
@@ -816,19 +825,23 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
   metrics["ring_channel_collision_count"] = py::int_(schedule.ring_channel_collision_count);
   std::uint32_t min_work_step_bytes = std::numeric_limits<std::uint32_t>::max();
   std::uint32_t max_work_step_bytes = 0;
+  std::uint32_t max_work_fifo_depth = 0;
   for (const auto& work : schedule.works) {
     min_work_step_bytes = std::min(min_work_step_bytes, work.step_bytes);
     max_work_step_bytes = std::max(max_work_step_bytes, work.step_bytes);
+    max_work_fifo_depth = std::max(max_work_fifo_depth, work.fifo_depth);
   }
   if (schedule.works.empty()) min_work_step_bytes = 0;
   metrics["min_work_step_bytes"] = py::int_(min_work_step_bytes);
   metrics["max_work_step_bytes"] = py::int_(max_work_step_bytes);
+  metrics["max_work_fifo_depth"] = py::int_(max_work_fifo_depth);
   metrics["active_peer_count"] = py::int_(cached_peers.size());
   metrics["ring_broadcast"] = py::bool_(
     std::any_of(tasks.begin(), tasks.end(), [](const v2::V2LoweringTask& task) { return task.ring_id != v2::kNoRing; }));
   metrics["ring_relay_count"] = py::int_(std::count_if(
     tasks.begin(), tasks.end(), [](const v2::V2LoweringTask& task) { return task.forward_peer != v2::kNoPeer; }));
   metrics["fifo_depth"] = py::int_(state->fifo_depth);
+  metrics["registered_fifo_depth"] = py::int_(state->layout.fifo_depth);
   metrics["gin_fifo_depth"] = py::int_(state->gin_fifo_depth);
   metrics["chunk_bytes"] = py::int_(state->chunk_bytes);
   metrics["gin_chunk_bytes"] = py::int_(state->gin_chunk_bytes);
