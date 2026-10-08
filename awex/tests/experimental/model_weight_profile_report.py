@@ -13,7 +13,15 @@ import json
 import statistics
 from pathlib import Path
 
-from awex.tests.experimental.dynamic_rollout_profile_report import percentile
+
+def percentile(values: list[float], fraction: float) -> float:
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * fraction
+    lower = int(position)
+    return ordered[lower] + (
+        ordered[min(lower + 1, len(ordered) - 1)] - ordered[lower]
+    ) * (position - lower)
+
 
 PREPARE_METRICS = (
     "transport_init_time_ms",

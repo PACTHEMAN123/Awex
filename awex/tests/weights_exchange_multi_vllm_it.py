@@ -600,13 +600,15 @@ class MultiVLLMWeightsExchangeIT:
         )
 
     def join_rollout_models(self, epoch, target):
-        from awex.tests.experimental.dynamic_rollout_profile import MockCompute
+        from awex.tests.experimental.model_background_compute import (
+            BackgroundBF16Compute,
+        )
 
         version = int(self.megatron_engine.global_step)
         old_endpoints = self.publication_endpoints()
         started_ns = time.time_ns()
         weight = next(p for p in self.mcore_model.parameters() if p.ndim == 2)
-        compute = MockCompute(weight[:1024, :1024], batch=512, repeats=256)
+        compute = BackgroundBF16Compute(weight[:1024, :1024], batch=512, repeats=256)
         compute.start(300)
         inference_compute = {}
         try:

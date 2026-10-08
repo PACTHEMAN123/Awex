@@ -10,7 +10,7 @@ import time
 
 import torch
 
-from awex.tests.experimental.dynamic_rollout_profile import MockCompute
+from awex.tests.experimental.model_background_compute import BackgroundBF16Compute
 
 
 class ModelWeightProfile:
@@ -67,7 +67,9 @@ class ModelWeightProfile:
             if self.compute is not None:
                 raise RuntimeError("Model profile compute already started")
             weight = next(p for p in self.parameters.values() if p.ndim == 2)
-            self.compute = MockCompute(weight[:1024, :1024], batch=512, repeats=256)
+            self.compute = BackgroundBF16Compute(
+                weight[:1024, :1024], batch=512, repeats=256
+            )
             self.compute.start(300)
             result = {"compute_started": True}
         elif operation == "compute_stop":

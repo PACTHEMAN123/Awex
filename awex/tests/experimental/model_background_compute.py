@@ -1,4 +1,4 @@
-"""Bounded BF16 computation and wall-clock spans for the elastic mock.
+"""Bounded background BF16 computation for loaded-model join profiling.
 
 CUDA events measure elapsed stream time, including scheduling/host gaps, rather
 than kernel occupancy. Span endpoints bound submission and
@@ -10,21 +10,12 @@ from __future__ import annotations
 
 import threading
 import time
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 
 import torch
 
 
-@contextmanager
-def span(events: list[dict], name: str):
-    started = time.time_ns()
-    try:
-        yield
-    finally:
-        events.append({"name": name, "start_ns": started, "end_ns": time.time_ns()})
-
-
-class MockCompute:
+class BackgroundBF16Compute:
     """Continuously complete bounded GEMM batches on a separate CUDA stream."""
 
     def __init__(self, weight: torch.Tensor, batch: int, repeats: int):
