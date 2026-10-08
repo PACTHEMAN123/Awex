@@ -35,6 +35,7 @@ from awex.transfer import nccl_device_v2 as device_v2
 
 import torch
 import torch.distributed as dist
+from awex.tests.experimental.dynamic_rollout_profile import MockCompute, span
 from awex.transfer.rollout_membership import (
     Participant,
     RolloutJoinCoordinator,
@@ -195,6 +196,7 @@ def worker(args) -> None:
     store = _store(args, False)
     transport = group = None
     parameters = None
+    compute = None
     shape = (args.rows, args.cols)
     device = "cpu" if args.backend == "cpu-mock" else "cuda"
     if device == "cuda":
@@ -221,6 +223,8 @@ def worker(args) -> None:
                 store.get(f"command/{_key(participant)}/{index}").decode()
             )
             started = time.perf_counter()
+            started_ns = time.time_ns()
+            phases = []
             try:
                 if command["op"] == "stop":
                     if transport is not None:
@@ -231,8 +235,26 @@ def worker(args) -> None:
                         f"reply/{_key(participant)}/{index}", json.dumps({"ok": True})
                     )
                     break
-                if command["op"] == "prepare":
+                if command["op"] == "clock":
+                    result = {"worker_ns": time.time_ns()}
+                elif command["op"] == "compute_start":
+                    if compute is not None or args.fp8:
+                        raise ValueError(
+                            "Profiling compute requires BF16 and an idle worker"
+                        )
+                    compute = MockCompute(
+                        parameters[NAME], args.compute_batch, args.compute_repeats
+                    )
+                    compute.start(args.timeout)
+                    result = {"compute_started": True}
+                elif command["op"] == "compute_stop":
+                    result = {
+                        "compute_events": compute.stop(args.timeout) if compute else []
+                    }
+                    compute = None
+                elif command["op"] == "prepare":
                     membership = RolloutMembership(**command["membership"])
+                    phase_start = time.time_ns()
                     new_group = init_custom_process_group(
                         backend="gloo" if device == "cpu" else "nccl",
                         store=dist.PrefixStore(f"transfer/{membership.epoch}", store),
@@ -241,7 +263,16 @@ def worker(args) -> None:
                         group_name=f"dynamic-{membership.epoch}",
                         timeout=timedelta(seconds=args.timeout),
                     )
-                    plan = _plan(membership, participant, shape, args.fp8)
+                    phases.append(
+                        {
+                            "name": "process_group",
+                            "start_ns": phase_start,
+                            "end_ns": time.time_ns(),
+                        }
+                    )
+                    with span(phases, "plan_build"):
+                        plan = _plan(membership, participant, shape, args.fp8)
+                    phase_start = time.time_ns()
                     if parameters is None:
                         dtype = (
                             torch.float8_e4m3fn
@@ -292,6 +323,13 @@ def worker(args) -> None:
                         )
                         dist.destroy_process_group(group)
                     group = new_group
+                    phases.append(
+                        {
+                            "name": "host_bind_and_old_release",
+                            "start_ns": phase_start,
+                            "end_ns": time.time_ns(),
+                        }
+                    )
                     # Establish the native communicator, FIFO registration and
                     # device schedule/cache now, without publishing weights.
                     # Check model buffers to catch accidental warm-up updates.
@@ -299,9 +337,11 @@ def worker(args) -> None:
                         name: tensor.view(torch.uint8).clone()
                         for name, tensor in parameters.items()
                     }
-                    preparation_metrics = transport.initialize_prepared_plan(
-                        parameters, plan, args.role == "training"
-                    )
+                    with span(phases, "device_communicator_fifo_cache"):
+                        preparation_metrics = transport.initialize_prepared_plan(
+                            parameters, plan, args.role == "training"
+                        )
+                    phase_start = time.time_ns()
                     assert transport.is_device_plan_ready(
                         parameters, plan, args.role == "training"
                     )
@@ -322,6 +362,13 @@ def worker(args) -> None:
                             "Preparation modified model weight/scale storage"
                         )
                     dist.barrier(group=group)
+                    phases.append(
+                        {
+                            "name": "verify_and_ready_barrier",
+                            "start_ns": phase_start,
+                            "end_ns": time.time_ns(),
+                        }
+                    )
                     result = {
                         "epoch": membership.epoch,
                         "rank": membership.rank(participant),
@@ -350,7 +397,8 @@ def worker(args) -> None:
                     exchange = (
                         transport.send if args.role == "training" else transport.recv
                     )
-                    metrics = exchange(parameters, plan, version)
+                    with span(phases, "weight_exchange"):
+                        metrics = exchange(parameters, plan, version)
                     if not metrics.get("plan_cache_hit") or any(
                         metrics.get(key, -1) != 0.0
                         for key in (
@@ -434,6 +482,9 @@ def worker(args) -> None:
                     command_ms=(time.perf_counter() - started) * 1000,
                     hostname=socket.gethostname(),
                     torch_version=torch.__version__,
+                    start_ns=started_ns,
+                    end_ns=time.time_ns(),
+                    phases=phases,
                 )
             except Exception:
                 store.set(
@@ -444,6 +495,8 @@ def worker(args) -> None:
             store.set(f"reply/{_key(participant)}/{index}", json.dumps(result))
             index += 1
     finally:
+        if compute is not None:
+            compute.stop(args.timeout)
         if transport is not None:
             transport.close()
         dist.destroy_process_group()
@@ -501,6 +554,7 @@ def driver(args) -> dict:
     indexes = {}
     identities = {}
     records = []
+    clock_samples = {}
     agent_descriptions = {}
     counts = args.target_engines
     joins = dict(zip(args.join_after, counts))
@@ -520,7 +574,16 @@ def driver(args) -> dict:
             node, gpu = placements[participant]
             config = {
                 name: getattr(args, name)
-                for name in ("backend", "ring", "rows", "cols", "timeout", "fp8")
+                for name in (
+                    "backend",
+                    "ring",
+                    "rows",
+                    "cols",
+                    "timeout",
+                    "fp8",
+                    "compute_batch",
+                    "compute_repeats",
+                )
             }
             reply = agent_command(
                 node, dict(config, op="launch", participant=participant, device=gpu)
@@ -569,6 +632,10 @@ def driver(args) -> dict:
             str(args.cols),
             "--timeout",
             str(args.timeout),
+            "--compute-batch",
+            str(args.compute_batch),
+            "--compute-repeats",
+            str(args.compute_repeats),
         ]
         if args.fp8:
             command.append("--fp8")
@@ -589,6 +656,7 @@ def driver(args) -> dict:
             processes.append(subprocess.Popen(command))
 
     def dispatch(members, command):
+        dispatched_ns = time.time_ns()
         for participant in members.participants:
             store.set(
                 f"command/{_key(participant)}/{indexes[participant]}",
@@ -599,6 +667,7 @@ def driver(args) -> dict:
             reply = json.loads(
                 store.get(f"reply/{_key(participant)}/{indexes[participant]}").decode()
             )
+            received_ns = time.time_ns()
             indexes[participant] += 1
             if not reply["ok"]:
                 raise RuntimeError(reply["error"])
@@ -614,7 +683,22 @@ def driver(args) -> dict:
                     )
                 identities[participant] = identity
             replies[_key(participant)] = reply
+            if command["op"] == "clock":
+                sample = {
+                    "offset_ns": (dispatched_ns + received_ns) // 2 - reply["worker_ns"],
+                    "uncertainty_ns": (received_ns - dispatched_ns) // 2,
+                }
+                previous = clock_samples.get(_key(participant))
+                if (
+                    previous is None
+                    or sample["uncertainty_ns"] < previous["uncertainty_ns"]
+                ):
+                    clock_samples[_key(participant)] = sample
         return replies
+
+    def calibrate(members):
+        for _ in range(3):
+            dispatch(members, {"op": "clock"})
 
     try:
         if args.local_agents:
@@ -661,6 +745,8 @@ def driver(args) -> dict:
                     used.add(identity)
         for participant in membership.participants:
             launch(participant)
+        if args.profile_compute:
+            calibrate(membership)
         records.append(
             {
                 "event": "initial_prepare",
@@ -695,6 +781,10 @@ def driver(args) -> dict:
             )
             completed = version + 1
             if completed in joins:
+                join_started_ns = time.time_ns()
+                if args.profile_compute:
+                    dispatch(membership, {"op": "compute_start"})
+                launch_started_ns = time.time_ns()
                 target = joins[completed]
                 for i in range(len(membership.engine_ids), target):
                     coordinator.request_join(f"engine-{i}", args.tp)
@@ -702,7 +792,9 @@ def driver(args) -> dict:
                 for participant in expanded.participants:
                     if participant not in indexes:
                         launch(participant)
-                started = time.perf_counter()
+                if args.profile_compute:
+                    calibrate(expanded)
+                prepare_started_ns = time.time_ns()
                 replies = dispatch(
                     expanded, {"op": "prepare", "membership": asdict(expanded)}
                 )
@@ -715,7 +807,13 @@ def driver(args) -> dict:
                         participant, replies[_key(participant)]["epoch"]
                     )
                 coordinator.commit_join()
+                ready_ns = time.time_ns()
                 assert coordinator.serving_engine_ids == membership.engine_ids
+                compute_replies = (
+                    dispatch(expanded, {"op": "compute_stop"})
+                    if args.profile_compute
+                    else {}
+                )
                 record = {
                     "event": "join",
                     "after_updates": completed,
@@ -723,13 +821,25 @@ def driver(args) -> dict:
                     "engine_ids": expanded.engine_ids,
                     "serving_engine_ids": coordinator.serving_engine_ids,
                     "next_version": version + 1,
-                    "prepare_ms": (time.perf_counter() - started) * 1000,
+                    "prepare_ms": (ready_ns - prepare_started_ns) / 1e6,
+                    "start_ns": join_started_ns,
+                    "launch_start_ns": launch_started_ns,
+                    "prepare_start_ns": prepare_started_ns,
+                    "ready_ns": ready_ns,
+                    "join_ms": (ready_ns - join_started_ns) / 1e6,
+                    "launch_and_startup_ms": (prepare_started_ns - launch_started_ns)
+                    / 1e6,
+                    "compute_ranks": compute_replies,
                     "ranks": replies,
                 }
                 records.append(record)
                 print(
                     json.dumps(
-                        {key: value for key, value in record.items() if key != "ranks"}
+                        {
+                            key: value
+                            for key, value in record.items()
+                            if key not in ("ranks", "compute_ranks")
+                        }
                     ),
                     flush=True,
                 )
@@ -754,6 +864,10 @@ def driver(args) -> dict:
             if args.external
             else "local",
             "agent_descriptions": agent_descriptions,
+            "profile_compute": args.profile_compute,
+            "compute_batch": args.compute_batch,
+            "compute_repeats": args.compute_repeats,
+            "clock_samples": clock_samples,
             "records": records,
         }
         if args.output:
@@ -824,6 +938,13 @@ def main() -> None:
     parser.add_argument("--cols", type=int, default=256)
     parser.add_argument("--fp8", action="store_true")
     parser.add_argument(
+        "--profile-compute",
+        action="store_true",
+        help="Run snapshot BF16 GEMMs on old ranks during joins; emit wall spans and CUDA event durations",
+    )
+    parser.add_argument("--compute-batch", type=int, default=512)
+    parser.add_argument("--compute-repeats", type=int, default=8)
+    parser.add_argument(
         "--ring", choices=("off", "naive", "swizzle"), default="swizzle"
     )
     parser.add_argument("--output")
@@ -832,6 +953,12 @@ def main() -> None:
     parser.add_argument("--tp-rank", type=int, default=0)
     parser.add_argument("--device", type=int, default=0)
     args = parser.parse_args()
+    if (
+        args.compute_batch < 1
+        or args.compute_repeats < 1
+        or (args.profile_compute and args.fp8)
+    ):
+        parser.error("Background compute requires BF16 and positive batch/repeats")
     if args.rows < 128 or args.cols < 128 or args.rows % 128 or args.cols % 128:
         parser.error("Matrix shape must be positive multiples of 128")
     if args.worker:

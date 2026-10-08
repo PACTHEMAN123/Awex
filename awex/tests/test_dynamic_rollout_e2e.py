@@ -60,6 +60,11 @@ def test_late_rollout_processes_receive_the_immediate_next_bf16_update(
             "30",
             "--output",
             str(output),
+            "--profile-compute",
+            "--compute-batch",
+            "16",
+            "--compute-repeats",
+            "1",
             *options,
         ],
         cwd=Path(__file__).resolve().parents[2],
@@ -70,6 +75,8 @@ def test_late_rollout_processes_receive_the_immediate_next_bf16_update(
     assert result.returncode == 0, result.stdout + result.stderr
     summary = json.loads(output.read_text())
     assert summary["passed"] and not summary["cuda_kernel_validated"]
+    assert summary["profile_compute"]
+    assert len(summary["clock_samples"]) == 4
     assert summary["worker_launch"] == ("node-agents" if node_agents else "local")
     publications = [
         item for item in summary["records"] if item["event"] == "publication"
@@ -93,6 +100,29 @@ def test_late_rollout_processes_receive_the_immediate_next_bf16_update(
             for rank in record["ranks"].values():
                 assert rank["preparation_metrics"]["device_plan_ready"]
                 assert not rank["preparation_metrics"]["kernel_launched"]
+                assert [phase["name"] for phase in rank["phases"]] == [
+                    "process_group",
+                    "plan_build",
+                    "host_bind_and_old_release",
+                    "device_communicator_fifo_cache",
+                    "verify_and_ready_barrier",
+                ]
+            if record["event"] == "join":
+                assert record["join_ms"] >= record["prepare_ms"] > 0
+                assert record["launch_and_startup_ms"] > 0
+                for key in ("training//0", "rollout/engine-0/0"):
+                    events = record["compute_ranks"][key]["compute_events"]
+                    assert events and all(event["gpu_ms"] is None for event in events)
+                    assert any(
+                        event["start_ns"] >= record["prepare_start_ns"]
+                        and event["end_ns"] <= record["ready_ns"]
+                        for event in events
+                    )
+                new_engine = "engine-1" if record["epoch"] == 1 else "engine-2"
+                assert (
+                    record["compute_ranks"][f"rollout/{new_engine}/0"]["compute_events"]
+                    == []
+                )
         elif record["event"] == "publication":
             for rank in record["ranks"].values():
                 assert rank["metrics"]["plan_cache_hit"]

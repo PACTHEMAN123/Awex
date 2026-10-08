@@ -36,7 +36,11 @@ def source_fingerprint() -> str:
         )
     ]
     files += sorted((root / "transfer" / "nccl_device_v2").glob("*"))
-    files += [Path(__file__), Path(__file__).with_name("nccl_device_v2_dynamic_e2e.py")]
+    files += [
+        Path(__file__),
+        Path(__file__).with_name("nccl_device_v2_dynamic_e2e.py"),
+        Path(__file__).with_name("dynamic_rollout_profile.py"),
+    ]
     digest = hashlib.sha256()
     for path in files:
         if path.is_file() and path.suffix in (".py", ".cu", ".cuh", ".h"):
@@ -114,6 +118,14 @@ def run_agent(args: argparse.Namespace) -> None:
                     ]
                     for setting in ("backend", "ring", "rows", "cols", "timeout"):
                         argv.extend(["--" + setting, str(command[setting])])
+                    for setting in ("compute_batch", "compute_repeats"):
+                        if setting in command:
+                            argv.extend(
+                                [
+                                    "--" + setting.replace("_", "-"),
+                                    str(command[setting]),
+                                ]
+                            )
                     if command["fp8"]:
                         argv.append("--fp8")
                     process = subprocess.Popen(argv)

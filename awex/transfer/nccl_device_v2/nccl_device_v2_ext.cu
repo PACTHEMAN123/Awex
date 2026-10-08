@@ -763,6 +763,9 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
   double plan_initialization_time_ms = 0.0;
   const bool plan_cache_hit = state->plan_initialized;
   if (!state->plan_initialized) {
+    // All Python descriptors have been converted above. Collective allocation,
+    // lowering and uploads must allow an application's compute thread to run.
+    py::gil_scoped_release release;
     const auto initialization_start = Clock::now();
     initialize_sparse_window(state, active_peers, tasks, direction, stream);
     v2::V2LoweringConfig config;
@@ -912,7 +915,10 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
     // Cache creation registers the FIFO window and uploads immutable schedule
     // metadata. Complete those operations before acknowledging membership
     // readiness. Never run a copy/quant/relay kernel or advance last_sequence.
-    AWEX_CUDA_V2_CHECK(cudaStreamSynchronize(stream));
+    {
+      py::gil_scoped_release release;
+      AWEX_CUDA_V2_CHECK(cudaStreamSynchronize(stream));
+    }
     metrics["device_plan_ready"] = py::bool_(state->plan_initialized && state->window_initialized);
     metrics["kernel_launched"] = py::bool_(false);
     metrics["prepare_total_time_ms"] =
@@ -1012,6 +1018,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
         throw std::runtime_error("invalid nccl_device_v2 network parallelism");
       }
       const std::string unique_id = id;
+      py::gil_scoped_release release;
       auto state = make_state(unique_id, world_size, rank, device, timeout_ms,
                               static_cast<std::uint32_t>(max_channels), static_cast<std::uint32_t>(fifo_depth),
                               static_cast<std::size_t>(step_bytes), static_cast<std::size_t>(chunk_bytes),
@@ -1051,6 +1058,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
     if (state == nullptr) {
       return;
     }
+    py::gil_scoped_release release;
     try {
       destroy_state(state);
     } catch (...) {
