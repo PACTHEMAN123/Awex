@@ -259,10 +259,29 @@ def _ring_order(
     *,
     infer_instance_world_size: int = 0,
     num_infer_engines: int = 1,
+    rollout_node_ids: tuple[Any, ...] | None = None,
 ) -> list[int]:
     ordered = sorted(peers)
     if strategy is _RingOrderStrategy.FIXED or len(ordered) < 2:
         return ordered
+
+    if rollout_node_ids is not None:
+        if len(rollout_node_ids) != num_infer_engines or infer_instance_world_size <= 0:
+            raise NCCLDeviceV2UnavailableError("Invalid explicit rollout topology")
+        groups: dict[Any, list[int]] = {}
+        for peer in ordered:
+            groups.setdefault(
+                rollout_node_ids[peer // infer_instance_world_size], []
+            ).append(peer)
+        node_groups = list(groups.values())
+        node_offset = int(root) % len(node_groups)
+        member_offset = int(root) // len(node_groups)
+        swizzled = []
+        for i in range(len(node_groups)):
+            group = node_groups[(node_offset + i) % len(node_groups)]
+            offset = member_offset % len(group)
+            swizzled.extend(group[offset:] + group[:offset])
+        return swizzled
 
     try:
         local_world_size = int(os.environ.get("AWEX_NODE_LOCAL_WORLD_SIZE", "0"))
@@ -322,6 +341,7 @@ def _apply_send_ring_routes(
     infer_instance_world_size: int,
     num_infer_engines: int,
     swizzle: bool,
+    rollout_node_ids: tuple[Any, ...] | None = None,
 ) -> None:
     instance_world_size = int(infer_instance_world_size)
     engine_count = int(num_infer_engines)
@@ -376,6 +396,7 @@ def _apply_send_ring_routes(
             strategy,
             infer_instance_world_size=instance_world_size,
             num_infer_engines=engine_count,
+            rollout_node_ids=rollout_node_ids,
         )
         canonical = [signature(index) for index in indices_by_peer[order[0]]]
         if not canonical or any(
@@ -422,6 +443,7 @@ def _apply_recv_ring_routes(
     infer_instance_world_size: int,
     num_infer_engines: int,
     swizzle: bool,
+    rollout_node_ids: tuple[Any, ...] | None = None,
 ) -> None:
     instance_world_size = int(infer_instance_world_size)
     engine_count = int(num_infer_engines)
@@ -443,6 +465,7 @@ def _apply_recv_ring_routes(
             strategy,
             infer_instance_world_size=instance_world_size,
             num_infer_engines=engine_count,
+            rollout_node_ids=rollout_node_ids,
         )
         position = order.index(rank)
         batch.peers[index] = root if position == 0 else order[position - 1]
@@ -563,6 +586,7 @@ def _build_send_batch(
     ring_broadcast: bool = False,
     ring_swizzle: bool = False,
     fp8_block_shape: tuple[int, int] | None = None,
+    rollout_node_ids: tuple[Any, ...] | None = None,
 ) -> _V2Batch:
     _resolve_chunk_bytes(chunk_bytes)
     tensors: list[torch.Tensor] = []
@@ -680,6 +704,7 @@ def _build_send_batch(
             infer_instance_world_size=infer_instance_world_size,
             num_infer_engines=num_infer_engines,
             swizzle=ring_swizzle,
+            rollout_node_ids=rollout_node_ids,
         )
     return batch
 
@@ -696,6 +721,7 @@ def _build_recv_batch(
     ring_broadcast: bool = False,
     ring_swizzle: bool = False,
     fp8_block_shape: tuple[int, int] | None = None,
+    rollout_node_ids: tuple[Any, ...] | None = None,
 ) -> _V2Batch:
     _resolve_chunk_bytes(chunk_bytes)
     tensors: list[torch.Tensor] = []
@@ -847,6 +873,7 @@ def _build_recv_batch(
             infer_instance_world_size=infer_instance_world_size,
             num_infer_engines=num_infer_engines,
             swizzle=ring_swizzle,
+            rollout_node_ids=rollout_node_ids,
         )
     return batch
 
@@ -987,11 +1014,19 @@ class NCCLDeviceV2Transport:
         ring_broadcast: bool | None = None,
         ring_swizzle: bool | None = None,
         membership_epoch: int = 0,
+        rollout_node_ids: tuple[Any, ...] | None = None,
     ):
         self._operation_lock = threading.RLock()
         if membership_epoch < 0:
             raise NCCLDeviceV2UnavailableError("membership_epoch must be nonnegative")
         self.membership_epoch = int(membership_epoch)
+        if rollout_node_ids is not None and len(rollout_node_ids) != num_infer_engines:
+            raise NCCLDeviceV2UnavailableError(
+                "Explicit rollout topology must cover every engine"
+            )
+        self.rollout_node_ids = (
+            tuple(rollout_node_ids) if rollout_node_ids is not None else None
+        )
         self._membership_binding = None
         self._device_prepared_binding = None
         self._reconfiguration_failed = False
@@ -1314,6 +1349,7 @@ class NCCLDeviceV2Transport:
                 ring_broadcast=self.ring_broadcast,
                 ring_swizzle=self.ring_swizzle,
                 fp8_block_shape=self.fp8_block_shape,
+                rollout_node_ids=self.rollout_node_ids,
             )
             build_batch_time_ms = (time.perf_counter() - build_start) * 1000.0
         metrics = self._run(batch, sender=True, sequence=_sequence_from_step(step_id))
@@ -1343,6 +1379,7 @@ class NCCLDeviceV2Transport:
                 ring_broadcast=self.ring_broadcast,
                 ring_swizzle=self.ring_swizzle,
                 fp8_block_shape=self.fp8_block_shape,
+                rollout_node_ids=self.rollout_node_ids,
             )
             build_batch_time_ms = (time.perf_counter() - build_start) * 1000.0
         metrics = self._run(batch, sender=False, sequence=_sequence_from_step(step_id))
@@ -1369,6 +1406,7 @@ class NCCLDeviceV2Transport:
             ring_broadcast=self.ring_broadcast,
             ring_swizzle=self.ring_swizzle,
             fp8_block_shape=self.fp8_block_shape,
+            rollout_node_ids=self.rollout_node_ids,
         )
         self._prepared_send = (parameters, plan, batch)
         self._device_prepared_binding = None
@@ -1392,6 +1430,7 @@ class NCCLDeviceV2Transport:
             ring_broadcast=self.ring_broadcast,
             ring_swizzle=self.ring_swizzle,
             fp8_block_shape=self.fp8_block_shape,
+            rollout_node_ids=self.rollout_node_ids,
         )
         self._prepared_recv = (parameters, plan, batch)
         self._device_prepared_binding = None
@@ -1493,6 +1532,7 @@ class NCCLDeviceV2Transport:
         participant: Participant,
         parameters: dict[str, torch.Tensor],
         plan: TransferPlan,
+        rollout_node_ids: tuple[Any, ...] | None = None,
     ) -> None:
         """Bind an expanded epoch without replacing model tensors or the kernel.
 
@@ -1502,6 +1542,12 @@ class NCCLDeviceV2Transport:
         new ranks. Process groups are borrowed and remain caller-owned.
         """
         rank = membership.rank(participant)
+        if rollout_node_ids is not None and len(rollout_node_ids) != len(
+            membership.engine_ids
+        ):
+            raise NCCLDeviceV2UnavailableError(
+                "Explicit rollout topology must cover every engine"
+            )
         sender = participant[0] == "training"
         training_size = (
             self.world_size - self.infer_instance_world_size * self.num_infer_engines
@@ -1556,6 +1602,9 @@ class NCCLDeviceV2Transport:
             self.world_size = membership.world_size
             self.infer_instance_world_size = membership.inference_tp_size
             self.num_infer_engines = len(membership.engine_ids)
+            self.rollout_node_ids = (
+                tuple(rollout_node_ids) if rollout_node_ids is not None else None
+            )
             self._logical_to_communicator = list(range(self.world_size))
             self._logged_batch_shape = False
             if sender:

@@ -208,6 +208,45 @@ def test_v2_swizzle_groups_round_robin_engines_by_node(monkeypatch):
     assert cross_node_relay.forward_peers == [2]
 
 
+def test_v2_elastic_swizzle_uses_actual_nodes_instead_of_gpu_capacity(monkeypatch):
+    monkeypatch.setattr(nccl_device_v2, "_ensure_cuda_tensor", lambda *_: None)
+    monkeypatch.setenv("AWEX_NODE_LOCAL_WORLD_SIZE", "8")
+    tensor = torch.arange(8, dtype=torch.int32)
+    topology = (10, 20, 10, 20)
+    targets = [0, 2, 4, 6]
+    send = _build_send_batch(
+        {"weight": tensor},
+        TransferPlan(
+            operations={peer: [_replica_operation(8, peer)] for peer in targets}
+        ),
+        rank=8,
+        world_size=24,
+        chunk_bytes=16,
+        infer_instance_world_size=2,
+        num_infer_engines=4,
+        ring_broadcast=True,
+        ring_swizzle=True,
+        rollout_node_ids=topology,
+    )
+    assert send.peers == [0]
+    # Both local edges must remain LSA candidates for an intermediate cohort.
+    for rank, source, forward in ((0, 8, 4), (4, 0, 2), (2, 4, 6), (6, 2, -1)):
+        recv = _build_recv_batch(
+            {"weight": torch.empty_like(tensor)},
+            TransferPlan(operations={8: [_replica_operation(8, rank)]}),
+            rank=rank,
+            world_size=24,
+            chunk_bytes=16,
+            infer_instance_world_size=2,
+            num_infer_engines=4,
+            ring_broadcast=True,
+            ring_swizzle=True,
+            rollout_node_ids=topology,
+        )
+        assert recv.peers == [source]
+        assert recv.forward_peers == [forward]
+
+
 def test_v2_swizzle_switch_is_inert_when_ring_broadcast_is_off(monkeypatch):
     monkeypatch.setattr(nccl_device_v2, "_ensure_cuda_tensor", lambda *_: None)
     tensor = torch.arange(8, dtype=torch.int32)

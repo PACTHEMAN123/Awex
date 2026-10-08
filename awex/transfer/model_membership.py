@@ -13,7 +13,7 @@ import time
 import torch.distributed as dist
 
 from awex.models.qwen3 import annotate_qwen3_dense_transfer_plan
-from awex.transfer.nccl_device_v2 import NCCLDeviceV2Transport
+from awex.transfer.nccl_device_v2 import NCCLDeviceV2Transport, _local_node_id
 from awex.transfer.rollout_membership import RolloutMembership
 from awex.transfer.transfer_plan import TransferPlanBuilder
 from awex.util.common import get_free_port, get_ip_address
@@ -115,6 +115,24 @@ def prepare_model_membership(worker, specification: dict, sender: bool) -> dict:
     )
     old_group = worker.weights_update_group
     try:
+
+        def rollout_topology():
+            nodes = [None] * membership.world_size
+            dist.all_gather_object(nodes, _local_node_id(), group=group)
+            engine_nodes = []
+            for engine in range(engines):
+                tp_nodes = nodes[
+                    engine * membership.inference_tp_size : (engine + 1)
+                    * membership.inference_tp_size
+                ]
+                if len(set(tp_nodes)) != 1:
+                    raise ValueError(
+                        "Model joins require each rollout TP group on one node"
+                    )
+                engine_nodes.append(tp_nodes[0])
+            return tuple(engine_nodes)
+
+        rollout_node_ids = phase("rollout_topology", rollout_topology)
         if transport is None:
             transport = NCCLDeviceV2Transport(
                 group,
@@ -123,6 +141,7 @@ def prepare_model_membership(worker, specification: dict, sender: bool) -> dict:
                 infer_instance_world_size=membership.inference_tp_size,
                 num_infer_engines=engines,
                 membership_epoch=epoch,
+                rollout_node_ids=rollout_node_ids,
             )
             phase(
                 "host_bind",
@@ -134,7 +153,12 @@ def prepare_model_membership(worker, specification: dict, sender: bool) -> dict:
             phase(
                 "old_release_and_host_bind",
                 lambda: transport.reconfigure(
-                    group, membership, participant, parameters, plan
+                    group,
+                    membership,
+                    participant,
+                    parameters,
+                    plan,
+                    rollout_node_ids=rollout_node_ids,
                 ),
             )
         metrics = phase(
@@ -190,4 +214,5 @@ def prepare_model_membership(worker, specification: dict, sender: bool) -> dict:
         "prepare_ms": (time.perf_counter() - started) * 1000,
         "phases": phases,
         "preparation_metrics": metrics,
+        "rollout_node_ids": rollout_node_ids,
     }
