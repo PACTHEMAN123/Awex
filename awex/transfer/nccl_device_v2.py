@@ -993,6 +993,7 @@ class NCCLDeviceV2Transport:
             raise NCCLDeviceV2UnavailableError("membership_epoch must be nonnegative")
         self.membership_epoch = int(membership_epoch)
         self._membership_binding = None
+        self._device_prepared_binding = None
         self._reconfiguration_failed = False
         if world_size < 2 or world_size > 256:
             raise NCCLDeviceV2UnavailableError(
@@ -1370,6 +1371,7 @@ class NCCLDeviceV2Transport:
             fp8_block_shape=self.fp8_block_shape,
         )
         self._prepared_send = (parameters, plan, batch)
+        self._device_prepared_binding = None
 
     @_serialized_transport_call
     def prepare_recv(
@@ -1392,6 +1394,7 @@ class NCCLDeviceV2Transport:
             fp8_block_shape=self.fp8_block_shape,
         )
         self._prepared_recv = (parameters, plan, batch)
+        self._device_prepared_binding = None
 
     def _check_membership_binding(self, parameters, plan, sender):
         if self._reconfiguration_failed:
@@ -1408,6 +1411,79 @@ class NCCLDeviceV2Transport:
                 raise NCCLDeviceV2UnavailableError(
                     "Stale parameters, plan or role after membership change"
                 )
+
+    @_serialized_transport_call
+    def initialize_prepared_plan(
+        self,
+        parameters: dict[str, torch.Tensor],
+        plan: TransferPlan,
+        sender: bool,
+    ) -> dict[str, Any]:
+        """Collectively build communicator/FIFO/cache before the next update.
+
+        Call on every new-epoch rank, after prepare_send/prepare_recv and before
+        acknowledging membership preparation. No weights are read or written,
+        no quantization/forwarding kernel runs, and no weight version advances.
+        """
+        self._check_membership_binding(parameters, plan, sender)
+        prepared = self._prepared_send if sender else self._prepared_recv
+        if prepared is None or prepared[0] is not parameters or prepared[1] is not plan:
+            raise NCCLDeviceV2UnavailableError(
+                "Prepare the exact host plan before initializing its device cache"
+            )
+        started = time.perf_counter()
+        try:
+            init_time_ms = self._ensure_initialized()
+            batch = prepared[2]
+            metrics = dict(
+                self._extension.prepare(
+                    self._handle,
+                    batch.tensors,
+                    batch.lengths,
+                    batch.tensor_offsets,
+                    batch.tensor_row_bytes,
+                    batch.tensor_row_strides,
+                    batch.peers,
+                    batch.ordinals,
+                    batch.expected_counts,
+                    batch.forward_peers,
+                    batch.ring_ids,
+                    bool(sender),
+                    *([batch.quantization] if self.fp8_block_shape else []),
+                )
+            )
+            if not metrics.get("device_plan_ready") or metrics.get(
+                "kernel_launched", True
+            ):
+                raise NCCLDeviceV2UnavailableError(
+                    "Device prepare did not establish a cache without launching a kernel"
+                )
+            self._device_prepared_binding = (parameters, plan, bool(sender))
+            metrics.update(
+                transport_init_time_ms=init_time_ms,
+                membership_epoch=self.membership_epoch,
+                preparation_total_time_ms=(time.perf_counter() - started) * 1000,
+            )
+            return metrics
+        except Exception:
+            self._reconfiguration_failed = True
+            self.close()
+            raise
+
+    def is_device_plan_ready(
+        self, parameters: dict, plan: TransferPlan, sender: bool
+    ) -> bool:
+        """Readiness for these exact tensors, role and plan in this epoch."""
+        with self._operation_lock:
+            binding = self._device_prepared_binding
+            return bool(
+                not self._reconfiguration_failed
+                and self._initialized
+                and binding is not None
+                and binding[0] is parameters
+                and binding[1] is plan
+                and binding[2] == sender
+            )
 
     @_serialized_transport_call
     def reconfigure(
@@ -1503,6 +1579,7 @@ class NCCLDeviceV2Transport:
             self._initialized = False
             self._prepared_send = None
             self._prepared_recv = None
+            self._device_prepared_binding = None
 
     def __del__(self):
         try:

@@ -66,7 +66,9 @@ class RolloutJoinCoordinator:
     """Keep new engines unavailable until all ranks publish their first snapshot.
 
     Join requests may arrive during an update. Applying them requires an idle
-    publication boundary. A failed reconfiguration is terminal: applications must
+    publication boundary. Old engines may serve their previous complete version
+    while the next transport membership/cache is prepared without modifying
+    model storage. A failed reconfiguration is terminal: applications must
     recover explicitly rather than serving a partially updated group.
     """
 
@@ -79,6 +81,7 @@ class RolloutJoinCoordinator:
         self._updated = set()
         self._version = None
         self._ready = False
+        self._serving_cohort: tuple[str, ...] = ()
         self._failure = None
         self._lock = RLock()
 
@@ -89,14 +92,12 @@ class RolloutJoinCoordinator:
     @property
     def serving_engine_ids(self) -> tuple[str, ...]:
         with self._lock:
-            if (
-                self._failure
-                or not self._ready
-                or self._pending
-                or self._version is not None
-            ):
+            if self._failure or self._version is not None:
                 return ()
-            return self.membership.engine_ids
+            # Transport preparation changes metadata/resources, not model
+            # weights. Old rollout workers may keep serving their last complete
+            # version while the next membership is being prepared.
+            return self._serving_cohort
 
     def request_join(self, engine_id: str, inference_tp_size: int) -> bool:
         with self._lock:
@@ -198,6 +199,7 @@ class RolloutJoinCoordinator:
             self.last_version = self._version
             self._version = None
             self._ready = True
+            self._serving_cohort = self.membership.engine_ids
             return self.last_version
 
     def fail(self, reason: str) -> None:

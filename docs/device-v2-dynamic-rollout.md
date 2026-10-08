@@ -27,7 +27,13 @@ acknowledgements must come from the application's RPC/control plane.
    training default process group remains unchanged.
 4. On each survivor, call `transport.reconfigure(group, membership, participant,
    parameters, plan)`. On new workers, create and prepare a fresh transport with
-   `membership_epoch=membership.epoch`. Close/destroy caller-owned old process
+   `membership_epoch=membership.epoch`. Then collectively call
+   `transport.initialize_prepared_plan(parameters, plan, sender)` on every
+   participant. This creates the native communicator, registers the sparse
+   FIFO, lowers/uploads the C++ schedule, and establishes its device cache
+   **without** copying/quantizing/forwarding weights or advancing a version.
+   `is_device_plan_ready(...)` must return true before acknowledging preparation.
+   Close/destroy caller-owned old process
    groups only after the corresponding transport has released its resources.
 5. Acknowledge preparation on **all** ranks, then `commit_join()`.
 6. Publish the next full snapshot and acknowledge its exact epoch/version on
@@ -45,8 +51,12 @@ weight receive buffer to the device transport. Process groups are borrowed;
 the application owns their lifecycle. Epoch/geometry are checked across all
 participants when the new device communicator initializes.
 
-`serving_engine_ids` is empty during transition/publication or after failure;
-the initial cohort also requires a complete first snapshot. A rebuild failure
+`serving_engine_ids` retains the old, fully synchronized cohort while the new
+membership/cache is prepared, so existing model weights can continue to serve
+rollouts during preparation. Newly joined engines remain unavailable until
+the next full snapshot completes. The cohort is empty during a weight
+publication or after failure; the initial cohort also requires a complete first
+snapshot. A rebuild failure
 poisons the transport. The driver must call `coordinator.fail(reason)` and stop
 serving that group, then recover explicitly with fresh transport objects.
 Plan validation failures before resource release leave the old transport
@@ -74,8 +84,9 @@ receives the immediately following update (zero-based versions 3 and 6), then
 every subsequent update. `--ring off|naive|swizzle` and removing `--fp8` cover
 the feature combinations.
 
-**CPU mock is control-plane/plan-lowering validation only.** Its execution
-hook replaces the CUDA launch with Gloo broadcast and reference quantization.
+**CPU mock is control-plane/plan-lowering validation only.** Its hooks mock
+native communicator/cache initialization and replace the CUDA launch with Gloo
+broadcast and reference quantization.
 It does not exercise GIN, device FIFO forwarding, relay kernels, or fused FP8,
 and its timings must not be used as device v2 performance results. Full
 `weights_exchange_multi_vllm_it.py`, 30B vLLM, and veRL integration have not
@@ -110,8 +121,64 @@ physical GPU binding does not follow the moving transfer rank. Explicit
 `NCCL_IB_HCA` settings are preserved. Keep existing NUMA/CPU bindings in each
 node's worker launch environment.
 
+### Automatic late launch on multiple hosts
+
+Use node agents to make joins automatic instead of manually starting every
+emitted worker. Start one bounded agent on each already selected/verified node,
+then start the driver with a JSON placement map. The map covers all final
+participants and assigns each a node label and unique node-local device.
+Agents keep ownership of only this run's children and reap them on driver
+shutdown or their control-store timeout. Driver/agent source fingerprints must
+match before any worker is spawned. GPU preflight rejects duplicate physical
+GPU assignments even if the same host has two node labels.
+
+For a portable test of the launcher protocol (two agents on **one CPU host**):
+
+```bash
+python -m awex.tests.experimental.nccl_device_v2_dynamic_e2e \
+  --backend cpu-mock --local-agents \
+  --placements awex/tests/experimental/dynamic_rollout_placements.example.json \
+  --tp 2 --join-after 3 6 --target-engines 2 4 --updates 10 \
+  --ring swizzle --fp8 --output dynamic-agent-mock.json
+```
+
+For real GPUs, replace `DRIVER_ADDRESS` below with the current verified driver
+container address. On node-a and node-b, respectively, from the same branch and
+their node-local environment, start:
+
+```bash
+python -m awex.tests.experimental.dynamic_rollout_agent \
+  --node node-a --control-address DRIVER_ADDRESS --control-port 19170 --timeout 300
+```
+
+```bash
+python -m awex.tests.experimental.dynamic_rollout_agent \
+  --node node-b --control-address DRIVER_ADDRESS --control-port 19170 --timeout 300
+```
+
+Then on the driver:
+
+```bash
+python -m awex.tests.experimental.nccl_device_v2_dynamic_e2e \
+  --backend device-v2 \
+  --placements awex/tests/experimental/dynamic_rollout_placements.example.json \
+  --control-address DRIVER_ADDRESS --control-port 19170 --timeout 300 \
+  --tp 2 --join-after 3 6 --target-engines 2 4 --updates 10 \
+  --rows 4096 --cols 1024 --ring swizzle --fp8 --output dynamic-agent-gpu.json
+```
+
+The example requires node-a GPUs 0–3 and node-b GPUs 0–5 to be free. Adjust
+the map to the selected deployment before running. A late engine is first
+spawned at its join boundary, using the node agent's interpreter; no old worker
+is restarted. Agents accept only this benchmark's worker configuration, not
+arbitrary shell commands. This harness remains synthetic weight exchange, not
+the full 30B vLLM/Megatron integration test.
+
 Output records include every participant's epoch/version, PID, storage
 addresses, weight checks, per-update metrics, source payload, and membership
-preparation time. GPU update metrics include communicator initialization on
-the first post-join update. Measure that separately from later steady updates;
-do not count validation/reference construction as transfer time.
+preparation time. Preparation checks that weight/scale buffers remain unchanged.
+Every publication, including the first post-join update, must hit the plan cache
+and report zero communicator initialization, host batch construction, native
+plan initialization, host lowering, and metadata upload time. The benchmark
+fails if any of that work leaks into publication. Preparation time is recorded
+separately; do not count validation/reference construction as transfer time.

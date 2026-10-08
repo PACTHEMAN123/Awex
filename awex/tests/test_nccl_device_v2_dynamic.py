@@ -208,3 +208,62 @@ def test_new_communicator_rejects_mismatched_epoch_or_geometry(
     monkeypatch.setattr(module.dist, "all_gather", gather)
     with pytest.raises(RuntimeError, match="Membership epoch and inference geometry"):
         transport._ensure_initialized()
+
+
+def test_device_prepare_builds_cache_without_launching_or_changing_weights(prepared):
+    transport, params, plan, _, _, _ = prepared
+    source = params["weight"].clone()
+    calls = []
+
+    def prepare(*args):
+        calls.append(args)
+        return {
+            "device_plan_ready": True,
+            "kernel_launched": False,
+            "plan_cache_hit": False,
+        }
+
+    transport._extension.prepare = prepare
+    transport._extension.launch = lambda *_: pytest.fail(
+        "Preparation launched a weight kernel"
+    )
+    assert not transport.is_device_plan_ready(params, plan, True)
+    metrics = transport.initialize_prepared_plan(params, plan, True)
+    assert metrics["device_plan_ready"] and not metrics["kernel_launched"]
+    assert metrics["transport_init_time_ms"] == 0.0
+    assert calls[0][0] == 42 and calls[0][-1] is True
+    assert calls[0][2] == transport._prepared_send[2].lengths
+    assert transport.is_device_plan_ready(params, plan, True)
+    assert not transport.is_device_plan_ready(
+        params, make_plan(1, RolloutMembership(0, 1, 1, ("old",))), True
+    )
+    assert torch.equal(params["weight"], source)
+    transport.close()
+    assert not transport.is_device_plan_ready(params, plan, True)
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        {"device_plan_ready": False, "kernel_launched": False},
+        {"device_plan_ready": True, "kernel_launched": True},
+        {"device_plan_ready": True},
+    ],
+)
+def test_prepare_failure_is_not_acknowledged_as_ready(prepared, result):
+    transport, params, plan, destroyed, _, _ = prepared
+    transport._extension.prepare = lambda *_: result
+    with pytest.raises(RuntimeError, match="without launching"):
+        transport.initialize_prepared_plan(params, plan, True)
+    assert destroyed == [42]
+    assert not transport.is_device_plan_ready(params, plan, True)
+    with pytest.raises(RuntimeError, match="rebuild failed"):
+        transport.send(params, plan, 1)
+
+
+def test_prepare_does_not_initialize_wrong_host_plan(prepared):
+    transport, params, _, destroyed, _, _ = prepared
+    wrong_plan = make_plan(1, RolloutMembership(0, 1, 1, ("old",)))
+    with pytest.raises(RuntimeError, match="exact host plan"):
+        transport.initialize_prepared_plan(params, wrong_plan, True)
+    assert destroyed == []

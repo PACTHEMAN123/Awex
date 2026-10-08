@@ -734,14 +734,15 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
                 const std::vector<int64_t>& tensor_row_strides, const std::vector<int64_t>& peers,
                 const std::vector<int64_t>& ordinals, const std::vector<int64_t>& expected_counts,
                 const std::vector<int64_t>& forward_peers, const std::vector<int64_t>& ring_ids, bool sender,
-                int64_t sequence, const std::vector<std::vector<int64_t>>& quantization = {}) {
+                int64_t sequence, const std::vector<std::vector<int64_t>>& quantization = {},
+                bool prepare_only = false) {
   using Clock = std::chrono::steady_clock;
   const auto launch_start = Clock::now();
   auto* state = reinterpret_cast<DeviceState*>(handle);
   if (state == nullptr) {
     throw std::runtime_error("Invalid nccl_device_v2 state handle");
   }
-  if (sequence <= 0 || static_cast<std::uint64_t>(sequence) <= state->last_sequence) {
+  if (!prepare_only && (sequence <= 0 || static_cast<std::uint64_t>(sequence) <= state->last_sequence)) {
     throw std::runtime_error("nccl_device_v2 sequence must increase and be positive");
   }
 
@@ -894,6 +895,18 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
   metrics["metadata_upload_time_ms"] = metadata_upload_time_ms;
   metrics["plan_initialization_time_ms"] = plan_initialization_time_ms;
 
+  if (prepare_only) {
+    // Cache creation registers the FIFO window and uploads immutable schedule
+    // metadata. Complete those operations before acknowledging membership
+    // readiness. Never run a copy/quant/relay kernel or advance last_sequence.
+    AWEX_CUDA_V2_CHECK(cudaStreamSynchronize(stream));
+    metrics["device_plan_ready"] = py::bool_(state->plan_initialized && state->window_initialized);
+    metrics["kernel_launched"] = py::bool_(false);
+    metrics["prepare_total_time_ms"] =
+      std::chrono::duration<double, std::milli>(Clock::now() - launch_start).count();
+    return metrics;
+  }
+
   AWEX_CUDA_V2_CHECK(cudaMemsetAsync(state->local_base, 0, state->layout.payload_offset, stream));
   v2::V2KernelArgs args{};
   args.works = state->buffers.works;
@@ -1004,7 +1017,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
              py::arg("tensor_offsets"), py::arg("tensor_row_bytes"), py::arg("tensor_row_strides"),
              py::arg("peers"), py::arg("ordinals"), py::arg("expected_counts"), py::arg("forward_peers"),
              py::arg("ring_ids"), py::arg("sender"), py::arg("sequence"),
-             py::arg("quantization") = std::vector<std::vector<int64_t>>{});
+             py::arg("quantization") = std::vector<std::vector<int64_t>>{},
+             py::arg("prepare_only") = false);
+  module.def("prepare", [](int64_t handle, const py::list& tensors,
+                const std::vector<int64_t>& lengths, const std::vector<int64_t>& tensor_offsets,
+                const std::vector<int64_t>& tensor_row_bytes, const std::vector<int64_t>& tensor_row_strides,
+                const std::vector<int64_t>& peers, const std::vector<int64_t>& ordinals,
+                const std::vector<int64_t>& expected_counts, const std::vector<int64_t>& forward_peers,
+                const std::vector<int64_t>& ring_ids, bool sender,
+                const std::vector<std::vector<int64_t>>& quantization) {
+      return launch(handle, tensors, lengths, tensor_offsets, tensor_row_bytes, tensor_row_strides,
+                    peers, ordinals, expected_counts, forward_peers, ring_ids, sender, 0,
+                    quantization, true);
+    }, py::arg("handle"), py::arg("tensors"), py::arg("lengths"), py::arg("tensor_offsets"),
+    py::arg("tensor_row_bytes"), py::arg("tensor_row_strides"), py::arg("peers"), py::arg("ordinals"),
+    py::arg("expected_counts"), py::arg("forward_peers"), py::arg("ring_ids"), py::arg("sender"),
+    py::arg("quantization") = std::vector<std::vector<int64_t>>{});
   module.def("destroy", [](int64_t handle) {
     auto* state = reinterpret_cast<DeviceState*>(handle);
     if (state == nullptr) {

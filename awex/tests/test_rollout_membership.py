@@ -26,13 +26,13 @@ def test_queued_join_during_update_is_applied_only_at_boundary():
     assert membership.rank(("training", "", 0)) == 2
     assert next_membership.rank(("rollout", "old", 1)) == 1
     assert next_membership.rank(("rollout", "new", 0)) == 2
-    assert coordinator.serving_engine_ids == ()
+    assert coordinator.serving_engine_ids == ("old",)
     with pytest.raises(RuntimeError, match="Every old and new"):
         coordinator.commit_join()
     for participant in next_membership.participants:
         coordinator.acknowledge_prepared(participant, 1)
     coordinator.commit_join()
-    assert coordinator.serving_engine_ids == ()
+    assert coordinator.serving_engine_ids == ("old",)
     coordinator.begin_publication(1)
     for participant in next_membership.participants[:-1]:
         coordinator.acknowledge_updated(participant, 1, 1)

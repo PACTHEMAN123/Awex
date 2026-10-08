@@ -111,10 +111,11 @@ def _plan(
 
 
 def _mock_run(self, batch, sender: bool, sequence: int) -> dict:
-    """Replace ONLY CUDA execution for the portable control-plane check.
+    """Portable control-plane execution, without CUDA/FIFO validation.
 
     Real device v2 send/recv, plan lowering, prepare, and reconfigure still run.
     Gloo broadcast does not validate FIFO, GIN, or relay-kernel execution.
+    A separate mock hook replaces native communicator/cache preparation too.
     """
     parameters, participant, shape, fp8 = self._mock_state
     for tp in range(self.infer_instance_world_size):
@@ -146,7 +147,32 @@ def _mock_run(self, batch, sender: bool, sequence: int) -> dict:
         "execution": "gloo_cpu_mock",
         "plan_cache_hit": hit,
         "payload_bytes": sum(batch.lengths),
+        "transport_init_time_ms": 0.0,
+        "plan_initialization_time_ms": 0.0,
+        "metadata_upload_time_ms": 0.0,
+        "host_lowering_time_ms": 0.0,
     }
+
+
+def _mock_initialize(self) -> float:
+    if self._initialized:
+        return 0.0
+
+    def prepare(*args):
+        dist.barrier(group=self.group)
+        hit = getattr(self, "_mock_last_epoch", None) == self.membership_epoch
+        self._mock_last_epoch = self.membership_epoch
+        return {
+            "execution": "gloo_cpu_mock",
+            "device_plan_ready": True,
+            "kernel_launched": False,
+            "plan_cache_hit": hit,
+        }
+
+    self._extension = SimpleNamespace(prepare=prepare, destroy=lambda _: None)
+    self._handle = 1
+    self._initialized = True
+    return 0.0
 
 
 def _store(args, server: bool):
@@ -251,6 +277,9 @@ def worker(args) -> None:
                                 args.fp8,
                             )
                             transport._run = MethodType(_mock_run, transport)
+                            transport._ensure_initialized = MethodType(
+                                _mock_initialize, transport
+                            )
                         prepare = (
                             transport.prepare_send
                             if args.role == "training"
@@ -263,6 +292,27 @@ def worker(args) -> None:
                         )
                         dist.destroy_process_group(group)
                     group = new_group
+                    # Establish the native communicator, FIFO registration and
+                    # device schedule/cache now, without publishing weights.
+                    # Check model buffers to catch accidental warm-up updates.
+                    before = {
+                        name: tensor.view(torch.uint8).clone()
+                        for name, tensor in parameters.items()
+                    }
+                    preparation_metrics = transport.initialize_prepared_plan(
+                        parameters, plan, args.role == "training"
+                    )
+                    assert transport.is_device_plan_ready(
+                        parameters, plan, args.role == "training"
+                    )
+                    if not all(
+                        torch.equal(tensor.view(torch.uint8), before[name])
+                        for name, tensor in parameters.items()
+                    ):
+                        raise AssertionError(
+                            "Preparation modified model weight/scale storage"
+                        )
+                    dist.barrier(group=group)
                     result = {
                         "epoch": membership.epoch,
                         "rank": membership.rank(participant),
@@ -271,6 +321,7 @@ def worker(args) -> None:
                             name: tensor.data_ptr()
                             for name, tensor in parameters.items()
                         },
+                        "preparation_metrics": preparation_metrics,
                     }
                 elif command["op"] == "publish":
                     version = command["version"]
@@ -291,6 +342,19 @@ def worker(args) -> None:
                         transport.send if args.role == "training" else transport.recv
                     )
                     metrics = exchange(parameters, plan, version)
+                    if not metrics.get("plan_cache_hit") or any(
+                        metrics.get(key, -1) != 0.0
+                        for key in (
+                            "transport_init_time_ms",
+                            "plan_initialization_time_ms",
+                            "metadata_upload_time_ms",
+                            "host_lowering_time_ms",
+                            "build_batch_time_ms",
+                        )
+                    ):
+                        raise AssertionError(
+                            "Publication unexpectedly initialized communicator/plan/cache"
+                        )
                     transfer_ms = (time.perf_counter() - transfer_start) * 1000
                     if args.role == "training":
                         if not torch.equal(parameters[NAME], source):
@@ -350,11 +414,40 @@ def worker(args) -> None:
 
 def driver(args) -> dict:
     final_world = args.tp * (1 + args.target_engines[-1])
+    placements = {}
+    if args.placements:
+        for entry in json.loads(Path(args.placements).read_text()):
+            participant = tuple(entry["participant"])
+            if participant in placements:
+                raise ValueError("Repeated placement participant")
+            placements[participant] = (entry["node"], entry["device"])
+        final_membership = RolloutMembership(
+            0,
+            args.tp,
+            args.tp,
+            tuple(f"engine-{i}" for i in range(args.target_engines[-1])),
+        )
+        if set(placements) != set(final_membership.participants):
+            raise ValueError(
+                "Placements must cover every initial and final participant"
+            )
+        if len(set(placements.values())) != len(placements):
+            raise ValueError("Each worker requires its own node-local device")
+        if any(
+            not isinstance(node, str)
+            or not node
+            or "/" in node
+            or not isinstance(device, int)
+            or device < 0
+            for node, device in placements.values()
+        ):
+            raise ValueError("Invalid node/device placement")
     if final_world > 256:
         raise ValueError("Requested topology exceeds device v2's 256-rank limit")
     if (
         args.backend == "device-v2"
         and not args.external
+        and not placements
         and torch.cuda.device_count() < final_world
     ):
         raise ValueError(
@@ -366,14 +459,47 @@ def driver(args) -> dict:
     )
     coordinator = RolloutJoinCoordinator(membership)
     processes = []
+    agents = []
+    agent_indexes = {node: 0 for node, _ in placements.values()}
     indexes = {}
     identities = {}
     records = []
+    agent_descriptions = {}
     counts = args.target_engines
     joins = dict(zip(args.join_after, counts))
 
+    def agent_command(node, command):
+        index = agent_indexes[node]
+        store.set(f"agent/{node}/command/{index}", json.dumps(command))
+        reply = json.loads(store.get(f"agent/{node}/reply/{index}").decode())
+        agent_indexes[node] += 1
+        if not reply["ok"]:
+            raise RuntimeError(reply["error"])
+        return reply
+
     def launch(participant):
         indexes[participant] = 0
+        if placements:
+            node, gpu = placements[participant]
+            config = {
+                name: getattr(args, name)
+                for name in ("backend", "ring", "rows", "cols", "timeout", "fp8")
+            }
+            reply = agent_command(
+                node, dict(config, op="launch", participant=participant, device=gpu)
+            )
+            print(
+                json.dumps(
+                    {
+                        "event": "worker_started",
+                        "participant": participant,
+                        "node": node,
+                        **reply,
+                    }
+                ),
+                flush=True,
+            )
+            return
         gpu = (
             participant[2]
             if participant[0] == "training"
@@ -454,6 +580,48 @@ def driver(args) -> dict:
         return replies
 
     try:
+        if args.local_agents:
+            for node in agent_indexes:
+                agents.append(
+                    subprocess.Popen(
+                        [
+                            sys.executable,
+                            "-m",
+                            "awex.tests.experimental.dynamic_rollout_agent",
+                            "--node",
+                            node,
+                            "--control-address",
+                            args.control_address,
+                            "--control-port",
+                            str(store.port),
+                            "--timeout",
+                            str(args.timeout),
+                        ]
+                    )
+                )
+        if placements:
+            from awex.tests.experimental.dynamic_rollout_agent import source_fingerprint
+
+            expected_fingerprint = source_fingerprint()
+            for node in agent_indexes:
+                description = agent_command(node, {"op": "describe"})
+                if description["source_fingerprint"] != expected_fingerprint:
+                    raise RuntimeError(
+                        f"Node {node} has different device v2/benchmark source"
+                    )
+                agent_descriptions[node] = description
+            if args.backend == "device-v2":
+                used = set()
+                for node, device in placements.values():
+                    identity = (agent_descriptions[node]["hostname"], device)
+                    if (
+                        device >= agent_descriptions[node]["gpu_count"]
+                        or identity in used
+                    ):
+                        raise ValueError(
+                            "Placement overlaps a physical GPU or exceeds node capacity"
+                        )
+                    used.add(identity)
         for participant in membership.participants:
             launch(participant)
         records.append(
@@ -510,12 +678,13 @@ def driver(args) -> dict:
                         participant, replies[_key(participant)]["epoch"]
                     )
                 coordinator.commit_join()
-                assert not coordinator.serving_engine_ids
+                assert coordinator.serving_engine_ids == membership.engine_ids
                 record = {
                     "event": "join",
                     "after_updates": completed,
                     "epoch": expanded.epoch,
                     "engine_ids": expanded.engine_ids,
+                    "serving_engine_ids": coordinator.serving_engine_ids,
                     "next_version": version + 1,
                     "prepare_ms": (time.perf_counter() - started) * 1000,
                     "ranks": replies,
@@ -528,6 +697,8 @@ def driver(args) -> dict:
                     flush=True,
                 )
         dispatch(coordinator.membership, {"op": "stop"})
+        for node in agent_indexes:
+            agent_command(node, {"op": "stop"})
         summary = {
             "passed": True,
             "backend": args.backend,
@@ -540,6 +711,12 @@ def driver(args) -> dict:
             "initial_engines": args.initial_engines,
             "join_after": args.join_after,
             "target_engines": args.target_engines,
+            "worker_launch": "node-agents"
+            if placements
+            else "manual"
+            if args.external
+            else "local",
+            "agent_descriptions": agent_descriptions,
             "records": records,
         }
         if args.output:
@@ -556,6 +733,16 @@ def driver(args) -> dict:
         coordinator.fail(str(exc))
         raise
     finally:
+        # Request shutdown without waiting for a potentially failed host. Each
+        # agent owns and reaps only this run's child workers.
+        for node, index in agent_indexes.items():
+            store.set(f"agent/{node}/command/{index}", json.dumps({"op": "stop"}))
+        for process in agents:
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.terminate()
+                process.wait(timeout=10)
         # Only child processes owned by this driver are stopped; external GPU
         # workers exit on their own bounded store/collective timeout on failure.
         for process in processes:
@@ -576,6 +763,15 @@ def main() -> None:
         "--backend", choices=("cpu-mock", "device-v2"), default="cpu-mock"
     )
     parser.add_argument("--external", action="store_true")
+    parser.add_argument(
+        "--placements",
+        help="JSON participant/node/device map for prestarted node agents",
+    )
+    parser.add_argument(
+        "--local-agents",
+        action="store_true",
+        help="CPU-only local test of the multi-host launcher protocol",
+    )
     parser.add_argument(
         "--worker-python", help="Interpreter for emitted remote worker commands"
     )
@@ -606,6 +802,10 @@ def main() -> None:
             parser.error("Workers require the driver's control port")
         worker(args)
     else:
+        if args.local_agents and (args.backend != "cpu-mock" or not args.placements):
+            parser.error("Local agents require CPU mock and a placement map")
+        if args.external and args.placements:
+            parser.error("Use either manual external workers or node agents")
         targets = [args.initial_engines] + args.target_engines
         if len(args.join_after) != len(args.target_engines) or any(
             a >= b for a, b in zip(targets, targets[1:])
