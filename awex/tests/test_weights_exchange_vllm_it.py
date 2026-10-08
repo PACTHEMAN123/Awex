@@ -36,6 +36,7 @@ from awex.util import device as device_util
 
 
 def _set_distributed_env(monkeypatch, rank=0, local_rank=0, world_size=2):
+    monkeypatch.delenv("LOCAL_WORLD_SIZE", raising=False)
     monkeypatch.setenv("AWEX_DEVICE_TYPE", "cuda")
     monkeypatch.setenv("RANK", str(rank))
     monkeypatch.setenv("LOCAL_RANK", str(local_rank))
@@ -62,9 +63,7 @@ def test_inference_only_vllm_children_keep_node_local_rank_offsets(monkeypatch):
 
     groups = weights_exchange_vllm_infer_it._inference_device_groups(args)
     for engine_rank, devices in enumerate(groups):
-        weights_exchange_vllm_infer_it._start_vllm_server(
-            args, engine_rank, devices
-        )
+        weights_exchange_vllm_infer_it._start_vllm_server(args, engine_rank, devices)
 
     assert groups == [["2", "3"], ["5", "7"]]
     assert launched[0][1]["AWEX_NODE_LOCAL_RANK_OFFSET"] == "0"
@@ -84,17 +83,13 @@ def test_inference_only_vllm_children_keep_node_local_rank_offsets(monkeypatch):
         ("model.embed_tokens.weight", 1, True, True),
     ],
 )
-def test_megatron_compare_layer_filter(
-    name, max_layers, include_non_layer, expected
-):
+def test_megatron_compare_layer_filter(name, max_layers, include_non_layer, expected):
     assert _should_include_name(name, max_layers, include_non_layer) is expected
 
 
 def test_select_devices_reserves_disjoint_train_and_vllm_gpus(monkeypatch):
     _set_distributed_env(monkeypatch, rank=1, local_rank=1)
-    monkeypatch.setattr(
-        device_util, "visible_devices_env_value", lambda: "2,3,4,5"
-    )
+    monkeypatch.setattr(device_util, "visible_devices_env_value", lambda: "2,3,4,5")
     config = copy.deepcopy(vllm_inference_config)
     config["tp_size"] = 2
 
@@ -120,9 +115,7 @@ def test_train_tp_requires_matching_torchrun_world_size(monkeypatch):
 
 def test_train_ep_reserves_actual_world_size_before_vllm_gpus(monkeypatch):
     _set_distributed_env(monkeypatch, rank=1, local_rank=1, world_size=2)
-    monkeypatch.setattr(
-        device_util, "visible_devices_env_value", lambda: "2,3,4,5"
-    )
+    monkeypatch.setattr(device_util, "visible_devices_env_value", lambda: "2,3,4,5")
     config = copy.deepcopy(vllm_inference_config)
     config["tp_size"] = 2
 
@@ -151,9 +144,7 @@ def test_train_parallelism_defaults_expert_tp_to_dense_tp(monkeypatch):
 
 def test_explicit_expert_tp_can_share_world_ranks_with_dense_tp(monkeypatch):
     _set_distributed_env(monkeypatch, world_size=2)
-    monkeypatch.setattr(
-        device_util, "visible_devices_env_value", lambda: "0,1,2"
-    )
+    monkeypatch.setattr(device_util, "visible_devices_env_value", lambda: "0,1,2")
 
     integration = VLLMWeightsExchangeIT(
         comm_backend="nccl",
@@ -171,9 +162,7 @@ def test_explicit_expert_tp_can_share_world_ranks_with_dense_tp(monkeypatch):
 )
 def test_vllm_child_uses_current_python(monkeypatch, integration_class):
     _set_distributed_env(monkeypatch, world_size=1)
-    monkeypatch.setattr(
-        device_util, "visible_devices_env_value", lambda: "0,1"
-    )
+    monkeypatch.setattr(device_util, "visible_devices_env_value", lambda: "0,1")
     config = copy.deepcopy(vllm_inference_config)
     config["tp_size"] = 1
     launched = []

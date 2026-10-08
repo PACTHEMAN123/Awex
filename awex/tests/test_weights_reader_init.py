@@ -143,6 +143,8 @@ def test_late_model_reader_initializes_workers_with_explicit_join_epoch(monkeypa
         meta_server_addr="127.0.0.1:12345",
         tp_size=1,
         num_engines=2,
+        pp_size=1,
+        dp_size=1,
         engine_rank=1,
         comm_backend="nccl_device_v2",
         enable_debug_mode=True,
@@ -167,6 +169,8 @@ def test_existing_model_reader_prepares_without_reinitializing_model(monkeypatch
         meta_server_addr="127.0.0.1:12345",
         tp_size=1,
         num_engines=1,
+        pp_size=1,
+        dp_size=1,
         comm_backend="nccl_device_v2",
         enable_debug_mode=True,
     )

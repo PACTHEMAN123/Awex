@@ -51,6 +51,12 @@ def prepare_model_membership(worker, specification: dict, sender: bool) -> dict:
     phases = []
     started_ns = time.time_ns()
     started = time.perf_counter()
+    models = worker.model if sender else [worker.model]
+    pointers = {
+        f"{stage}/{name}": parameter.data_ptr()
+        for stage, model in enumerate(models)
+        for name, parameter in model.named_parameters()
+    }
 
     def phase(name, call):
         begin = time.time_ns()
@@ -144,6 +150,12 @@ def prepare_model_membership(worker, specification: dict, sender: bool) -> dict:
         raise
     if old_group is not None:
         dist.destroy_process_group(old_group)
+    if pointers != {
+        f"{stage}/{name}": parameter.data_ptr()
+        for stage, model in enumerate(models)
+        for name, parameter in model.named_parameters()
+    }:
+        raise AssertionError("Preparing membership replaced loaded model storage")
     worker.weights_update_group = group
     worker.device_transport = transport
     worker.transfer_plan = plan
@@ -170,6 +182,7 @@ def prepare_model_membership(worker, specification: dict, sender: bool) -> dict:
         )
     return {
         "pid": os.getpid(),
+        "pointers": pointers,
         "epoch": epoch,
         "rank": rank,
         "start_ns": started_ns,
