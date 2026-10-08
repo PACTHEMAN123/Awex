@@ -9,7 +9,7 @@ import pytest
 
 
 @pytest.mark.parametrize("node_agents", [False, True])
-def test_late_rollout_processes_receive_the_immediate_next_fp8_update(
+def test_late_rollout_processes_receive_the_immediate_next_bf16_update(
     tmp_path, node_agents
 ):
     output = tmp_path / "results.json"
@@ -46,7 +46,6 @@ def test_late_rollout_processes_receive_the_immediate_next_fp8_update(
             "awex.tests.experimental.nccl_device_v2_dynamic_e2e",
             "--backend",
             "cpu-mock",
-            "--fp8",
             "--tp",
             "1",
             "--join-after",

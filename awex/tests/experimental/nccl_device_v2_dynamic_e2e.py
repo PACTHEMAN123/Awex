@@ -374,7 +374,35 @@ def worker(args) -> None:
                                 atol=0,
                             )
                         elif not torch.equal(parameters[NAME], source):
-                            raise AssertionError("BF16 weight bytes differ")
+                            mismatches = (
+                                (parameters[NAME] != source)
+                                .flatten()
+                                .nonzero()
+                                .flatten()
+                            )
+                            sample = mismatches[:16]
+                            raise AssertionError(
+                                "BF16 weight bytes differ: "
+                                + json.dumps(
+                                    {
+                                        "participant": participant,
+                                        "epoch": transport.membership_epoch,
+                                        "version": version,
+                                        "count": mismatches.numel(),
+                                        "first": mismatches[0].item(),
+                                        "last": mismatches[-1].item(),
+                                        "indices": sample.tolist(),
+                                        "actual": parameters[NAME]
+                                        .flatten()[sample]
+                                        .float()
+                                        .tolist(),
+                                        "expected": source.flatten()[sample]
+                                        .float()
+                                        .tolist(),
+                                        "metrics": metrics,
+                                    }
+                                )
+                            )
                     if not torch.equal(parameters[NORM], norm):
                         raise AssertionError("Norm weight bytes differ")
                     dist.barrier(group=group)
