@@ -1,6 +1,7 @@
 import pickle
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from awex.config import InferenceConfig
@@ -126,3 +127,56 @@ def test_weights_reader_infer_conf_carries_engine_name(monkeypatch):
     assert engine.received_task_kwargs is not None
     init_infer_conf = pickle.loads(engine.received_task_kwargs["infer_conf_bytes"])
     assert init_infer_conf["engine_name"] == "vllm"
+
+
+def test_late_model_reader_initializes_workers_with_explicit_join_epoch(monkeypatch):
+    params_meta = [_build_param_meta()]
+    meta_server = _DummyMetaServerClient()
+    meta_server.objects["training_params_meta"] = params_meta
+    monkeypatch.setattr(
+        "awex.reader.weights_reader.MetaServerClient", lambda *a, **k: meta_server
+    )
+    monkeypatch.setattr(
+        "awex.reader.weights_reader.check_train_infer_params_meta", lambda *a, **k: None
+    )
+    config = InferenceConfig(
+        meta_server_addr="127.0.0.1:12345",
+        tp_size=1,
+        num_engines=2,
+        engine_rank=1,
+        comm_backend="nccl_device_v2",
+        enable_debug_mode=True,
+    )
+    engine = _DummyInferenceEngine(config)
+    reader = WeightsReader(engine, meta_resolver=_DummyMetaResolver(params_meta))
+    specification = {"epoch": 1, "num_engines": 2}
+    reader.prepare_membership(specification)
+    assert reader.initialized
+    assert engine.received_task_kwargs["membership_specification"] == specification
+    assert engine.received_task_kwargs["num_engines"] == 2
+    with pytest.raises(ValueError, match="add engines"):
+        reader.prepare_membership(specification)
+
+
+def test_existing_model_reader_prepares_without_reinitializing_model(monkeypatch):
+    params_meta = [_build_param_meta()]
+    monkeypatch.setattr(
+        "awex.reader.weights_reader.MetaServerClient", _DummyMetaServerClient
+    )
+    config = InferenceConfig(
+        meta_server_addr="127.0.0.1:12345",
+        tp_size=1,
+        num_engines=1,
+        comm_backend="nccl_device_v2",
+        enable_debug_mode=True,
+    )
+    engine = _DummyInferenceEngine(config)
+    reader = WeightsReader(engine, meta_resolver=_DummyMetaResolver(params_meta))
+    reader.initialized = True
+    reader._initialize = lambda: pytest.fail(
+        "Surviving model reader must not reinitialize"
+    )
+    specification = {"epoch": 1, "num_engines": 2}
+    reader.prepare_membership(specification)
+    assert engine.received_task_kwargs == {"specification": specification}
+    assert reader.infer_world_size == 2

@@ -1,6 +1,7 @@
 """Bounded BF16 computation and wall-clock spans for the elastic mock.
 
-GPU event durations measure device work. Span endpoints bound submission and
+CUDA events measure elapsed stream time, including scheduling/host gaps, rather
+than kernel occupancy. Span endpoints bound submission and
 completion on the host; they are deliberately not presented as kernel timestamps.
 The computation reads a private snapshot of the last published model weights.
 """

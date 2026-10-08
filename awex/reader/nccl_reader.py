@@ -509,6 +509,7 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
             backend_effective_gbps = profile_metrics.get("payload_bytes", 0.0) / (
                 backend_execute_time_ms * 1_000_000.0
             )
+        self.last_transfer_metrics = dict(profile_metrics)
         emit_profile(
             logger,
             event="weight_transfer",

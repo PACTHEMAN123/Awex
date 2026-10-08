@@ -101,7 +101,11 @@ _AWEX_WORKER_SIGNATURES = {
             "enable_colocate_mode",
             "ipc_backend",
         ],
-        "optional": ["enable_debug_mode", "weights_comm_nccl_group_size"],
+        "optional": [
+            "enable_debug_mode",
+            "weights_comm_nccl_group_size",
+            "membership_specification",
+        ],
     },
     "_update_parameters_in_tp_worker": {"required": ["step_id"], "optional": []},
     "_pre_update_weights_in_tp_worker": {"required": ["step_id"], "optional": []},
@@ -138,6 +142,16 @@ class AwexInitRequest(OpenAIBaseModel):
 class AwexUpdateRequest(OpenAIBaseModel):
     step_id: int
     kwargs: dict[str, Any] | None = None
+
+
+class AwexMembershipRequest(OpenAIBaseModel):
+    epoch: int
+    num_engines: int
+
+
+class AwexModelProfileRequest(OpenAIBaseModel):
+    operation: str
+    version: int = 0
 
 
 class PublicationInitRequest(OpenAIBaseModel):
@@ -560,6 +574,47 @@ def register_awex_plugin() -> None:
         except Exception as exc:
             logger.exception("Awex update failed")
             return _to_json_error(f"Awex update failed: {exc}")
+
+    @router.post("/areal_awex_model_profile")
+    async def awex_model_profile(
+        request: AwexModelProfileRequest, raw_request: Request
+    ):
+        try:
+            if request.operation not in (
+                "clear",
+                "verify",
+                "compute_start",
+                "compute_stop",
+            ):
+                raise ValueError("Unsupported model profile command")
+            from awex.tests.experimental.model_weight_profile import model_profile_task
+
+            adapter = _get_awex_adapter(raw_request)
+            results = await asyncio.to_thread(
+                adapter.execute_task_in_model_worker,
+                model_profile_task,
+                operation=request.operation,
+                version=request.version,
+            )
+            return JSONResponse(content={"success": True, "ranks": results})
+        except Exception as exc:
+            logger.exception("Awex model profile failed")
+            return _to_json_error(f"Awex model profile failed: {exc}")
+
+    @router.post("/areal_awex_prepare_membership")
+    async def awex_prepare_membership(
+        request: AwexMembershipRequest, raw_request: Request
+    ):
+        try:
+            adapter = _get_awex_adapter(raw_request)
+            results = await asyncio.to_thread(
+                adapter.weights_exchange_reader.prepare_membership,
+                {"epoch": request.epoch, "num_engines": request.num_engines},
+            )
+            return JSONResponse(content={"success": True, "ranks": results})
+        except Exception as exc:
+            logger.exception("Awex membership preparation failed")
+            return _to_json_error(f"Awex membership preparation failed: {exc}")
 
     @router.post("/publication_init")
     async def publication_init(request: PublicationInitRequest, raw_request: Request):

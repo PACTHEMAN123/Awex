@@ -223,7 +223,7 @@ class WeightsReader(WeightExchangeReader):
         infer_parameters_meta_bytes = pickle.dumps(self.parameters_meta)
         train_parameters_meta_bytes = pickle.dumps(self.training_params_meta)
         infer_conf_bytes = pickle.dumps(self.infer_conf)
-        self.inference_engine.execute_task_in_model_worker(
+        self._preparation_results = self.inference_engine.execute_task_in_model_worker(
             self._init_in_tp_worker,
             infer_conf_bytes=infer_conf_bytes,
             parameters_meta_bytes=infer_parameters_meta_bytes,
@@ -238,6 +238,7 @@ class WeightsReader(WeightExchangeReader):
             enable_colocate_mode=self.enable_colocate_mode,
             ipc_backend=self.ipc_backend,
             weights_comm_nccl_group_size=self.weights_comm_nccl_group_size,
+            membership_specification=getattr(self, "_pending_membership", None),
         )
         logger.info(
             f"Finished full initialization of weights reader for engine rank {self.engine_rank}"
@@ -302,7 +303,51 @@ class WeightsReader(WeightExchangeReader):
             ipc_backend=ipc_backend,
             weights_comm_nccl_group_size=kwargs.get("weights_comm_nccl_group_size"),
         )
-        scheduler.awes_weights_reader.initialize()
+        specification = kwargs.get("membership_specification")
+        if specification is None:
+            scheduler.awes_weights_reader.initialize()
+        else:
+            from awex.transfer.model_membership import prepare_model_membership
+
+            if weights_comm_backend != "nccl_device_v2" or enable_colocate_mode:
+                raise ValueError("Model joins require non-colocated device v2")
+            WorkerWeightsReader.initialize(scheduler.awes_weights_reader)
+            scheduler.awes_weights_reader._set_device()
+            scheduler.awes_weights_reader.deserialized_weights = {}
+            return prepare_model_membership(
+                scheduler.awes_weights_reader, specification, sender=False
+            )
+
+    def prepare_membership(self, specification: dict):
+        with self.lock:
+            if (
+                self.infer_engine_config.comm_backend != "nccl_device_v2"
+                or self.enable_colocate_mode
+            ):
+                raise ValueError("Model joins require non-colocated device v2")
+            engines = specification["num_engines"]
+            if engines < self.num_engines or (
+                self.initialized and engines == self.num_engines
+            ):
+                raise ValueError("Existing model readers must add engines")
+            self.num_engines = engines
+            self.infer_engine_config.num_engines = engines
+            self.infer_world_size = engines * self.tp_size * self.pp_size * self.dp_size
+            if not self.initialized:
+                self._pending_membership = specification
+                self._initialize()
+                self.initialized = True
+                return self._preparation_results
+            return self.inference_engine.execute_task_in_model_worker(
+                self._prepare_membership_in_tp_worker, specification=specification
+            )
+
+    @staticmethod
+    def _prepare_membership_in_tp_worker(specification: dict, **kwargs):
+        from awex.transfer.model_membership import prepare_model_membership
+
+        worker = kwargs["model_context"]["scheduler"].awes_weights_reader
+        return prepare_model_membership(worker, specification, sender=False)
 
     def update_weights(self, step_id, **kwargs):
         with self.lock:
@@ -786,9 +831,7 @@ class WorkerWeightsReader:
         post_flush_device_sync_time_ms = (
             time.perf_counter() - post_flush_sync_start
         ) * 1000.0
-        flush_cache_time_ms = (
-            time.perf_counter() - flush_cache_start
-        ) * 1000.0
+        flush_cache_time_ms = (time.perf_counter() - flush_cache_start) * 1000.0
         duration = time.perf_counter() - start_time
         compute_statistics(
             self._history_update_weights_time, step_id, duration, "Update weights"

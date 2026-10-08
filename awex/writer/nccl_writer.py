@@ -54,6 +54,14 @@ _QWEN3_STATIC_DEVICE_LAYOUT_ARCHITECTURES = {
 
 
 class NCCLWeightsWriter(WeightsExchangeShardingWriter):
+    def prepare_membership(self, specification: dict) -> dict:
+        from awex.transfer.model_membership import prepare_model_membership
+
+        with self.lock:
+            if not self.initialized:
+                raise RuntimeError("Publish the initial model snapshot before joining")
+            return prepare_model_membership(self, specification, sender=True)
+
     def _initialize(self):
         super()._initialize()
         self.device_transport = None
@@ -304,9 +312,7 @@ class NCCLWeightsWriter(WeightsExchangeShardingWriter):
                 parameters = self.convert_parameters(
                     required_names=self.required_param_names
                 )
-                convert_time_ms = (
-                    time.perf_counter() - convert_start
-                ) * 1000.0
+                convert_time_ms = (time.perf_counter() - convert_start) * 1000.0
                 logger.info("Writer: Converting parameters completed")
                 if self.enable_mem_debug:
                     print_current_gpu_status(
@@ -361,15 +367,11 @@ class NCCLWeightsWriter(WeightsExchangeShardingWriter):
                     group=self.weights_update_group,
                     device_ids=[device_util.current_device()],
                 )
-                sync_start_barrier_time_ms = (
-                    time.perf_counter() - sync_start
-                ) * 1000.0
+                sync_start_barrier_time_ms = (time.perf_counter() - sync_start) * 1000.0
             backend_execute_start = time.perf_counter()
             if using_device_transport:
                 profile_metrics.update(
-                    self.device_transport.send(
-                        parameters, self.transfer_plan, step_id
-                    )
+                    self.device_transport.send(parameters, self.transfer_plan, step_id)
                 )
                 device_util.synchronize(device_id=device_util.current_device())
             else:
@@ -429,9 +431,9 @@ class NCCLWeightsWriter(WeightsExchangeShardingWriter):
             )
             backend_effective_gbps = 0.0
             if backend_execute_time_ms > 0:
-                backend_effective_gbps = profile_metrics.get(
-                    "payload_bytes", 0.0
-                ) / (backend_execute_time_ms * 1_000_000.0)
+                backend_effective_gbps = profile_metrics.get("payload_bytes", 0.0) / (
+                    backend_execute_time_ms * 1_000_000.0
+                )
             emit_profile(
                 logger,
                 event="weight_transfer",
@@ -471,9 +473,7 @@ class NCCLWeightsWriter(WeightsExchangeShardingWriter):
             if should_collect_garbage:
                 gc_collect_start = time.perf_counter()
                 gc.collect()
-                gc_collect_time_ms = (
-                    time.perf_counter() - gc_collect_start
-                ) * 1000.0
+                gc_collect_time_ms = (time.perf_counter() - gc_collect_start) * 1000.0
             emit_profile(
                 logger,
                 event="weight_transfer_cleanup",

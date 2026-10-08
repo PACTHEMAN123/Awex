@@ -17,12 +17,14 @@
 
 import argparse
 import copy
+import json
 import os
 import subprocess
 import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import requests
 import torch
@@ -332,7 +334,12 @@ class MultiVLLMWeightsExchangeIT:
 
     def publication_endpoints(self):
         if self.inference_endpoints:
-            return self.inference_endpoints
+            return [
+                endpoint
+                for endpoint in self.inference_endpoints
+                if not getattr(self, "elastic_enabled", False)
+                or endpoint[0] < self.inference_config["num_engines"]
+            ]
         return [
             (engine_rank, self.host, self.port + engine_rank)
             for engine_rank in range(self.inference_config["num_engines"])
@@ -516,8 +523,26 @@ class MultiVLLMWeightsExchangeIT:
         if self.megatron_engine is None:
             raise RuntimeError("Megatron backend not initialized")
 
+        version = int(self.megatron_engine.global_step)
+        if getattr(self, "elastic_model_profile", False):
+            with torch.no_grad():
+                markers = [
+                    p
+                    for name, p in self.mcore_model.named_parameters()
+                    if name.endswith("final_layernorm.weight")
+                ]
+                if len(markers) != 1:
+                    raise RuntimeError(
+                        "Expected one Megatron final norm version marker (PP1)"
+                    )
+                markers[0].fill_(1 + (version + 2) / 64)
+            if self.is_driver:
+                self.model_profile("clear", version)
+            self._training_barrier()
+
         end_to_end_start = time.perf_counter()
         self.publication.publish()
+        publication_ms = (time.perf_counter() - end_to_end_start) * 1000
         logger.info("Update weights finished")
         if self.is_driver:
             step_id = int(self.megatron_engine.global_step)
@@ -533,6 +558,131 @@ class MultiVLLMWeightsExchangeIT:
                 end_to_end_update_time_ms=(time.perf_counter() - end_to_end_start)
                 * 1000.0,
             )
+        if getattr(self, "elastic_model_profile", False) and self.is_driver:
+            verified = self.model_profile("verify", version)
+            self.elastic_records.append(
+                {
+                    "event": "publication",
+                    "version": version,
+                    "num_engines": self.inference_config["num_engines"],
+                    "ranks": verified,
+                    "end_to_end_update_ms": publication_ms,
+                }
+            )
+
+    def endpoint_command(self, route, payload, endpoints=None):
+        endpoints = self.publication_endpoints() if endpoints is None else endpoints
+        with ThreadPoolExecutor(max_workers=len(endpoints)) as executor:
+            futures = [
+                executor.submit(
+                    requests.post,
+                    f"http://{host}:{port}/{route}",
+                    json=payload,
+                    timeout=600,
+                )
+                for _, host, port in endpoints
+            ]
+            results = {}
+            for endpoint, future in zip(endpoints, futures):
+                response = future.result()
+                if response.status_code != 200:
+                    raise RuntimeError(
+                        f"Engine {endpoint[0]} {route} failed: {response.text}"
+                    )
+                results[str(endpoint[0])] = response.json()["ranks"]
+            return results
+
+    def model_profile(self, operation, version, endpoints=None):
+        return self.endpoint_command(
+            "areal_awex_model_profile",
+            {"operation": operation, "version": version},
+            endpoints,
+        )
+
+    def join_rollout_models(self, epoch, target):
+        from awex.tests.experimental.dynamic_rollout_profile import MockCompute
+
+        version = int(self.megatron_engine.global_step)
+        old_endpoints = self.publication_endpoints()
+        started_ns = time.time_ns()
+        weight = next(p for p in self.mcore_model.parameters() if p.ndim == 2)
+        compute = MockCompute(weight[:1024, :1024], batch=512, repeats=256)
+        compute.start(300)
+        inference_compute = {}
+        try:
+            if self.is_driver:
+                self.model_profile("compute_start", version, old_endpoints)
+                client = self.megatron_engine.weights_exchange_writer.meta_server_client
+                launch_start_ns = time.time_ns()
+                client.put_object(f"elastic/launch/{epoch}", {"num_engines": target})
+                client.get_object(f"elastic/launched/{epoch}", timeout=600)
+                previous = self.inference_config["num_engines"]
+                self.inference_config["num_engines"] = target
+                new_endpoints = [
+                    e for e in self.publication_endpoints() if e[0] >= previous
+                ]
+                for endpoint in new_endpoints:
+                    self._wait_for_health(endpoint, timeout=600)
+                    self.publication._initialize_endpoint(endpoint)
+            self._training_barrier()
+            specification = {"epoch": epoch, "num_engines": target}
+            prepare_start_ns = time.time_ns()
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = (
+                    executor.submit(
+                        self.endpoint_command,
+                        "areal_awex_prepare_membership",
+                        specification,
+                    )
+                    if self.is_driver
+                    else None
+                )
+                prepared = (
+                    self.megatron_engine.weights_exchange_writer.prepare_membership(
+                        specification
+                    )
+                )
+                if future is not None:
+                    inference_prepared = future.result()
+            self._training_barrier()
+            ready_ns = time.time_ns()
+            if self.is_driver:
+                # Old engines must still hold their last full snapshot here.
+                self.model_profile("verify", version, old_endpoints)
+                inference_compute = self.model_profile("compute_stop", version)
+        finally:
+            compute_events = compute.stop(300)
+        training_result = {"prepare": prepared, "compute_events": compute_events}
+        gathered = [None] * self.world_size if self.is_driver else None
+        if self.world_size > 1:
+            dist.gather_object(training_result, gathered, dst=0)
+        else:
+            gathered = [training_result]
+        if self.is_driver:
+            record = {
+                "event": "join",
+                "epoch": epoch,
+                "num_engines": target,
+                "start_ns": started_ns,
+                "launch_start_ns": launch_start_ns,
+                "prepare_start_ns": prepare_start_ns,
+                "ready_ns": ready_ns,
+                "join_ms": (ready_ns - started_ns) / 1e6,
+                "launch_and_startup_ms": (prepare_start_ns - launch_start_ns) / 1e6,
+                "prepare_ms": (ready_ns - prepare_start_ns) / 1e6,
+                "training_ranks": gathered,
+                "inference_ranks": inference_prepared,
+                "inference_compute": inference_compute,
+            }
+            self.elastic_records.append(record)
+            logger.info(
+                "Elastic model join ready: epoch=%s engines=%s join_ms=%.3f prepare_ms=%.3f",
+                epoch,
+                target,
+                record["join_ms"],
+                record["prepare_ms"],
+            )
+        self._training_barrier()
 
 
 def main(args):
@@ -578,6 +728,11 @@ def main(args):
         publication_timeout_seconds=args.publication_timeout_seconds,
         inference_endpoints=args.inference_endpoint,
     )
+    weights_exchange_it.elastic_enabled = bool(args.join_after)
+    weights_exchange_it.elastic_model_profile = args.elastic_model_profile
+    weights_exchange_it.elastic_records = []
+    joins = dict(zip(args.join_after, args.target_engines))
+    epoch = 0
 
     try:
         weights_exchange_it.initialize()
@@ -591,6 +746,25 @@ def main(args):
                 args.num_updates,
             )
             weights_exchange_it.exchange_weights()
+            if update_index + 1 in joins:
+                epoch += 1
+                weights_exchange_it.join_rollout_models(epoch, joins[update_index + 1])
+        if weights_exchange_it.is_driver and args.elastic_output:
+            Path(args.elastic_output).write_text(
+                json.dumps(
+                    {
+                        "passed": True,
+                        "model_path": args.model_path,
+                        "dtype": "bfloat16",
+                        "real_model_weights": True,
+                        "train_world_size": weights_exchange_it.world_size,
+                        "inference_tp_size": args.vllm_tp_size,
+                        "records": weights_exchange_it.elastic_records,
+                    },
+                    indent=2,
+                )
+                + "\n"
+            )
     finally:
         weights_exchange_it.destroy()
         _destroy_process_group(timeout=5)
@@ -619,6 +793,14 @@ def _destroy_process_group(timeout: float = 5.0) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run awex vLLM integration test")
+    parser.add_argument("--join-after", type=_positive_int, nargs="*", default=[])
+    parser.add_argument("--target-engines", type=_positive_int, nargs="*", default=[])
+    parser.add_argument(
+        "--elastic-model-profile",
+        action="store_true",
+        help="Exact full-model GPU validation and BF16 compute during joins (extra reference model storage)",
+    )
+    parser.add_argument("--elastic-output")
     parser.add_argument(
         "-b",
         "--comm_backend",
@@ -821,13 +1003,32 @@ if __name__ == "__main__":
         help="Directory to dump validation tensors.",
     )
     args = parser.parse_args()
+    targets = [args.num_engines, *args.target_engines]
+    if len(args.join_after) != len(args.target_engines) or any(
+        a >= b for a, b in zip(targets, targets[1:])
+    ):
+        parser.error("Join boundaries require strictly increasing engine counts")
+    if sorted(set(args.join_after)) != args.join_after or any(
+        not 1 <= n < args.num_updates for n in args.join_after
+    ):
+        parser.error("Join boundaries must increase and leave a following update")
+    if args.join_after and (
+        not args.remote_inference
+        or args.publication_mechanism != "awex"
+        or args.comm_backend != "nccl_device_v2"
+    ):
+        parser.error("Model joins require remote inference and Awex device v2")
+    if args.elastic_model_profile and (
+        args.train_pp_size != 1 or args.comm_backend != "nccl_device_v2"
+    ):
+        parser.error("Full model profiling currently requires PP1 and device v2")
     if args.warmup_updates < 0 or args.warmup_updates >= args.num_updates:
         parser.error("--warmup-updates must be in [0, --num-updates)")
     if args.inference_endpoint:
         if not args.remote_inference:
             parser.error("--inference-endpoint requires --remote-inference")
         endpoint_ranks = sorted(endpoint[0] for endpoint in args.inference_endpoint)
-        if endpoint_ranks != list(range(args.num_engines)):
+        if endpoint_ranks != list(range(targets[-1])):
             parser.error(
                 "--inference-endpoint ranks must cover every engine rank in "
                 "[0, --num-engines) exactly once"
