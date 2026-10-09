@@ -55,6 +55,9 @@ For CPU regression checks without a CUDA build:
 PYTHONPATH=python python -m pytest -q
 ```
 
-The refactor and GPU acceptance matrix are in progress. CPU checks do not prove
-real weight-transfer correctness or performance equivalence; see
-[acceptance requirements](docs/acceptance.md).
+The user-defined naive/off/swizzle routing matrix completes 21 real-model cases
+with full-weight, cache, generation and actual path checks. See
+[measurements and acceptance](docs/acceptance.md) for timings, retained variation
+and original GRPO/Elastic evidence, and [routing](docs/ring-routing.md) for the
+fixed-entry, node-local naive chain. CPU checks alone do not establish GPU
+performance equivalence.

@@ -38,11 +38,18 @@ original steady-call GIL ownership and keeps explicit prepare releasing GIL.
 The cleanup wheel was installed at `3dd7325` on all four H20 nodes;
 its extension SHA-256 is unchanged and full integration imports pass. Four real BF16
 GRPO configurations now qualify this cleanup; both PP1 FP8 cases also pass
-10-step real GRPO. All 21 standalone cases pass full-checkpoint correctness, cache and generation. Original kernel-call GIL ownership is restored; explicit prepare still releases GIL. The isolated prototype is near baseline, but the final package repeats slower on FP8 naive, so that performance anomaly remains unresolved. Final BF16 swizzle and FP8 GRPO core updates are near baseline, with all full-weight/cache/resource checks passed. PP4 is excluded by explicit user request.
+10-step real GRPO. All 21 standalone cases pass full-checkpoint correctness, cache and generation. Original kernel-call GIL ownership is restored; explicit prepare still releases GIL. The isolated prototype is near baseline, but the final package repeats slower on FP8 naive, so that performance anomaly is retained for the superseded naive route. Final BF16 swizzle and FP8 GRPO core updates are near baseline, with all full-weight/cache/resource checks passed. PP4 is excluded by explicit user request.
 
 At revision `3b69d74`, real Qwen3 BF16 Elastic correctness and adjacent original
 transfer comparisons pass; preparation timing is recorded independently of
-core weight updates. Current qualification and pending experiment coverage are
+core weight updates. Qualification and measured experiment coverage are
 recorded in `acceptance.md`. Experiments 8, 9, 11 and 12 have their required coverage. Experiment 10 has
 complete real-model correctness coverage; its independent FP8 naive performance
-anomaly remains under diagnosis despite final packaged-build correctness passing.
+anomaly is retained as historical diagnostic evidence despite final packaged-build correctness passing.
+
+The user-defined node-grouped naive/off/swizzle rerun at `8039c11` completes all
+21 real-model cases with independently archived full-weight/cache/generation
+and actual-edge checks. Native bytes and transfer knobs remain unchanged.
+This supersedes the previous naive route definition; old performance diagnostics
+remain historical records. Current timings and retained off variation are in
+`acceptance.md`. No additional control or Elastic queue is launched.

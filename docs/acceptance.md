@@ -4,11 +4,71 @@ Baseline: Awex `codex/device-v2-dynamic-rollout`, revision
 `6dabfbf7ede790c34011924136f132514fa4b60c`. New library: ShardStream.
 Historical baseline results are comparison evidence, never new-library passes.
 
+## Completed user-defined routing measurements
+
+Routing and deployed wheel source: `8039c11`. The user-requested real-model
+naive/off/swizzle rerun completes all 21 cases (12 BF16, 9 FP8). Each loads the
+local Qwen3-30B-A3B checkpoint, performs ten publications (three warmup, seven
+measured), passes full-weight/FP8-byte-scale, generation and cache checks, and
+independently checks actual prepared send/relay edges against real node placement.
+All raw archives are locally SHA-256 verified and independently audited.
+
+Naive now shares a fixed first-hop instance across sending sources, then relays
+through consecutive instances on each node. Swizzle rotates entry node/member
+on the same actual node groups; off sends directly. These measurements validate
+the requested route definition. Older naive data below measures the previous
+route, remains preserved, and is not an equivalent-path performance control.
+The old naive native/GIL diagnostic series is closed without a causal conclusion.
+No native source, compiled native bytes or transfer-resource knobs change in
+this routing revision. Route-dependent active peers and schedules can change.
+
+Full publication p50 / p95, milliseconds:
+
+| Precision | Rollout TP × instances | naive | off | swizzle |
+|---|---|---:|---:|---:|
+| BF16 | 4 × 4 | 619.52 / 620.81 | 931.98 / 938.21 | 538.65 / 597.85 |
+| BF16 | 2 × 4 | 1271.31 / 1272.01 | 1045.45 / 1047.60 | 677.07 / 677.48 |
+| BF16 | 2 × 8 | 1366.74 / 1441.35 | 5637.43 / 6459.94 | 557.75 / 561.62 |
+| BF16 | 2 × 2 | 1297.44 / 1309.77 | 1155.02 / 1155.44 | 1173.18 / 1176.14 |
+| FP8 | 2 × 2 | 687.11 / 702.01 | 550.23 / 550.84 | 617.25 / 621.92 |
+| FP8 | 2 × 4 | 663.80 / 668.87 | 541.77 / 543.85 | 356.23 / 366.79 |
+| FP8 | 2 × 8 | 644.14 / 656.56 | 1110.26 / 1110.59 | 293.85 / 294.99 |
+
+All 3864 measured worker records hit cache, with zero
+initialization, plan initialization, metadata upload, host lowering and batch
+building costs. The figure retains all 147 measured publication samples.
+
+BF16 TP2×8 off remains variable across runs: this pass is 5637/6460 ms,
+versus an earlier original at 5490/5910 ms (+2.69%/+9.31%), and an earlier
+candidate at 2085/2085 ms. All 224 rank/step pairs match both references on 65
+non-time fields; the current native binary is unchanged. This demonstrates no
+allocation change, but does not establish a cause for the timing variation or
+statistical equivalence. Every slow sample is retained. Historical timing
+comparisons for all cases are recorded separately; no further control queue is
+started. PP4 and additional Elastic runs remain excluded.
+
+Workspace evidence: `../../results/shardstream-refactor-20261009/` contains
+`node-grouped-matrix-summary.json`, `node-grouped-matrix-summary.md`,
+`node-grouped-matrix-performance.png/.pdf`, `node-grouped-off-resource-audit.json`
+and `verified-node-grouped-archives/manifest.json`. These files record exact
+source/native hashes, samples, historical provenance and actual path audits.
+
+One FP8 TP2×4 swizzle attempt failed before any publication because an
+inference node's 18 GiB `/dev/shm` was full. Its raw failure is independently
+archived; it supplies no performance sample. Only the two inference-node tmpfs
+capacity limits were increased to 64 GiB, preserving all IPC objects. The four
+uncompleted cases then ran; the first 17 were not repeated. This environment
+repair changes no NCCL/GIN or native allocation knobs. Exact before/after capacity
+is recorded in `ring-shm-capacity-repair.json`.
+
+Earlier GRPO/Elastic qualifications below retain their original source revisions;
+they are not relabeled as newly rerun training or Elastic experiments.
+
 | Experiment | Required coverage | Current new-library evidence |
 |---|---|---|
 | 8 | Real veRL GRPO BF16, historical NCCL controls, main plus three PP1 topologies; PP4 excluded by user | At `3dd7325`: main TP2/CP2/EP8→TP4×4 (40 steps), TP4/CP2/EP8→TP2×8 (40 steps), TP4/CP2/EP8→TP4×4 (40 steps), and TP4/CP2/EP8→TP8×2 (10 steps) pass; BF16 coverage complete |
-| 9 | Real model weight exchange, three fanout topologies, off/naive/swizzle routes with controls | All nine required BF16 topology/route cases pass full parameters, cache and generation; TP4×4/naive and TP2×8/off current original/candidate controls show no basic regression; slow historical/main-matrix samples remain preserved, between-run variation cause unproven |
-| 10 | Three fanouts × three routes, paired BF16/FP8, weight bytes/scales/cache/generation | All nine BF16 and nine FP8 cases pass full checkpoint checks, cache and generation; FP8 TP2×8/swizzle is within +2.3%/+2.4% of current original; naive performance remains under diagnosis after the final package repeats at 1968.28/2329.06 ms despite the earlier binding prototype's 1283.32/1325.96 ms |
+| 9 | Real model weight exchange, fanout topologies, off/naive/swizzle routes | New node-grouped rerun: all 12 BF16 cases pass full parameters/cache/generation and actual edge audits; current timings and retained off variation above |
+| 10 | Three fanouts × three routes, paired BF16/FP8, weight bytes/scales/cache/generation | All nine paired BF16/FP8 routes rerun at 8039c11; exact weight/byte/scale, cache/generation and actual path audits pass. Old naive timing diagnostics retained below as superseded-route history |
 | 11 | Real veRL FP8, training TP2/TP4 to inference TP2×8, historical paired controls | Both TP2/TP4 complete 10 steps, each with 256 cached worker transfers: full updates 314.19/323.15 and 309.85/315.17 ms; historical comparisons recorded |
 | 12 | Real Qwen3-30B-A3B BF16, 2→4→8 model instances, full equality, first publication cache hit, background preparation timeline | At `3b69d74`: real-model correctness, cache, background compute and steady transfer comparison pass; prepare timing recorded separately |
 
@@ -64,7 +124,7 @@ claimed. The subsequent removal of uncalled helpers is installed at `3dd7325` on
 four nodes with an unchanged native extension hash. Its four required BF16
 GRPO configurations and both FP8 configurations pass. The standalone model
 matrix passes all 21 full-checkpoint, cache and generation checks. The FP8
-TP2×8 naive update-latency anomaly remains under diagnosis. Restoring original
+TP2×8 naive update-latency anomaly is retained as a superseded-route diagnostic. Restoring original
 GIL ownership produced one near-baseline prototype sample, but the final package
 repeats slower. All samples are retained; no transfer resource settings changed.
 
@@ -143,7 +203,7 @@ full HF/scale/BF16/generation/cache checks. Final BF16 TP4×4 swizzle is
 Final FP8 GRPO TP2→TP2×8 updates are 321.74/327.75 ms versus preceding candidate
 314.19/323.15 ms (+2.40%/+1.42%), with all 256 cached transfers and 23 resource
 fields matched. Trainer-step p50/p95 is 21.74/25.37 s versus 21.66/23.55 s
-(+0.37%/+7.73%). Only the independent naive FP8 anomaly remains under diagnosis.
+(+0.37%/+7.73%). Only the independent naive FP8 anomaly is retained as a superseded-route diagnostic.
 
 A fresh original `6dabfbf` control after the final package completes all exact
 HF byte/scale/mixed-BF16, generation and 224 cache checks at 1291.74/1472.39 ms.
@@ -218,7 +278,7 @@ Swizzle also consumes actual placement; off stays direct. All native sources and
 resource configuration defaults remain unchanged. The earlier naive results
 measure the previous route definition and are retained as historical evidence.
 
-A new complete 21-case standalone BF16/FP8 × off/naive/swizzle matrix is pending.
+The new complete 21-case standalone BF16/FP8 × off/naive/swizzle matrix is complete; results and audit scope are at the top of this document.
 Each worker records actual ring edges for path audit, in addition to full loaded
 HF weights, exact FP8 byte/scale checks, cache and generation validation. PP4 and
 additional Elastic runs remain excluded. CPU regressions: 79 pass.
