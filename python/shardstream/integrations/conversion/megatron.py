@@ -627,7 +627,7 @@ def get_full_tensor(weight: torch.Tensor, dim: int = 0):
 
 def transform_mcore_qkv_weight(weight: torch.Tensor, tf_config: TransformerConfig):
     """
-    Megatron QKV is alternately packed, SGlangQKV is packed consecutively.
+    Megatron QKV is alternately packed, fused QKV is packed consecutively.
                     tp0                tp1
                                │
                ┌───────┬───┬───│───────┬───┬───┐
@@ -722,7 +722,7 @@ def convert_qkv_weight_along_tp_attention(
     train_tp_size: int | None = None,
 ):
     """
-    SGlang QKV: The weight matrix is concatenated along
+    fused QKV: The weight matrix is concatenated along
     the output dimension. The layer is parallelized along the head dimension.
     When the number of key/value heads is smaller than the number of query
     heads (e.g., multi-query/grouped-query attention), the key/value head may
@@ -818,7 +818,7 @@ def convert_qkv_bias_along_tp_attention(
     train_tp_size: int | None = None,
 ):
     """
-    Convert QKV bias for SGlang format with TP attention.
+    Convert QKV bias for fused format with TP attention.
     Similar to convert_qkv_weight_along_tp_attention but for bias parameters.
     """
     total_num_kv_heads = tf_config.num_query_groups

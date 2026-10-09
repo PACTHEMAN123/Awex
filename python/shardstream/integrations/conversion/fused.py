@@ -66,7 +66,7 @@ class FusedWeightConverter:
     def _convert_attention_param(
         self, name: str, parameter: torch.Tensor, layer_number: str
     ) -> List[Tuple[str, torch.Tensor]]:
-        """Convert attention parameters from SGlang to HuggingFace format"""
+        """Convert attention parameters from fused to HuggingFace format"""
         if "qkv_proj" in name or "query_key_value" in name:
             if self._fuse_qkv(name):
                 return [(name, parameter)]
@@ -130,7 +130,7 @@ class FusedWeightConverter:
     def _convert_mlp_param(
         self, name: str, parameter: torch.Tensor, layer_number: str
     ) -> List[Tuple[str, torch.Tensor]]:
-        """Convert MLP parameters from SGlang to HuggingFace format
+        """Convert MLP parameters from fused to HuggingFace format
         Input name example:
             mlp.gate_up_proj.weight
             mlp.down_proj.weight
@@ -162,7 +162,7 @@ class FusedWeightConverter:
     def _convert_expert_tp_param(
         self, name: str, parameter: torch.Tensor, layer_number: str
     ) -> List[Tuple[str, torch.Tensor]]:
-        """Convert expert parameters from SGlang to HuggingFace format.
+        """Convert expert parameters from fused to HuggingFace format.
 
         Input name example:
             mlp.experts.w13_weight
@@ -206,7 +206,7 @@ class FusedWeightConverter:
     def _convert_expert_moe_param(
         self, name: str, parameter: torch.Tensor, layer_number: str
     ) -> List[Tuple[str, torch.Tensor]]:
-        """Convert expert parameters from SGlang to HuggingFace format."""
+        """Convert expert parameters from fused to HuggingFace format."""
         if "expert_bias" in name:
             return [(name, parameter)]
         if "shared_experts" in name:
@@ -259,7 +259,7 @@ class FusedWeightConverter:
     def convert_param(
         self, name: str, parameter: torch.Tensor
     ) -> List[Tuple[str, torch.Tensor]]:
-        """Convert a parameter from SGlang format to HuggingFace format"""
+        """Convert a parameter from fused format to HuggingFace format"""
         direct_name_mapping = {
             "model.embed_tokens.weight": "model.embed_tokens.weight",
             "model.norm.weight": "model.norm.weight",

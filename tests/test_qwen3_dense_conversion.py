@@ -85,7 +85,7 @@ def test_layer_names_match_the_train_side_contract():
         "model.layers.0.self_attn.k_norm.weight": torch.randn(HEAD_DIM),
         "model.layers.0.input_layernorm.weight": torch.randn(HIDDEN),
         "model.layers.0.post_attention_layernorm.weight": torch.randn(HIDDEN),
-        # sglang serves the dense MLP through MergedColumnParallelLinear
+        # vLLM serves the dense MLP through MergedColumnParallelLinear
         "model.layers.0.mlp.gate_up_proj.weight": torch.randn(2 * INTERMEDIATE, HIDDEN),
         "model.layers.0.mlp.down_proj.weight": torch.randn(HIDDEN, INTERMEDIATE),
     }

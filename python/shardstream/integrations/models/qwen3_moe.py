@@ -61,9 +61,9 @@ class Qwen3ShardingStrategy(ShardingStrategy):
 
 
 class Qwen3FusedWeightConverter(FusedWeightConverter):
-    """SGLang/vLLM -> HF converter for Qwen3-MoE.
+    """vLLM -> HF converter for Qwen3-MoE.
 
-    Splits the SGLang fused qkv_proj into canonical q/k/v projections
+    Splits the vLLM fused qkv_proj into canonical q/k/v projections
     (GQA-aware split in the base class) so that inference-side weight
     metadata matches the per-parameter HF names emitted by the Megatron
     train-side converter. Expert parameters (experts.w13_weight /
