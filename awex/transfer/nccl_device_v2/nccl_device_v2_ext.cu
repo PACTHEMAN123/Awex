@@ -539,8 +539,12 @@ void initialize_sparse_window(DeviceState* state, const std::vector<std::uint32_
       return 0;
     });
     time_preparation(state, "fifo_registration", [&] {
+      // This window is used by our Device API kernels, never by NCCL host
+      // collectives. COLL_SYMMETRIC would additionally initialize NCCL's
+      // internal symmetric collective kernels and their unused GIN resources.
+      // DEFAULT still registers the collective LSA/GIN window and peer maps.
       AWEX_NCCL_V2_CHECK(ncclCommWindowRegister(state->comm, state->local_base, state->window_bytes, &state->window,
-                                                NCCL_WIN_COLL_SYMMETRIC));
+                                                NCCL_WIN_DEFAULT));
       return 0;
     });
 
