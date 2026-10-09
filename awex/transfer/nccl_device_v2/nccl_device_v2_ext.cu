@@ -57,6 +57,7 @@ struct LaunchBuffers {
 };
 
 struct DeviceState {
+  std::vector<std::pair<std::string, double>> preparation_phases;
   ncclComm_t comm = nullptr;
   ncclWindow_t window = nullptr;
   v2::V2GinState gin;
@@ -101,6 +102,15 @@ struct DeviceState {
 };
 
 void release_buffers(LaunchBuffers* buffers);
+
+template <typename Function>
+auto time_preparation(DeviceState* state, const char* name, Function call) {
+  const auto started = std::chrono::steady_clock::now();
+  auto result = call();
+  state->preparation_phases.emplace_back(name,
+    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
+  return result;
+}
 
 [[noreturn]] void throw_nccl(ncclResult_t result, const char* expression) {
   throw std::runtime_error(std::string(expression) + " failed: " + ncclGetErrorString(result));
@@ -203,7 +213,10 @@ std::unique_ptr<DeviceState> make_state(const std::string& unique_id_bytes, int 
   ncclUniqueId unique_id;
   std::memcpy(&unique_id, unique_id_bytes.data(), sizeof(unique_id));
   try {
-    AWEX_NCCL_V2_CHECK(ncclCommInitRank(&state->comm, world_size, unique_id, state->rank));
+    time_preparation(state.get(), "nccl_communicator", [&] {
+      AWEX_NCCL_V2_CHECK(ncclCommInitRank(&state->comm, world_size, unique_id, state->rank));
+      return 0;
+    });
 
     ncclCommProperties_t properties = NCCL_COMM_PROPERTIES_INITIALIZER;
     AWEX_NCCL_V2_CHECK(ncclCommQueryProperties(state->comm, &properties));
@@ -221,7 +234,9 @@ std::unique_ptr<DeviceState> make_state(const std::string& unique_id_bytes, int 
     }
     v2::v2SetGinType(&state->gin, properties);
 
-    state->topology = v2::discoverV2Topology(state->comm, world_size, rank, device, channel_limit);
+    state->topology = time_preparation(state.get(), "native_topology", [&] {
+      return v2::discoverV2Topology(state->comm, world_size, rank, device, channel_limit);
+    });
     state->total_channels = state->topology.total_channels;
     state->peer_channels = state->topology.peer_channels;
   } catch (...) {
@@ -410,8 +425,10 @@ void initialize_sparse_window(DeviceState* state, const std::vector<std::uint32_
       local_payload_slots[peer] = payload_peer_count++;
     }
   }
-  const auto payload_peer_slots = v2::topology_detail::allGather(
-    state->comm, local_payload_slots.data(), local_payload_slots.size(), state->world_size, stream);
+  const auto payload_peer_slots = time_preparation(state, "payload_geometry_exchange", [&] {
+    return v2::topology_detail::allGather(
+      state->comm, local_payload_slots.data(), local_payload_slots.size(), state->world_size, stream);
+  });
   std::uint32_t payload_peer_capacity = 0;
   for (int source = 0; source < state->world_size; ++source) {
     std::uint32_t source_payload_peer_count = 0;
@@ -439,8 +456,9 @@ void initialize_sparse_window(DeviceState* state, const std::vector<std::uint32_
 
   const bool local_gin = v2::v2HasGinPeer(active_peers, state->peer_transports);
   const std::uint32_t local_gin_flag = local_gin ? 1U : 0U;
-  const auto gin_flags =
-    v2::topology_detail::allGather(state->comm, &local_gin_flag, 1, state->world_size, stream);
+  const auto gin_flags = time_preparation(state, "gin_feature_exchange", [&] {
+    return v2::topology_detail::allGather(state->comm, &local_gin_flag, 1, state->world_size, stream);
+  });
   state->gin.enabled =
     std::any_of(gin_flags.begin(), gin_flags.end(), [](std::uint32_t value) { return value != 0; });
   v2::v2ValidateGinSupport(state->gin, state->nccl_version);
@@ -477,7 +495,9 @@ void initialize_sparse_window(DeviceState* state, const std::vector<std::uint32_
       static_cast<std::uint32_t>(active_peers.size()) : 0U;
   const std::uint32_t local_flags[] = {
     local_non_ring | local_ring, local_non_ring_lsa, local_fp8, local_source_peer_count};
-  const auto flags = v2::topology_detail::allGather(state->comm, local_flags, 4, state->world_size, stream);
+  const auto flags = time_preparation(state, "fifo_feature_exchange", [&] {
+    return v2::topology_detail::allGather(state->comm, local_flags, 4, state->world_size, stream);
+  });
   bool ring_only = true, has_ring = false, has_non_ring_lsa = false, has_fp8 = false;
   std::uint32_t source_peer_count = 0;
   for (int rank = 0; rank < state->world_size; ++rank) {
@@ -514,9 +534,15 @@ void initialize_sparse_window(DeviceState* state, const std::vector<std::uint32_
                                                       slot_bytes, state->world_size)
                                 .window_bytes;
   try {
-    AWEX_NCCL_V2_CHECK(ncclMemAlloc(&state->local_base, state->window_bytes));
-    AWEX_NCCL_V2_CHECK(ncclCommWindowRegister(state->comm, state->local_base, state->window_bytes, &state->window,
-                                              NCCL_WIN_COLL_SYMMETRIC));
+    time_preparation(state, "fifo_allocation", [&] {
+      AWEX_NCCL_V2_CHECK(ncclMemAlloc(&state->local_base, state->window_bytes));
+      return 0;
+    });
+    time_preparation(state, "fifo_registration", [&] {
+      AWEX_NCCL_V2_CHECK(ncclCommWindowRegister(state->comm, state->local_base, state->window_bytes, &state->window,
+                                                NCCL_WIN_COLL_SYMMETRIC));
+      return 0;
+    });
 
     state->remote_bases.resize(state->world_size, nullptr);
     state->remote_bases[state->rank] = state->local_base;
@@ -569,12 +595,17 @@ void initialize_sparse_window(DeviceState* state, const std::vector<std::uint32_
           forward_bytes += task.nbytes;
         }
       }
-      v2::v2InitializeGin(&state->gin, state->comm, state->world_size, state->total_channels,
-                          state->gin_fifo_depth, state->network_step_bytes, state->gin.context_count,
-                          active_peers, state->peer_transports, std::move(peer_payload_bytes),
-                          &state->peer_channels, gin_channel_budget_factor);
-      const auto peer_channel_matrix = v2::topology_detail::allGather(
-        state->comm, state->peer_channels.data(), state->peer_channels.size(), state->world_size, stream);
+      time_preparation(state, "gin_device_communicator", [&] {
+        v2::v2InitializeGin(&state->gin, state->comm, state->world_size, state->total_channels,
+                            state->gin_fifo_depth, state->network_step_bytes, state->gin.context_count,
+                            active_peers, state->peer_transports, std::move(peer_payload_bytes),
+                            &state->peer_channels, gin_channel_budget_factor);
+        return 0;
+      });
+      const auto peer_channel_matrix = time_preparation(state, "channel_negotiation", [&] {
+        return v2::topology_detail::allGather(
+          state->comm, state->peer_channels.data(), state->peer_channels.size(), state->world_size, stream);
+      });
       state->gin.channels_per_peer = 1;
       for (const std::uint32_t peer : active_peers) {
         if (state->peer_transports[peer] != static_cast<std::uint8_t>(v2::V2Transport::kGin)) continue;
@@ -818,6 +849,11 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
   const auto& cached_peers = state->active_peers;
 
   py::dict metrics;
+  if (prepare_only) {
+    py::dict phases;
+    for (const auto& phase : state->preparation_phases) phases[py::str(phase.first)] = py::float_(phase.second);
+    metrics["native_preparation_phases_ms"] = phases;
+  }
   metrics["communicator_rank"] = py::int_(state->rank);
   metrics["lsa_team_size"] = py::int_(state->lsa_team.nRanks);
   metrics["work_count"] = py::int_(schedule.works.size());
