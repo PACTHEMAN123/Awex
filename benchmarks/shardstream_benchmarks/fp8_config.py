@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""Native vLLM FP8 storage for the fused device-v2 transfer experiment."""
+"""Native vLLM FP8 storage for the fused ShardStream transfer experiment."""
 
 import json
 import os

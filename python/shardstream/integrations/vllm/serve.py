@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""vLLM OpenAI API server entrypoint with Awex routes registered."""
+"""vLLM OpenAI API server entrypoint with ShardStream routes registered."""
 
 import uvloop
 from vllm.entrypoints.openai.api_server import run_server
@@ -41,18 +41,18 @@ logger = logging.getLogger(__name__)
 
 
 def main():
-    # Register Awex routes + worker patches directly (not via vLLM plugin system).
+    # Register ShardStream routes + worker patches directly (not via vLLM plugin system).
     register_shardstream_routes()
 
     cli_env_setup()
     parser = FlexibleArgumentParser(
-        description="vLLM OpenAI-Compatible RESTful API server (Awex)."
+        description="vLLM OpenAI-Compatible RESTful API server (ShardStream)."
     )
     parser = make_arg_parser(parser)
     args = parser.parse_args()
     validate_parsed_serve_args(args)
 
-    logger.info("Starting vLLM server with Awex routes enabled")
+    logger.info("Starting vLLM server with ShardStream routes enabled")
     uvloop.run(run_server(args))
 
 

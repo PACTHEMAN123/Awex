@@ -145,7 +145,7 @@ def _operation_groups(
     peers = sorted(plan.operations)
     if any(peer < 0 or peer >= world_size for peer in peers):
         raise TransportUnavailableError(
-            f"v2 plan contains an invalid peer for world_size={world_size}: {peers}"
+            f"Transport plan contains an invalid peer for world_size={world_size}: {peers}"
         )
     if rank in peers:
         raise TransportUnavailableError(
@@ -454,7 +454,7 @@ def _tensor_copy_layout(tensor: torch.Tensor, name: str) -> tuple[int, int]:
         return total_bytes, total_bytes
     if int(tensor.stride(-1)) != 1:
         raise TransportUnavailableError(
-            "v2 only supports views contiguous in their innermost dimension: "
+            "Transport only supports views contiguous in their innermost dimension: "
             f"parameter={name}, shape={tuple(tensor.shape)}, "
             f"stride={tuple(tensor.stride())}"
         )
@@ -462,7 +462,7 @@ def _tensor_copy_layout(tensor: torch.Tensor, name: str) -> tuple[int, int]:
         expected = int(tensor.shape[dimension + 1]) * int(tensor.stride(dimension + 1))
         if int(tensor.stride(dimension)) != expected:
             raise TransportUnavailableError(
-                "v2 tensor view cannot be represented by one row stride: "
+                "Transport tensor view cannot be represented by one row stride: "
                 f"parameter={name}, shape={tuple(tensor.shape)}, "
                 f"stride={tuple(tensor.stride())}"
             )
@@ -470,7 +470,7 @@ def _tensor_copy_layout(tensor: torch.Tensor, name: str) -> tuple[int, int]:
     row_stride = int(tensor.stride(-2)) * element_size
     if row_bytes <= 0 or row_stride < row_bytes:
         raise TransportUnavailableError(
-            f"v2 tensor row stride is invalid: parameter={name}"
+            f"Transport tensor row stride is invalid: parameter={name}"
         )
     return row_bytes, row_stride
 
@@ -1061,7 +1061,7 @@ class Transport:
             unique_id = self._extension.get_unique_id()
             if len(unique_id) != unique_id_size:
                 raise TransportUnavailableError(
-                    "NCCL unique-id size returned by the v2 extension is inconsistent."
+                    "NCCL unique-id size returned by the ShardStream extension is inconsistent."
                 )
             unique_id_tensor.copy_(
                 torch.tensor(list(unique_id), dtype=torch.uint8, device=device)

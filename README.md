@@ -27,6 +27,18 @@ cmake --build build -j2
 cmake --install build --prefix /path/to/install
 ```
 
+An installed library can be consumed without Python or PyTorch:
+
+```cmake
+find_package(ShardStream 0.1 CONFIG REQUIRED)
+target_link_libraries(your_target PRIVATE ShardStream::shardstream)
+```
+
+Set `CMAKE_PREFIX_PATH` to the installation prefix. The public host API is in
+`<shardstream/runtime.h>`; the caller owns tensor memory and CUDA streams.
+A standalone C++ consumer of the installed `3dd7325` library passes link and
+execution checks, with no PyTorch or Python dynamic dependencies.
+
 To install the Python extension with the current environment's PyTorch:
 
 ```sh

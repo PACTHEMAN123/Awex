@@ -962,13 +962,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--meta-server-host",
         default="",
-        help="Address on which the training driver exposes the Awex meta server.",
+        help="Address on which the training driver exposes the ShardStream meta server.",
     )
     parser.add_argument(
         "--meta-server-port",
         type=int,
         default=0,
-        help="Fixed Awex meta-server port (0 selects a free port).",
+        help="Fixed ShardStream meta-server port (0 selects a free port).",
     )
     parser.add_argument(
         "--publication-store-host",
@@ -1005,11 +1005,11 @@ if __name__ == "__main__":
         or args.publication_mechanism != "shardstream"
         or args.comm_backend != "transport"
     ):
-        parser.error("Model joins require remote inference and Awex device v2")
+        parser.error("Model joins require remote inference and ShardStream transport")
     if args.elastic_model_profile and (
         args.train_pp_size != 1 or args.comm_backend != "transport"
     ):
-        parser.error("Full model profiling currently requires PP1 and device v2")
+        parser.error("Full model profiling currently requires PP1 and the ShardStream transport")
     if args.warmup_updates < 0 or args.warmup_updates >= args.num_updates:
         parser.error("--warmup-updates must be in [0, --num-updates)")
     if args.inference_endpoint:

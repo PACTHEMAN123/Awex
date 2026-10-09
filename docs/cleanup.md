@@ -32,10 +32,17 @@ loader, pairwise NCCL subgroup creation, an unused PP layout inference chain
 (the actual model-derived PP map remains), Python FP8 conversion, unused transfer
 chunk/rank-axis helpers, descriptor-count tooling and IPC serialization constants.
 Library and benchmark Python code now has 13,931 lines and 605 definitions.
-All 74 local regression tests pass. Native files and compiler settings remain
-unchanged; the installed H20 wheel must be refreshed before counting GPU runs
-as acceptance of this second cleanup.
+All 74 local regression tests pass. C++ runtime, CUDA transfer kernel and compiler
+settings remain unchanged; the subsequent Torch binding correction restores
+original steady-call GIL ownership and keeps explicit prepare releasing GIL.
+The cleanup wheel was installed at `3dd7325` on all four H20 nodes;
+its extension SHA-256 is unchanged and full integration imports pass. Four real BF16
+GRPO configurations now qualify this cleanup; both PP1 FP8 cases also pass
+10-step real GRPO. All 21 standalone cases pass full-checkpoint correctness, cache and generation. Restoring original kernel-call GIL ownership brings FP8 naive to +8.5%/+4.6% against the current original, with full real-weight checks passed; final packaged-build checks remain. PP4 is excluded by explicit user request.
 
 At revision `3b69d74`, real Qwen3 BF16 Elastic correctness and adjacent original
-transfer comparisons pass; details and outstanding preparation timing questions
-are recorded in `acceptance.md`. Experiments 8–11 remain incomplete.
+transfer comparisons pass; preparation timing is recorded independently of
+core weight updates. Current qualification and pending experiment coverage are
+recorded in `acceptance.md`. Experiments 8, 9, 11 and 12 have their required coverage. Experiment 10 has
+complete real-model correctness coverage and a qualified FP8 naive binding
+correction; final packaged-build checks remain.
