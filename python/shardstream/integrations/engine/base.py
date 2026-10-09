@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
+
 from abc import ABC, abstractmethod
 from typing import List, Optional
 
@@ -63,13 +64,6 @@ class InferenceEngine(Engine):
         pass
 
     @abstractmethod
-    def update_weights_from_disk(
-        self, model_path: str, load_format: Optional[str] = None
-    ):
-        """Update weights from disk for inference engine."""
-        pass
-
-    @abstractmethod
     def update_weights(self, **kwargs):
         """Update weights for inference engine."""
         pass
@@ -86,11 +80,6 @@ class InferenceEngine(Engine):
 
 
 class TrainingEngine(Engine):
-    @abstractmethod
-    def save_hf_checkpoint(self, path: str):
-        """Save model checkpoint."""
-        pass
-
     @abstractmethod
     def write_weights(self, **kwargs):
         """Write weights for training engine."""

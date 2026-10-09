@@ -293,8 +293,7 @@ class MultiVLLMWeightsExchangeIT:
 
         device_util.set_device(self.local_rank)
         if not dist.is_initialized():
-            backend = "hccl" if self.device_backend == "npu" else "nccl"
-            dist.init_process_group(backend)
+            dist.init_process_group("nccl")
 
         logger.info(
             "Megatron rank %s/%s uses physical device id=%s (logical device %s)",
@@ -473,11 +472,6 @@ class MultiVLLMWeightsExchangeIT:
         logger.info("Megatron backend initialized")
 
     def setup_megatron(self):
-        # Ensure MindSpeed patches are applied before importing Megatron when on NPU.
-        from shardstream.integrations.sharding.mindspeed import ensure_mindspeed_patched
-
-        ensure_mindspeed_patched("weights_exchange_vllm_it")
-
         from megatron.core import parallel_state as mpu
         from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 
@@ -492,18 +486,7 @@ class MultiVLLMWeightsExchangeIT:
             expert_tensor_parallel_size=self.train_expert_tp_size,
         )
 
-        try:
-            model_parallel_cuda_manual_seed(0)
-        except Exception as exc:
-            if device_util.get_device_type() != "npu":
-                raise
-            logger.warning(
-                "model_parallel_cuda_manual_seed failed on NPU (%s); "
-                "falling back to torch.npu.manual_seed.",
-                exc,
-            )
-            if getattr(torch, "npu", None) is not None:
-                torch.npu.manual_seed(0)
+        model_parallel_cuda_manual_seed(0)
 
         loaded = megatron_model_from_hf(
             model_path=self.inference_config["model_path"],
@@ -946,14 +929,14 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--device-backend",
-        choices=["auto", "cuda", "npu", "cpu"],
+        choices=["auto", "cuda"],
         default="auto",
-        help="Device backend to use (auto/cuda/npu/cpu).",
+        help="Device backend to use (auto/cuda).",
     )
     parser.add_argument(
         "--use-mbridge",
         action="store_true",
-        help="Load HF weights into Megatron via mbridge (skip DCP conversion).",
+        help="Load HF weights into Megatron via mbridge.",
     )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
@@ -1040,9 +1023,6 @@ if __name__ == "__main__":
             )
     if args.device_backend and args.device_backend != "auto":
         os.environ["SHARDSTREAM_DEVICE_TYPE"] = args.device_backend
-    if device_util.get_device_type() == "npu" and args.comm_backend == "nccl":
-        logger.warning("Switching comm_backend from nccl to hccl for NPU backend.")
-        args.comm_backend = "hccl"
     if args.dump_weights_list_for_validation:
         args.dump_weights_list_for_validation = [
             name.strip()

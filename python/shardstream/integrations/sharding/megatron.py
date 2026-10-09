@@ -15,12 +15,12 @@
 # specific language governing permissions and limitations
 # under the License.
 
+
 import os
 
 import torch.distributed as dist
 
 from shardstream._utils import device as device_util
-from shardstream.integrations.sharding.mindspeed import ensure_mindspeed_patched
 from shardstream.metadata.rank import RankInfo
 
 
@@ -43,8 +43,6 @@ def get_mcore_sharding_strategy(model_name: str, rank_info: RankInfo, **kwargs):
 
 
 def get_mcore_rank_info() -> RankInfo:
-    # Ensure MindSpeed patches are applied before Megatron parallel_state imports.
-    ensure_mindspeed_patched("get_mcore_rank_info")
     from megatron.core import parallel_state as mpu
 
     dp_size = mpu.get_data_parallel_world_size()

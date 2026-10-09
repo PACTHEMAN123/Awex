@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
+
 """Converter for vLLM parameter names to HF/Megatron-friendly names.
 
 We normalize vLLM self-attention names to the HF-style projection naming
@@ -25,18 +26,12 @@ from shardstream.integrations.conversion.base import (
     append_scale_inv,
     normalize_scale_inv_name,
 )
-from shardstream.integrations.conversion.fused import (
-    LinearMLASGlangConverterMixin,
-    SGlangToHFWeightConverter,
-)
+from shardstream.integrations.conversion.fused import FusedWeightConverter
 
 
-class VLLMToHFWeightConverter(
-    LinearMLASGlangConverterMixin,
-    SGlangToHFWeightConverter,
-):
+class VLLMToHFWeightConverter(FusedWeightConverter):
     def _normalize_name(self, name: str) -> str:
-        name, has_scale_inv = normalize_scale_inv_name(name)
+        (name, has_scale_inv) = normalize_scale_inv_name(name)
         replacements = [
             (".self_attn.attn.qkv", ".attention.query_key_value_proj"),
             (".self_attn.attn.qkv_proj", ".attention.query_key_value_proj"),
@@ -51,7 +46,6 @@ class VLLMToHFWeightConverter(
         for old, new in replacements:
             if old in name:
                 name = name.replace(old, new)
-        # Guard against double normalization.
         name = name.replace("query_key_value_proj_proj", "query_key_value_proj")
         return append_scale_inv(name, has_scale_inv)
 

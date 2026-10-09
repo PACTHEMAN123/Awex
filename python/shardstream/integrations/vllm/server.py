@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
+
 import asyncio
 import inspect
 from typing import Any, Dict, Optional
@@ -39,8 +40,6 @@ class ShardStreamVLLMServerAdapter:
         enable_debug_mode: bool = False,
         debug_mode_config: Optional[Dict[str, Any]] = None,
         disable_weights_exchange_pipeline: bool = False,
-        enable_colocate_mode: bool = False,
-        weights_exchange_ipc_backend: str = "cuda",
         weights_comm_nccl_group_size: int = 1,
         nnodes: Optional[int] = None,
         node_rank: Optional[int] = None,
@@ -55,16 +54,14 @@ class ShardStreamVLLMServerAdapter:
         self._initialized = False
         self._initializing = False
         self._loop = loop
-
         vllm_config = engine_client.vllm_config
         parallel_config = vllm_config.parallel_config
         self.hf_config = engine_client.model_config.hf_config
         self.engine_name = "vllm"
-
         pc_nnodes = getattr(parallel_config, "nnodes", None)
         pc_node_rank = getattr(parallel_config, "node_rank", None)
-        resolved_nnodes = nnodes if nnodes is not None else (pc_nnodes or 1)
-        resolved_node_rank = node_rank if node_rank is not None else (pc_node_rank or 0)
+        resolved_nnodes = nnodes if nnodes is not None else pc_nnodes or 1
+        resolved_node_rank = node_rank if node_rank is not None else pc_node_rank or 0
         enable_expert_parallel = bool(
             getattr(parallel_config, "enable_expert_parallel", False)
         )
@@ -78,7 +75,6 @@ class ShardStreamVLLMServerAdapter:
             if enable_expert_parallel
             else 1
         )
-
         self._config = InferenceConfig(
             tp_size=parallel_config.tensor_parallel_size,
             pp_size=parallel_config.pipeline_parallel_size,
@@ -96,8 +92,6 @@ class ShardStreamVLLMServerAdapter:
             enable_debug_mode=enable_debug_mode,
             debug_mode_config=debug_mode_config or {},
             disable_weights_exchange_pipeline=disable_weights_exchange_pipeline,
-            enable_colocate_mode=enable_colocate_mode,
-            weights_exchange_ipc_backend=weights_exchange_ipc_backend,
             weights_comm_nccl_group_size=weights_comm_nccl_group_size,
             weights_validation_steps=weights_validation_steps,
             validate_weights_every_n_steps=validate_weights_every_n_steps,
@@ -134,12 +128,6 @@ class ShardStreamVLLMServerAdapter:
         if not self._initialized:
             raise RuntimeError("ShardStream adapter not initialized.")
         self.weights_exchange_reader.update_weights(step_id=step_id, **kwargs)
-
-    def update_weights_from_disk(self, model_path: str, load_format: str | None = None):
-        logger.info("Updating vLLM weights from disk: %s", model_path)
-        self._collective_rpc(
-            "shardstream_update_weights_from_disk", args=(model_path, load_format)
-        )
 
     def release_memory_occupation(self, tags=None) -> None:
         logger.info("Release memory occupation via vLLM sleep.")
@@ -181,10 +169,6 @@ class ShardStreamVLLMServerAdapter:
         kwargs: Optional[dict] = None,
     ):
         rpc_client = self._get_dp_rpc_client()
-
-        # Internal DP (DPLB) path: gather utility results from every core engine.
-        # This is needed for metadata collection where returning only the first
-        # core would drop shards that exist on other DP cores.
         if not (
             rpc_client is not None
             and hasattr(rpc_client, "core_engines")
@@ -193,13 +177,11 @@ class ShardStreamVLLMServerAdapter:
             return [
                 self._collective_rpc(method, timeout=timeout, args=args, kwargs=kwargs)
             ]
-
         core_engines = list(getattr(rpc_client, "core_engines", []))
         if not core_engines:
             return [
                 self._collective_rpc(method, timeout=timeout, args=args, kwargs=kwargs)
             ]
-
         call_utility = rpc_client._call_utility_async
         if inspect.iscoroutinefunction(call_utility):
 
@@ -219,23 +201,12 @@ class ShardStreamVLLMServerAdapter:
                 )
 
             return self._run_on_loop(_gather_all())
-
         return [
-            call_utility(
-                "collective_rpc",
-                method,
-                timeout,
-                args,
-                kwargs,
-                engine=engine,
-            )
+            call_utility("collective_rpc", method, timeout, args, kwargs, engine=engine)
             for engine in core_engines
         ]
 
     def _get_dp_rpc_client(self):
-        # vLLM OpenAI API server usually passes AsyncLLM to the adapter, where
-        # the real core client is AsyncLLM.engine_core. In other integration
-        # paths, the adapter may receive the core client directly.
         if hasattr(self._engine_client, "core_engines") and hasattr(
             self._engine_client, "_call_utility_async"
         ):
@@ -266,7 +237,7 @@ class ShardStreamVLLMServerAdapter:
         )
 
     def execute_task_in_model_worker(self, fn, **kwargs):
-        if not self._initialized and not self._initializing:
+        if not self._initialized and (not self._initializing):
             raise RuntimeError("ShardStream adapter not initialized.")
         if isinstance(fn, str):
             method = fn

@@ -61,8 +61,6 @@ class ShardStreamPublicationMechanism(PublicationMechanism):
             "nnodes": 1,
             "node_rank": 0,
         }
-        if harness.device_backend == "npu":
-            payload["weights_exchange_ipc_backend"] = "cpu"
         if harness.validate:
             payload["weights_validation_steps"] = 1
             payload["validate_weights_every_n_steps"] = 1

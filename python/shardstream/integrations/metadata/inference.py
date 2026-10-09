@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
+
 import json
 import os
 from datetime import datetime
@@ -38,11 +39,7 @@ from shardstream.metadata.sharding import ShardingType
 
 class InferParamMetaResolver(ParamMetaResolver):
     def __init__(
-        self,
-        inference_engine,
-        convert_params=False,
-        num_engines=1,
-        engine_rank=0,
+        self, inference_engine, convert_params=False, num_engines=1, engine_rank=0
     ):
         """
         Args:
@@ -56,7 +53,6 @@ class InferParamMetaResolver(ParamMetaResolver):
         self.convert_params = convert_params
         self.num_engines = num_engines
         self.engine_rank = engine_rank
-
         suffix = f"{engine_rank}_{os.getpid()}_{datetime.now().strftime('%Y_%m_%d_%H_%M_%S')}.json"
         if self._inference_engine.config.enable_debug_mode:
             non_converted_params_raw_meta = (
@@ -82,7 +78,6 @@ class InferParamMetaResolver(ParamMetaResolver):
             engine_rank=engine_rank,
             convert_params=self.convert_params,
         )
-        # vLLM IPC serializes RankInfo to dict; restore for internal usage.
         for info in self._params_raw_meta:
             rank_info = info.get("rank_info")
             if isinstance(rank_info, dict):
@@ -112,7 +107,7 @@ class InferParamMetaResolver(ParamMetaResolver):
             with open(abs_filename, "w") as f:
                 json.dump(dump_parameters_meta(self._params_meta), f, indent=4)
             logger.info(f"Inference rank {engine_rank}, params_meta: {abs_filename}")
-        self.total_numel = sum(param.global_numel for param in self._params_meta)
+        self.total_numel = sum((param.global_numel for param in self._params_meta))
         self.total_size = compute_total_model_size(self._params_meta)
         logger.info(
             f"Total number of elements in the model: {self.total_numel}, total size: {self.total_size} bytes"
@@ -149,7 +144,6 @@ class InferParamMetaResolver(ParamMetaResolver):
     ) -> Dict[str, Any]:
         if not params_raw_meta:
             raise ValueError("No inference parameter metadata collected.")
-
         rank0_params = [
             info for info in params_raw_meta if info["rank_info"].global_rank == 0
         ]
@@ -160,8 +154,7 @@ class InferParamMetaResolver(ParamMetaResolver):
             dedup_rank0 = list(by_identity.values())
             if len(dedup_rank0) > 1:
                 logger.warning(
-                    "Found %s rank0 metas (dedup=%s); selecting canonical by "
-                    "(dp,tp,pp,ep,attn_tp,attn_dp).",
+                    "Found %s rank0 metas (dedup=%s); selecting canonical by (dp,tp,pp,ep,attn_tp,attn_dp).",
                     len(rank0_params),
                     len(dedup_rank0),
                 )
@@ -176,8 +169,6 @@ class InferParamMetaResolver(ParamMetaResolver):
                 )
             )
             return dedup_rank0[0]
-
-        # Fallback: if no global_rank==0 exists (unexpected), use minimum identity.
         logger.warning(
             "No global_rank==0 meta found; falling back to minimum rank identity."
         )
@@ -220,7 +211,7 @@ class InferParamMetaResolver(ParamMetaResolver):
             "params_meta": params_meta,
             "model_arch_name": model_arch_name,
         }
-        sglang_to_hf_weight_converter = get_infer_weights_converter(
+        infer_to_hf_weight_converter = get_infer_weights_converter(
             engine_name,
             model_arch_name,
             hf_config=hf_config,
@@ -230,7 +221,7 @@ class InferParamMetaResolver(ParamMetaResolver):
         params = []
         for name, param in model.named_parameters():
             if convert_params:
-                for hf_name, hf_param in sglang_to_hf_weight_converter.convert_param(
+                for hf_name, hf_param in infer_to_hf_weight_converter.convert_param(
                     name, param
                 ):
                     params.append((hf_name, hf_param))
@@ -240,11 +231,11 @@ class InferParamMetaResolver(ParamMetaResolver):
             if getattr(hf_config, "tie_word_embeddings", False):
                 pp_rank = model_context.get("pp_rank", 0)
                 pp_size = model_context.get("pp_size", 1)
-                names = {n for n, _ in params}
+                names = {n for (n, _) in params}
                 if (
                     pp_rank == pp_size - 1
                     and "lm_head.weight" not in names
-                    and "model.embed_tokens.weight" in names
+                    and ("model.embed_tokens.weight" in names)
                 ):
                     embed_tensor = None
                     for n, p in params:
@@ -252,33 +243,30 @@ class InferParamMetaResolver(ParamMetaResolver):
                             embed_tensor = p
                             break
                     if embed_tensor is not None:
-                        # Both engines tie the output weights to the embedding
-                        # and expose no lm_head, while the training side still
-                        # publishes it. The reader adds the same alias, so the
-                        # metadata has to match or the transfer plan reports a
-                        # missing key.
                         params.append(("lm_head.weight", embed_tensor))
                         logger.info(
-                            "Infer meta: added lm_head.weight alias for tied "
-                            "embeddings on %s",
+                            "Infer meta: added lm_head.weight alias for tied embeddings on %s",
                             engine_name,
                         )
         if os.environ.get("SHARDSTREAM_DEBUG_INFER_META", "0") == "1":
-            names = [n for n, _ in params]
+            names = [n for (n, _) in params]
             has_lm_head = any(
-                n.endswith("lm_head.weight")
-                or n.endswith("lm_head")
-                or n.endswith("model.lm_head.weight")
-                for n in names
+                (
+                    n.endswith("lm_head.weight")
+                    or n.endswith("lm_head")
+                    or n.endswith("model.lm_head.weight")
+                    for n in names
+                )
             )
             has_embed = any(
-                n.endswith("embed_tokens.weight")
-                or n.endswith("model.embed_tokens.weight")
-                for n in names
+                (
+                    n.endswith("embed_tokens.weight")
+                    or n.endswith("model.embed_tokens.weight")
+                    for n in names
+                )
             )
             logger.info(
-                "Infer meta debug: engine=%s engine_rank=%s pp_rank=%s/%s tp_rank=%s "
-                "convert_params=%s has_lm_head=%s has_embed=%s total_params=%s",
+                "Infer meta debug: engine=%s engine_rank=%s pp_rank=%s/%s tp_rank=%s convert_params=%s has_lm_head=%s has_embed=%s total_params=%s",
                 engine_name,
                 engine_rank,
                 model_context.get("pp_rank"),
@@ -303,7 +291,9 @@ class InferParamMetaResolver(ParamMetaResolver):
                 }
             )
         if non_contiguous:
-            sample = ", ".join(f"{name}:{shape}" for name, shape in non_contiguous[:8])
+            sample = ", ".join(
+                (f"{name}:{shape}" for (name, shape) in non_contiguous[:8])
+            )
             logger.info(
                 "Infer meta rank %s has %s non-contiguous params (showing up to 8): %s",
                 rank_info.global_rank,
@@ -314,6 +304,6 @@ class InferParamMetaResolver(ParamMetaResolver):
                 logger.debug(
                     "Infer meta rank %s remaining non-contiguous params: %s",
                     rank_info.global_rank,
-                    [name for name, _ in non_contiguous[8:]],
+                    [name for (name, _) in non_contiguous[8:]],
                 )
         return meta

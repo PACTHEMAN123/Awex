@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
+
 import os
 import time
 from typing import Any, Dict, List, Optional
@@ -35,9 +36,6 @@ class MegatronEngine(TrainingEngine):
         self.config = config
         logger.info(f"config {self.config}")
         self.model = model
-        self.enable_colocate_mode = self.config.get(
-            "enable_colocate_mode", False
-        ) or self.config.pop("enable_colocate_mode", False)
         self.enable_debug_mode = self.config.get("enable_debug_mode", False)
         self.comm_backend = self.config.get("comm_backend", "transport")
         self.enable_forward_share_gpu = self.config.get(
@@ -45,7 +43,7 @@ class MegatronEngine(TrainingEngine):
         )
         self.meta_server_addr = self.config.get("meta_server_addr", "")
         os.environ["SHARDSTREAM_META_SERVER_ADDR"] = self.meta_server_addr or ""
-        ip, port = (self.meta_server_addr or ":").split(":")
+        (ip, port) = (self.meta_server_addr or ":").split(":")
         os.environ["SHARDSTREAM_META_SERVER_IP"] = ip
         os.environ["SHARDSTREAM_META_SERVER_PORT"] = port
         self.offloaded = set()
@@ -60,12 +58,6 @@ class MegatronEngine(TrainingEngine):
         self.weights_exchange_writer.initialize()
         device = device_util.current_device()
         logger.info(f"Finish initialize on device {device}")
-        if self.enable_colocate_mode:
-            # release memory for inference engine to initialize
-            self.release_memory_occupation()
-
-    def save_hf_checkpoint(self, path: str):
-        raise NotImplementedError
 
     def write_weights(self, **kwargs):
         logger.info(
@@ -77,8 +69,6 @@ class MegatronEngine(TrainingEngine):
         logger.info(
             f"Finished writing weights for step {self.global_step} for rank {dist.get_rank()}, took {duration:.3f} seconds"
         )
-        if self.enable_colocate_mode:
-            self.release_memory_occupation()
 
     def close(self) -> None:
         if self.weights_exchange_writer is not None:

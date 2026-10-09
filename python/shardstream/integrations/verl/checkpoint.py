@@ -31,13 +31,11 @@ from shardstream.integrations.config import InferenceConfig
 from shardstream.integrations.verl.environment import configure_ray_locality
 
 configure_ray_locality()
-from shardstream.control.store import start_meta_server  # noqa: E402
-from shardstream.integrations.engine.megatron import (  # noqa: E402
+from shardstream.control.store import start_meta_server
+from shardstream.integrations.engine.megatron import (
     MegatronEngine as ShardStreamMegatronEngine,
 )
-from shardstream.integrations.reader.base import (  # noqa: E402
-    get_weights_exchange_reader,  # noqa: E402
-)
+from shardstream.integrations.reader.base import get_weights_exchange_reader
 
 logger = logging.getLogger(__name__)
 
@@ -87,8 +85,6 @@ class _VerlVLLMInferenceEngine:
             enable_debug_mode=enable_debug_mode,
             debug_mode_config=debug_mode_config,
             disable_weights_exchange_pipeline=disable_weights_exchange_pipeline,
-            enable_colocate_mode=False,
-            weights_exchange_ipc_backend="cuda",
             weights_comm_nccl_group_size=weights_comm_nccl_group_size,
         ).validated()
         self.weights_exchange_reader = None

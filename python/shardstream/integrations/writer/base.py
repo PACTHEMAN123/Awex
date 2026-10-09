@@ -27,7 +27,6 @@ import torch
 import torch.distributed as dist
 
 from shardstream import logging
-from shardstream._utils import device as device_util
 from shardstream._utils.common import (
     check_train_infer_params_meta,
     compute_statistics,
@@ -35,7 +34,6 @@ from shardstream._utils.common import (
     stripped_env_vars,
 )
 from shardstream._utils.gpu import get_gpu_status
-from shardstream._utils.tensor import check_and_log_nan_values
 from shardstream.control.store import MetaServerClient
 from shardstream.integrations.conversion.megatron import get_mcore_model_parameters
 from shardstream.integrations.metadata.training import McoreParamMetaResolver
@@ -51,7 +49,6 @@ class WeightExchangeWriter(ABC):
     def __init__(self, train_engine):
         self.train_engine = train_engine
         self.enable_debug_mode = train_engine.enable_debug_mode
-        self.enable_colocate_mode = train_engine.enable_colocate_mode
 
     @abstractmethod
     def initialize(self, **kwargs):
@@ -103,12 +100,6 @@ class WeightsExchangeShardingWriter(WeightExchangeWriter):
         self.dump_weights_dir_for_validation = self.config.get(
             "dump_weights_dir_for_validation", os.getcwd()
         )
-        if (
-            device_util.get_device_type() == "npu"
-            and self.config.get("weights_exchange_ipc_backend", "cuda") == "cuda"
-        ):
-            logger.info("Switching IPC backend from cuda to cpu for NPU runtime.")
-            self.config["weights_exchange_ipc_backend"] = "cpu"
         logger.info(f"Disable pipeline for weights writer: {self.disable_pipeline}")
         logger.info(f"Env variables for weights writer: {stripped_env_vars()}")
         self.lock = threading.Lock()
@@ -351,8 +342,6 @@ class WeightsExchangeShardingWriter(WeightExchangeWriter):
                 f"Start to write weights for step {step_id}, current thread {threading.current_thread()}"
             )
             try:
-                if self.enable_colocate_mode:
-                    self._release_memory_for_weights_exchange()
                 if not self.initialized:
                     logger.info("Start to initialize weights exchange sharding writer")
                     self._initialize()
@@ -362,12 +351,7 @@ class WeightsExchangeShardingWriter(WeightExchangeWriter):
                     )
                 self._validate_weights(step_id, **kwargs)
                 start_time = time.time()
-                if self.enable_colocate_mode:
-                    self.train_engine.resume_memory_occupation(tags=["weights"])
-                    self._write_weights_in_colocate_mode(step_id, **kwargs)
-                else:
-                    self._write_weights(step_id, **kwargs)
-                self._finish_weights_update()
+                self._write_weights(step_id, **kwargs)
                 duration = time.time() - start_time
                 compute_statistics(
                     self._history_write_weights_time, step_id, duration, "Write weights"
@@ -375,50 +359,6 @@ class WeightsExchangeShardingWriter(WeightExchangeWriter):
             except Exception as e:
                 logger.exception(f"Error in write_weights: {e}")
                 raise e
-
-    def _release_memory_for_weights_exchange(self):
-        if self.num_infer_engines is None:
-            logger.info("Start to get number of inference engines from meta server")
-            self.num_infer_engines = self.meta_server_client.get_object(
-                "num_infer_engines", timeout=self.timeout
-            )
-            logger.info("Start to wait for all inference engines to be initialized")
-            self.meta_server_client.wait_set_until_size(
-                "num_inited_inference_engines",
-                self.num_infer_engines,
-                timeout=self.timeout,
-            )
-            logger.info(
-                "All inference engines have been initialized, start to resume weights memory occupation"
-            )
-        self.train_engine.release_memory_occupation(tags=["optimizer"])
-        self.train_engine.resume_memory_occupation(tags=["weights"])
-        dist.barrier()
-        if dist.get_rank() == 0:
-            self.meta_server_client.add_object_to_set(
-                "all_training_offloaded_optimizers", dist.get_rank()
-            )
-
-    def _finish_weights_update(self):
-        if not self.enable_colocate_mode:
-            return
-        logger.info("Waiting for all inference engines to finish weights update")
-        self.meta_server_client.wait_set_until_size(
-            "finished_weights_update_engines",
-            self.num_infer_engines,
-            timeout=self.timeout,
-        )
-        logger.info(
-            "All inference engines have finished weights update, start to release weights memory occupation"
-        )
-        dist.barrier()
-        if dist.get_rank() == 0:
-            self.meta_server_client.delete_if_exists("finished_weights_update_engines")
-            self.meta_server_client.delete_if_exists(
-                "all_training_offloaded_optimizers"
-            )
-            self.meta_server_client.delete_if_exists("all_training_offloaded_weights")
-        logger.info("Finished releasing weights memory occupation")
 
     def _write_weights(self, step_id, **kwargs):
         logger.info(f"Writing weights for step {step_id}")
@@ -444,22 +384,8 @@ class WeightsExchangeShardingWriter(WeightExchangeWriter):
                 temp_parameters.clear()
         gc.collect()
         logger.info(f"GPU status after write weights:\n{get_gpu_status()}")
-        if self.enable_colocate_mode:
-            self.train_engine.release_memory_occupation("weights")
-            self.meta_server_client.add_object_to_set(
-                "all_training_offloaded_weights", self.transfer_rank
-            )
         self.finish_step(step_id)
         logger.info(f"Finished writing weights for step {step_id}")
-
-    def _write_weights_in_colocate_mode(self, step_id, **kwargs):
-        logger.info(
-            f"Start to write weights in colocate mode for rank {self.transfer_rank}"
-        )
-        self._write_weights(step_id, **kwargs)
-        logger.info(
-            f"Finished writing weights in colocate mode for rank {self.transfer_rank}"
-        )
 
     def _validate_weights(self, step_id, **kwargs):
         if self.validated_steps == 0:
@@ -469,7 +395,6 @@ class WeightsExchangeShardingWriter(WeightExchangeWriter):
         if (step_id - self.start_step) % self.validate_weights_every_n_steps != 0:
             return
         self.validated_steps += 1
-        model_path = kwargs.get("path")
         need_converted_dump = bool(self.dump_weights_list_for_validation)
         for model in self.model:
             for name, parameter in model.named_parameters():
@@ -482,7 +407,7 @@ class WeightsExchangeShardingWriter(WeightExchangeWriter):
                     logger.info(
                         f"[Writer] Saved parameter(native) {name} to {abs_path}"
                     )
-        if not model_path and (not need_converted_dump):
+        if not need_converted_dump:
             return
         parameters = self.convert_parameters()
         for name, parameter in parameters.items():
@@ -493,50 +418,6 @@ class WeightsExchangeShardingWriter(WeightExchangeWriter):
                 )
                 torch.save(parameter.detach().cpu(), abs_path)
                 logger.info(f"[Writer] Saved parameter(converted) {name} to {abs_path}")
-        if not model_path:
-            return
-        logger.info(
-            f"Start to write weights for step {step_id} to {model_path} for weights validation"
-        )
-        for name, parameter in parameters.items():
-            check_and_log_nan_values(parameter, name, stage_info=" before validation")
-            if self.dump_weights_for_validation:
-                logger.info(
-                    f"Parameter {name} with shape {parameter.shape}: {parameter}"
-                )
-        self.train_engine.save_hf_checkpoint(model_path)
-        dist.barrier()
-        logger.info(
-            f"Validation weights Barrier passed for weights writer for step {step_id}, all weights are written to disk"
-        )
-        if dist.get_rank() == 0:
-            load_key = "weights_ready_for_load"
-            self.meta_server_client.put_object(load_key, True)
-            start_time = time.time()
-            last_log_time = time.time()
-            send_key = "weights_ready_for_send"
-            ready_engines = self.meta_server_client.get_object(
-                send_key, default_value=set()
-            )
-            while len(ready_engines) != self.num_infer_engines:
-                current_time = time.time()
-                if current_time - last_log_time >= 10:
-                    logger.info(
-                        f"Waiting {current_time - start_time} seconds for {self.num_infer_engines} inference engine instances to read weights for step {step_id}, ready_engines: {ready_engines}"
-                    )
-                    last_log_time = current_time
-                ready_engines = self.meta_server_client.get_object(
-                    send_key, default_value=set()
-                )
-                time.sleep(0.5)
-            self.meta_server_client.delete_if_exists(send_key)
-            self.meta_server_client.delete_if_exists(load_key)
-            dist.barrier()
-        else:
-            dist.barrier()
-        logger.info(
-            f"All inference engine instances has read weights for step {step_id} from {model_path}"
-        )
 
     def finish_step(self, step_id):
         pass
@@ -549,9 +430,6 @@ def get_weights_exchange_writer(train_engine) -> WeightExchangeWriter:
     from shardstream.integrations.writer.worker import TransportWriter
 
     return TransportWriter(train_engine)
-    raise ValueError(
-        f"Unsupported weights exchange comm backend: {train_engine.comm_backend}"
-    )
 
 
 def _maybe_get_tf_config(models):

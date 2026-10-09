@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
+
 import subprocess
 
 import torch
@@ -28,13 +29,6 @@ logger = logging.getLogger(__name__)
 
 def get_gpu_status() -> str:
     """Get accelerator status information in CSV format."""
-    if device_util.get_device_type() == "npu":
-        try:
-            return subprocess.check_output(["npu-smi", "info"], text=True)
-        except subprocess.CalledProcessError as e:
-            return f"Failed to get NPU status via npu-smi: {e}"
-        except FileNotFoundError:
-            return "npu-smi not found; NPU status unavailable."
     try:
         return subprocess.check_output(
             [
@@ -56,23 +50,10 @@ def print_gpu_status(stage):
 
 def print_current_gpu_status(stage):
     device_type = device_util.get_device_type()
-    if device_type == "npu":
-        npu_mod = getattr(torch, "npu", None)
-        if npu_mod is None:
-            logger.info(
-                f"Device npu memory status for [{stage}]: torch.npu unavailable"
-            )
-            return
-        allocated = npu_mod.memory_allocated()
-        reserved = npu_mod.memory_reserved()
-        mem_free, mem_total = npu_mod.mem_get_info()
-    else:
-        allocated = torch.cuda.memory_allocated()
-        reserved = torch.cuda.memory_reserved()
-        mem_free, mem_total = torch.cuda.mem_get_info()
+    allocated = torch.cuda.memory_allocated()
+    reserved = torch.cuda.memory_reserved()
+    (mem_free, mem_total) = torch.cuda.mem_get_info()
     occupy = mem_total - mem_free
     logger.info(
-        f"Device {device_type} memory status for [{stage}]: torch allocated {pretty_bytes(allocated)}, "
-        f"torch reserved {pretty_bytes(reserved)} "
-        f"device mem_free {pretty_bytes(mem_free)}, device occupy {pretty_bytes(occupy)}"
+        f"Device {device_type} memory status for [{stage}]: torch allocated {pretty_bytes(allocated)}, torch reserved {pretty_bytes(reserved)} device mem_free {pretty_bytes(mem_free)}, device occupy {pretty_bytes(occupy)}"
     )

@@ -178,7 +178,6 @@
     "meta/meta_server.py": "control/store.py",
     "sharding/vllm_sharding.py": "integrations/sharding/vllm.py",
     "sharding/mcore_sharding.py": "integrations/sharding/megatron.py",
-    "util/mindspeed.py": "integrations/sharding/mindspeed.py",
     "util/gpu.py": "_utils/gpu.py",
     "util/profile.py": "_utils/profile.py",
     "util/system_util.py": "_utils/system.py",

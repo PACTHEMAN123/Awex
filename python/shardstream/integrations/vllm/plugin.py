@@ -27,33 +27,22 @@ from shardstream.integrations.config import InferenceConfig
 from shardstream.integrations.verl.environment import configure_ray_locality
 
 configure_ray_locality()
-
-from shardstream.integrations.publication.vllm import (  # noqa: E402
-    PublicationVLLMServerAdapter,  # noqa: E402
-)
-from shardstream.integrations.vllm.server import (  # noqa: E402
-    ShardStreamVLLMServerAdapter,  # noqa: E402
-)
+from shardstream.integrations.publication.vllm import PublicationVLLMServerAdapter
+from shardstream.integrations.vllm.server import ShardStreamVLLMServerAdapter
 
 logger = logging.getLogger(__name__)
-
-# Newer vLLM moved OpenAIBaseModel and removed the shared module-level router.
-# Try new paths first, fall back to legacy.
 try:
     from vllm.entrypoints.openai.engine.protocol import OpenAIBaseModel
 except ImportError:
     from vllm.entrypoints.openai.protocol import OpenAIBaseModel
-
 try:
-    from vllm.entrypoints.openai.api_server import router  # type: ignore[attr-defined]
+    from vllm.entrypoints.openai.api_server import router
 
     _USING_LEGACY_VLLM_ROUTER = True
 except ImportError:
     router = APIRouter()
     _USING_LEGACY_VLLM_ROUTER = False
-
 _shardstream_build_app_patched = False
-
 _shardstream_plugin_registered = False
 _SHARDSTREAM_WORKER_METHODS = {
     "_get_model_param_info": (
@@ -80,11 +69,6 @@ _SHARDSTREAM_WORKER_METHODS = {
         "shardstream.integrations.reader.base",
         "WeightsReader._verify_weights_on_tp_worker",
     ),
-    # Optional test helper (kept as a template):
-    # "get_weights_from_tp_worker": (
-    #     "awex.tests.weights_exchange_it",
-    #     "get_weights_from_tp_worker",
-    # ),
 }
 _SHARDSTREAM_WORKER_SIGNATURES = {
     "_get_model_param_info": {
@@ -102,8 +86,6 @@ _SHARDSTREAM_WORKER_SIGNATURES = {
             "weights_comm_backend",
             "debug_mode_config",
             "disable_pipeline",
-            "enable_colocate_mode",
-            "ipc_backend",
         ],
         "optional": [
             "enable_debug_mode",
@@ -132,8 +114,6 @@ class ShardStreamInitRequest(OpenAIBaseModel):
     enable_debug_mode: bool = False
     debug_mode_config: dict[str, Any] | None = None
     disable_weights_exchange_pipeline: bool = False
-    enable_colocate_mode: bool = False
-    weights_exchange_ipc_backend: str = "cuda"
     weights_comm_nccl_group_size: int = 1
     nnodes: int | None = None
     node_rank: int | None = None
@@ -179,7 +159,6 @@ def _to_json_error(message: str, status_code: int = 500):
 
 
 def _sanitize_for_ipc(obj):
-    # Ensure objects are msgpack-serializable for vLLM EngineCore IPC.
     try:
         import torch
 
@@ -190,7 +169,7 @@ def _sanitize_for_ipc(obj):
     except Exception:
         pass
     if isinstance(obj, dict):
-        return {k: _sanitize_for_ipc(v) for k, v in obj.items()}
+        return {k: _sanitize_for_ipc(v) for (k, v) in obj.items()}
     if isinstance(obj, (list, tuple)):
         return [_sanitize_for_ipc(v) for v in obj]
     return obj
@@ -241,13 +220,13 @@ def _patch_shardstream_worker() -> None:
             tp_rank = tp_group.rank_in_group
             tp_size = tp_group.world_size
         except AssertionError:
-            tp_rank, tp_size = 0, 1
+            (tp_rank, tp_size) = (0, 1)
         try:
             pp_group = get_pp_group()
             pp_rank = pp_group.rank_in_group
             pp_size = pp_group.world_size
         except AssertionError:
-            pp_rank, pp_size = 0, 1
+            (pp_rank, pp_size) = (0, 1)
         try:
             dp_group = get_dp_group()
             dp_rank = dp_group.rank_in_group
@@ -260,8 +239,7 @@ def _patch_shardstream_worker() -> None:
             ep_rank = ep_group.rank_in_group
             ep_size = ep_group.world_size
         except AssertionError:
-            ep_rank, ep_size = 0, 1
-
+            (ep_rank, ep_size) = (0, 1)
         local_world_size = int(getattr(parallel_config, "world_size", 1) or 1)
         local_rank = int(getattr(parallel_config, "rank", 0) or 0)
         cp_size = int(getattr(parallel_config, "prefill_context_parallel_size", 1) or 1)
@@ -282,14 +260,10 @@ def _patch_shardstream_worker() -> None:
         cp_mode = os.environ.get("SHARDSTREAM_CP_MODE")
         if not cp_mode:
             cp_mode = "ring" if cp_size > 1 else "none"
-        # In internal DP mode, each core process commonly uses rank in [0, TP*PP*CP),
-        # so compose a world-size-across-dp global rank with dp_rank.
         if 0 <= local_rank < local_world_size:
             global_rank = dp_rank * local_world_size + local_rank
         else:
-            # Fallback for launchers that already expose a fully global rank.
             global_rank = local_rank
-
         reported_local_rank = getattr(self, "local_rank", local_rank)
         return {
             "tp_rank": tp_rank,
@@ -305,7 +279,6 @@ def _patch_shardstream_worker() -> None:
             "local_rank": reported_local_rank,
             "global_rank": global_rank,
             "world_size": parallel_config.world_size_across_dp,
-            # engine_rank is AWEX external instance index, not vLLM internal DP rank.
             "engine_rank": external_engine_rank,
             "is_infer": True,
             "attn_tp_rank": tp_rank,
@@ -362,8 +335,6 @@ def _patch_shardstream_worker() -> None:
                 moe_dense_tp_size=None,
                 nnodes=nnodes,
                 node_rank=node_rank,
-                # AWEX num_engines/engine_rank describe external inference instances.
-                # Do not derive them from vLLM internal DP.
                 num_engines=external_num_engines,
                 engine_rank=external_engine_rank,
                 comm_backend=comm_backend,
@@ -417,9 +388,7 @@ def _patch_shardstream_worker() -> None:
             current.close()
         rank_info = _shardstream_rank_info(self, None)
         receiver = create_vllm_publication_receiver(
-            mechanism,
-            config,
-            worker_rank=int(rank_info["global_rank"]),
+            mechanism, config, worker_rank=int(rank_info["global_rank"])
         )
         self._publication_receiver = receiver
         return _sanitize_for_ipc(receiver.initialize())
@@ -442,9 +411,6 @@ def _patch_shardstream_worker() -> None:
 
     WorkerBase.shardstream_get_model_context = shardstream_get_model_context
     WorkerBase.shardstream_execute = shardstream_execute
-    WorkerBase.shardstream_update_weights_from_disk = (
-        shardstream_update_weights_from_disk
-    )
     WorkerBase.flush_cache = flush_cache
     WorkerBase.publication_init = publication_init
     WorkerBase.publication_update = publication_update
@@ -479,24 +445,11 @@ def _filter_shardstream_kwargs(method_name: str, kwargs: dict) -> dict:
     required = signature.get("required", [])
     optional = signature.get("optional", [])
     allowed = set(required) | set(optional)
-    filtered = {k: v for k, v in kwargs.items() if k in allowed}
+    filtered = {k: v for (k, v) in kwargs.items() if k in allowed}
     missing = [k for k in required if k not in filtered]
     if missing:
         raise ValueError(f"Missing required args for {method_name}: {missing}")
     return filtered
-
-
-def shardstream_update_weights_from_disk(
-    self, model_path: str, load_format: str | None = None
-):
-    from vllm.model_executor.model_loader import get_model_loader
-
-    self.model_runner.model_config.model = model_path
-    model_loader = get_model_loader(self.model_runner.vllm_config.load_config)
-    model_loader.load_weights(
-        self.model_runner.model, model_config=self.model_runner.model_config
-    )
-    return True
 
 
 def flush_cache(self):
@@ -550,7 +503,6 @@ def register_shardstream_plugin() -> None:
     if _shardstream_plugin_registered:
         return
     _shardstream_plugin_registered = True
-
     _patch_shardstream_worker()
     _ensure_router_attached()
 
@@ -568,8 +520,6 @@ def register_shardstream_plugin() -> None:
                 enable_debug_mode=request.enable_debug_mode,
                 debug_mode_config=request.debug_mode_config,
                 disable_weights_exchange_pipeline=request.disable_weights_exchange_pipeline,
-                enable_colocate_mode=request.enable_colocate_mode,
-                weights_exchange_ipc_backend=request.weights_exchange_ipc_backend,
                 weights_comm_nccl_group_size=request.weights_comm_nccl_group_size,
                 nnodes=request.nnodes,
                 node_rank=request.node_rank,
@@ -647,8 +597,7 @@ def register_shardstream_plugin() -> None:
     async def publication_init(request: PublicationInitRequest, raw_request: Request):
         try:
             logger.info(
-                "API server starts publication_init, mechanism=%s",
-                request.mechanism,
+                "API server starts publication_init, mechanism=%s", request.mechanism
             )
             timeout_seconds = int(request.config.get("timeout_seconds", 1800))
             adapter = PublicationVLLMServerAdapter(
@@ -677,8 +626,7 @@ def register_shardstream_plugin() -> None:
     ):
         try:
             logger.info(
-                "API server starts publication_update, step_id=%s",
-                request.step_id,
+                "API server starts publication_update, step_id=%s", request.step_id
             )
             adapter = _get_publication_adapter(raw_request)
             results = await asyncio.to_thread(adapter.update, request.step_id)

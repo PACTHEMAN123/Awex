@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
+
 import os
 from importlib.metadata import version
 
@@ -28,9 +29,6 @@ from shardstream._utils import device as device_util
 logger = logging.getLogger(__name__)
 
 
-# Copy from pytorch and OpenRLHF to allow creating multiple main groups.
-# https://github.com/pytorch/pytorch/blob/main/torch/distributed/distributed_c10d.py
-# https://github.com/OpenRLHF/OpenRLHF/blob/main/openrlhf/utils/distributed_util.py
 def init_custom_process_group(
     backend=None,
     init_method=None,
@@ -50,10 +48,9 @@ def init_custom_process_group(
         rendezvous,
     )
 
-    assert (store is None) or (init_method is None), (
+    assert store is None or init_method is None, (
         "Cannot specify both init_method and store."
     )
-
     if store is not None:
         assert world_size > 0, "world_size must be positive if using store"
         assert rank >= 0, "rank must be non-negative if using store"
@@ -65,26 +62,17 @@ def init_custom_process_group(
         backend = Backend("undefined")
     if timeout is None:
         timeout = default_pg_timeout
-
-    # backward compatible API
     if store is None:
         rendezvous_iterator = rendezvous(init_method, rank, world_size, timeout=timeout)
-        store, rank, world_size = next(rendezvous_iterator)
+        (store, rank, world_size) = next(rendezvous_iterator)
         store.set_timeout(timeout)
-
-        # Use a PrefixStore to avoid accidental overrides of keys used by
-        # different systems (e.g. RPC) in case the store is multi-tenant.
         store = PrefixStore(group_name, store)
-
-    # NOTE: The pg_options parameter was renamed into backend_options in PyTorch 2.6.0
-    # https://github.com/pytorch/pytorch/commit/a0c7029a75628cd5fa8df83c0de0ea98ee7fd844
-    # We need to determine the appropriate parameter name based on PyTorch version
     pg_options_param_name = (
         "backend_options"
         if Version(version("torch")) >= Version("2.6")
         else "pg_options"
     )
-    pg, _ = _new_process_group_helper(
+    (pg, _) = _new_process_group_helper(
         world_size,
         rank,
         [],
@@ -128,45 +116,27 @@ def create_pair_subgroups_from_parent(parent_group, world_size):
             _world,
         )
 
-        # Get my rank within the parent group
         my_rank = dist.get_rank(group=parent_group)
-
-        # Get the backend and store from the parent group
-        backend, parent_store = _world.pg_map[parent_group]
-
+        (backend, parent_store) = _world.pg_map[parent_group]
         logger.info(
             f"Creating pair subgroups from parent group with backend={backend}, my_rank={my_rank}, world_size={world_size}"
         )
-
-        # Create subgroups for all pairs
         pair_subgroups = {}
         for i in range(world_size):
             for j in range(i + 1, world_size):
-                # Only processes that are part of this pair create the group
                 if my_rank != i and my_rank != j:
-                    # This process is not part of this pair subgroup
                     continue
-
-                # Create a unique prefix store for this pair
                 pair_name = f"pair_{i}_{j}"
                 pair_store = PrefixStore(pair_name, parent_store)
-
-                # Determine this process's rank within the pair (0 or 1)
                 pair_rank = 0 if my_rank == i else 1
                 pair_world_size = 2
-
-                # Get timeout from parent group
                 timeout = parent_group._timeout
-
-                # Determine the appropriate parameter name based on PyTorch version
                 pg_options_param_name = (
                     "backend_options"
                     if Version(version("torch")) >= Version("2.6")
                     else "pg_options"
                 )
-
-                # Create the pair subgroup using _new_process_group_helper
-                pg, _ = _new_process_group_helper(
+                (pg, _) = _new_process_group_helper(
                     pair_world_size,
                     pair_rank,
                     [],
@@ -176,65 +146,34 @@ def create_pair_subgroups_from_parent(parent_group, world_size):
                     **{pg_options_param_name: None},
                     timeout=timeout,
                 )
-
-                # Set up the rank mapping for this pair subgroup
-                # Map pair ranks (0, 1) to parent group ranks (i, j)
                 _world.pg_group_ranks[pg] = {0: i, 1: j}
-
-                pair_subgroups[(i, j)] = pg
+                pair_subgroups[i, j] = pg
                 logger.info(
                     f"Rank {my_rank} created pair subgroup ({i}, {j}) with pair_rank={pair_rank}"
                 )
-
         logger.info(
             f"Rank {my_rank} built {len(pair_subgroups)} pair subgroups from parent group"
         )
         return pair_subgroups if pair_subgroups else None
-
     except Exception as e:
         logger.exception(f"Failed to build pair subgroups: {e}")
         return None
 
 
 def init_weights_update_group(
-    master_address,
-    master_port,
-    rank,
-    world_size,
-    group_name,
-    backend="nccl",
-    role="",
+    master_address, master_port, rank, world_size, group_name, backend="nccl", role=""
 ):
     """Initialize the Torch process group for model parameter updates."""
     assert torch.distributed.is_initialized(), (
         "Default torch process group must be initialized"
     )
     assert group_name != "", "Group name cannot be empty"
-
     visible_env = device_util.visible_devices_env_value()
     logger.info(
-        f"init custom process group for {role}: master_address={master_address}, master_port={master_port}, "
-        f"rank={rank}, world_size={world_size}, group_name={group_name}, backend={backend}, "
-        f"current device id {device_util.current_device()} "
-        f"{'/'.join(device_util.visible_devices_env_names())} {visible_env or '(unset)'} "
-        f"Local rank env {os.environ.get('LOCAL_RANK')} DEVICE env {os.environ.get('DEVICE')} "
-        f"Global rank env {os.environ.get('RANK')}"
+        f"init custom process group for {role}: master_address={master_address}, master_port={master_port}, rank={rank}, world_size={world_size}, group_name={group_name}, backend={backend}, current device id {device_util.current_device()} {'/'.join(device_util.visible_devices_env_names())} {visible_env or '(unset)'} Local rank env {os.environ.get('LOCAL_RANK')} DEVICE env {os.environ.get('DEVICE')} Global rank env {os.environ.get('RANK')}"
     )
-
     try:
         options = None
-        if backend == "hccl":
-            import torch_npu
-
-            options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
-            # first,using specified buffer size instead of global buffer size while large size has higher throughput,
-            # because the memory used is 2 * buffer_size MB.
-            # second,rollout and actor must have a same buffer size for group init.
-            options.hccl_config = {
-                "hccl_buffer_size": int(
-                    os.getenv("SHARDSTREAM_P2P_HCCL_BUFFER_SIZE", "200")
-                )
-            }
         group = init_custom_process_group(
             backend=backend,
             init_method=f"tcp://{master_address}:{master_port}",
@@ -265,8 +204,6 @@ def setup_batch_isend_irecv(
     logger.info(
         f"Setup batch isend irecv for rank {rank} world size {world_size} device {device}"
     )
-
-    # Create tensors for sending and receiving
     torch_device = device_util.get_torch_device(device)
     send_tensor = torch.full(
         (tensor_size,), rank, dtype=dtype, device=torch_device, requires_grad=False
@@ -274,15 +211,11 @@ def setup_batch_isend_irecv(
     recv_tensor = torch.zeros(
         (tensor_size,), dtype=dtype, device=torch_device, requires_grad=False
     )
-
-    # Prepare the ops for batch_isend_irecv
     ops = []
-
     mid_point = world_size // 2
     if world_size <= 1:
         logger.info(f"Skip batch isend/irecv setup because world size={world_size}.")
     elif world_size % 2 == 0:
-        # Even world_size: pair the first half with the second half.
         if rank < mid_point:
             target_rank = rank + mid_point
             if target_rank < world_size:
@@ -300,28 +233,19 @@ def setup_batch_isend_irecv(
                     )
                 )
     else:
-        # Odd world_size: use a simple ring so every rank has a partner.
         recv_from = (rank - 1 + world_size) % world_size
         send_to = (rank + 1) % world_size
         ops.append(dist.P2POp(dist.irecv, recv_tensor, recv_from, group=process_group))
         ops.append(dist.P2POp(dist.isend, send_tensor, send_to, group=process_group))
-
-    # Execute batch_isend_irecv
     if ops:
         reqs = dist.batch_isend_irecv(ops)
-        # Wait for all communications to complete
         for req in reqs:
             req.wait()
-
-    # Synchronize
     device_util.synchronize(device_id=device_util.current_device())
     dist.barrier(group=process_group, device_ids=[device_util.current_device()])
-
     logger.info(
         f"Simple communication completed for process group of size {world_size}"
     )
-
-    # Verify the results
     if world_size <= 1:
         return
     if world_size % 2 == 0:
@@ -335,5 +259,4 @@ def setup_batch_isend_irecv(
         assert torch.all(recv_tensor == expected_value), (
             f"Rank {rank} received incorrect data from rank {expected_value}"
         )
-
     logger.info("Simple communication verification successful")

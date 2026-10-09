@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
+
 import time
 from typing import Any, Dict, List, Optional, Union
 
@@ -24,15 +25,7 @@ from shardstream.integrations.engine.base import InferenceEngine
 from shardstream.integrations.reader.base import get_weights_exchange_reader
 
 logger = logging.getLogger(__name__)
-
-
-_VLLM_TASK_SIGNATURES = {
-    # Example/template: fill in supported task names and the allowed kwargs.
-    # "shardstream_execute": {
-    #     "required": ["task_module", "task_qualname", "task_kwargs"],
-    #     "optional": [],
-    # },
-}
+_VLLM_TASK_SIGNATURES = {}
 
 
 class VLLMEngine(InferenceEngine):
@@ -83,31 +76,6 @@ class VLLMEngine(InferenceEngine):
                 f"Skip initializing weights exchange reader for {self.rank_coordinate}"
             )
 
-    def update_weights_from_disk(
-        self, model_path: str, load_format: Optional[str] = None
-    ):
-        if load_format is not None:
-            logger.warning(
-                "vLLM remote update does not support load_format; ignoring %s",
-                load_format,
-            )
-        if not self._initialized:
-            raise RuntimeError("Engine not initialized. Call initialize() first.")
-        logger.info(
-            f"Start to update weights from disk for step {self.global_step} for "
-            f"{self.rank_coordinate}, path: {model_path}"
-        )
-        self._vllm_engine.call_utility(
-            "shardstream_update_weights_from_disk",
-            args=[model_path, load_format],
-            kwargs={},
-            run_on_all=True,
-        )
-        logger.info(
-            f"Finished updating weights from disk for step {self.global_step} for "
-            f"{self.rank_coordinate}, path: {model_path}"
-        )
-
     def update_weights(self, **kwargs):
         logger.info(
             f"Start to update weights for step {self.global_step} for {self.rank_coordinate}"
@@ -116,8 +84,7 @@ class VLLMEngine(InferenceEngine):
         self.weights_exchange_reader.update_weights(step_id=self.global_step, **kwargs)
         duration = time.time() - start_time
         logger.info(
-            f"Finished updating weights for step {self.global_step} for {self.rank_coordinate}, "
-            f"took {duration:.3f} seconds"
+            f"Finished updating weights for step {self.global_step} for {self.rank_coordinate}, took {duration:.3f} seconds"
         )
 
     def release_memory_occupation(self, tags: Optional[List[str]] = None) -> None:
@@ -154,8 +121,7 @@ class VLLMEngine(InferenceEngine):
             raise RuntimeError("Engine not initialized. Call initialize() first.")
         if self.node_rank != 0:
             raise RuntimeError(
-                f"Non-zero rank node {self.rank_coordinate} is not allowed to "
-                f"execute task in model workers"
+                f"Non-zero rank node {self.rank_coordinate} is not allowed to execute task in model workers"
             )
         run_on_all = kwargs.pop("run_on_all", True)
         if isinstance(fn, str):
@@ -202,7 +168,7 @@ def _adapt_task_kwargs(method: str, kwargs: Dict[str, Any]) -> Dict[str, Any]:
     required = signature.get("required", [])
     optional = signature.get("optional", [])
     allowed = set(required) | set(optional)
-    filtered = {k: v for k, v in kwargs.items() if k in allowed}
+    filtered = {k: v for (k, v) in kwargs.items() if k in allowed}
     missing = [k for k in required if k not in filtered]
     if missing:
         raise ValueError(f"Missing required args for {method}: {missing}")

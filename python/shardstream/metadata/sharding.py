@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
+
 from enum import Enum
 
 from shardstream import logging
@@ -28,18 +29,16 @@ class ShardingType(Enum):
     Enum representing the type of sharding applied to a parameter.
     """
 
-    NO_SHARDING = "NO_SHARDING"  # No sharding, parameter is fully replicated
-    TP_SHARDING = "TP_SHARDING"  # Tensor parallel sharding
-    DP_TP_SHARDING = "DP_TP_SHARDING"  # Data parallel + tensor parallel sharding (e.g., for attention)
-    EP_SHARDING = "EP_SHARDING"  # Expert model parallel sharding
-    EP_TP_SHARDING = "EP_TP_SHARDING"  # Expert model tensor parallel sharding
+    NO_SHARDING = "NO_SHARDING"
+    TP_SHARDING = "TP_SHARDING"
+    DP_TP_SHARDING = "DP_TP_SHARDING"
+    EP_SHARDING = "EP_SHARDING"
+    EP_TP_SHARDING = "EP_TP_SHARDING"
 
 
 _default_parameter_sharding_dimensions = {
-    # Word embeddings and output layers
     "word_embeddings.weight": 0,
     "lm_head.weight": 0,
-    # Attention layers - weights
     "query_key_value.weight": 0,
     "q_proj.weight": 0,
     "k_proj.weight": 0,
@@ -53,29 +52,24 @@ _default_parameter_sharding_dimensions = {
     "dense.weight": 1,
     "o_proj.weight": 1,
     "g_norm.weight": 0,
-    # Attention layers - biases
     "query_key_value.bias": 0,
     "q_proj.bias": 0,
     "k_proj.bias": 0,
     "v_proj.bias": 0,
-    "dense.bias": 0,  # Note: bias is NOT sharded along dim 1 like weight, but dim 0
-    # MLP expert layers
-    "experts.w13_weight": 0,  # Second dimension sharded (2816 -> 704)
-    "experts.w2_weight": 1,  # Third dimension sharded (1408 -> 352)
-    # MLP or shared expert layers - weights
+    "dense.bias": 0,
+    "experts.w13_weight": 0,
+    "experts.w2_weight": 1,
     "gate_up_proj.weight": 0,
     "gate_proj.weight": 0,
     "up_proj.weight": 0,
     "down_proj.weight": 1,
-    # MLP or shared expert layers - biases
     "gate_up_proj.bias": 0,
     "gate_proj.bias": 0,
     "up_proj.bias": 0,
-    "down_proj.bias": 0,  # Note: bias is NOT sharded along dim 1 like weight, but dim 0
+    "down_proj.bias": 0,
 }
 
 
-# Function to get sharding dimension using last two parts
 def get_default_sharding_dim(param_name):
     """Get sharding dimension using the last two parts of parameter name.
     Example usage:
@@ -102,18 +96,13 @@ def get_default_sharding_dim(param_name):
     """
     param_name = param_name.replace("_scale_inv", "")
     parts = param_name.split(".")
-
     if len(parts) >= 2:
-        # Try with last two parts
         key = f"{parts[-2]}.{parts[-1]}"
         if key in _default_parameter_sharding_dimensions:
             return _default_parameter_sharding_dimensions[key]
-
     key = parts[-1]
     if key in _default_parameter_sharding_dimensions:
         return _default_parameter_sharding_dimensions[key]
-
-    # Default to row-wise sharding for unknown parameters
     return 0
 
 
@@ -144,12 +133,8 @@ class ShardingStrategy:
         self.ep_size = ep_size
         self.ep_tp_size = ep_tp_size
         self.rank_info = rank_info
-        self.device_backend = device_backend
 
     def _maybe_adjust_sharding_dim(self, parameter_name: str, sharding_dim: int) -> int:
-        # Sharding dimensions are defined in canonical HF/Megatron orientation.
-        # Inference-side converters should project runtime-specific layouts
-        # (e.g. vLLM-ascend transposed MoE tensors) back to canonical views.
         return sharding_dim
 
     def get_attention_sharding_strategy(self, parameter_name, **kwargs):
@@ -163,15 +148,15 @@ class ShardingStrategy:
         if self.enable_dp_attention:
             attn_tp_size = self.rank_info.attn_tp_size
             if attn_tp_size > 1:
-                return ShardingType.DP_TP_SHARDING, sharding_dim, attn_tp_size
+                return (ShardingType.DP_TP_SHARDING, sharding_dim, attn_tp_size)
             else:
-                return ShardingType.NO_SHARDING, sharding_dim, 1
+                return (ShardingType.NO_SHARDING, sharding_dim, 1)
         else:
             tp_size = self.rank_info.tp_size
             if tp_size > 1:
-                return ShardingType.TP_SHARDING, sharding_dim, tp_size
+                return (ShardingType.TP_SHARDING, sharding_dim, tp_size)
             else:
-                return ShardingType.NO_SHARDING, sharding_dim, 1
+                return (ShardingType.NO_SHARDING, sharding_dim, 1)
 
     def get_embedding_sharding_strategy(self, *args, **kwargs):
         """
@@ -188,12 +173,9 @@ class ShardingStrategy:
             parameter_name, get_default_sharding_dim(parameter_name)
         )
         tp_size = self.rank_info.tp_size
-        # Default strategy: shard MLP weights across tensor-parallel
-        # ranks whenever tp_size > 1. Model-specific strategies can
-        # override this behaviour via a custom ShardingStrategy.
         if tp_size > 1:
-            return ShardingType.TP_SHARDING, sharding_dim, tp_size
-        return ShardingType.NO_SHARDING, sharding_dim, 1
+            return (ShardingType.TP_SHARDING, sharding_dim, tp_size)
+        return (ShardingType.NO_SHARDING, sharding_dim, 1)
 
     def get_shared_expert_sharding_strategy(self, parameter_name, **kwargs):
         """
@@ -205,9 +187,9 @@ class ShardingStrategy:
                 parameter_name, get_default_sharding_dim(parameter_name)
             )
             if self.tp_size > 1:
-                return ShardingType.TP_SHARDING, sharding_dim, self.tp_size
+                return (ShardingType.TP_SHARDING, sharding_dim, self.tp_size)
             else:
-                return ShardingType.NO_SHARDING, sharding_dim, 1
+                return (ShardingType.NO_SHARDING, sharding_dim, 1)
         else:
             return self.get_expert_sharding_strategy(parameter_name, **kwargs)
 
@@ -220,13 +202,13 @@ class ShardingStrategy:
             parameter_name, get_default_sharding_dim(parameter_name)
         )
         if self.ep_size > 1 and self.ep_tp_size > 1:
-            return ShardingType.EP_TP_SHARDING, sharding_dim, self.ep_tp_size
+            return (ShardingType.EP_TP_SHARDING, sharding_dim, self.ep_tp_size)
         elif self.ep_size > 1:
-            return ShardingType.EP_SHARDING, sharding_dim, self.ep_size
+            return (ShardingType.EP_SHARDING, sharding_dim, self.ep_size)
         elif self.tp_size > 1:
-            return ShardingType.TP_SHARDING, sharding_dim, self.tp_size
+            return (ShardingType.TP_SHARDING, sharding_dim, self.tp_size)
         else:
-            return ShardingType.NO_SHARDING, sharding_dim, 1
+            return (ShardingType.NO_SHARDING, sharding_dim, 1)
 
     def get_lm_head_sharding_strategy(self, parameter_name, **kwargs):
         """
@@ -239,15 +221,15 @@ class ShardingStrategy:
         if self.enable_dp_lm_head:
             attn_tp_size = self.rank_info.attn_tp_size
             if attn_tp_size > 1:
-                return ShardingType.DP_TP_SHARDING, sharding_dim, attn_tp_size
+                return (ShardingType.DP_TP_SHARDING, sharding_dim, attn_tp_size)
             else:
-                return ShardingType.NO_SHARDING, sharding_dim, 1
+                return (ShardingType.NO_SHARDING, sharding_dim, 1)
         else:
             tp_size = self.rank_info.tp_size
             if tp_size > 1:
-                return ShardingType.TP_SHARDING, sharding_dim, tp_size
+                return (ShardingType.TP_SHARDING, sharding_dim, tp_size)
             else:
-                return ShardingType.NO_SHARDING, sharding_dim, 1
+                return (ShardingType.NO_SHARDING, sharding_dim, 1)
 
     def get_sharding_strategy(self, parameter_name, **kwargs):
         """
@@ -259,30 +241,26 @@ class ShardingStrategy:
             sharding_dim = self._maybe_adjust_sharding_dim(
                 parameter_name, get_default_sharding_dim(parameter_name)
             )
-            return ShardingType.NO_SHARDING, sharding_dim, 1
+            return (ShardingType.NO_SHARDING, sharding_dim, 1)
         if (
             "input_layernorm" in parameter_name
             or "post_attention_layernorm" in parameter_name
         ):
-            return ShardingType.NO_SHARDING, 0, 1
+            return (ShardingType.NO_SHARDING, 0, 1)
         if "norm" in parameter_name:
-            return ShardingType.NO_SHARDING, 0, 1
+            return (ShardingType.NO_SHARDING, 0, 1)
         if "embedding" in parameter_name or "embed_tokens" in parameter_name:
-            # ``embed_tokens`` is the canonical HF name for the input embedding
-            # (mcore/sglang converters both normalize to it); it must inherit
-            # embedding sharding semantics even though it does not contain the
-            # literal substring "embedding".
             return self.get_embedding_sharding_strategy(parameter_name, **kwargs)
         if "lm_head" in parameter_name:
             return self.get_lm_head_sharding_strategy(parameter_name, **kwargs)
         if "expert_bias" in parameter_name:
-            return ShardingType.NO_SHARDING, 0, 1
+            return (ShardingType.NO_SHARDING, 0, 1)
         if "shared_experts" in parameter_name:
             return self.get_shared_expert_sharding_strategy(parameter_name, **kwargs)
         if "expert" in parameter_name:
             return self.get_expert_sharding_strategy(parameter_name, **kwargs)
         if "gate.weight" in parameter_name or "router.weight" in parameter_name:
-            return ShardingType.NO_SHARDING, 0, 1
+            return (ShardingType.NO_SHARDING, 0, 1)
         if "mlp" in parameter_name:
             return self.get_mlp_sharding_strategy(parameter_name, **kwargs)
         if "attention" in parameter_name:
@@ -290,29 +268,4 @@ class ShardingStrategy:
         sharding_dim = self._maybe_adjust_sharding_dim(
             parameter_name, get_default_sharding_dim(parameter_name)
         )
-        return ShardingType.TP_SHARDING, sharding_dim, tp_size
-
-
-class LinearMLAShardingMixin:
-    def get_sharding_strategy(self, parameter_name, **kwargs):
-        if any(
-            key in parameter_name
-            for key in (
-                "attention.kv_a_proj_with_mqa.weight",
-                "attention.q_a_proj.weight",
-                "attention.fused_qkv_a_proj_with_mqa.weight",
-                "attention.kv_a_layernorm.weight",
-                "attention.q_a_layernorm.weight",
-            )
-        ):
-            sharding_dim = get_default_sharding_dim(parameter_name)
-            return ShardingType.NO_SHARDING, sharding_dim, 1
-
-        if "attention.g_norm.weight" in parameter_name:
-            sharding_dim = get_default_sharding_dim(parameter_name)
-            tp_size = self.rank_info.tp_size
-            if tp_size > 1:
-                return ShardingType.TP_SHARDING, sharding_dim, tp_size
-            return ShardingType.NO_SHARDING, sharding_dim, 1
-
-        return super().get_sharding_strategy(parameter_name, **kwargs)
+        return (ShardingType.TP_SHARDING, sharding_dim, tp_size)

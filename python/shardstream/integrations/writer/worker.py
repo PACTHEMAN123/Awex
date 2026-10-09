@@ -25,20 +25,13 @@ import torch.distributed as dist
 
 from shardstream import logging
 from shardstream._utils import device as device_util
-from shardstream._utils.common import compute_statistics, get_ip_address
+from shardstream._utils.common import compute_statistics
 from shardstream._utils.gpu import print_current_gpu_status
 from shardstream._utils.process_group import (
     init_weights_update_group,
     setup_batch_isend_irecv,
 )
 from shardstream._utils.profile import emit_profile, profile_phase
-from shardstream._utils.system import count_open_fds
-from shardstream._utils.tensor import (
-    cuda_ipc_serialize,
-    group_tensors_by_shape_and_dtype,
-    ipc_serialize,
-    release_tensors,
-)
 from shardstream.integrations.writer.base import WeightsExchangeShardingWriter
 from shardstream.plan import (
     TransferPlanBuilder,
@@ -66,9 +59,6 @@ class TransportWriter(WeightsExchangeShardingWriter):
         logger.info(
             f"Start to initialize NCCL weights writer for rank {self.transfer_rank}"
         )
-        if self.enable_colocate_mode:
-            self._init_writer_in_colocate_mode()
-            return
         logger.info(f"Start to build transfer plan for rank {self.transfer_rank}")
         self.transfer_plan = TransferPlanBuilder(
             self.infer_world_size,
@@ -78,7 +68,7 @@ class TransportWriter(WeightsExchangeShardingWriter):
         ).build_local_transfer_plan(
             self.infer_params_meta, self.parameters_meta, self.transfer_rank
         )
-        if True and self.model_arch_name in _QWEN3_STATIC_DEVICE_LAYOUT_ARCHITECTURES:
+        if self.model_arch_name in _QWEN3_STATIC_DEVICE_LAYOUT_ARCHITECTURES:
             from shardstream.integrations.models.qwen3 import (
                 annotate_qwen3_dense_transfer_plan,
             )
@@ -107,7 +97,7 @@ class TransportWriter(WeightsExchangeShardingWriter):
             for op in ops
         }
         self.device_parameters = None
-        if True and self.model_arch_name in _QWEN3_STATIC_DEVICE_LAYOUT_ARCHITECTURES:
+        if self.model_arch_name in _QWEN3_STATIC_DEVICE_LAYOUT_ARCHITECTURES:
             self.device_parameters = self.compile_device_parameters(
                 self.required_param_names
             )
@@ -210,25 +200,7 @@ class TransportWriter(WeightsExchangeShardingWriter):
         self.already_initialized = True
 
     def _destroy_weights_exchange_process_group(self):
-        if self.destroy_pg_after_update and self.backend == "hccl":
-            self.already_initialized = False
-            torch.distributed.destroy_process_group(self.weights_update_group)
-            torch.npu.synchronize()
-            torch.npu.empty_cache()
-
-    def _init_writer_in_colocate_mode(self):
-        self.ipc_backend = self.asystem_train_config.get(
-            "weights_exchange_ipc_backend", "cuda"
-        )
-        ip_address = get_ip_address()
-        self._set_device()
-        device_id = device_util.current_device()
-        self.meta_server_client.add_object_to_set(
-            "training_device_rank_entries", (ip_address, device_id, self.transfer_rank)
-        )
-        logger.info(
-            f"Initialized NCCL weights writer for rank {self.transfer_rank} in colocate mode"
-        )
+        pass
 
     @torch.no_grad()
     def _write_weights(self, step_id, **kwargs):
@@ -389,100 +361,4 @@ class TransportWriter(WeightsExchangeShardingWriter):
             if self.enable_mem_debug:
                 if device_util.get_device_type() == "cuda":
                     torch.cuda.empty_cache()
-                elif device_util.get_device_type() == "npu" and hasattr(torch, "npu"):
-                    torch.npu.empty_cache()
                 print_current_gpu_status(f"writer-{self.transfer_rank} after cleanup")
-
-    @torch.no_grad()
-    def _prepare_params_for_colocate(self):
-        logger.info(
-            f"Start to write weights in colocate mode for rank {self.transfer_rank}"
-        )
-        self.train_engine.release_grad_memory()
-        converted = self.convert_parameters()
-        (tensors, names) = ([], [])
-        for name, tensor in converted.items():
-            assert not tensor.requires_grad
-            tensors.append(tensor)
-            names.append(name)
-        return (tensors, names)
-
-    @torch.no_grad()
-    def _write_weights_in_colocate_mode(self, step_id, **kwargs):
-        start_time = time.time()
-        (tensors, names) = self._prepare_params_for_colocate()
-        num_tensors = len(tensors)
-        if self.ipc_backend in ("cpu", "npu"):
-            tensors = [t.cpu() for t in tensors]
-        logger.info(
-            f"Start to group tensors by shape and dtype for rank {self.transfer_rank}"
-        )
-        (group_tensors, metadata) = group_tensors_by_shape_and_dtype(tensors)
-        device_util.synchronize(device_id=device_util.current_device())
-        logger.info(
-            f"Finished grouping tensors by shape and dtype for rank {self.transfer_rank}"
-        )
-        print_current_gpu_status(
-            f"after group_tensors_by_shape_and_dtype for rank {self.transfer_rank}"
-        )
-        logger.info(f"Open fds before serialize: {count_open_fds()}")
-        release_tensors(tensors)
-        del tensors
-        self.train_engine.release_memory_occupation("weights")
-        self.meta_server_client.add_object_to_set(
-            "all_training_offloaded_weights", self.transfer_rank
-        )
-        print_current_gpu_status(
-            f"after offloaded weights for rank {self.transfer_rank}"
-        )
-        if self.ipc_backend in ("cpu", "npu"):
-            group_shared = [tensor.cpu().share_memory_() for tensor in group_tensors]
-            serialized_weights = ipc_serialize((group_shared, metadata, names))
-        else:
-            group_shared = [
-                tensor.to(device_util.get_torch_device()).share_memory_()
-                for tensor in group_tensors
-            ]
-            serialized_weights = cuda_ipc_serialize((group_shared, metadata, names))
-        device_util.synchronize(device_id=device_util.current_device())
-        logger.info(
-            f"Finished serializing ipc weights with {num_tensors} params, and {len(group_shared)} groups for rank {self.transfer_rank}"
-        )
-        logger.info(f"Open fds after serialize: {count_open_fds()}")
-        ip_address = get_ip_address()
-        device_id = device_util.current_device()
-        key_suffix = f"_{ip_address}_{device_id}_{step_id}"
-        serialized_weights_key = f"training_serialized_weights{key_suffix}"
-        self.meta_server_client.put_object(
-            serialized_weights_key,
-            (self.transfer_rank, self.rank_info, serialized_weights),
-        )
-        logger.info(
-            f"Put {len(group_shared)} serialized training weights to meta server with key {serialized_weights_key} for step {step_id}"
-        )
-        update_finished_key = f"weights_update_finished{key_suffix}"
-        self.meta_server_client.get_object(update_finished_key, timeout=self.timeout)
-        self.meta_server_client.delete_if_exists(update_finished_key)
-        release_tensors(group_tensors)
-        release_tensors(group_shared)
-        del group_tensors
-        del group_shared
-        device_util.synchronize(device_id=device_util.current_device())
-        gc.collect()
-        if device_util.get_device_type() == "cuda":
-            torch.cuda.empty_cache()
-        print_current_gpu_status(
-            f"after clear group_shared for rank {self.transfer_rank}"
-        )
-        write_finished_key = f"write_finished{key_suffix}"
-        self.meta_server_client.put_object(write_finished_key, True)
-        duration = time.time() - start_time
-        compute_statistics(
-            self._history_write_weights_time,
-            step_id,
-            duration,
-            "Send weights using NCCL in colocate mode",
-        )
-        logger.info(
-            f"Finished writing weights in colocate mode for rank {self.transfer_rank}"
-        )

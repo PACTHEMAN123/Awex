@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
+
 import json
 import math
 import os
@@ -50,8 +51,6 @@ def _is_allowed_infer_only_alias(
     if os.environ.get("SHARDSTREAM_FP8_BLOCKWISE", "0") == "1" and extra_key.endswith(
         ".weight_scale_inv"
     ):
-        # The fused FIFO path generates/transfers these scales with the weight;
-        # BF16 training metadata deliberately contains no separate scale tensor.
         weight_key = extra_key.removesuffix("_scale_inv")
         return weight_key in infer_keys and weight_key in train_keys
     return False
@@ -98,18 +97,13 @@ def get_free_port():
 
 
 def to_binary(data):
-    # Serialize messages using pickle
     pickled_data = pickle.dumps(data)
-    # Get the length of the pickled data
     data_len = len(pickled_data)
-    # Create the binary response: length of data (4 bytes) + pickled data
     return struct.pack("!I", data_len) + pickled_data
 
 
 def from_binary(binary):
-    # Extract the length of the pickled data
     data_len = struct.unpack("!I", binary[:4])[0]
-    # Extract and unpickle the data
     pickled_data = binary[4 : 4 + data_len]
     data = pickle.loads(pickled_data)
     return data
@@ -121,19 +115,19 @@ def to_dict(param_meta, ignore_keys=None) -> dict:
 
     def convert_value(v):
         if isinstance(v, Enum):
-            return v.value  # Handle enums
+            return v.value
         if isinstance(v, (tuple, list)):
             return [convert_value(x) for x in v]
         if isinstance(v, torch.dtype):
-            return str(v)  # Handle torch.dtype
+            return str(v)
         if isinstance(v, slice):
-            return str(v)  # Handle slice
+            return str(v)
         if isinstance(v, dict):
-            return {k: convert_value(v) for k, v in v.items() if k not in ignore_keys}
+            return {k: convert_value(v) for (k, v) in v.items() if k not in ignore_keys}
         if hasattr(v, "__dict__"):
             return {
                 k: convert_value(v)
-                for k, v in v.__dict__.items()
+                for (k, v) in v.__dict__.items()
                 if not k.startswith("_") and k not in ignore_keys
             }
         if hasattr(v, "__slots__"):
@@ -161,7 +155,6 @@ def compute_statistics(stage_history: dict, step_id: int, duration: float, stage
     if len(history) > 10000:
         history.pop(0)
     if step_id == 2 and len(history) > 1:
-        # first step contains init time
         history.pop(history.index(max(history)))
     num_updates = len(history)
     stage_history[stage] = history = sorted(history)
@@ -170,8 +163,7 @@ def compute_statistics(stage_history: dict, step_id: int, duration: float, stage
     max_time = history[-1]
     min_time = history[0]
     logger.info(
-        f"{stage} time statistics for step {step_id}: average time: {avg_time:.4f} seconds, median time: {median_time:.4f} seconds, "
-        f"min time: {min_time:.4f} seconds,  max time: {max_time:.4f} seconds"
+        f"{stage} time statistics for step {step_id}: average time: {avg_time:.4f} seconds, median time: {median_time:.4f} seconds, min time: {min_time:.4f} seconds,  max time: {max_time:.4f} seconds"
     )
 
 
@@ -196,14 +188,10 @@ def check_train_infer_params_meta(
     if strict_key_match:
         mismatched = bool(missing_on_infer or extra_on_infer)
     else:
-        # Safe two-stage contract:
-        # - train keys must exist in infer canonical ingress
-        # - infer-only keys are allowed only for explicit alias coverage
         mismatched = bool(missing_on_infer or unsupported_extra_on_infer)
     if mismatched:
         logger.error(
-            "Inconsistent parameters meta keys: train=%s infer=%s "
-            "missing_on_infer=%s extra_on_infer=%s unsupported_extra_on_infer=%s strict=%s",
+            "Inconsistent parameters meta keys: train=%s infer=%s missing_on_infer=%s extra_on_infer=%s unsupported_extra_on_infer=%s strict=%s",
             len(train_meta),
             len(infer_meta),
             sorted(missing_on_infer),
@@ -213,17 +201,11 @@ def check_train_infer_params_meta(
         )
         if raise_exception:
             raise ValueError(
-                "Inconsistent parameters meta keys: "
-                f"train={len(train_meta)} infer={len(infer_meta)} "
-                f"missing_on_infer={sorted(missing_on_infer)} "
-                f"extra_on_infer={sorted(extra_on_infer)} "
-                f"unsupported_extra_on_infer={sorted(unsupported_extra_on_infer)} "
-                f"strict={strict_key_match}"
+                f"Inconsistent parameters meta keys: train={len(train_meta)} infer={len(infer_meta)} missing_on_infer={sorted(missing_on_infer)} extra_on_infer={sorted(extra_on_infer)} unsupported_extra_on_infer={sorted(unsupported_extra_on_infer)} strict={strict_key_match}"
             )
     elif extra_on_infer:
         logger.info(
-            "Infer meta has extra keys not required by training (allowed alias subset), "
-            "count=%s sample=%s",
+            "Infer meta has extra keys not required by training (allowed alias subset), count=%s sample=%s",
             len(extra_on_infer),
             sorted(extra_on_infer)[:8],
         )
@@ -231,10 +213,7 @@ def check_train_infer_params_meta(
         infer_param_meta = infer_meta[param_name]
         train_param_meta = train_meta[param_name]
         if infer_param_meta.global_numel != train_param_meta.global_numel:
-            error_msg = (
-                f"Inconsistent number of elements for parameter {param_name}: "
-                f"{infer_param_meta.global_numel} != {train_param_meta.global_numel}"
-            )
+            error_msg = f"Inconsistent number of elements for parameter {param_name}: {infer_param_meta.global_numel} != {train_param_meta.global_numel}"
             if raise_exception:
                 raise ValueError(error_msg)
             else:
@@ -248,9 +227,9 @@ def check_train_infer_params_meta(
         fused_fp8 = (
             os.environ.get("SHARDSTREAM_FP8_BLOCKWISE", "0") == "1"
             and str(infer_param_meta.dtype).removeprefix("torch.") == "float8_e4m3fn"
-            and str(train_param_meta.dtype).removeprefix("torch.") == "bfloat16"
+            and (str(train_param_meta.dtype).removeprefix("torch.") == "bfloat16")
         )
-        if infer_param_meta.dtype != train_param_meta.dtype and not fused_fp8:
+        if infer_param_meta.dtype != train_param_meta.dtype and (not fused_fp8):
             error_msg = f"Inconsistent dtype for parameter {param_name}: {infer_param_meta.dtype} != {train_param_meta.dtype}"
             if raise_exception:
                 raise ValueError(error_msg)
@@ -258,15 +237,12 @@ def check_train_infer_params_meta(
                 logger.error(error_msg)
         infer_tp_size = len(infer_param_meta.replicas[0].shards)
         train_tp_size = len(train_param_meta.replicas[0].shards)
-        max_tp, min_tp = (
+        (max_tp, min_tp) = (
             max(infer_tp_size, train_tp_size),
             min(infer_tp_size, train_tp_size),
         )
         if max_tp % min_tp != 0:
-            error_msg = (
-                f"Inference for parameter {param_name} has wrong tp_size: "
-                f"infer {infer_tp_size} train {train_tp_size}"
-            )
+            error_msg = f"Inference for parameter {param_name} has wrong tp_size: infer {infer_tp_size} train {train_tp_size}"
             if raise_exception:
                 raise ValueError(error_msg)
             else:
@@ -284,8 +260,6 @@ def pretty_bytes(size_bytes):
 
 
 def stripped_env_vars():
-    # Log the bindings needed to reproduce weight-transfer experiments.
-    # An environment dump can include unrelated authentication material.
     keys = (
         "RANK",
         "LOCAL_RANK",
@@ -317,16 +291,8 @@ class AttrDict(dict):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # Ensure that attributes refer to dictionary keys
         self.__dict__ = self
 
 
-def simple_hf_config(hg_config):
-    config = hg_config.to_dict()
-    final_config = {}
-    for k, v in config.items():
-        if "sglang" in str(v):
-            logger.warning(f"Skipping sglang config {k}: {v}")
-            continue
-        final_config[k] = v
-    return AttrDict(**config)
+def simple_hf_config(hf_config):
+    return AttrDict(**hf_config.to_dict())

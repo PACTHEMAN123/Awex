@@ -65,7 +65,6 @@ def derive_expected_pp_ranks(
 class WeightExchangeReader(ABC):
     def __init__(self, inference_engine):
         self.inference_engine = inference_engine
-        self.enable_colocate_mode = inference_engine.config.enable_colocate_mode
         self.infer_config = inference_engine.config
         self.weights_comm_nccl_group_size = (
             self.infer_config.weights_comm_nccl_group_size
@@ -123,10 +122,6 @@ class WeightsReader(WeightExchangeReader):
         self.raise_on_validation_fail = self.debug_mode_config.get(
             "raise_on_validation_fail", False
         )
-        self.ipc_backend = config.weights_exchange_ipc_backend
-        if device_util.get_device_type() == "npu" and self.ipc_backend == "cuda":
-            logger.info("Switching IPC backend from cuda to cpu for NPU runtime.")
-            self.ipc_backend = "cpu"
         self.timeout = 10000
         self.lock = threading.Lock()
         self.initialized = False
@@ -137,10 +132,6 @@ class WeightsReader(WeightExchangeReader):
 
     def initialize(self, **kwargs):
         self.meta_server_client.put_object("num_infer_engines", self.num_engines)
-        if self.enable_colocate_mode:
-            logger.info("Start to release memory after inference engine initialized")
-            self.inference_engine.release_memory_occupation()
-            logger.info("Finished releasing memory after inference engine initialized")
         self.meta_server_client.add_object_to_set(
             "num_inited_inference_engines", self.engine_rank
         )
@@ -208,8 +199,6 @@ class WeightsReader(WeightExchangeReader):
             enable_debug_mode=config.enable_debug_mode,
             debug_mode_config=config.debug_mode_config,
             disable_pipeline=config.disable_weights_exchange_pipeline,
-            enable_colocate_mode=self.enable_colocate_mode,
-            ipc_backend=self.ipc_backend,
             weights_comm_nccl_group_size=self.weights_comm_nccl_group_size,
             membership_specification=getattr(self, "_pending_membership", None),
         )
@@ -228,8 +217,6 @@ class WeightsReader(WeightExchangeReader):
         weights_comm_backend: str,
         debug_mode_config: Dict[str, Any],
         disable_pipeline: bool,
-        enable_colocate_mode: bool,
-        ipc_backend: str,
         **kwargs,
     ):
         """Cache meta to avoid send to to worker everytime when update weights"""
@@ -249,7 +236,7 @@ class WeightsReader(WeightExchangeReader):
 
         cls = TransportWorkerReader
         scheduler.shardstream_weights_reader = cls(
-            engine_name=infer_conf.get("engine_name", "sglang"),
+            engine_name=infer_conf.get("engine_name", "vllm"),
             model=model,
             model_context=model_context,
             infer_conf=infer_conf,
@@ -261,8 +248,6 @@ class WeightsReader(WeightExchangeReader):
             enable_debug_mode=kwargs.get("enable_debug_mode", False),
             debug_mode_config=debug_mode_config,
             disable_pipeline=disable_pipeline,
-            enable_colocate_mode=enable_colocate_mode,
-            ipc_backend=ipc_backend,
             weights_comm_nccl_group_size=kwargs.get("weights_comm_nccl_group_size"),
         )
         specification = kwargs.get("membership_specification")
@@ -271,8 +256,6 @@ class WeightsReader(WeightExchangeReader):
         else:
             from shardstream.integrations.membership import prepare_model_membership
 
-            if False or enable_colocate_mode:
-                raise ValueError("Model joins require non-colocated transport")
             WorkerWeightsReader.initialize(scheduler.shardstream_weights_reader)
             scheduler.shardstream_weights_reader._set_device()
             scheduler.shardstream_weights_reader.deserialized_weights = {}
@@ -282,8 +265,6 @@ class WeightsReader(WeightExchangeReader):
 
     def prepare_membership(self, specification: dict):
         with self.lock:
-            if False or self.enable_colocate_mode:
-                raise ValueError("Model joins require non-colocated transport")
             engines = specification["num_engines"]
             if engines < self.num_engines or (
                 self.initialized and engines == self.num_engines
@@ -324,9 +305,6 @@ class WeightsReader(WeightExchangeReader):
             logger.info(
                 f"Start to update weights for step {step_id} for engine rank {self.engine_rank}"
             )
-            if self.enable_colocate_mode:
-                self.inference_engine.release_memory_occupation()
-                self._pre_update_weights(step_id=step_id)
             self.inference_engine.execute_task_in_model_worker(
                 self._update_parameters_in_tp_worker, step_id=step_id
             )
@@ -340,32 +318,6 @@ class WeightsReader(WeightExchangeReader):
                 dump_weights_dir_for_validation=self.dump_weights_dir_for_validation,
                 **kwargs,
             )
-            if self.enable_colocate_mode:
-                self._resume_kvcache_memory_occupation()
-
-    def _resume_weights_memory_occupation(self):
-        assert self.enable_colocate_mode
-        logger.info(
-            "Start to resume weights memory occupation, waiting for all train ranks to offload optimizer"
-        )
-        self.meta_server_client.get_object(
-            "all_training_offloaded_optimizers", timeout=self.timeout
-        )
-        logger.info(
-            "All train ranks have offloaded optimizer states, start to resume weights memory occupation"
-        )
-        self.inference_engine.resume_memory_occupation("weights")
-        logger.info("Finished resuming weights memory occupation")
-
-    def _resume_kvcache_memory_occupation(self):
-        assert self.enable_colocate_mode
-        self.meta_server_client.add_object_to_set(
-            "finished_weights_update_engines", self.engine_rank
-        )
-        self.inference_engine.resume_memory_occupation("kv_cache")
-        logger.info(
-            f"Finished resuming kvcache memory occupation for engine rank {self.engine_rank}"
-        )
 
     def _pre_validate_weights(self, step_id, **kwargs):
         if self.validated_steps == 0:
@@ -374,67 +326,9 @@ class WeightsReader(WeightExchangeReader):
             return
         if (step_id - self.start_step) % self.validate_weights_every_n_steps != 0:
             return
-        model_path = kwargs.get("path")
-        if not model_path:
-            self.inference_engine.execute_task_in_model_worker(
-                self._pre_validate_weights_on_tp_worker, step_id=step_id
-            )
-            return
-        logger.info(f"Start to pre-validate weights for step {step_id}")
-        start_time = time.time()
-        last_log_time = time.time()
-        load_key = "weights_ready_for_load"
-        while not self.meta_server_client.has_key(load_key):
-            current_time = time.time()
-            if current_time - last_log_time >= 10:
-                logger.info(
-                    f"Reader is waiting {current_time - start_time} seconds for {load_key} to be ready for validation for step {step_id}, model_path: {model_path}"
-                )
-                last_log_time = current_time
-            time.sleep(0.5)
-        logger.info(
-            f"Weights for step {step_id} are ready for reader, model_path: {model_path}"
-        )
-        if self.enable_colocate_mode:
-            self._resume_weights_memory_occupation()
-        self.inference_engine.update_weights_from_disk(
-            model_path, kwargs.get("load_format")
-        )
-        logger.info(
-            f"Finished updating weights from disk for step {step_id}, model_path: {model_path}"
-        )
-        self.weights_meta = self.inference_engine.execute_task_in_model_worker(
+        self.inference_engine.execute_task_in_model_worker(
             self._pre_validate_weights_on_tp_worker, step_id=step_id
         )
-        send_key = "weights_ready_for_send"
-        self.meta_server_client.add_object_to_set(send_key, self.engine_rank)
-        ready_engines = self.meta_server_client.get_object(send_key)
-        logger.info(
-            f"Inference engine instances has read weights for step {step_id} from {model_path}: {ready_engines}"
-        )
-        start_time = time.time()
-        last_log_time = time.time()
-        while len(ready_engines) != self.num_engines:
-            current_time = time.time()
-            if current_time - last_log_time >= 10:
-                logger.info(
-                    f"Waiting {current_time - start_time} seconds for all inference engine instances to read weights for step {step_id}, model_path: {model_path}"
-                )
-                last_log_time = current_time
-            new_ready_engines = self.meta_server_client.get_object(send_key)
-            if new_ready_engines is None or len(new_ready_engines) == 0:
-                break
-            if new_ready_engines != ready_engines:
-                logger.info(
-                    f"Inference engine instances has read weights for step {step_id} from {model_path}: {new_ready_engines}"
-                )
-                ready_engines = new_ready_engines
-            time.sleep(0.5)
-        logger.info(
-            f"All inference engine instances has read weights for step {step_id} from {model_path}"
-        )
-        if self.enable_colocate_mode:
-            self.inference_engine.release_memory_occupation()
 
     @classmethod
     def _pre_validate_weights_on_tp_worker(cls, step_id, **kwargs):
@@ -580,29 +474,6 @@ class WeightsReader(WeightExchangeReader):
         logger.info("Finished verifying parameters")
         return results
 
-    def _pre_update_weights(self, step_id, **kwargs):
-        if not self.enable_colocate_mode:
-            return
-        self.inference_engine.execute_task_in_model_worker(
-            self._pre_update_weights_in_tp_worker, step_id=step_id
-        )
-        self.meta_server_client.wait_set_until_size(
-            "all_training_offloaded_weights",
-            self.training_world_size,
-            timeout=self.timeout,
-        )
-        self.inference_engine.resume_memory_occupation("weights")
-        logger.info(
-            f"Finished pre-updating weights for step {step_id} in colocate mode on engine rank {self.engine_rank}"
-        )
-
-    @classmethod
-    def _pre_update_weights_in_tp_worker(cls, **kwargs):
-        model_context = kwargs["model_context"]
-        scheduler = model_context["scheduler"]
-        weights_reader = scheduler.shardstream_weights_reader
-        weights_reader.pre_update_weights(**kwargs)
-
     @classmethod
     def _update_parameters_in_tp_worker(cls, **kwargs):
         model_context = kwargs["model_context"]
@@ -626,8 +497,6 @@ class WorkerWeightsReader:
         enable_debug_mode: bool = False,
         debug_mode_config: Dict[str, Any] = None,
         disable_pipeline: bool = False,
-        enable_colocate_mode: bool = False,
-        ipc_backend: str = "cuda",
         weights_comm_nccl_group_size: int = None,
     ):
         self.engine_name = engine_name
@@ -650,14 +519,10 @@ class WorkerWeightsReader:
             "raise_on_validation_fail", False
         )
         self.disable_pipeline = disable_pipeline
-        self.enable_colocate_mode = enable_colocate_mode
-        self.ipc_backend = ipc_backend
         self.weights_comm_nccl_group_size = weights_comm_nccl_group_size
         self.train_to_infer_device_mapping = None
         self.infer_to_train_device_mapping = None
-        logger.info(
-            f"Disable pipeline for weights reader: {self.disable_pipeline} enable_colocate_mode {enable_colocate_mode}"
-        )
+        logger.info(f"Disable pipeline for weights reader: {self.disable_pipeline}")
         self.parameters_meta = parameters_meta
         self.training_params_meta = training_params_meta
         self.training_world_size = training_params_meta[0].shards[0].world_size
@@ -737,9 +602,6 @@ class WorkerWeightsReader:
                 "WeightsReader: added lm_head.weight alias for tied embeddings."
             )
 
-    def pre_update_weights(self, step_id, **kwargs):
-        pass
-
     def update_weights(self, step_id, **kwargs):
         start_time = time.perf_counter()
         pre_update_sync_start = time.perf_counter()
@@ -748,10 +610,7 @@ class WorkerWeightsReader:
             time.perf_counter() - pre_update_sync_start
         ) * 1000.0
         update_body_start = time.perf_counter()
-        if self.enable_colocate_mode:
-            self._update_weights_in_colocate_mode(step_id, **kwargs)
-        else:
-            self._update_weights(step_id, **kwargs)
+        self._update_weights(step_id, **kwargs)
         update_body_time_ms = (time.perf_counter() - update_body_start) * 1000.0
         logger.info(
             f"Start to flush cache for step {step_id} for rank {self.transfer_rank}"
@@ -810,9 +669,6 @@ class WorkerWeightsReader:
         logger.info(
             f"Finished updating weights for step {step_id} for rank {self.engine_rank}-{self.rank_info.global_rank}"
         )
-
-    def _update_weights_in_colocate_mode(self, step_id, **kwargs):
-        self._update_weights(step_id, **kwargs)
 
     def finish_step(self, step_id):
         pass

@@ -26,10 +26,7 @@ import torch.distributed as dist
 from shardstream import logging
 from shardstream._utils import device as device_util
 from shardstream._utils.common import compute_statistics, get_free_port, get_ip_address
-from shardstream._utils.gpu import get_gpu_status, print_current_gpu_status
 from shardstream._utils.profile import emit_profile, profile_phase
-from shardstream._utils.system import count_open_fds
-from shardstream._utils.tensor import reconstruct_ipc_weights
 from shardstream.integrations.reader.base import WorkerWeightsReader
 from shardstream.plan import (
     TransferPlanBuilder,
@@ -63,7 +60,7 @@ class TransportWorkerReader(WorkerWeightsReader):
         self.transfer_plan = plan_builder.build_local_transfer_plan(
             self.parameters_meta, self.training_params_meta, self.transfer_rank
         )
-        if True and self.model_arch_name == "Qwen3ForCausalLM":
+        if self.model_arch_name == "Qwen3ForCausalLM":
             from shardstream.integrations.models.qwen3 import (
                 annotate_qwen3_dense_transfer_plan,
             )
@@ -106,11 +103,7 @@ class TransportWorkerReader(WorkerWeightsReader):
         )
         self.master_address = master_address
         self.master_port = master_port
-        self.world_size = (
-            self.infer_world_size
-            if self.enable_colocate_mode
-            else self.transfer_world_size
-        )
+        self.world_size = self.transfer_world_size
         self._set_device()
         self._init_weights_exchange_process_group()
         self._shake_hands_with_writer()
@@ -138,8 +131,6 @@ class TransportWorkerReader(WorkerWeightsReader):
         self.rank_coordinate = (
             f"{self.engine_rank}-{self.rank_info.global_rank}-{self.transfer_rank}"
         )
-        if self.enable_colocate_mode:
-            self._init_reader_in_colocate_mode()
         self.deserialized_weights = {}
         logger.info(
             f"Created NCCL weights reader for rank {self.rank_info.global_rank}, engine rank {self.engine_rank}"
@@ -160,11 +151,6 @@ class TransportWorkerReader(WorkerWeightsReader):
             logger.info(
                 f"NCCL ready: recv tensor from rank 0 for rank {self.transfer_rank}"
             )
-        if (
-            self.enable_colocate_mode
-            and self.transfer_rank == self.infer_world_size - 1
-        ):
-            dist.send(self.ready_tensor, dst=0, group=self.weights_update_group)
         setup_batch_isend_irecv(
             self.weights_update_group, self.transfer_rank, self.world_size
         )
@@ -217,57 +203,7 @@ class TransportWorkerReader(WorkerWeightsReader):
         self.already_initialized = True
 
     def _destroy_weights_exchange_process_group(self):
-        if self.destroy_pg_after_update and self.backend == "hccl":
-            self.already_initialized = False
-            torch.distributed.destroy_process_group(self.weights_update_group)
-            torch.npu.synchronize()
-            torch.npu.empty_cache()
-
-    def _init_reader_in_colocate_mode(self):
-        raise ValueError("Transport requires separate training and rollout workers")
-
-    def pre_update_weights(self, step_id, **kwargs):
         pass
-
-    def collect_training_weights(self, step_id, **kwargs):
-        if not self.enable_colocate_mode:
-            return
-        ip_address = get_ip_address()
-        device_id = device_util.current_device()
-        key = f"training_serialized_weights_{ip_address}_{device_id}_{step_id}"
-        logger.info(
-            f"Start to get serialized ipc weights {key} for rank {self.rank_coordinate}"
-        )
-        (self.send_rank, self.send_rank_info, serialized_weights) = (
-            self.meta_server_client.get_object(key, timeout=self.timeout)
-        )
-        logger.info(
-            f"Finished getting serialized ipc weights {key} for rank {self.rank_coordinate}"
-        )
-        logger.info(
-            f"GPU status before deserialization:\n{get_gpu_status()} for rank {self.rank_coordinate}"
-        )
-        logger.info(f"Open fds before deserialization: {count_open_fds()}")
-        (self.deserialized_weights, num_groups) = reconstruct_ipc_weights(
-            serialized_weights, ipc_backend=self.ipc_backend, device_id=device_id
-        )
-        logger.info(
-            f"Deserialized {len(self.deserialized_weights)} parameters and {num_groups} groups"
-        )
-        logger.info(
-            f"GPU status after deserialization for rank {self.rank_coordinate}:\n{get_gpu_status()}"
-        )
-        logger.info(f"Open fds after deserialization: {count_open_fds()}")
-
-    @staticmethod
-    def _sync_non_contiguous_tensor_pairs(non_contiguous_tensor_pairs):
-        if not non_contiguous_tensor_pairs:
-            return
-        with torch.no_grad():
-            for original_tensor, recv_tensor in non_contiguous_tensor_pairs:
-                original_tensor.copy_(recv_tensor)
-            non_contiguous_tensor_pairs.clear()
-            del non_contiguous_tensor_pairs
 
     def _update_weights(self, step_id, **kwargs):
         """
@@ -387,57 +323,4 @@ class TransportWorkerReader(WorkerWeightsReader):
             resource_cleanup_time_ms=resource_cleanup_time_ms,
             gc_collect_time_ms=gc_collect_time_ms,
             gc_collect_skipped=not should_collect_garbage,
-        )
-
-    def _update_weights_in_colocate_mode(self, step_id, **kwargs):
-        assert self.enable_colocate_mode, "Colocate mode is not enabled"
-        self.collect_training_weights(step_id, **kwargs)
-        logger.info(
-            f"Start to update weights using NCCL for step {step_id} from {len(self.transfer_plan.operations)} ranks({self.send_ranks_sample}) for rank {self.rank_coordinate}."
-        )
-        start_time = time.time()
-        self.colocate_transport.update_weights_in_colocate_mode(
-            self.train_to_infer_device_mapping,
-            self.infer_to_train_device_mapping,
-            self.transfer_rank,
-            self.rank_coordinate,
-            self.infer_world_size,
-            self.send_transfer_plan,
-            self.transfer_plan,
-            self.weights_update_group,
-            self.deserialized_weights,
-            self.parameters,
-            step_id=step_id,
-        )
-        print_current_gpu_status(
-            f"after weights update using NCCL for rank {self.rank_coordinate}"
-        )
-        self.deserialized_weights = None
-        gc.collect()
-        device_util.synchronize()
-        duration = time.time() - start_time
-        compute_statistics(
-            self._history_update_weights_time,
-            step_id,
-            duration,
-            "Receive weights using NCCL",
-        )
-        ip_address = get_ip_address()
-        device_id = device_util.current_device()
-        key_suffix = f"_{ip_address}_{device_id}_{step_id}"
-        update_finished_key = f"weights_update_finished{key_suffix}"
-        self.meta_server_client.put_object(update_finished_key, True)
-        dist.barrier(
-            group=self.weights_update_group, device_ids=[device_util.current_device()]
-        )
-        logger.info(
-            f"Barrier passed for reader step {step_id} with rank {self.transfer_rank}"
-        )
-        gc.collect()
-        if device_util.get_device_type() == "cuda":
-            torch.cuda.empty_cache()
-        write_finished_key = f"write_finished{key_suffix}"
-        self.meta_server_client.get_object_then_delete(write_finished_key)
-        logger.info(
-            f"Finished updating weights in colocate mode for rank {self.transfer_rank}"
         )

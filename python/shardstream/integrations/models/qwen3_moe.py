@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
+
 from typing import List, Tuple
 
 import torch
@@ -24,7 +25,7 @@ from shardstream.integrations.conversion.base import (
     append_scale_inv,
     normalize_scale_inv_name,
 )
-from shardstream.integrations.conversion.fused import SGlangToHFWeightConverter
+from shardstream.integrations.conversion.fused import FusedWeightConverter
 from shardstream.metadata.sharding import ShardingStrategy
 
 logger = logging.getLogger(__name__)
@@ -42,23 +43,24 @@ class Qwen3ShardingStrategy(ShardingStrategy):
         self.num_kv_heads = int(num_kv_heads) if num_kv_heads else None
 
     def get_sharding_strategy(self, parameter_name, **kwargs):
-        sharding_type, sharding_dim, num_shards = super().get_sharding_strategy(
+        (sharding_type, sharding_dim, num_shards) = super().get_sharding_strategy(
             parameter_name, **kwargs
         )
-        is_kv_projection = ".self_attn.k_proj." in parameter_name or (
-            ".self_attn.v_proj." in parameter_name
+        is_kv_projection = (
+            ".self_attn.k_proj." in parameter_name
+            or ".self_attn.v_proj." in parameter_name
         )
         if (
-            self.engine_name in {"sglang", "vllm"}
+            self.engine_name == "vllm"
             and is_kv_projection
             and self.num_kv_heads
-            and num_shards > self.num_kv_heads
+            and (num_shards > self.num_kv_heads)
         ):
-            return sharding_type, sharding_dim, self.num_kv_heads
-        return sharding_type, sharding_dim, num_shards
+            return (sharding_type, sharding_dim, self.num_kv_heads)
+        return (sharding_type, sharding_dim, num_shards)
 
 
-class SGlangToHFWeightConverterQwen3Moe(SGlangToHFWeightConverter):
+class Qwen3FusedWeightConverter(FusedWeightConverter):
     """SGLang/vLLM -> HF converter for Qwen3-MoE.
 
     Splits the SGLang fused qkv_proj into canonical q/k/v projections
@@ -69,41 +71,31 @@ class SGlangToHFWeightConverterQwen3Moe(SGlangToHFWeightConverter):
     """
 
     def _fuse_qkv(self, name: str) -> bool:
-        # Train side reports canonical self_attn.{q,k,v}_proj names, so the
-        # inference side must unfuse qkv_proj for transfer-plan matching.
         return False
 
     def convert_param(
         self, name: str, parameter: torch.Tensor
     ) -> List[Tuple[str, torch.Tensor]]:
-        # vLLM exposes the fused expert tensors below an implementation-only
-        # routed_experts container. The base converter attaches the expert id
-        # to every "experts" token, so leaving that segment in place produces
-        # mlp.experts.<id>.routed_experts.<id> instead of the HF contract.
         name = name.replace(".experts.routed_experts.", ".experts.")
-        base_name, has_scale_inv = normalize_scale_inv_name(name)
+        (base_name, has_scale_inv) = normalize_scale_inv_name(name)
         return [
             (append_scale_inv(converted_name, has_scale_inv), tensor)
-            for converted_name, tensor in super().convert_param(base_name, parameter)
+            for (converted_name, tensor) in super().convert_param(base_name, parameter)
         ]
 
     def _convert_layer_norm_param(
         self, name: str, parameter: torch.Tensor, layer_number: str
     ) -> List[Tuple[str, torch.Tensor]]:
-        # Qwen3 uses self_attn.{q,k}_norm; the base class only recognizes
-        # the bailing-style {query,key}_layernorm names.
         if "q_norm" in name or "k_norm" in name:
             return [(name, parameter)]
         return super()._convert_layer_norm_param(name, parameter, layer_number)
 
 
 def _build_mcore_converter_qwen3_moe():
-    # Lazily import Megatron converter to avoid MindSpeed patching in
-    # vLLM-only paths (same pattern as ling.py).
     from shardstream.integrations.conversion.megatron import McoreToHFWeightConverter
 
     class McoreToHFWeightConverterQwen3Moe(McoreToHFWeightConverter):
-        """Stock HF/sglang qwen3_moe serves canonical attention names
+        """Stock HF/vLLM qwen3_moe serves canonical attention names
         (self_attn.{q,k,v,o}_proj + self_attn.{q,k}_norm), so keep them
         verbatim instead of the bailing-flavored renames, and split the
         Megatron fused linear_qkv with GQA-aware group strides — the base
@@ -131,14 +123,11 @@ def _build_mcore_converter_qwen3_moe():
             attn_tp = max(1, int(getattr(self.rank_info, "attn_tp_size", 1)))
             if hf.num_key_value_heads % attn_tp != 0:
                 raise ValueError(
-                    f"num_key_value_heads ({hf.num_key_value_heads}) must be "
-                    f"divisible by attn_tp_size ({attn_tp})"
+                    f"num_key_value_heads ({hf.num_key_value_heads}) must be divisible by attn_tp_size ({attn_tp})"
                 )
             if hf.num_attention_heads % hf.num_key_value_heads != 0:
                 raise ValueError(
-                    f"num_attention_heads ({hf.num_attention_heads}) must be "
-                    f"divisible by num_key_value_heads "
-                    f"({hf.num_key_value_heads})"
+                    f"num_attention_heads ({hf.num_attention_heads}) must be divisible by num_key_value_heads ({hf.num_key_value_heads})"
                 )
             num_groups = hf.num_key_value_heads // attn_tp
             q_per_group = hf.num_attention_heads // hf.num_key_value_heads
@@ -146,10 +135,7 @@ def _build_mcore_converter_qwen3_moe():
             expected_rows = num_groups * group_rows
             if parameter.shape[0] != expected_rows:
                 raise ValueError(
-                    "Unexpected linear_qkv rows for GQA split: "
-                    f"got {parameter.shape[0]}, expected {expected_rows} "
-                    f"(kv_heads={hf.num_key_value_heads}, attn_tp={attn_tp}, "
-                    f"q_per_group={q_per_group}, head_dim={head_dim})"
+                    f"Unexpected linear_qkv rows for GQA split: got {parameter.shape[0]}, expected {expected_rows} (kv_heads={hf.num_key_value_heads}, attn_tp={attn_tp}, q_per_group={q_per_group}, head_dim={head_dim})"
                 )
             blocks = parameter.reshape(num_groups, group_rows, *parameter.shape[1:])
             q_rows = q_per_group * head_dim
@@ -160,7 +146,7 @@ def _build_mcore_converter_qwen3_moe():
             v = blocks[:, q_rows + head_dim :].reshape(
                 num_groups * head_dim, *parameter.shape[1:]
             )
-            return q.contiguous(), k.contiguous(), v.contiguous()
+            return (q.contiguous(), k.contiguous(), v.contiguous())
 
         def convert_param_to_device_layout(
             self, name: str, parameter: torch.Tensor, vp_stage: int = None
@@ -172,8 +158,7 @@ def _build_mcore_converter_qwen3_moe():
             )
             if not is_qkv_parameter:
                 return self.convert_param(name, parameter, vp_stage=vp_stage)
-
-            layer_number, remaining_name = canonical_name.replace(
+            (layer_number, remaining_name) = canonical_name.replace(
                 "decoder.layers.", "", 1
             ).split(".", 1)
             if remaining_name not in {
@@ -182,7 +167,6 @@ def _build_mcore_converter_qwen3_moe():
             }:
                 raise ValueError(f"Unexpected Qwen3-MoE QKV name: {canonical_name}")
             suffix = "weight" if canonical_name.endswith("weight") else "bias"
-            # Import lazily because qwen3.py reuses this converter factory.
             from shardstream.integrations.models.qwen3 import (
                 build_qwen3_dense_qkv_layouts,
             )
@@ -199,11 +183,12 @@ def _build_mcore_converter_qwen3_moe():
         def _convert_attention_param(
             self, name: str, parameter: torch.Tensor, layer_number: str
         ) -> List[Tuple[str, torch.Tensor]]:
-            if "self_attention.linear_qkv.weight" in name or (
-                "self_attention.linear_qkv.bias" in name
+            if (
+                "self_attention.linear_qkv.weight" in name
+                or "self_attention.linear_qkv.bias" in name
             ):
                 suffix = "weight" if name.endswith("weight") else "bias"
-                q, k, v = self._split_gqa_qkv(parameter)
+                (q, k, v) = self._split_gqa_qkv(parameter)
                 return [
                     (f"self_attn.q_proj.{suffix}", q),
                     (f"self_attn.k_proj.{suffix}", k),
@@ -218,6 +203,5 @@ CONFIG = {
     "model_name": "Qwen3MoeForCausalLM",
     "sharding_strategy": Qwen3ShardingStrategy,
     "mcore_converter": _build_mcore_converter_qwen3_moe,
-    "sglang_converter": SGlangToHFWeightConverterQwen3Moe,
-    "vllm_converter": SGlangToHFWeightConverterQwen3Moe,
+    "vllm_converter": Qwen3FusedWeightConverter,
 }

@@ -1,4 +1,4 @@
-"""Prepare device-v2 membership against live Megatron/vLLM model storage.
+"""Prepare transport membership against live Megatron/vLLM model storage.
 
 Applications must finish the previous publication on all ranks first. These
 operations replace only the borrowed transfer group and its transport plans;
@@ -22,11 +22,11 @@ from shardstream.transport import Transport, _local_node_id
 
 def prepare_model_membership(worker, specification: dict, sender: bool) -> dict:
     """Collectively prepare a larger homogeneous cohort on every live rank."""
-    if worker.comm_backend != "transport" or worker.enable_colocate_mode:
-        raise ValueError("Model membership requires non-colocated transport")
+    if worker.comm_backend != "transport":
+        raise ValueError("Model membership requires the transport backend")
     if worker.model_arch_name not in ("Qwen3ForCausalLM", "Qwen3MoeForCausalLM"):
         raise ValueError("Model membership requires a stable Qwen3 device layout")
-    epoch, engines = specification["epoch"], specification["num_engines"]
+    (epoch, engines) = (specification["epoch"], specification["num_engines"])
     transport = worker.device_transport
     if transport is not None:
         if (
@@ -40,7 +40,7 @@ def prepare_model_membership(worker, specification: dict, sender: bool) -> dict:
         epoch,
         worker.training_world_size,
         worker.infer_instance_world_size,
-        tuple(f"engine-{i}" for i in range(engines)),
+        tuple((f"engine-{i}" for i in range(engines))),
     )
     participant = (
         ("training", "", worker.rank_info.global_rank)
@@ -54,8 +54,8 @@ def prepare_model_membership(worker, specification: dict, sender: bool) -> dict:
     models = worker.model if sender else [worker.model]
     pointers = {
         f"{stage}/{name}": parameter.data_ptr()
-        for stage, model in enumerate(models)
-        for name, parameter in model.named_parameters()
+        for (stage, model) in enumerate(models)
+        for (name, parameter) in model.named_parameters()
     }
 
     def phase(name, call):
@@ -98,7 +98,7 @@ def prepare_model_membership(worker, specification: dict, sender: bool) -> dict:
         worker.meta_server_client.put_object(
             master_key, (get_ip_address(), get_free_port())
         )
-    master_address, master_port = worker.meta_server_client.get_object(
+    (master_address, master_port) = worker.meta_server_client.get_object(
         master_key, timeout=300
     )
     group = phase(
@@ -176,8 +176,8 @@ def prepare_model_membership(worker, specification: dict, sender: bool) -> dict:
         dist.destroy_process_group(old_group)
     if pointers != {
         f"{stage}/{name}": parameter.data_ptr()
-        for stage, model in enumerate(models)
-        for name, parameter in model.named_parameters()
+        for (stage, model) in enumerate(models)
+        for (name, parameter) in model.named_parameters()
     }:
         raise AssertionError("Preparing membership replaced loaded model storage")
     worker.weights_update_group = group
@@ -187,7 +187,7 @@ def prepare_model_membership(worker, specification: dict, sender: bool) -> dict:
     worker.transfer_world_size = membership.world_size
     worker.infer_world_size = membership.inference_world_size
     worker.already_initialized = True
-    worker.master_address, worker.master_port = master_address, master_port
+    (worker.master_address, worker.master_port) = (master_address, master_port)
     if sender:
         worker.num_infer_engines = engines
         worker.device_parameters = parameters

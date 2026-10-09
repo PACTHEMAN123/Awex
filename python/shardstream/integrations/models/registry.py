@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
+
 import importlib
 import inspect
 import pkgutil
@@ -25,7 +26,6 @@ from typing import Any, Callable, Dict, Optional
 from transformers import PretrainedConfig
 
 from shardstream import logging
-from shardstream.integrations.conversion.fused import SGlangToHFWeightConverter
 from shardstream.integrations.conversion.vllm import VLLMToHFWeightConverter
 from shardstream.metadata.sharding import ShardingStrategy
 
@@ -36,7 +36,6 @@ logger = logging.getLogger(__name__)
 class ModelConfig:
     sharding_strategy: Callable[..., ShardingStrategy]
     mcore_converter: Optional[Callable[..., Any]]
-    sglang_converter: Optional[Callable[..., Any]]
 
 
 class _ModelRegistry:
@@ -54,7 +53,6 @@ class _ModelRegistry:
             return ModelConfig(
                 sharding_strategy=ShardingStrategy,
                 mcore_converter=None,
-                sglang_converter=None,
             )
 
 
@@ -80,9 +78,7 @@ def import_model_configs():
                 continue
             if hasattr(module, "CONFIG"):
                 entry = module.CONFIG
-                if isinstance(
-                    entry, list
-                ):  # To support multiple model classes in one module
+                if isinstance(entry, list):
                     for tmp in entry:
                         model_name = tmp["model_name"]
                         assert model_name not in model_arch_name_to_config, (
@@ -95,7 +91,6 @@ def import_model_configs():
                         f"Duplicated model config for {model_name}"
                     )
                     model_arch_name_to_config[model_name] = entry
-
     return model_arch_name_to_config
 
 
@@ -108,8 +103,7 @@ def get_sharding_strategy(model_name: str):
 
 
 def _resolve_converter(
-    config_value: Optional[Callable[..., Any]],
-    default: Callable[..., Any],
+    config_value: Optional[Callable[..., Any]], default: Callable[..., Any]
 ):
     if config_value is None:
         return default
@@ -136,8 +130,7 @@ def get_train_weights_converter(
         )
 
         converter = _resolve_converter(
-            _get_config_value(config, "mcore_converter"),
-            McoreToHFWeightConverter,
+            _get_config_value(config, "mcore_converter"), McoreToHFWeightConverter
         )
         if tf_config is None:
             tf_config = (
@@ -158,16 +151,9 @@ def get_infer_weights_converter(
     infer_engine_config: Dict,
 ):
     config = ModelRegistry.get_model_config(model_name)
-    if engine_name == "sglang":
-        converter = _resolve_converter(
-            _get_config_value(config, "sglang_converter"),
-            SGlangToHFWeightConverter,
-        )
-        return converter(hf_config, infer_engine_config, rank_info)
     if engine_name == "vllm":
         converter = _resolve_converter(
-            _get_config_value(config, "vllm_converter"),
-            VLLMToHFWeightConverter,
+            _get_config_value(config, "vllm_converter"), VLLMToHFWeightConverter
         )
         return converter(hf_config, infer_engine_config, rank_info)
     else:

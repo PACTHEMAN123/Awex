@@ -36,3 +36,9 @@ target-version = "py310"
 [tool.ruff.lint]
 select = ["E", "F", "I"]
 ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# NCCL preload and Ray locality must run before importing their consumers.
+"python/shardstream/transport.py" = ["E402"]
+"python/shardstream/integrations/vllm/plugin.py" = ["E402"]
+"python/shardstream/integrations/verl/checkpoint.py" = ["E402"]

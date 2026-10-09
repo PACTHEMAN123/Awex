@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-import os
+
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -58,23 +58,21 @@ def _normalize_pp_stage_layer_id_map(
         elif isinstance(raw_key, str):
             if ":" not in raw_key:
                 raise ValueError(
-                    "Invalid pp stage map key, expected '<pp_rank>:<vp_stage>': "
-                    f"{raw_key}"
+                    f"Invalid pp stage map key, expected '<pp_rank>:<vp_stage>': {raw_key}"
                 )
-            pp_raw, vp_raw = raw_key.split(":", 1)
+            (pp_raw, vp_raw) = raw_key.split(":", 1)
             pp_rank = int(pp_raw)
             vp_stage = int(vp_raw)
         else:
             raise ValueError(f"Unsupported pp stage map key type: {type(raw_key)}")
         if not isinstance(raw_layer_map, dict):
             raise ValueError(
-                "Invalid pp stage map value, expected dict: "
-                f"key={raw_key}, value_type={type(raw_layer_map)}"
+                f"Invalid pp stage map value, expected dict: key={raw_key}, value_type={type(raw_layer_map)}"
             )
         stage_map: Dict[int, int] = {}
         for local_layer_id, global_layer_id in raw_layer_map.items():
             stage_map[int(local_layer_id)] = int(global_layer_id)
-        normalized[(pp_rank, vp_stage)] = stage_map
+        normalized[pp_rank, vp_stage] = stage_map
     return normalized
 
 
@@ -93,16 +91,12 @@ def _normalize_pipeline_layout(
     layout = getattr(pipeline_layout, "layout", pipeline_layout)
     if not isinstance(layout, list) or not layout:
         raise ValueError("pipeline_model_parallel_layout must be a non-empty list")
-
-    # 2D shape: layout[pp_rank][vp_stage] -> [layer_types...]
     if isinstance(layout[0], list) and layout[0] and isinstance(layout[0][0], list):
         layout_2d = layout
-    # 1D shape: [stage0_layers, stage1_layers, ...]
     elif isinstance(layout[0], list):
         if len(layout) % pp_size != 0:
             raise ValueError(
-                "pipeline_model_parallel_layout stage count must be divisible by pp_size: "
-                f"stages={len(layout)}, pp_size={pp_size}"
+                f"pipeline_model_parallel_layout stage count must be divisible by pp_size: stages={len(layout)}, pp_size={pp_size}"
             )
         vp_size = len(layout) // pp_size
         layout_2d = [
@@ -113,33 +107,33 @@ def _normalize_pipeline_layout(
         raise ValueError(
             "pipeline_model_parallel_layout must contain stage layer lists"
         )
-
     if len(layout_2d) != pp_size:
         raise ValueError(
-            "pipeline_model_parallel_layout pp dimension mismatch: "
-            f"layout_pp={len(layout_2d)}, pp_size={pp_size}"
+            f"pipeline_model_parallel_layout pp dimension mismatch: layout_pp={len(layout_2d)}, pp_size={pp_size}"
         )
     vp_size = len(layout_2d[0])
     if vp_size <= 0:
         raise ValueError("pipeline_model_parallel_layout has empty vp dimension")
-    if any(len(pp_row) != vp_size for pp_row in layout_2d):
+    if any((len(pp_row) != vp_size for pp_row in layout_2d)):
         raise ValueError(
             "pipeline_model_parallel_layout has inconsistent vp dimension across pp ranks"
         )
-    return layout_2d, vp_size
+    return (layout_2d, vp_size)
 
 
 def _build_stage_layer_counts_from_layout(
     pipeline_layout, pp_size: int
 ) -> List[List[int]]:
-    layout_2d, vp_size = _normalize_pipeline_layout(pipeline_layout, pp_size)
+    (layout_2d, vp_size) = _normalize_pipeline_layout(pipeline_layout, pp_size)
     stage_counts = [[0 for _ in range(vp_size)] for _ in range(pp_size)]
     for pp_rank in range(pp_size):
         for vp_stage in range(vp_size):
             stage_counts[pp_rank][vp_stage] = sum(
-                1
-                for layer_type in layout_2d[pp_rank][vp_stage]
-                if _is_decoder_layer(layer_type)
+                (
+                    1
+                    for layer_type in layout_2d[pp_rank][vp_stage]
+                    if _is_decoder_layer(layer_type)
+                )
             )
     return stage_counts
 
@@ -164,15 +158,12 @@ def _build_stage_layer_counts_from_split_config(
         raise ValueError(
             f"virtual_pipeline_model_parallel_size must be positive, got {vp_size}"
         )
-
     if (first_layers is not None or last_layers is not None) and (
         account_embed or account_loss
     ):
         raise ValueError(
-            "num_layers_in_first/last_pipeline_stage cannot be mixed with "
-            "account_for_embedding/loss_in_pipeline_split"
+            "num_layers_in_first/last_pipeline_stage cannot be mixed with account_for_embedding/loss_in_pipeline_split"
         )
-
     layers_per_pp_rank = {}
     if first_layers is not None or last_layers is not None:
         if first_layers is not None and int(first_layers) <= 0:
@@ -183,7 +174,6 @@ def _build_stage_layer_counts_from_split_config(
             raise ValueError(
                 f"num_layers_in_last_pipeline_stage must be positive, got {last_layers}"
             )
-
         first_layers = int(first_layers or 0)
         last_layers = int(last_layers or 0)
         layers_to_distribute = num_hidden_layers - first_layers - last_layers
@@ -194,13 +184,11 @@ def _build_stage_layer_counts_from_split_config(
             middle_pp_size -= 1
         if layers_to_distribute < 0:
             raise ValueError(
-                "Invalid uneven pipeline setup: specified first/last layers exceed total layers "
-                f"(total={num_hidden_layers}, first={first_layers}, last={last_layers})"
+                f"Invalid uneven pipeline setup: specified first/last layers exceed total layers (total={num_hidden_layers}, first={first_layers}, last={last_layers})"
             )
         if middle_pp_size > 0 and layers_to_distribute % middle_pp_size != 0:
             raise ValueError(
-                "Uneven pipeline middle layers must be divisible by middle pp size: "
-                f"middle_layers={layers_to_distribute}, middle_pp_size={middle_pp_size}"
+                f"Uneven pipeline middle layers must be divisible by middle pp size: middle_layers={layers_to_distribute}, middle_pp_size={middle_pp_size}"
             )
         middle_layers = (
             layers_to_distribute // middle_pp_size if middle_pp_size > 0 else 0
@@ -228,15 +216,11 @@ def _build_stage_layer_counts_from_split_config(
             effective_layers += 1
         if effective_layers % pp_size != 0:
             raise ValueError(
-                "PP split is not divisible under account_for_embedding/loss settings: "
-                f"effective_layers={effective_layers}, pp_size={pp_size}, "
-                f"num_hidden_layers={num_hidden_layers}, "
-                f"account_for_embedding={account_embed}, account_for_loss={account_loss}"
+                f"PP split is not divisible under account_for_embedding/loss settings: effective_layers={effective_layers}, pp_size={pp_size}, num_hidden_layers={num_hidden_layers}, account_for_embedding={account_embed}, account_for_loss={account_loss}"
             )
         layers_per_pp = effective_layers // pp_size
         for pp_rank in pp_ranks:
             layers_per_pp_rank[pp_rank] = layers_per_pp
-
     stage_counts = [[0 for _ in range(vp_size)] for _ in range(pp_size)]
     for pp_rank in pp_ranks:
         layers_this_pp = int(layers_per_pp_rank[pp_rank])
@@ -246,24 +230,20 @@ def _build_stage_layer_counts_from_split_config(
             )
         if vp_size > 1 and layers_this_pp % vp_size != 0:
             raise ValueError(
-                "Layers per pp rank must be divisible by virtual pipeline size: "
-                f"pp_rank={pp_rank}, layers={layers_this_pp}, vp_size={vp_size}"
+                f"Layers per pp rank must be divisible by virtual pipeline size: pp_rank={pp_rank}, layers={layers_this_pp}, vp_size={vp_size}"
             )
         per_vp = layers_this_pp // vp_size if vp_size > 1 else layers_this_pp
         for vp_stage in range(vp_size):
             stage_counts[pp_rank][vp_stage] = per_vp
-
     if account_embed:
         stage_counts[0][0] -= 1
     if account_loss:
         stage_counts[pp_rank_last][vp_size - 1] -= 1
-
     for pp_rank in pp_ranks:
         for vp_stage in range(vp_size):
             if stage_counts[pp_rank][vp_stage] < 0:
                 raise ValueError(
-                    "Negative decoder layer count after account_for_* adjustment: "
-                    f"pp_rank={pp_rank}, vp_stage={vp_stage}, count={stage_counts[pp_rank][vp_stage]}"
+                    f"Negative decoder layer count after account_for_* adjustment: pp_rank={pp_rank}, vp_stage={vp_stage}, count={stage_counts[pp_rank][vp_stage]}"
                 )
     return stage_counts
 
@@ -279,15 +259,13 @@ def _resolve_pp_stage_global_layer_ids(
         num_hidden_layers = _cfg_get(tf_config, "num_layers", None)
     if num_hidden_layers is None:
         raise ValueError(
-            "num_hidden_layers is required for PP layer mapping "
-            "(missing in hf_config and tf_config)"
+            "num_hidden_layers is required for PP layer mapping (missing in hf_config and tf_config)"
         )
     num_hidden_layers = int(num_hidden_layers)
     pp_size = max(int(rank_info.pp_size), 1)
     pp_rank = int(rank_info.pp_rank)
     if pp_rank < 0 or pp_rank >= pp_size:
         raise ValueError(f"Invalid pp_rank={pp_rank} for pp_size={pp_size}")
-
     pipeline_layout = _cfg_get(tf_config, "pipeline_model_parallel_layout", None)
     if pipeline_layout is not None:
         stage_counts = _build_stage_layer_counts_from_layout(pipeline_layout, pp_size)
@@ -295,14 +273,12 @@ def _resolve_pp_stage_global_layer_ids(
         stage_counts = _build_stage_layer_counts_from_split_config(
             num_hidden_layers, rank_info, tf_config
         )
-
     vp_size = len(stage_counts[0]) if stage_counts else 1
     stage_vp = 0 if vp_stage is None else int(vp_stage)
     if stage_vp < 0 or stage_vp >= vp_size:
         raise ValueError(
             f"Invalid vp_stage={stage_vp} for vp_size={vp_size}, pp_rank={pp_rank}"
         )
-
     start_offset = 0
     stage_layer_count = stage_counts[pp_rank][stage_vp]
     for curr_vp in range(vp_size):
@@ -313,13 +289,10 @@ def _resolve_pp_stage_global_layer_ids(
         else:
             continue
         break
-
-    total_layers = sum(sum(row) for row in stage_counts)
+    total_layers = sum((sum(row) for row in stage_counts))
     if total_layers != num_hidden_layers:
         raise ValueError(
-            "Resolved PP stage layer counts do not match num_hidden_layers: "
-            f"resolved_total={total_layers}, num_hidden_layers={num_hidden_layers}, "
-            f"pp_size={pp_size}, stage_counts={stage_counts}"
+            f"Resolved PP stage layer counts do not match num_hidden_layers: resolved_total={total_layers}, num_hidden_layers={num_hidden_layers}, pp_size={pp_size}, stage_counts={stage_counts}"
         )
     return list(range(start_offset, start_offset + stage_layer_count))
 
@@ -336,7 +309,7 @@ def _process_mcore_pp_name(
     Process the name of a parameter to remove the pipeline parallel rank.
     """
     if "layers." in name:
-        left, remains = name.rsplit(".layers.", 1)
+        (left, remains) = name.rsplit(".layers.", 1)
         splits = remains.split(".")
         local_layer_id = int(splits[0])
         if not pp_stage_layer_id_map:
@@ -346,16 +319,12 @@ def _process_mcore_pp_name(
         layer_map = pp_stage_layer_id_map.get(stage_key)
         if layer_map is None:
             raise ValueError(
-                "Missing pp stage layer map for current rank/stage: "
-                f"pp_rank={rank_info.pp_rank}, vp_stage={stage_vp}, name={name}"
+                f"Missing pp stage layer map for current rank/stage: pp_rank={rank_info.pp_rank}, vp_stage={stage_vp}, name={name}"
             )
         if local_layer_id not in layer_map:
             stage_layer_ids = sorted(layer_map.keys())
             raise ValueError(
-                "Local layer id missing in pp stage layer map: "
-                f"local_layer_id={local_layer_id}, pp_rank={rank_info.pp_rank}, "
-                f"pp_size={rank_info.pp_size}, vp_stage={stage_vp}, "
-                f"known_local_ids={stage_layer_ids}, name={name}"
+                f"Local layer id missing in pp stage layer map: local_layer_id={local_layer_id}, pp_rank={rank_info.pp_rank}, pp_size={rank_info.pp_size}, vp_stage={stage_vp}, known_local_ids={stage_layer_ids}, name={name}"
             )
         global_layer_id = layer_map[local_layer_id]
         remaining_parts = ".".join(splits[1:])
@@ -372,10 +341,6 @@ class McoreToHFWeightConverter:
         infer_conf: Dict,
         tf_config: TransformerConfig,
     ):
-        from shardstream.integrations.sharding.mindspeed import ensure_mindspeed_patched
-
-        # MindSpeed patches should only be applied when Megatron conversion is used.
-        ensure_mindspeed_patched("mcore_converter")
         self.hf_config = hf_config
         self.tf_config = tf_config
         self.rank_info = rank_info
@@ -383,11 +348,6 @@ class McoreToHFWeightConverter:
         self._pp_stage_layer_id_map = _normalize_pp_stage_layer_id_map(
             infer_conf.get("train_pp_stage_layer_id_map")
         )
-        self._infer_device_backend = self._resolve_infer_device_backend(infer_conf)
-        # Keep training-side tensors in canonical HF/Megatron orientation.
-        # NPU/vLLM-ascend layout adaptation is handled on inference side.
-        self._transpose_moe_fc1_for_npu = False
-        self._transpose_log_once = set()
         self.router_dtype = infer_conf.get("router_dtype", "bf16")
         if self.router_dtype == "bf16":
             self.router_dtype = torch.bfloat16
@@ -401,80 +361,11 @@ class McoreToHFWeightConverter:
             raise ValueError("infer_atten_tp_size must be specified")
         self.infer_atten_tp_size = infer_conf["infer_atten_tp_size"]
 
-    @staticmethod
-    def _read_cfg_value(config, key: str, default=None):
-        if config is None:
-            return default
-        if isinstance(config, dict):
-            return config.get(key, default)
-        return getattr(config, key, default)
-
-    def _resolve_infer_device_backend(self, infer_conf: Dict) -> str:
-        conf_backend = infer_conf.get("device_backend")
-        if isinstance(conf_backend, str):
-            conf_backend = conf_backend.strip().lower()
-            if conf_backend in {"cuda", "npu", "cpu"}:
-                return conf_backend
-        env_backend = os.environ.get("SHARDSTREAM_DEVICE_TYPE", "").strip().lower()
-        if env_backend in {"cuda", "npu", "cpu"}:
-            return env_backend
-        infer_engine_config = infer_conf.get("infer_engine_config")
-        cfg_backend = self._read_cfg_value(
-            infer_engine_config, "device_backend", None
-        ) or self._read_cfg_value(infer_engine_config, "device_type", None)
-        if isinstance(cfg_backend, str):
-            cfg_backend = cfg_backend.strip().lower()
-            if cfg_backend in {"cuda", "npu", "cpu"}:
-                return cfg_backend
-        comm_backend = self._read_cfg_value(infer_engine_config, "comm_backend", None)
-        if isinstance(comm_backend, str) and comm_backend.strip().lower() == "hccl":
-            return "npu"
-        if os.environ.get("ASCEND_RT_VISIBLE_DEVICES"):
-            return "npu"
-        return "cuda"
-
-    def _maybe_align_linear_weight_for_infer_layout(
-        self, source_name: str, target_name: str, parameter: torch.Tensor
-    ) -> torch.Tensor:
-        if not self._transpose_moe_fc1_for_npu:
-            return parameter
-        if parameter.ndim != 2:
-            return parameter
-        is_fc1 = "linear_fc1.weight" in source_name
-        is_fc2 = "linear_fc2.weight" in source_name
-        if not (is_fc1 or is_fc2):
-            return parameter
-        # Only MoE expert MLP fc1 on vllm-ascend needs transposed sender layout.
-        if "experts" not in source_name and "shared_experts" not in source_name:
-            return parameter
-        if is_fc1:
-            if target_name not in {
-                "gate_up_proj.weight",
-                "gate_proj.weight",
-                "up_proj.weight",
-            }:
-                return parameter
-        elif is_fc2:
-            if target_name != "down_proj.weight":
-                return parameter
-        key = f"{source_name}->{target_name}"
-        if key not in self._transpose_log_once:
-            logger.info(
-                "Transpose MoE fc1 weight for infer layout: %s -> %s, shape %s -> %s",
-                source_name,
-                target_name,
-                tuple(parameter.shape),
-                (parameter.shape[1], parameter.shape[0]),
-            )
-            self._transpose_log_once.add(key)
-        return parameter.transpose(0, 1).contiguous()
-
     def _convert_attention_param(
         self, name: str, parameter: torch.Tensor, layer_number: str
     ) -> List[Tuple[str, torch.Tensor]]:
         if "self_attention.linear_qkv.weight" in name:
             if self._fuse_qkv(name):
-                # Keep fused format
                 parameter = convert_qkv_weight_along_tp_attention(
                     parameter,
                     self.infer_atten_tp_size,
@@ -484,7 +375,6 @@ class McoreToHFWeightConverter:
                 )
                 return [("self_attn.qkv_proj.weight", parameter)]
             else:
-                # Split into separate Q, K, V projections
                 shape0 = parameter.shape[0]
                 stride = shape0 // 3
                 return [
@@ -497,7 +387,6 @@ class McoreToHFWeightConverter:
                 ]
         elif "self_attention.linear_qkv.bias" in name:
             if self._fuse_qkv(name):
-                # Keep fused format
                 parameter = convert_qkv_bias_along_tp_attention(
                     parameter,
                     self.infer_atten_tp_size,
@@ -507,8 +396,9 @@ class McoreToHFWeightConverter:
                 )
                 return [("self_attn.qkv_proj.bias", parameter)]
             else:
-                # Split into separate Q, K, V projection biases
-                query, key, value = transform_mcore_qkv_bias(parameter, self.tf_config)
+                (query, key, value) = transform_mcore_qkv_bias(
+                    parameter, self.tf_config
+                )
                 return [
                     ("self_attn.q_proj.bias", query),
                     ("self_attn.k_proj.bias", key),
@@ -535,7 +425,6 @@ class McoreToHFWeightConverter:
             if self._fuse_gate_up_proj(name):
                 converted = [("gate_up_proj.weight", parameter)]
             else:
-                # split gate_proj and up_proj
                 converted = [
                     (
                         "gate_proj.weight",
@@ -552,12 +441,8 @@ class McoreToHFWeightConverter:
             if self._fuse_gate_up_proj(name):
                 converted = [("gate_up_proj.bias", parameter)]
             else:
-                # split gate_proj and up_proj biases
                 converted = [
-                    (
-                        "gate_proj.bias",
-                        parameter.narrow(0, 0, parameter.shape[0] // 2),
-                    ),
+                    ("gate_proj.bias", parameter.narrow(0, 0, parameter.shape[0] // 2)),
                     (
                         "up_proj.bias",
                         parameter.narrow(
@@ -571,15 +456,7 @@ class McoreToHFWeightConverter:
             converted = [("down_proj.bias", parameter)]
         else:
             raise NotImplementedError(f"Unsupported parameter name: {name}")
-        return [
-            (
-                target_name,
-                self._maybe_align_linear_weight_for_infer_layout(
-                    name, target_name, converted_param
-                ),
-            )
-            for target_name, converted_param in converted
-        ]
+        return converted
 
     def _convert_gate(
         self, name: str, parameter: torch.Tensor
@@ -607,7 +484,7 @@ class McoreToHFWeightConverter:
         ):
             return [
                 (f"mlp.shared_experts.{name}", param)
-                for name, param in self._convert_linear(name, parameter)
+                for (name, param) in self._convert_linear(name, parameter)
             ]
         elif (
             "shared_experts.linear_fc2.weight" in name
@@ -615,14 +492,12 @@ class McoreToHFWeightConverter:
         ):
             return [
                 (f"mlp.shared_experts.{name}", param)
-                for name, param in self._convert_linear(name, parameter)
+                for (name, param) in self._convert_linear(name, parameter)
             ]
         elif "mlp.experts." in name:
             if "local_experts" in name:
-                # mlp.experts.local_experts.0.linear_fc1.weight
                 local_expert_id = int(name.rsplit(".", 3)[-3])
             else:
-                # mlp.experts.linear_fc1.weight0
                 local_expert_id = int(name.rsplit("weight", 1)[-1])
             num_experts = self.hf_config.num_experts
             num_experts_per_partition = num_experts // self.rank_info.ep_size
@@ -631,17 +506,17 @@ class McoreToHFWeightConverter:
             )
             return [
                 (f"mlp.experts.{expert_id}.{name}", param)
-                for name, param in self._convert_linear(name, parameter)
+                for (name, param) in self._convert_linear(name, parameter)
             ]
         elif (
             "linear_fc1.weight" in name
             or "linear_fc2.weight" in name
             or "linear_fc1.bias" in name
-            or "linear_fc2.bias" in name
+            or ("linear_fc2.bias" in name)
         ):
             return [
                 (f"mlp.{name}", param)
-                for name, param in self._convert_linear(name, parameter)
+                for (name, param) in self._convert_linear(name, parameter)
             ]
         else:
             raise NotImplementedError(f"Unsupported parameter name: {name}")
@@ -651,9 +526,6 @@ class McoreToHFWeightConverter:
     ) -> Tuple[str, torch.Tensor]:
         """Convert bias parameters"""
         if "expert_bias" in name:
-            # SGLang keeps the auxiliary router expert bias in fp32 even when
-            # router matmul runs in bf16.  Downcasting here makes AWEX-loaded
-            # SGLang diverge from the native HF load at step 0.
             return ("mlp.gate.expert_bias", parameter.to(torch.float32))
         else:
             raise NotImplementedError(f"Unsupported bias parameter name: {name}")
@@ -671,12 +543,11 @@ class McoreToHFWeightConverter:
         if getattr(self.hf_config, "norm_head", False):
             import torch.nn.functional as F
 
-            parameter = F.normalize(parameter, dim=0, p=2, eps=1e-7)
+            parameter = F.normalize(parameter, dim=0, p=2, eps=1e-07)
         return [("lm_head.weight", parameter)]
 
     @staticmethod
     def _normalize_attn_name(name: str) -> str:
-        # Align Megatron names with vLLM/sglang-style attention naming.
         replacements = [
             ("self_attn.qkv_proj", "attention.query_key_value_proj"),
             ("self_attn.o_proj", "attention.dense"),
@@ -714,7 +585,7 @@ class McoreToHFWeightConverter:
         if "output_layer.weight" in name:
             return self._convert_lm_head_param(name, parameter)
         name = name.replace("decoder.layers.", "")
-        layer_number, remaining_name = name.split(".", 1)
+        (layer_number, remaining_name) = name.split(".", 1)
         if "self_attention" in remaining_name:
             converted = []
             for attn_name, param in self._convert_attention_param(
@@ -725,16 +596,16 @@ class McoreToHFWeightConverter:
             return converted
         elif "mlp" in remaining_name:
             if "mlp.gate.weight" in name or "mlp.router.weight" in name:
-                name, param = self._convert_gate(name, parameter)
+                (name, param) = self._convert_gate(name, parameter)
                 return [(f"model.layers.{layer_number}.{name}", param)]
             elif "expert_bias" in name:
-                name, param = self._convert_expert_bias_param(
+                (name, param) = self._convert_expert_bias_param(
                     name, parameter, layer_number
                 )
                 return [(f"model.layers.{layer_number}.{name}", param)]
             return [
                 (f"model.layers.{layer_number}.{name}", param)
-                for name, param in self._convert_mlp_param(
+                for (name, param) in self._convert_mlp_param(
                     remaining_name, parameter, layer_number
                 )
             ]
@@ -742,314 +613,13 @@ class McoreToHFWeightConverter:
             raise NotImplementedError(f"Unsupported parameter name: {name}")
 
 
-class LinearMLAMcoreConverterMixin:
-    def __init__(
-        self,
-        hf_config: PretrainedConfig,
-        rank_info: RankInfo,
-        infer_conf: Dict,
-        tf_config: TransformerConfig,
-    ):
-        super().__init__(hf_config, rank_info, infer_conf, tf_config=tf_config)
-        # `layer_group_size` / `linear_attn_norm_group_size` are BailingMoeV2.5
-        # hybrid-attention params. AReaL's MegatronEngine does not inject them into
-        # the Megatron TransformerConfig, so fall back to the HF config (matching
-        # AReaL's own bailing_moe.py mapping: linear_attn_norm_group_size defaults
-        # to HF `group_norm_size`). Without this, layer_group_size stays 1 and every
-        # Lightning-attention layer is misrouted to the MLA path -> `linear_gate`
-        # raises "Unsupported parameter name".
-        self.layer_group_size = int(
-            _cfg_get(tf_config, "layer_group_size", None)
-            or getattr(hf_config, "layer_group_size", None)
-            or 1
-        )
-        self.linear_attn_norm_group_size = (
-            _cfg_get(tf_config, "linear_attn_norm_group_size", None)
-            or getattr(hf_config, "linear_attn_norm_group_size", None)
-            or getattr(hf_config, "group_norm_size", None)
-        )
-        self.fuse_qkv_a_proj = getattr(hf_config, "q_lora_rank", None) is not None
-        self.qkv_a_proj_cache: Dict[str, Dict[str, torch.Tensor]] = {}
-
-    def _post_process_linear_mla_params(
-        self, converted_params: List[Tuple[str, torch.Tensor]]
-    ) -> List[Tuple[str, torch.Tensor]]:
-        return converted_params
-
-    def _is_linear_layer(self, layer_number: int) -> bool:
-        if self.layer_group_size <= 1:
-            return False
-        return (layer_number + 1) % self.layer_group_size != 0
-
-    def _convert_g_norm_weight(self, parameter: torch.Tensor) -> torch.Tensor:
-        # SGLang's BailingGroupRMSNormGate stores g_norm.weight as a flat 1D
-        # tensor [hidden_inner_size // tp_size] and applies grouping at runtime.
-        # The Megatron weight is also 1D; reshaping it to 2D here only added a
-        # leading dim (data order unchanged) and made the train-side metadata
-        # ndim (2) differ from the infer-side ndim (1), which crashed the AWEX
-        # transfer plan with `IndexError: tuple index out of range` in
-        # _build_region_communication_plan (Problem 38). Keep it 1D to match the
-        # SGLang canonical layout.
-        return parameter.clone().detach().reshape(-1)
-
-    def _convert_lightning_attention_param(
-        self, name: str, parameter: torch.Tensor, layer_number: str
-    ) -> List[Tuple[str, torch.Tensor]]:
-        if "self_attention.pre_gate_norm.te_norm.weight" in name:
-            return []
-        if "self_attention.pre_gate_norm.weight" in name:
-            return [("attention.g_norm.weight", self._convert_g_norm_weight(parameter))]
-        # BailingMoeV2.5 uses "gate_norm" instead of "pre_gate_norm" for
-        # the Lightning Attention gating normalization layer.
-        if "self_attention.gate_norm.weight" in name:
-            return [("attention.g_norm.weight", self._convert_g_norm_weight(parameter))]
-
-        name_mapping = {
-            "self_attention.input_layernorm.weight": "input_layernorm.weight",
-            "self_attention.linear_gate.weight": "attention.g_proj.weight",
-            "self_attention.linear_proj.weight": "attention.dense.weight",
-            "self_attention.q_layernorm.weight": "attention.query_layernorm.weight",
-            "self_attention.k_layernorm.weight": "attention.key_layernorm.weight",
-        }
-        for src_name, target_name in name_mapping.items():
-            if src_name in name:
-                return [(target_name, parameter)]
-
-        if "self_attention.linear_qkv.weight" in name:
-            parameter = convert_qkv_weight_along_tp_attention(
-                parameter,
-                self.infer_atten_tp_size,
-                self.tf_config,
-                train_tp_rank=self.rank_info.attn_tp_rank,
-                train_tp_size=self.rank_info.attn_tp_size,
-            )
-            return [("attention.query_key_value.weight", parameter)]
-
-        return super()._convert_attention_param(name, parameter, layer_number)
-
-    def _try_fuse_qkv_a_proj(
-        self, target_name: str, parameter: torch.Tensor, layer_number: str
-    ) -> List[Tuple[str, torch.Tensor]]:
-        layer_cache = self.qkv_a_proj_cache.setdefault(layer_number, {})
-        if target_name.endswith("kv_a_proj_with_mqa.weight"):
-            cache_key = "kv_a_proj"
-            other_key = "q_a_proj"
-        elif target_name.endswith("q_a_proj.weight"):
-            cache_key = "q_a_proj"
-            other_key = "kv_a_proj"
-        else:
-            return [(target_name, parameter)]
-
-        layer_cache[cache_key] = parameter
-        if other_key not in layer_cache:
-            return []
-
-        # SGLang consumes this parameter per TP rank as [q_i ; kv_i]. With
-        # train attention TP the writer emits a tensor that AWEX chunks on
-        # dim 0, so it has to be laid out [q_0;kv_0;q_1;kv_1;...] or each rank
-        # receives a slice straddling q and kv. Without train attention TP the
-        # tensor reaches every rank uncut and must match SGLang's own
-        # load_weights layout, the plain concatenation. Both layouts have the
-        # same shape, so choosing wrong corrupts attention silently instead of
-        # raising.
-        if self.rank_info.attn_tp_size == 1:
-            fused_tensor = torch.cat(
-                [layer_cache["q_a_proj"], layer_cache["kv_a_proj"]], dim=0
-            )
-        else:
-            fused_tensor = pack_fused_qkv_a_proj_for_tp(
-                layer_cache["q_a_proj"],
-                layer_cache["kv_a_proj"],
-                self.infer_atten_tp_size,
-            )
-        del self.qkv_a_proj_cache[layer_number]
-        return [("attention.fused_qkv_a_proj_with_mqa.weight", fused_tensor)]
-
-    def _convert_mla_attention_param(
-        self, name: str, parameter: torch.Tensor, layer_number: str
-    ) -> List[Tuple[str, torch.Tensor]]:
-        name_mapping = {
-            "input_layernorm.weight": "input_layernorm.weight",
-            "self_attention.linear_proj.weight": "attention.dense.weight",
-            "self_attention.linear_q_proj.weight": "attention.q_proj.weight",
-            "self_attention.linear_kv_down_proj.weight": "attention.kv_a_proj_with_mqa.weight",
-            "self_attention.linear_q_down_proj.weight": "attention.q_a_proj.weight",
-            "self_attention.linear_kv_up_proj.weight": "attention.kv_b_proj.weight",
-            "self_attention.linear_kv_up_proj.layer_norm_weight": "attention.kv_a_layernorm.weight",
-            "self_attention.linear_q_up_proj.weight": "attention.q_b_proj.weight",
-            "self_attention.linear_q_up_proj.layer_norm_weight": "attention.q_a_layernorm.weight",
-        }
-        for src_name, target_name in name_mapping.items():
-            if src_name not in name:
-                continue
-            if target_name in {
-                "attention.kv_a_proj_with_mqa.weight",
-                "attention.q_a_proj.weight",
-            }:
-                parameter = get_full_tensor(parameter, dim=0)
-                if self.rank_info.tp_rank != 0:
-                    return []
-                if self.fuse_qkv_a_proj:
-                    return self._try_fuse_qkv_a_proj(
-                        target_name, parameter, layer_number
-                    )
-            return [(target_name, parameter)]
-
-        return super()._convert_attention_param(name, parameter, layer_number)
-
-    # MLA-specific parameter name fragments that uniquely identify MLA layers,
-    # even when the global layer ID is unavailable (PP meta-resolution phase).
-    _MLA_PARAM_MARKERS = (
-        "linear_q_down_proj",
-        "linear_q_up_proj",
-        "linear_kv_down_proj",
-        "linear_kv_up_proj",
-        "linear_q_proj",
-    )
-
-    def _is_mla_param(self, name: str) -> bool:
-        return any(marker in name for marker in self._MLA_PARAM_MARKERS)
-
-    def _convert_attention_param(
-        self, name: str, parameter: torch.Tensor, layer_number: str
-    ) -> List[Tuple[str, torch.Tensor]]:
-        # When PP stage layer ID map is unavailable (during meta resolution),
-        # local layer IDs may not reflect the true global position. Fall back
-        # to detecting layer type from the parameter name itself.
-        if self._is_mla_param(name):
-            return self._convert_mla_attention_param(name, parameter, layer_number)
-        if self._is_linear_layer(int(layer_number)):
-            return self._convert_lightning_attention_param(
-                name, parameter, layer_number
-            )
-        return self._convert_mla_attention_param(name, parameter, layer_number)
-
-    @torch.no_grad()
-    def convert_param(
-        self, name: str, parameter: torch.Tensor, vp_stage: int = None
-    ) -> List[Tuple[str, torch.Tensor]]:
-        name = name.replace("module.", "")
-        name = _process_mcore_pp_name(
-            name,
-            self.rank_info,
-            self.hf_config,
-            self.tf_config,
-            vp_stage=vp_stage,
-            pp_stage_layer_id_map=self._pp_stage_layer_id_map,
-        )
-        direct_name_mapping = {
-            "embedding.word_embeddings.weight": "model.embed_tokens.weight",
-            "decoder.final_layernorm.weight": "model.norm.weight",
-        }
-        if name in direct_name_mapping:
-            return [(direct_name_mapping[name], parameter)]
-        if "output_layer.weight" in name:
-            return self._post_process_linear_mla_params(
-                self._convert_lm_head_param(name, parameter)
-            )
-
-        if not name.startswith("decoder.layers."):
-            raise NotImplementedError(f"Unsupported parameter name: {name}")
-
-        layer_number, remaining_name = name.replace("decoder.layers.", "", 1).split(
-            ".",
-            1,
-        )
-
-        if "self_attention" in remaining_name:
-            converted = []
-            for attn_name, param in self._convert_attention_param(
-                remaining_name, parameter, layer_number
-            ):
-                attn_name = self._normalize_attn_name(attn_name)
-                converted.append((f"model.layers.{layer_number}.{attn_name}", param))
-            return self._post_process_linear_mla_params(converted)
-
-        if (
-            "input_layernorm.weight" in remaining_name
-            or "g_norm.weight" in remaining_name
-        ):
-            return self._post_process_linear_mla_params(
-                [(f"model.layers.{layer_number}.{remaining_name}", parameter)]
-            )
-
-        if "mlp" in remaining_name:
-            if "mlp.gate.weight" in name or "mlp.router.weight" in name:
-                name, param = self._convert_gate(name, parameter)
-                converted = [(f"model.layers.{layer_number}.{name}", param)]
-            elif "expert_bias" in name:
-                name, param = self._convert_expert_bias_param(
-                    name, parameter, layer_number
-                )
-                converted = [(f"model.layers.{layer_number}.{name}", param)]
-            else:
-                converted = [
-                    (f"model.layers.{layer_number}.{name}", param)
-                    for name, param in self._convert_mlp_param(
-                        remaining_name, parameter, layer_number
-                    )
-                ]
-            return self._post_process_linear_mla_params(converted)
-
-        raise NotImplementedError(f"Unsupported parameter name: {name}")
-
-
-def pack_fused_qkv_a_proj_for_tp(
-    q_proj: torch.Tensor,
-    kv_proj: torch.Tensor,
-    infer_tp_size: int,
-) -> torch.Tensor:
-    """Pack MLA q_a/kv_a full tensors in infer-TP local shard order.
-
-    SGLang's fused MLA parameter is consumed per TP rank as:
-    [q_local_rank_i ; kv_local_rank_i]
-
-    AWEX later applies generic TP chunking on dim 0, so the full writer-side
-    tensor must be laid out as:
-    [q_0 ; kv_0 ; q_1 ; kv_1 ; ...]
-    rather than [q_all ; kv_all].
-    """
-    if infer_tp_size <= 0:
-        raise ValueError(f"infer_tp_size must be positive, got {infer_tp_size}")
-    if q_proj.dim() != 2 or kv_proj.dim() != 2:
-        raise ValueError(
-            "Expected 2D MLA projection weights, got "
-            f"q_proj.dim={q_proj.dim()}, kv_proj.dim={kv_proj.dim()}"
-        )
-    if q_proj.shape[1] != kv_proj.shape[1]:
-        raise ValueError(
-            "MLA q/kv projection input dims must match, got "
-            f"q_proj.shape={tuple(q_proj.shape)}, kv_proj.shape={tuple(kv_proj.shape)}"
-        )
-    if q_proj.shape[0] % infer_tp_size != 0:
-        raise ValueError(
-            "MLA q projection rows must be divisible by infer_tp_size, got "
-            f"rows={q_proj.shape[0]}, infer_tp_size={infer_tp_size}"
-        )
-    if kv_proj.shape[0] % infer_tp_size != 0:
-        raise ValueError(
-            "MLA kv projection rows must be divisible by infer_tp_size, got "
-            f"rows={kv_proj.shape[0]}, infer_tp_size={infer_tp_size}"
-        )
-
-    q_shards = q_proj.chunk(infer_tp_size, dim=0)
-    kv_shards = kv_proj.chunk(infer_tp_size, dim=0)
-    return torch.cat(
-        [torch.cat([q_shards[i], kv_shards[i]], dim=0) for i in range(infer_tp_size)],
-        dim=0,
-    )
-
-
 def get_full_tensor(weight: torch.Tensor, dim: int = 0):
     from megatron.core import parallel_state as mpu
 
-    # TODO: support ep_tp
     train_tp_size = mpu.get_tensor_model_parallel_world_size()
     if train_tp_size != 1:
-        # this is rare: bailing moe don't use tensor model parallel
         tp_group = mpu.get_tensor_model_parallel_group()
         new_v = [torch.zeros_like(weight) for i in range(train_tp_size)]
-        # async_op must be False ?
         dist.all_gather(new_v, weight, group=tp_group, async_op=False)
         weight = torch.cat(new_v, dim=dim)
     return weight
@@ -1086,37 +656,23 @@ def transform_mcore_qkv_weight(weight: torch.Tensor, tf_config: TransformerConfi
                │               │       │       │
                └───────────────┴───────┴───────┘
     """
-    # from megatron.training import get_args
-
-    # args = get_args()
     weight = get_full_tensor(weight, dim=0)
     hidden_size = tf_config.hidden_size
     total_num_heads = tf_config.num_attention_heads
     total_num_kv_heads = tf_config.num_query_groups
     head_size = _get_head_size(tf_config)
-
     each_kv_size = head_size
     each_query_size = head_size * divide(total_num_heads, total_num_kv_heads)
-
-    # Check if weights are in replicated format or compact GQA format
     actual_size = weight.shape[0]
     expected_compact_size = (each_query_size + 2 * each_kv_size) * total_num_kv_heads
-    expected_replicated_size = 3 * hidden_size  # Q, K, V all have full hidden_size
-    # Qwen3 GQA format
-    expected_qwen3_gqa_size = (
-        hidden_size * 2 + 2 * hidden_size
-    )  # Q extends to 2, k v use hidden size
-
+    expected_replicated_size = 3 * hidden_size
+    expected_qwen3_gqa_size = hidden_size * 2 + 2 * hidden_size
     if actual_size == expected_compact_size:
-        # Compact GQA/MHA interleaved format (Megatron default):
-        # [Q0,K0,V0, Q1,K1,V1, ...] chunked by num_kv_heads.
-        # Must check BEFORE replicated because MHA (num_heads == num_kv_heads)
-        # makes compact_size == replicated_size.
         query_list = []
         key_list = []
         value_list = []
         for qkv in torch.chunk(weight, total_num_kv_heads, dim=0):
-            q, k, v = qkv.split([each_query_size, each_kv_size, each_kv_size], dim=0)
+            (q, k, v) = qkv.split([each_query_size, each_kv_size, each_kv_size], dim=0)
             query_list.append(q)
             key_list.append(k)
             value_list.append(v)
@@ -1124,24 +680,15 @@ def transform_mcore_qkv_weight(weight: torch.Tensor, tf_config: TransformerConfi
         all_key = torch.cat(key_list, dim=0)
         all_value = torch.cat(value_list, dim=0)
     elif actual_size == expected_replicated_size:
-        # Replicated format: K and V are replicated to match query heads
-        # Split into Q, K, V where each has size hidden_size
-        q, k, v = weight.split([hidden_size, hidden_size, hidden_size], dim=0)
-
-        # De-duplicate K and V by selecting only the unique KV groups
-        # K and V are replicated such that each KV group appears (total_num_heads / total_num_kv_heads) times
+        (q, k, v) = weight.split([hidden_size, hidden_size, hidden_size], dim=0)
         heads_per_kv_group = divide(total_num_heads, total_num_kv_heads)
         k_heads = k.reshape(total_num_heads, head_size, -1)
         v_heads = v.reshape(total_num_heads, head_size, -1)
-
-        # Select one representative head from each KV group
         k_unique = []
         v_unique = []
         for i in range(total_num_kv_heads):
-            # Each KV group starts at index i * heads_per_kv_group
             k_unique.append(k_heads[i * heads_per_kv_group])
             v_unique.append(v_heads[i * heads_per_kv_group])
-
         all_key = torch.cat(k_unique, dim=0).reshape(-1, k.shape[-1])
         all_value = torch.cat(v_unique, dim=0).reshape(-1, v.shape[-1])
         all_query = q
@@ -1153,26 +700,18 @@ def transform_mcore_qkv_weight(weight: torch.Tensor, tf_config: TransformerConfi
         each_kv_size = head_size
         each_query_size = head_size * divide(total_num_heads, total_num_kv_heads)
         for qkv in torch.chunk(weight, total_num_kv_heads, dim=0):
-            q, k, v = qkv.split([each_query_size, each_kv_size, each_kv_size], dim=0)
+            (q, k, v) = qkv.split([each_query_size, each_kv_size, each_kv_size], dim=0)
             query_list.append(q)
             key_list.append(k)
             value_list.append(v)
-        # concat the query, key, value
         all_query = torch.cat(query_list, dim=0)
         all_key = torch.cat(key_list, dim=0)
         all_value = torch.cat(value_list, dim=0)
     else:
         raise ValueError(
-            f"QKV weight size mismatch - unsupported format:\n"
-            f"  Actual weight shape[0]: {actual_size}\n"
-            f"  Expected compact GQA size: {expected_compact_size}\n"
-            f"  Expected replicated size: {expected_replicated_size}\n"
-            f"  Config: hidden_size={hidden_size}, num_heads={total_num_heads}, "
-            f"num_kv_heads={total_num_kv_heads}, head_size={head_size}\n"
-            f"  Per-group sizes: query={each_query_size}, kv={each_kv_size}"
+            f"QKV weight size mismatch - unsupported format:\n  Actual weight shape[0]: {actual_size}\n  Expected compact GQA size: {expected_compact_size}\n  Expected replicated size: {expected_replicated_size}\n  Config: hidden_size={hidden_size}, num_heads={total_num_heads}, num_kv_heads={total_num_kv_heads}, head_size={head_size}\n  Per-group sizes: query={each_query_size}, kv={each_kv_size}"
         )
-
-    return all_query, all_key, all_value
+    return (all_query, all_key, all_value)
 
 
 def convert_qkv_weight_along_tp_attention(
@@ -1189,16 +728,12 @@ def convert_qkv_weight_along_tp_attention(
     heads (e.g., multi-query/grouped-query attention), the key/value head may
     be replicated while the query heads are partitioned.
     """
-    # from megatron.training import get_args
-
-    # args = get_args()
     total_num_kv_heads = tf_config.num_query_groups
-    # Divide the weight matrix along the last dimension.
     if infer_atten_tp_size >= total_num_kv_heads:
         num_kv_head_replicas = divide(infer_atten_tp_size, total_num_kv_heads)
     else:
         num_kv_head_replicas = 1
-    query, key, value = transform_mcore_qkv_weight(weight, tf_config)
+    (query, key, value) = transform_mcore_qkv_weight(weight, tf_config)
     query_shards = query.chunk(infer_atten_tp_size, dim=0)
     if infer_atten_tp_size >= total_num_kv_heads:
         key_chunks = key.chunk(total_num_kv_heads, dim=0)
@@ -1233,76 +768,46 @@ def transform_mcore_qkv_bias(bias: torch.Tensor, tf_config: TransformerConfig):
     Transform Megatron QKV bias for grouped-query attention.
     Similar to transform_mcore_qkv_weight but for bias parameters.
     """
-    # from megatron.training import get_args
-
-    # args = get_args()
     bias = get_full_tensor(bias, dim=0)
     hidden_size = tf_config.hidden_size
     total_num_heads = tf_config.num_attention_heads
     total_num_kv_heads = tf_config.num_query_groups
     head_size = _get_head_size(tf_config)
-
     each_kv_size = head_size
     each_query_size = head_size * divide(total_num_heads, total_num_kv_heads)
-
-    # Check if biases are in replicated format or compact GQA format
     actual_size = bias.shape[0]
     expected_compact_size = (each_query_size + 2 * each_kv_size) * total_num_kv_heads
-    expected_replicated_size = 3 * hidden_size  # Q, K, V all have full hidden_size
-
+    expected_replicated_size = 3 * hidden_size
     if actual_size == expected_compact_size:
-        # Compact GQA/MHA interleaved format (Megatron default):
-        # [Q0,K0,V0, Q1,K1,V1, ...] chunked by num_kv_heads.
-        # Must check BEFORE replicated because MHA (num_heads == num_kv_heads)
-        # makes compact_size == replicated_size, and a fused QKV linear uses
-        # the same output-row ordering for weight and bias — this branch order
-        # mirrors transform_mcore_qkv_weight so both stay consistent.
         query_list = []
         key_list = []
         value_list = []
         for qkv in torch.chunk(bias, total_num_kv_heads, dim=0):
-            q, k, v = qkv.split([each_query_size, each_kv_size, each_kv_size], dim=0)
+            (q, k, v) = qkv.split([each_query_size, each_kv_size, each_kv_size], dim=0)
             query_list.append(q)
             key_list.append(k)
             value_list.append(v)
-        # concat the query, key, value
         all_query = torch.cat(query_list, dim=0)
         all_key = torch.cat(key_list, dim=0)
         all_value = torch.cat(value_list, dim=0)
     elif actual_size == expected_replicated_size:
-        # Replicated format: K and V are replicated to match query heads
-        # Split into Q, K, V where each has size hidden_size
-        q, k, v = bias.split([hidden_size, hidden_size, hidden_size], dim=0)
-
-        # De-duplicate K and V by selecting only the unique KV groups
-        # K and V are replicated such that each KV group appears (total_num_heads / total_num_kv_heads) times
+        (q, k, v) = bias.split([hidden_size, hidden_size, hidden_size], dim=0)
         heads_per_kv_group = divide(total_num_heads, total_num_kv_heads)
         k_heads = k.reshape(total_num_heads, head_size)
         v_heads = v.reshape(total_num_heads, head_size)
-
-        # Select one representative head from each KV group
         k_unique = []
         v_unique = []
         for i in range(total_num_kv_heads):
-            # Each KV group starts at index i * heads_per_kv_group
             k_unique.append(k_heads[i * heads_per_kv_group])
             v_unique.append(v_heads[i * heads_per_kv_group])
-
         all_key = torch.cat(k_unique, dim=0).reshape(-1)
         all_value = torch.cat(v_unique, dim=0).reshape(-1)
         all_query = q
     else:
         raise ValueError(
-            f"QKV bias size mismatch - unsupported format:\n"
-            f"  Actual bias shape[0]: {actual_size}\n"
-            f"  Expected compact GQA size: {expected_compact_size}\n"
-            f"  Expected replicated size: {expected_replicated_size}\n"
-            f"  Config: hidden_size={hidden_size}, num_heads={total_num_heads}, "
-            f"num_kv_heads={total_num_kv_heads}, head_size={head_size}\n"
-            f"  Per-group sizes: query={each_query_size}, kv={each_kv_size}"
+            f"QKV bias size mismatch - unsupported format:\n  Actual bias shape[0]: {actual_size}\n  Expected compact GQA size: {expected_compact_size}\n  Expected replicated size: {expected_replicated_size}\n  Config: hidden_size={hidden_size}, num_heads={total_num_heads}, num_kv_heads={total_num_kv_heads}, head_size={head_size}\n  Per-group sizes: query={each_query_size}, kv={each_kv_size}"
         )
-
-    return all_query, all_key, all_value
+    return (all_query, all_key, all_value)
 
 
 def convert_qkv_bias_along_tp_attention(
@@ -1316,16 +821,12 @@ def convert_qkv_bias_along_tp_attention(
     Convert QKV bias for SGlang format with TP attention.
     Similar to convert_qkv_weight_along_tp_attention but for bias parameters.
     """
-    # from megatron.training import get_args
-
-    # args = get_args()
     total_num_kv_heads = tf_config.num_query_groups
-    # Divide the bias along the dimension.
     if infer_atten_tp_size >= total_num_kv_heads:
         num_kv_head_replicas = divide(infer_atten_tp_size, total_num_kv_heads)
     else:
         num_kv_head_replicas = 1
-    query, key, value = transform_mcore_qkv_bias(bias, tf_config)
+    (query, key, value) = transform_mcore_qkv_bias(bias, tf_config)
     query_shards = query.chunk(infer_atten_tp_size, dim=0)
     if infer_atten_tp_size >= total_num_kv_heads:
         key_chunks = key.chunk(total_num_kv_heads, dim=0)
@@ -1364,7 +865,6 @@ def _to_local_mcore_tensor(parameter: torch.Tensor) -> torch.Tensor:
     while ``to_local()`` is only an uneven flat DP shard. Plain TP DTensors do
     not have ``orig_param`` and can be localized directly.
     """
-
     original = getattr(parameter, "orig_param", None)
     if isinstance(original, torch.Tensor):
         parameter = original
@@ -1379,12 +879,11 @@ def _to_local_mcore_tensor(parameter: torch.Tensor) -> torch.Tensor:
 
 def get_mcore_model_parameters(model) -> Dict[str, torch.Tensor]:
     params_dict = {
-        name: _to_local_mcore_tensor(param) for name, param in model.named_parameters()
+        name: _to_local_mcore_tensor(param)
+        for (name, param) in model.named_parameters()
     }
     state_dict = model.state_dict()
     for name, param in state_dict.items():
-        # there is a bug in megatron GPTModel: decoder.layers[n].mlp.router.expert_bias" in GPTModel
-        # is not registered in named_parameter, but in state_dict().
         if "expert_bias" in name:
             params_dict[name] = _to_local_mcore_tensor(param)
     return params_dict
