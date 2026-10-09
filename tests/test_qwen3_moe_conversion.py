@@ -1,0 +1,363 @@
+# Licensed to the Awex developers under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+"""Name-contract tests for the Qwen3-MoE vLLM->HF weight converter.
+
+The transfer plan matches inference-side and train-side parameters
+by name. The train side (Megatron converter) emits canonical per-parameter
+HF names, so the inference side must expand vLLM fused parameters —
+including MoE experts — to the exact same name set. These tests pin that
+contract on CPU without requiring vLLM or Megatron.
+"""
+
+from types import SimpleNamespace
+
+import pytest
+import torch
+from shardstream.integrations.models.qwen3_moe import (
+    CONFIG,
+    Qwen3FusedWeightConverter,
+    Qwen3ShardingStrategy,
+)
+from shardstream.integrations.models.registry import get_infer_weights_converter
+from shardstream.layout import StaticTensorLayout
+from shardstream.metadata.rank import RankInfo
+from shardstream.metadata.sharding import ShardingType
+
+# Tiny Qwen3-MoE-like geometry: GQA with 8 query heads and 2 KV heads.
+NUM_HEADS = 8
+NUM_KV_HEADS = 2
+HEAD_DIM = 4
+HIDDEN = 16
+MOE_INTERMEDIATE = 8
+NUM_EXPERTS = 4
+
+
+def _model_config():
+    return SimpleNamespace(
+        num_attention_heads=NUM_HEADS,
+        num_key_value_heads=NUM_KV_HEADS,
+        head_dim=HEAD_DIM,
+        hidden_size=HIDDEN,
+        num_experts=NUM_EXPERTS,
+        architectures=["Qwen3MoeForCausalLM"],
+    )
+
+
+def _rank_info(tp_rank=0, ep_rank=0):
+    return SimpleNamespace(tp_rank=tp_rank, ep_rank=ep_rank)
+
+
+def _infer_engine_config(tp_size=1, ep_size=1):
+    return SimpleNamespace(tp_size=tp_size, ep_size=ep_size, device_backend="cuda")
+
+
+def _make_converter(tp_size=1, ep_size=1, tp_rank=0, ep_rank=0):
+    return Qwen3FusedWeightConverter(
+        _model_config(),
+        _infer_engine_config(tp_size=tp_size, ep_size=ep_size),
+        _rank_info(tp_rank=tp_rank, ep_rank=ep_rank),
+    )
+
+
+def _fused_named_params(num_local_experts=NUM_EXPERTS):
+    """Parameter names/shapes as exposed by vLLM for one decoder layer."""
+    qkv_rows = (NUM_HEADS + 2 * NUM_KV_HEADS) * HEAD_DIM
+    return {
+        "model.embed_tokens.weight": torch.randn(32, HIDDEN),
+        "model.layers.0.self_attn.qkv_proj.weight": torch.randn(qkv_rows, HIDDEN),
+        "model.layers.0.self_attn.o_proj.weight": torch.randn(
+            HIDDEN, NUM_HEADS * HEAD_DIM
+        ),
+        "model.layers.0.self_attn.q_norm.weight": torch.randn(HEAD_DIM),
+        "model.layers.0.self_attn.k_norm.weight": torch.randn(HEAD_DIM),
+        "model.layers.0.input_layernorm.weight": torch.randn(HIDDEN),
+        "model.layers.0.post_attention_layernorm.weight": torch.randn(HIDDEN),
+        "model.layers.0.mlp.gate.weight": torch.randn(NUM_EXPERTS, HIDDEN),
+        "model.layers.0.mlp.experts.w13_weight": torch.randn(
+            num_local_experts, 2 * MOE_INTERMEDIATE, HIDDEN
+        ),
+        "model.layers.0.mlp.experts.w2_weight": torch.randn(
+            num_local_experts, HIDDEN, MOE_INTERMEDIATE
+        ),
+        "model.norm.weight": torch.randn(HIDDEN),
+        "lm_head.weight": torch.randn(32, HIDDEN),
+    }
+
+
+def _expected_hf_names(expert_ids):
+    """Canonical HF names the Megatron train-side converter reports."""
+    names = {
+        "model.embed_tokens.weight",
+        "model.layers.0.self_attn.q_proj.weight",
+        "model.layers.0.self_attn.k_proj.weight",
+        "model.layers.0.self_attn.v_proj.weight",
+        "model.layers.0.self_attn.o_proj.weight",
+        "model.layers.0.self_attn.q_norm.weight",
+        "model.layers.0.self_attn.k_norm.weight",
+        "model.layers.0.input_layernorm.weight",
+        "model.layers.0.post_attention_layernorm.weight",
+        "model.layers.0.mlp.gate.weight",
+        "model.norm.weight",
+        "lm_head.weight",
+    }
+    for expert_id in expert_ids:
+        names.add(f"model.layers.0.mlp.experts.{expert_id}.gate_proj.weight")
+        names.add(f"model.layers.0.mlp.experts.{expert_id}.up_proj.weight")
+        names.add(f"model.layers.0.mlp.experts.{expert_id}.down_proj.weight")
+    return names
+
+
+def test_fp8_block_scales_keep_canonical_names_and_storage_views():
+    converter = _make_converter(tp_size=2)
+    # Eight local Q block rows and two K/V block rows each.
+    attention = torch.arange(24, dtype=torch.float32).reshape(12, 2)
+    converted = dict(
+        converter.convert_param(
+            "model.layers.0.self_attn.qkv_proj.weight_scale_inv", attention
+        )
+    )
+    assert converted["model.layers.0.self_attn.q_proj.weight_scale_inv"].shape == (8, 2)
+    assert (
+        converted["model.layers.0.self_attn.k_proj.weight_scale_inv"].data_ptr()
+        == attention[8:].data_ptr()
+    )
+    assert (
+        converted["model.layers.0.self_attn.v_proj.weight_scale_inv"].data_ptr()
+        == attention[10:].data_ptr()
+    )
+    experts = torch.arange(4 * 6 * 16, dtype=torch.float32).reshape(4, 6, 16)
+    converted = dict(
+        converter.convert_param(
+            "model.layers.0.mlp.experts.routed_experts.w13_weight_scale_inv", experts
+        )
+    )
+    assert len(converted) == 8
+    assert (
+        converted["model.layers.0.mlp.experts.2.gate_proj.weight_scale_inv"].data_ptr()
+        == experts[2].data_ptr()
+    )
+    assert (
+        converted["model.layers.0.mlp.experts.2.up_proj.weight_scale_inv"].data_ptr()
+        == experts[2, 3:].data_ptr()
+    )
+
+
+@pytest.mark.parametrize("engine_name", ["vllm"])
+def test_registry_resolves_qwen3_moe_converter(engine_name):
+    converter = get_infer_weights_converter(
+        engine_name,
+        "Qwen3MoeForCausalLM",
+        _model_config(),
+        _rank_info(),
+        _infer_engine_config(),
+    )
+    assert isinstance(converter, Qwen3FusedWeightConverter)
+
+
+def test_convert_param_name_set_matches_train_side_contract():
+    converter = _make_converter()
+    converted_names = set()
+    for name, param in _fused_named_params().items():
+        for hf_name, _ in converter.convert_param(name, param):
+            converted_names.add(hf_name)
+    assert converted_names == _expected_hf_names(range(NUM_EXPERTS))
+
+
+def test_convert_param_expert_names_use_global_ids_with_ep():
+    # With ep_size=2 each rank holds half the experts; converted names must
+    # carry global expert ids offset by ep_rank.
+    num_local = NUM_EXPERTS // 2
+    converter = _make_converter(ep_size=2, ep_rank=1)
+    converted_names = set()
+    for name, param in _fused_named_params(num_local_experts=num_local).items():
+        for hf_name, _ in converter.convert_param(name, param):
+            converted_names.add(hf_name)
+    assert converted_names == _expected_hf_names(range(num_local, NUM_EXPERTS))
+
+
+def test_qkv_split_is_gqa_aware():
+    converter = _make_converter()
+    q = torch.randn(NUM_HEADS * HEAD_DIM, HIDDEN)
+    k = torch.randn(NUM_KV_HEADS * HEAD_DIM, HIDDEN)
+    v = torch.randn(NUM_KV_HEADS * HEAD_DIM, HIDDEN)
+    fused = torch.cat([q, k, v], dim=0)
+
+    result = dict(
+        converter.convert_param("model.layers.0.self_attn.qkv_proj.weight", fused)
+    )
+    assert torch.equal(result["model.layers.0.self_attn.q_proj.weight"], q)
+    assert torch.equal(result["model.layers.0.self_attn.k_proj.weight"], k)
+    assert torch.equal(result["model.layers.0.self_attn.v_proj.weight"], v)
+
+
+@pytest.mark.parametrize(
+    ("tp_size", "local_q_heads", "local_kv_heads"),
+    [
+        (2, NUM_HEADS // 2, NUM_KV_HEADS // 2),
+        (4, NUM_HEADS // 4, 1),
+    ],
+)
+def test_qkv_split_uses_local_tp_head_counts(tp_size, local_q_heads, local_kv_heads):
+    converter = _make_converter(tp_size=tp_size)
+    q = torch.randn(local_q_heads * HEAD_DIM, HIDDEN)
+    k = torch.randn(local_kv_heads * HEAD_DIM, HIDDEN)
+    v = torch.randn(local_kv_heads * HEAD_DIM, HIDDEN)
+    fused = torch.cat([q, k, v], dim=0)
+
+    result = dict(
+        converter.convert_param("model.layers.0.self_attn.qkv_proj.weight", fused)
+    )
+
+    assert torch.equal(result["model.layers.0.self_attn.q_proj.weight"], q)
+    assert torch.equal(result["model.layers.0.self_attn.k_proj.weight"], k)
+    assert torch.equal(result["model.layers.0.self_attn.v_proj.weight"], v)
+
+
+def test_kv_sharding_reports_logical_heads_when_tp_replicates():
+    rank_info = RankInfo(
+        tp_rank=0,
+        tp_size=4,
+        pp_rank=0,
+        pp_size=1,
+        dp_size=1,
+        dp_rank=0,
+        ep_rank=0,
+        ep_size=1,
+        ep_tp_rank=0,
+        ep_tp_size=1,
+        attn_tp_rank=0,
+        attn_tp_size=4,
+        attn_dp_rank=0,
+        world_size=4,
+        global_rank=0,
+        local_rank=0,
+        engine_rank=0,
+        is_infer=True,
+    )
+    strategy = Qwen3ShardingStrategy(
+        engine_name="vllm",
+        enable_dp_attention=False,
+        enable_dp_lm_head=False,
+        moe_dense_tp_size=4,
+        tp_size=4,
+        ep_size=1,
+        ep_tp_size=1,
+        rank_info=rank_info,
+        hf_config=_model_config(),
+    )
+
+    assert strategy.get_sharding_strategy("model.layers.0.self_attn.k_proj.weight") == (
+        ShardingType.TP_SHARDING,
+        0,
+        NUM_KV_HEADS,
+    )
+    assert strategy.get_sharding_strategy("model.layers.0.self_attn.q_proj.weight") == (
+        ShardingType.TP_SHARDING,
+        0,
+        4,
+    )
+
+
+def test_mcore_qkv_device_layout_uses_stable_source_spans():
+    converter_class = CONFIG["mcore_converter"]()
+    converter = converter_class.__new__(converter_class)
+    converter.hf_config = _model_config()
+    converter.rank_info = SimpleNamespace(pp_rank=0, pp_size=1)
+    converter.tf_config = SimpleNamespace()
+    converter._pp_stage_layer_id_map = {}
+    group_rows = (NUM_HEADS // NUM_KV_HEADS + 2) * HEAD_DIM
+    fused = torch.arange(
+        NUM_KV_HEADS * group_rows * HIDDEN, dtype=torch.float32
+    ).reshape(NUM_KV_HEADS * group_rows, HIDDEN)
+
+    converted = dict(
+        converter.convert_param_to_device_layout(
+            "decoder.layers.0.self_attention.linear_qkv.weight", fused
+        )
+    )
+
+    assert set(converted) == {
+        "model.layers.0.self_attn.q_proj.weight",
+        "model.layers.0.self_attn.k_proj.weight",
+        "model.layers.0.self_attn.v_proj.weight",
+    }
+    source_storage = fused.untyped_storage().data_ptr()
+    for layout in converted.values():
+        assert isinstance(layout, StaticTensorLayout)
+        assert all(
+            span.untyped_storage().data_ptr() == source_storage for span in layout.spans
+        )
+
+
+def test_qkv_split_rejects_indivisible_rows():
+    converter = _make_converter()
+    bad = torch.randn((NUM_HEADS + 2 * NUM_KV_HEADS) * HEAD_DIM + 1, HIDDEN)
+    try:
+        converter.convert_param("model.layers.0.self_attn.qkv_proj.weight", bad)
+    except ValueError as e:
+        assert "not divisible" in str(e)
+    else:
+        raise AssertionError("expected ValueError for indivisible qkv rows")
+
+
+def test_expert_split_values_match_fused_slices():
+    converter = _make_converter()
+    w13 = torch.randn(NUM_EXPERTS, 2 * MOE_INTERMEDIATE, HIDDEN)
+    w2 = torch.randn(NUM_EXPERTS, HIDDEN, MOE_INTERMEDIATE)
+
+    gate_up = dict(
+        converter.convert_param("model.layers.0.mlp.experts.w13_weight", w13)
+    )
+    down = dict(converter.convert_param("model.layers.0.mlp.experts.w2_weight", w2))
+
+    for expert_id in range(NUM_EXPERTS):
+        prefix = f"model.layers.0.mlp.experts.{expert_id}"
+        assert torch.equal(
+            gate_up[f"{prefix}.gate_proj.weight"], w13[expert_id, :MOE_INTERMEDIATE]
+        )
+        assert torch.equal(
+            gate_up[f"{prefix}.up_proj.weight"], w13[expert_id, MOE_INTERMEDIATE:]
+        )
+        assert torch.equal(down[f"{prefix}.down_proj.weight"], w2[expert_id])
+
+
+def test_vllm_routed_expert_container_matches_hf_names():
+    converter = _make_converter()
+    w13 = torch.randn(NUM_EXPERTS, 2 * MOE_INTERMEDIATE, HIDDEN)
+    w2 = torch.randn(NUM_EXPERTS, HIDDEN, MOE_INTERMEDIATE)
+
+    converted_names = {
+        name
+        for name, _ in converter.convert_param(
+            "model.layers.0.mlp.experts.routed_experts.w13_weight", w13
+        )
+    }
+    converted_names.update(
+        name
+        for name, _ in converter.convert_param(
+            "model.layers.0.mlp.experts.routed_experts.w2_weight", w2
+        )
+    )
+
+    expected_names = {
+        name
+        for name in _expected_hf_names(range(NUM_EXPERTS))
+        if ".mlp.experts." in name
+    }
+    assert converted_names == expected_names
+    assert not any("routed_experts" in name for name in converted_names)
