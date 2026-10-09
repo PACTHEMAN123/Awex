@@ -68,7 +68,7 @@ enum class Transport : std::uint8_t {
   kGin,
 };
 
-// This is the fixed-plan task shape consumed by the v2 lowering layer. The
+// This is the fixed-plan task shape consumed by the transport lowering layer. The
 // fields intentionally mirror the existing device task without adding a new
 // logical operation or changing its ordering.
 struct Task {

@@ -46,24 +46,24 @@ struct GinState {
 #endif
 };
 
-inline std::uint32_t v2PowerOfTwoUp(std::uint32_t value) {
+inline std::uint32_t powerOfTwoUp(std::uint32_t value) {
   std::uint32_t result = 1;
   while (result < value && result < kMaxChannels) result *= 2;
   return result;
 }
 
-inline std::uint64_t v2DivideUp(std::uint64_t value, std::uint64_t divisor) {
+inline std::uint64_t divideUp(std::uint64_t value, std::uint64_t divisor) {
   return value / divisor + (value % divisor != 0 ? 1 : 0);
 }
 
-inline bool v2HasGinPeer(const std::vector<std::uint32_t>& peers,
+inline bool hasGinPeer(const std::vector<std::uint32_t>& peers,
                          const std::vector<std::uint8_t>& transports) {
   return std::any_of(peers.begin(), peers.end(), [&](std::uint32_t peer) {
     return transports[peer] == static_cast<std::uint8_t>(Transport::kGin);
   });
 }
 
-inline void v2SetGinType(GinState* state, const ncclCommProperties_t& properties) {
+inline void setGinType(GinState* state, const ncclCommProperties_t& properties) {
 #if SHARDSTREAM_HAS_GIN
   state->type = properties.ginType;
 #else
@@ -72,30 +72,30 @@ inline void v2SetGinType(GinState* state, const ncclCommProperties_t& properties
 #endif
 }
 
-inline void v2ValidateGinSupport(const GinState& state, int nccl_version) {
+inline void validateGinSupport(const GinState& state, int nccl_version) {
   if (!state.enabled) return;
 #if SHARDSTREAM_HAS_GIN
   if (nccl_version < NCCL_VERSION(2, 30, 4)) {
-    throw std::runtime_error("nccl_device_v2 GIN transport requires NCCL 2.30.4 or newer at runtime");
+    throw std::runtime_error("transport GIN transport requires NCCL 2.30.4 or newer at runtime");
   }
   if (state.type == NCCL_GIN_TYPE_NONE) {
-    throw std::runtime_error("nccl_device_v2 found non-LSA peers, but the NCCL communicator has no GIN support");
+    throw std::runtime_error("transport found non-LSA peers, but the NCCL communicator has no GIN support");
   }
 #else
   (void)nccl_version;
   throw std::runtime_error(
-    "nccl_device_v2 found non-LSA peers, but this extension was not built with NCCL 2.30.4+ GIN headers");
+    "transport found non-LSA peers, but this extension was not built with NCCL 2.30.4+ GIN headers");
 #endif
 }
 
-inline void v2ConfigureGinChannels(GinState* state, std::uint32_t total_channels,
+inline void configureGinChannels(GinState* state, std::uint32_t total_channels,
                                    std::uint32_t gin_fifo_depth, std::size_t network_step_bytes,
                                    const std::vector<std::uint32_t>& active_peers,
                                    const std::vector<std::uint8_t>& transports,
                                    std::vector<std::uint32_t>* peer_channels,
                                    std::uint32_t channel_budget_factor = 6) {
   const std::uint32_t base_channels =
-    std::min(total_channels, v2PowerOfTwoUp(2 * state->connection_count));
+    std::min(total_channels, powerOfTwoUp(2 * state->connection_count));
   // Direct BF16->FP8 adds substantial copy-worker computation to each rail.
   // Use more of the existing channel/FIFO registration to overlap that work;
   // the copy-only and ring budgets stay unchanged. In a many-sender receiver,
@@ -113,15 +113,15 @@ inline void v2ConfigureGinChannels(GinState* state, std::uint32_t total_channels
 
   if (gin_peers.size() == 1) {
     (*peer_channels)[gin_peers.front()] =
-      std::min(total_channels, v2PowerOfTwoUp(state->channel_budget));
+      std::min(total_channels, powerOfTwoUp(state->channel_budget));
   } else {
     const std::uint64_t fifo_window_bytes =
       static_cast<std::uint64_t>(network_step_bytes) * gin_fifo_depth;
     std::vector<std::uint32_t> desired_channels(peer_channels->size(), 1);
     for (const std::uint32_t peer : gin_peers) {
       const std::uint64_t window_demand =
-        std::max<std::uint64_t>(1, v2DivideUp(state->peer_payload_bytes[peer], fifo_window_bytes));
-      desired_channels[peer] = v2PowerOfTwoUp(
+        std::max<std::uint64_t>(1, divideUp(state->peer_payload_bytes[peer], fifo_window_bytes));
+      desired_channels[peer] = powerOfTwoUp(
         static_cast<std::uint32_t>(std::min<std::uint64_t>(base_channels, window_demand)));
       (*peer_channels)[peer] = 1;
     }
@@ -162,7 +162,7 @@ inline void v2ConfigureGinChannels(GinState* state, std::uint32_t total_channels
   }
 }
 
-inline void v2InitializeGin(GinState* state, ncclComm_t comm, int world_size,
+inline void initializeGin(GinState* state, ncclComm_t comm, int world_size,
                             std::uint32_t total_channels, std::uint32_t gin_fifo_depth,
                             std::size_t network_step_bytes, std::uint32_t context_count,
                             const std::vector<std::uint32_t>& active_peers,
@@ -190,10 +190,10 @@ inline void v2InitializeGin(GinState* state, ncclComm_t comm, int world_size,
   state->context_count = static_cast<std::uint32_t>(state->dev_comm.ginContextCount);
   state->connection_count = static_cast<std::uint32_t>(state->dev_comm.ginConnectionCount);
   if (state->context_count == 0 || state->connection_count == 0) {
-    throw std::runtime_error("nccl_device_v2 GIN initialization returned no contexts or connections");
+    throw std::runtime_error("transport GIN initialization returned no contexts or connections");
   }
   state->peer_payload_bytes = std::move(peer_payload_bytes);
-  v2ConfigureGinChannels(state, total_channels, gin_fifo_depth, network_step_bytes, active_peers,
+  configureGinChannels(state, total_channels, gin_fifo_depth, network_step_bytes, active_peers,
                          transports, peer_channels, channel_budget_factor);
 #else
   (void)comm;
@@ -210,7 +210,7 @@ inline void v2InitializeGin(GinState* state, ncclComm_t comm, int world_size,
 #endif
 }
 
-inline ncclResult_t v2DestroyGin(GinState* state, ncclComm_t comm) {
+inline ncclResult_t destroyGin(GinState* state, ncclComm_t comm) {
   ncclResult_t result = ncclSuccess;
 #if SHARDSTREAM_HAS_GIN
   if (state->created) {
@@ -245,7 +245,7 @@ inline std::uint32_t ginContextCount(const GinState& state) {
 #endif
 }
 
-inline void v2SetGinKernelArgs(const GinState& state, ncclWindow_t window,
+inline void setGinKernelArgs(const GinState& state, ncclWindow_t window,
                                std::uint32_t active_gin_peers, std::uint32_t fifo_depth,
                                KernelArgs* args) {
   args->gin_enabled = state.enabled ? 1U : 0U;

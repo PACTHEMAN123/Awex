@@ -30,7 +30,7 @@ namespace transport {
 // block, even when lowering/FIFO steps split the record. No CTA barrier,
 // full-weight staging allocation, or separate quantization launch is needed.
 template <int BlockRows, int BlockCols>
-__device__ __forceinline__ void v2QuantizeToFifoImpl(
+__device__ __forceinline__ void quantizeToFifoImpl(
   const Fragment& f, std::uint8_t* destination, std::uint64_t offset,
   std::uint64_t nbytes, int tid, int nthreads) {
   const int lane = tid % kWarpSize;
@@ -103,7 +103,7 @@ __device__ __forceinline__ void v2QuantizeToFifoImpl(
 }
 
 template <int BlockRows, int BlockCols>
-__device__ __forceinline__ void v2ScatterFp8FromFifoImpl(
+__device__ __forceinline__ void scatterFp8FromFifoImpl(
   const Fragment& f, const std::uint8_t* source, std::uint8_t* forward,
   std::uint64_t offset, std::uint64_t nbytes, int tid, int nthreads) {
   constexpr std::uint32_t elements = BlockRows * BlockCols;
@@ -153,30 +153,30 @@ __device__ __forceinline__ void v2ScatterFp8FromFifoImpl(
   }
 }
 
-__device__ __forceinline__ void v2QuantizeToFifo(
+__device__ __forceinline__ void quantizeToFifo(
   const Fragment& f, std::uint8_t* destination, std::uint64_t offset,
   std::uint64_t nbytes, int tid, int nthreads) {
   if (f.block_rows == 128 && f.block_cols == 128)
-    v2QuantizeToFifoImpl<128, 128>(f, destination, offset, nbytes, tid, nthreads);
+    quantizeToFifoImpl<128, 128>(f, destination, offset, nbytes, tid, nthreads);
   else if (f.block_rows == 64 && f.block_cols == 64)
-    v2QuantizeToFifoImpl<64, 64>(f, destination, offset, nbytes, tid, nthreads);
+    quantizeToFifoImpl<64, 64>(f, destination, offset, nbytes, tid, nthreads);
   else if (f.block_rows == 64)
-    v2QuantizeToFifoImpl<64, 128>(f, destination, offset, nbytes, tid, nthreads);
+    quantizeToFifoImpl<64, 128>(f, destination, offset, nbytes, tid, nthreads);
   else
-    v2QuantizeToFifoImpl<128, 64>(f, destination, offset, nbytes, tid, nthreads);
+    quantizeToFifoImpl<128, 64>(f, destination, offset, nbytes, tid, nthreads);
 }
 
-__device__ __forceinline__ void v2ScatterFp8FromFifo(
+__device__ __forceinline__ void scatterFp8FromFifo(
   const Fragment& f, const std::uint8_t* source, std::uint8_t* forward,
   std::uint64_t offset, std::uint64_t nbytes, int tid, int nthreads) {
   if (f.block_rows == 128 && f.block_cols == 128)
-    v2ScatterFp8FromFifoImpl<128, 128>(f, source, forward, offset, nbytes, tid, nthreads);
+    scatterFp8FromFifoImpl<128, 128>(f, source, forward, offset, nbytes, tid, nthreads);
   else if (f.block_rows == 64 && f.block_cols == 64)
-    v2ScatterFp8FromFifoImpl<64, 64>(f, source, forward, offset, nbytes, tid, nthreads);
+    scatterFp8FromFifoImpl<64, 64>(f, source, forward, offset, nbytes, tid, nthreads);
   else if (f.block_rows == 64)
-    v2ScatterFp8FromFifoImpl<64, 128>(f, source, forward, offset, nbytes, tid, nthreads);
+    scatterFp8FromFifoImpl<64, 128>(f, source, forward, offset, nbytes, tid, nthreads);
   else
-    v2ScatterFp8FromFifoImpl<128, 64>(f, source, forward, offset, nbytes, tid, nthreads);
+    scatterFp8FromFifoImpl<128, 64>(f, source, forward, offset, nbytes, tid, nthreads);
 }
 
 }  // namespace transport

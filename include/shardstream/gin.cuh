@@ -127,7 +127,7 @@ __device__ __forceinline__ bool ginWaitSignal(const KernelArgs& args, const nccl
   auto* error = &reinterpret_cast<WindowHeader*>(args.local_window)->error;
   const unsigned long long start = clock64();
   while (gin.readSignal(signal) < expected) {
-    if (v2LoadError(error) != 0) return false;
+    if (loadError(error) != 0) return false;
     if (clock64() - start > args.timeout_cycles) {
       atomicCAS(error, 0U, error_code);
       return false;
@@ -180,20 +180,20 @@ __device__ __forceinline__ void ginRunSend(const KernelArgs& args, const Work& w
     }
     const unsigned long long copy_start = tid == 0 ? clock64() : 0;
     if (roles & kRoleWorker) {
-      v2GroupBarrier(wait_barrier, nworkers);
+      groupBarrier(wait_barrier, nworkers);
       if (*ready) {
-        v2CopyFragmentsToContiguous(
+        copyFragmentsToContiguous(
           args, work, ginLocalPayload(args, work.peer, channel, step, work.fifo_depth), cursor, slice_bytes, tid,
           nworkers);
       }
     }
 
-    v2GroupBarrier(main_barrier, nthreads);
+    groupBarrier(main_barrier, nthreads);
     if (tid == 0) {
       profile->copy_cycles += clock64() - copy_start;
       ++profile->slice_count;
     }
-    if ((roles & kRolePostSend) && v2LoadError(error) == 0) {
+    if ((roles & kRolePostSend) && loadError(error) == 0) {
       const unsigned long long post_start = clock64();
       // The cumulative ready counter requires ordered completion so a later
       // put cannot satisfy the wait for an earlier FIFO step.
@@ -202,7 +202,7 @@ __device__ __forceinline__ void ginRunSend(const KernelArgs& args, const Work& w
                       quantized_source);
       profile->post_cycles += clock64() - post_start;
     }
-    if (v2LoadError(error) != 0) return;
+    if (loadError(error) != 0) return;
     cursor += slice_bytes;
     ++step;
   }
@@ -213,7 +213,7 @@ __device__ __forceinline__ void ginRunSend(const KernelArgs& args, const Work& w
       *ready = ginWaitSignal(args, gin, credit_signal, step - 1, 4U);
       profile->final_wait_cycles += clock64() - wait_start;
     }
-    v2GroupBarrier(main_barrier, nthreads);
+    groupBarrier(main_barrier, nthreads);
   }
 }
 
@@ -239,14 +239,14 @@ __device__ __forceinline__ void ginRunRecv(const KernelArgs& args, const Work& w
       profile->input_wait_cycles += clock64() - wait_start;
     }
     const unsigned long long copy_start = tid == 0 ? clock64() : 0;
-    v2GroupBarrier(barrier, nthreads);
+    groupBarrier(barrier, nthreads);
     if (*ready && (roles & kRoleWorker)) {
-      v2CopyContiguousToFragments(
+      copyContiguousToFragments(
         args, work, ginLocalPayload(args, work.peer, channel, step, work.fifo_depth), cursor, slice_bytes, tid,
         nworkers);
     }
 
-    v2GroupBarrier(barrier, nthreads);
+    groupBarrier(barrier, nthreads);
     if (tid == 0) {
       profile->copy_cycles += clock64() - copy_start;
       ++profile->slice_count;
@@ -255,13 +255,13 @@ __device__ __forceinline__ void ginRunRecv(const KernelArgs& args, const Work& w
     const bool work_complete = cursor + slice_bytes == work.nbytes;
     const std::uint32_t returned_credits = static_cast<std::uint32_t>(
       work_complete && work_step % credit_batch != 0 ? work_step % credit_batch : credit_batch);
-    if ((roles & kRolePostRecv) && v2LoadError(error) == 0 &&
+    if ((roles & kRolePostRecv) && loadError(error) == 0 &&
         (work_complete || work_step % credit_batch == 0)) {
       const unsigned long long post_start = clock64();
       gin.signal(world, work.peer, GinCreditSignalAdd{credit_signal, returned_credits});
       profile->post_cycles += clock64() - post_start;
     }
-    if (v2LoadError(error) != 0) return;
+    if (loadError(error) != 0) return;
     cursor += slice_bytes;
     ++step;
   }

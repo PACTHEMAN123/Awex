@@ -14,7 +14,7 @@ find_library(NCCL_LIBRARY nccl HINTS "${SHARDSTREAM_NCCL_ROOT}/lib" "${SHARDSTRE
 if(NOT EXISTS "${NCCL_INCLUDE_DIR}/nccl_device.h")
   message(FATAL_ERROR "ShardStream requires NCCL Device API headers (NCCL 2.30.4+ for GIN)")
 endif()
-add_library(shardstream STATIC src/launch.cu)
+add_library(shardstream STATIC src/launch.cu src/runtime.cpp)
 add_library(ShardStream::shardstream ALIAS shardstream)
 target_compile_features(shardstream PUBLIC cxx_std_17 cuda_std_17)
 set_target_properties(shardstream PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -42,6 +42,8 @@ if(SHARDSTREAM_BUILD_PYTHON)
   target_link_libraries(_native PRIVATE shardstream ${TORCH_LIBRARIES} "${TORCH_PYTHON_LIBRARY}")
   target_include_directories(_native PRIVATE include/shardstream ${TORCH_INCLUDE_DIRS})
   separate_arguments(TORCH_COMPILE_FLAGS NATIVE_COMMAND "${TORCH_CXX_FLAGS}")
+  # The binding and library exchange std::string/vector values across their ABI.
+  target_compile_options(shardstream PUBLIC ${TORCH_COMPILE_FLAGS})
   target_compile_options(_native PRIVATE ${TORCH_COMPILE_FLAGS}
     $<$<COMPILE_LANGUAGE:CUDA>:-O3;--expt-extended-lambda;--expt-relaxed-constexpr;-Xptxas=-maxrregcount=96>)
   target_compile_features(_native PRIVATE cxx_std_17 cuda_std_17)

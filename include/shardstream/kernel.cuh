@@ -30,7 +30,7 @@ struct BatchShared {
   unsigned long long copy_completed[kMaxWorksPerBatch];
 };
 
-__device__ __forceinline__ std::uint32_t v2Roles(Direction direction, int tid, int nthreads, int* nworkers) {
+__device__ __forceinline__ std::uint32_t roles(Direction direction, int tid, int nthreads, int* nworkers) {
   const bool send = direction == Direction::kSend;
   *nworkers = nthreads - (nthreads >= 3 * kWarpSize ? kWarpSize : 0);
   std::uint32_t roles = tid < *nworkers ? kRoleWorker : 0;
@@ -42,99 +42,99 @@ __device__ __forceinline__ std::uint32_t v2Roles(Direction direction, int tid, i
 // In read mode the producer owns the FIFO payload. The sender only writes its
 // local window; the receiver performs the NVLink read and returns credits by
 // writing consumed_step back into the sender's window.
-__device__ __forceinline__ void v2RunSend(const KernelArgs& args, const Work& work, std::uint32_t channel, int tid,
+__device__ __forceinline__ void runSend(const KernelArgs& args, const Work& work, std::uint32_t channel, int tid,
                                           int nthreads, int main_barrier, int wait_barrier, int* ready,
                                           unsigned long long* step_cache, KernelProfile* profile) {
   int nworkers = 0;
-  const std::uint32_t roles = v2Roles(Direction::kSend, tid, nthreads, &nworkers);
+  const std::uint32_t roles = roles(Direction::kSend, tid, nthreads, &nworkers);
   auto* error = &reinterpret_cast<WindowHeader*>(args.local_window)->error;
   std::uint64_t cursor = 0;
   std::uint64_t step = work.step_begin;
   while (cursor < work.nbytes) {
     const std::uint64_t slice_bytes =
       work.step_bytes < work.nbytes - cursor ? work.step_bytes : work.nbytes - cursor;
-    FifoSlot* slot = v2FifoSlot(args, args.local_rank, work.peer, channel, step, work.fifo_depth, true);
+    FifoSlot* slot = fifoSlot(args, args.local_rank, work.peer, channel, step, work.fifo_depth, true);
     if (roles & kRoleWaitSend) {
       const unsigned long long wait_start = clock64();
-      *ready = v2WaitFree(slot, step, work.fifo_depth, step_cache, error, args.timeout_cycles);
+      *ready = waitFree(slot, step, work.fifo_depth, step_cache, error, args.timeout_cycles);
       profile->output_wait_cycles += clock64() - wait_start;
     }
     const unsigned long long copy_start = tid == 0 ? clock64() : 0;
     if (roles & kRoleWorker) {
-      v2GroupBarrier(wait_barrier, nworkers);
+      groupBarrier(wait_barrier, nworkers);
       if (*ready) {
         std::uint8_t* payload =
-          v2FifoPayload(args, args.local_rank, work.peer, channel, step, work.fifo_depth, true);
-        v2CopyFragmentsToContiguous(args, work, payload, cursor, slice_bytes, tid, nworkers);
+          fifoPayload(args, args.local_rank, work.peer, channel, step, work.fifo_depth, true);
+        copyFragmentsToContiguous(args, work, payload, cursor, slice_bytes, tid, nworkers);
       }
     }
 
     // Like NCCL SIMPLE send, a wide group reserves its final warp for Post.
     // Workers can begin the next step while Post fences and publishes this one.
-    v2GroupBarrier(main_barrier, nthreads);
+    groupBarrier(main_barrier, nthreads);
     if (tid == 0) {
       profile->copy_cycles += clock64() - copy_start;
       ++profile->slice_count;
     }
-    if ((roles & kRolePostSend) && v2LoadError(error) == 0) {
+    if ((roles & kRolePostSend) && loadError(error) == 0) {
       const unsigned long long post_start = clock64();
       slot->bytes = static_cast<std::uint32_t>(slice_bytes);
-      v2Publish(&slot->ready_step, step);
+      publish(&slot->ready_step, step);
       profile->post_cycles += clock64() - post_start;
     }
-    if (v2LoadError(error) != 0) return;
+    if (loadError(error) != 0) return;
     cursor += slice_bytes;
     ++step;
   }
 
   if (work.final && work.nbytes != 0) {
     FifoSlot* slot =
-      v2FifoSlot(args, args.local_rank, work.peer, channel, step - 1, work.fifo_depth, true);
+      fifoSlot(args, args.local_rank, work.peer, channel, step - 1, work.fifo_depth, true);
     if (roles & kRoleWaitSend) {
       const unsigned long long wait_start = clock64();
-      *ready = v2WaitConsumed(slot, step - 1, step_cache, error, args.timeout_cycles);
+      *ready = waitConsumed(slot, step - 1, step_cache, error, args.timeout_cycles);
       profile->final_wait_cycles += clock64() - wait_start;
     }
-    v2GroupBarrier(main_barrier, nthreads);
+    groupBarrier(main_barrier, nthreads);
   }
 }
 
-__device__ __forceinline__ void v2RunRecv(const KernelArgs& args, const Work& work, std::uint32_t channel, int tid,
+__device__ __forceinline__ void runRecv(const KernelArgs& args, const Work& work, std::uint32_t channel, int tid,
                                           int nthreads, int barrier, int* ready,
                                           unsigned long long* step_cache, KernelProfile* profile) {
   int nworkers = 0;
-  const std::uint32_t roles = v2Roles(Direction::kRecv, tid, nthreads, &nworkers);
+  const std::uint32_t roles = roles(Direction::kRecv, tid, nthreads, &nworkers);
   auto* error = &reinterpret_cast<WindowHeader*>(args.local_window)->error;
   std::uint64_t cursor = 0;
   std::uint64_t step = work.step_begin;
   while (cursor < work.nbytes) {
     const std::uint64_t slice_bytes =
       work.step_bytes < work.nbytes - cursor ? work.step_bytes : work.nbytes - cursor;
-    FifoSlot* slot = v2FifoSlot(args, work.peer, args.local_rank, channel, step, work.fifo_depth, false);
+    FifoSlot* slot = fifoSlot(args, work.peer, args.local_rank, channel, step, work.fifo_depth, false);
     if (roles & kRoleWaitRecv) {
       const unsigned long long wait_start = clock64();
-      *ready = v2WaitReady(&slot->ready_step, step, step_cache, error, args.timeout_cycles);
+      *ready = waitReady(&slot->ready_step, step, step_cache, error, args.timeout_cycles);
       profile->input_wait_cycles += clock64() - wait_start;
     }
     const unsigned long long copy_start = tid == 0 ? clock64() : 0;
-    v2GroupBarrier(barrier, nthreads);
+    groupBarrier(barrier, nthreads);
     if (*ready && (roles & kRoleWorker)) {
       const std::uint8_t* payload =
-        v2FifoPayload(args, work.peer, args.local_rank, channel, step, work.fifo_depth, false);
-      v2CopyContiguousToFragments(args, work, payload, cursor, slice_bytes, tid, nworkers);
+        fifoPayload(args, work.peer, args.local_rank, channel, step, work.fifo_depth, false);
+      copyContiguousToFragments(args, work, payload, cursor, slice_bytes, tid, nworkers);
     }
 
-    v2GroupBarrier(barrier, nthreads);
+    groupBarrier(barrier, nthreads);
     if (tid == 0) {
       profile->copy_cycles += clock64() - copy_start;
       ++profile->slice_count;
     }
-    if ((roles & kRolePostRecv) && v2LoadError(error) == 0) {
+    if ((roles & kRolePostRecv) && loadError(error) == 0) {
       const unsigned long long post_start = clock64();
-      v2Publish(&slot->consumed_step, step);
+      publish(&slot->consumed_step, step);
       profile->post_cycles += clock64() - post_start;
     }
-    if (v2LoadError(error) != 0) return;
+    if (loadError(error) != 0) return;
     cursor += slice_bytes;
     ++step;
   }
@@ -159,7 +159,7 @@ __device__ __forceinline__ void ginRunDirectRelay(
   const bool direct_source = input_gin && output_gin;
   auto source = [&] __device__(std::uint64_t step) -> const std::uint8_t* {
     return input_gin ? ginLocalPayload(args, work.peer, channel, step, work.fifo_depth)
-                     : v2FifoPayload(args, work.peer, args.local_rank, channel, step, work.fifo_depth, false);
+                     : fifoPayload(args, work.peer, args.local_rank, channel, step, work.fifo_depth, false);
   };
   const std::uint64_t slices = (work.nbytes + work.step_bytes - 1) / work.step_bytes;
   if (tid < kWarpSize) {
@@ -182,7 +182,7 @@ __device__ __forceinline__ void ginRunDirectRelay(
         }
         const unsigned long long copy_wait_start = clock64();
         while (success && atomicAdd(copy_completed, 0ULL) < input_step) {
-          if (v2LoadError(error) != 0) success = 0;
+          if (loadError(error) != 0) success = 0;
           if (clock64() - copy_wait_start > args.timeout_cycles) {
             atomicCAS(error, 0U, 4U);
             success = 0;
@@ -198,7 +198,7 @@ __device__ __forceinline__ void ginRunDirectRelay(
                      GinCreditSignalAdd{ginCreditSignal(args, args.local_rank, channel), credits});
           else {
             // LSA credits are per-slot rather than cumulative/batched.
-            v2Publish(&v2FifoSlot(args, work.peer, args.local_rank, channel, input_step,
+            publish(&fifoSlot(args, work.peer, args.local_rank, channel, input_step,
                                   work.fifo_depth, false)->consumed_step, input_step);
           }
           profile->post_cycles += clock64() - post_start;
@@ -218,7 +218,7 @@ __device__ __forceinline__ void ginRunDirectRelay(
           if (!retire(retired)) break;
           ++retired;
         }
-        if (v2LoadError(error) != 0) break;
+        if (loadError(error) != 0) break;
       }
       int success = 1;
       if (tid == 0) {
@@ -228,14 +228,14 @@ __device__ __forceinline__ void ginRunDirectRelay(
           success = ginWaitSignal(args, gin, ginCreditSignal(args, work.forward_peer, channel),
                                    output_step - work.fifo_depth, 3U);
         } else if (!output_gin) {
-          success = v2WaitFree(v2FifoSlot(args, args.local_rank, work.forward_peer, channel, output_step,
+          success = waitFree(fifoSlot(args, args.local_rank, work.forward_peer, channel, output_step,
                                         work.fifo_depth, true), output_step, work.fifo_depth,
                                &output_cache, error, args.timeout_cycles);
         }
         if (success) {
           success = input_gin
             ? ginWaitSignal(args, gin, ginReadySignal(args, work.peer, channel), work.step_begin + index, 2U)
-            : v2WaitReady(&v2FifoSlot(args, work.peer, args.local_rank, channel, work.step_begin + index,
+            : waitReady(&fifoSlot(args, work.peer, args.local_rank, channel, work.step_begin + index,
                                      work.fifo_depth, false)->ready_step, work.step_begin + index,
                           &input_cache, error, args.timeout_cycles);
         }
@@ -251,9 +251,9 @@ __device__ __forceinline__ void ginRunDirectRelay(
         // LSA FIFO or a locally registered GIN staging source.
         std::uint8_t* staging = output_gin
           ? ginLocalPayload(args, work.forward_peer, channel, work.forward_step_begin + index, work.fifo_depth)
-          : v2FifoPayload(args, args.local_rank, work.forward_peer, channel,
+          : fifoPayload(args, args.local_rank, work.forward_peer, channel,
                           work.forward_step_begin + index, work.fifo_depth, true);
-        v2CopyContiguous(staging, source(work.step_begin + index), bytes, tid, kWarpSize);
+        copyContiguous(staging, source(work.step_begin + index), bytes, tid, kWarpSize);
         warps.sync();
       }
       if (output_gin) gin.put(world, work.forward_peer, args.window,
@@ -267,24 +267,24 @@ __device__ __forceinline__ void ginRunDirectRelay(
               ncclGin_None{}, warps, ncclGin_None{}, cuda::thread_scope_thread,
               cuda::thread_scope_device, ncclGinOptFlagsDefault);
       else if (tid == 0) {
-        FifoSlot* slot = v2FifoSlot(args, args.local_rank, work.forward_peer, channel,
+        FifoSlot* slot = fifoSlot(args, args.local_rank, work.forward_peer, channel,
                                      work.forward_step_begin + index, work.fifo_depth, true);
         slot->bytes = static_cast<std::uint32_t>(bytes);
-        v2Publish(&slot->ready_step, work.forward_step_begin + index);
+        publish(&slot->ready_step, work.forward_step_begin + index);
       }
       if (tid == 0) profile->post_cycles += clock64() - post_start;
     }
-    while (retired < slices && v2LoadError(error) == 0) {
+    while (retired < slices && loadError(error) == 0) {
       if (!retire(retired)) break;
       ++retired;
     }
     // Staging sources may be reused by the next work. Its output wait protects
     // each slot; the final work must additionally drain downstream consumption.
-    if (!direct_source && work.final && slices != 0 && tid == 0 && v2LoadError(error) == 0) {
+    if (!direct_source && work.final && slices != 0 && tid == 0 && loadError(error) == 0) {
       const unsigned long long wait_start = clock64();
       const std::uint64_t last_step = work.forward_step_begin + slices - 1;
       if (output_gin) ginWaitSignal(args, gin, ginCreditSignal(args, work.forward_peer, channel), last_step, 4U);
-      else v2WaitConsumed(v2FifoSlot(args, args.local_rank, work.forward_peer, channel, last_step,
+      else waitConsumed(fifoSlot(args, args.local_rank, work.forward_peer, channel, last_step,
                                     work.fifo_depth, true), last_step, &output_cache, error, args.timeout_cycles);
       profile->final_wait_cycles += clock64() - wait_start;
     }
@@ -298,21 +298,21 @@ __device__ __forceinline__ void ginRunDirectRelay(
         const unsigned long long wait_start = clock64();
         *copy_ready = input_gin
           ? ginWaitSignal(args, gin, ginReadySignal(args, work.peer, channel), input_step, 2U)
-          : v2WaitReady(&v2FifoSlot(args, work.peer, args.local_rank, channel, input_step,
+          : waitReady(&fifoSlot(args, work.peer, args.local_rank, channel, input_step,
                                    work.fifo_depth, false)->ready_step, input_step,
                         &input_cache, error, args.timeout_cycles);
         profile->input_wait_cycles += clock64() - wait_start;
       }
-      v2GroupBarrier(copy_barrier, copy_threads);
+      groupBarrier(copy_barrier, copy_threads);
       if (!*copy_ready) break;
       const std::uint64_t offset = index * work.step_bytes;
       const std::uint64_t bytes = work.step_bytes < work.nbytes - offset
           ? work.step_bytes : work.nbytes - offset;
       const unsigned long long copy_start = copy_tid == 0 ? clock64() : 0;
-      v2CopyContiguousToFragments(args, work,
+      copyContiguousToFragments(args, work,
                                 source(input_step),
                                 offset, bytes, copy_tid, copy_threads);
-      v2GroupBarrier(copy_barrier, copy_threads);
+      groupBarrier(copy_barrier, copy_threads);
       if (copy_tid == 0) {
         atomicExch(copy_completed, input_step);
         profile->copy_cycles += clock64() - copy_start;
@@ -320,7 +320,7 @@ __device__ __forceinline__ void ginRunDirectRelay(
       }
     }
   }
-  v2GroupBarrier(barrier, nthreads);
+  groupBarrier(barrier, nthreads);
 }
 #endif
 
@@ -347,7 +347,7 @@ __device__ __forceinline__ void ginRunStagedRelay(
       if (tid == 0) {
         const unsigned long long start = clock64();
         while (atomicAdd(copy_completed, 0ULL) < work.step_begin + index) {
-          if (v2LoadError(error) != 0) { success = 0; break; }
+          if (loadError(error) != 0) { success = 0; break; }
           if (clock64() - start > args.timeout_cycles) {
             atomicCAS(error, 0U, 4U); success = 0; break;
           }
@@ -374,7 +374,7 @@ __device__ __forceinline__ void ginRunStagedRelay(
         output_step, output_step, bytes, index, index + 1 == slices, warp);
       if (tid == 0) profile->post_cycles += clock64() - post_start;
     }
-    if (work.final && slices != 0 && tid == 0 && v2LoadError(error) == 0) {
+    if (work.final && slices != 0 && tid == 0 && loadError(error) == 0) {
       const unsigned long long start = clock64();
       ginWaitSignal(args, gin, ginCreditSignal(args, work.forward_peer, channel),
         work.forward_step_begin + slices - 1, 4U);
@@ -395,17 +395,17 @@ __device__ __forceinline__ void ginRunStagedRelay(
           ginReadySignal(args, work.peer, channel), input_step, 2U);
         profile->output_wait_cycles += clock64() - start;
       }
-      v2GroupBarrier(copy_barrier, copy_threads);
+      groupBarrier(copy_barrier, copy_threads);
       if (!*copy_ready) break;
       const std::uint64_t offset = index * work.step_bytes;
       const std::uint64_t bytes = work.step_bytes < work.nbytes - offset
         ? work.step_bytes : work.nbytes - offset;
       const unsigned long long start = copy_tid == 0 ? clock64() : 0;
-      v2CopyContiguousToFragmentsAndContiguous(args, work,
+      copyContiguousToFragmentsAndContiguous(args, work,
         ginLocalPayload(args, work.forward_peer, channel, output_step, work.fifo_depth),
         ginLocalPayload(args, work.peer, channel, input_step, work.fifo_depth),
         offset, bytes, copy_tid, copy_threads);
-      v2GroupBarrier(copy_barrier, copy_threads);
+      groupBarrier(copy_barrier, copy_threads);
       if (copy_tid == 0) {
         // All workers finished their writes before publishing to the NIC warp.
         __threadfence();
@@ -415,7 +415,7 @@ __device__ __forceinline__ void ginRunStagedRelay(
       }
     }
   }
-  v2GroupBarrier(barrier, nthreads);
+  groupBarrier(barrier, nthreads);
 }
 #endif
 
@@ -423,7 +423,7 @@ __device__ __forceinline__ void ginRunStagedRelay(
 // successor before returning credit to its predecessor. Both LSA and GIN edges
 // use the same route channel and byte partition, so mixed intra/inter-node rings
 // retain NCCL broadcast's chunk-pipelined behavior.
-__device__ __forceinline__ void v2RunRelay(const KernelArgs& args, const Work& work, std::uint32_t channel,
+__device__ __forceinline__ void runRelay(const KernelArgs& args, const Work& work, std::uint32_t channel,
                                            int tid, int nthreads, int barrier, int wait_barrier, int* ready,
                                            int* forward_ready,
                                            unsigned long long* input_cache, unsigned long long* output_cache,
@@ -432,7 +432,7 @@ __device__ __forceinline__ void v2RunRelay(const KernelArgs& args, const Work& w
   // NCCL SIMPLE's waitPeer/genericOp: separate receive/send wait owners,
   // worker-only pre-copy synchronization, then the all-thread post barrier.
   // Source: NVIDIA NCCL src/device/prims_simple.h (Apache-2.0).
-  std::uint32_t roles = v2Roles(Direction::kRecv, tid, nthreads, &nworkers);
+  std::uint32_t roles = roles(Direction::kRecv, tid, nthreads, &nworkers);
   if (tid == 1) roles |= kRoleWaitSend;
   auto* error = &reinterpret_cast<WindowHeader*>(args.local_window)->error;
   const bool input_gin = args.peer_transports[work.peer] == static_cast<std::uint8_t>(Transport::kGin);
@@ -450,10 +450,10 @@ __device__ __forceinline__ void v2RunRelay(const KernelArgs& args, const Work& w
       work.step_bytes < work.nbytes - cursor ? work.step_bytes : work.nbytes - cursor;
     FifoSlot* input_slot = input_gin
       ? nullptr
-      : v2FifoSlot(args, work.peer, args.local_rank, channel, input_step, work.fifo_depth, false);
+      : fifoSlot(args, work.peer, args.local_rank, channel, input_step, work.fifo_depth, false);
     FifoSlot* output_slot = output_gin
       ? nullptr
-      : v2FifoSlot(args, args.local_rank, work.forward_peer, channel, output_step, work.fifo_depth, true);
+      : fifoSlot(args, args.local_rank, work.forward_peer, channel, output_step, work.fifo_depth, true);
 
     if (roles & (kRoleWaitRecv | kRoleWaitSend)) {
       const bool wait_send = (roles & kRoleWaitSend) != 0;
@@ -474,8 +474,8 @@ __device__ __forceinline__ void v2RunRelay(const KernelArgs& args, const Work& w
       {
         if (!(wait_send ? output_gin : input_gin)) {
           peer_ready = wait_send
-            ? v2WaitFree(output_slot, output_step, work.fifo_depth, output_cache, error, args.timeout_cycles)
-            : v2WaitReady(&input_slot->ready_step, input_step, input_cache, error, args.timeout_cycles);
+            ? waitFree(output_slot, output_step, work.fifo_depth, output_cache, error, args.timeout_cycles)
+            : waitReady(&input_slot->ready_step, input_step, input_cache, error, args.timeout_cycles);
         }
       }
       if (wait_send) {
@@ -487,7 +487,7 @@ __device__ __forceinline__ void v2RunRelay(const KernelArgs& args, const Work& w
       }
     }
     const unsigned long long copy_start = tid == 0 ? clock64() : 0;
-    if (roles & kRoleWorker) v2GroupBarrier(wait_barrier, nworkers);
+    if (roles & kRoleWorker) groupBarrier(wait_barrier, nworkers);
 
     const std::uint8_t* input_payload = nullptr;
     std::uint8_t* output_payload = nullptr;
@@ -498,23 +498,23 @@ __device__ __forceinline__ void v2RunRelay(const KernelArgs& args, const Work& w
     }
 #endif
     if (!input_gin) {
-      input_payload = v2FifoPayload(args, work.peer, args.local_rank, channel, input_step, work.fifo_depth, false);
+      input_payload = fifoPayload(args, work.peer, args.local_rank, channel, input_step, work.fifo_depth, false);
     }
     if (!output_gin) {
       output_payload =
-        v2FifoPayload(args, args.local_rank, work.forward_peer, channel, output_step, work.fifo_depth, true);
+        fifoPayload(args, args.local_rank, work.forward_peer, channel, output_step, work.fifo_depth, true);
     }
     if ((roles & kRoleWorker) && *ready && *forward_ready) {
-      v2CopyContiguousToFragmentsAndContiguous(args, work, output_payload, input_payload, cursor, slice_bytes, tid,
+      copyContiguousToFragmentsAndContiguous(args, work, output_payload, input_payload, cursor, slice_bytes, tid,
                                                nworkers);
     }
 
-    v2GroupBarrier(barrier, nthreads);
+    groupBarrier(barrier, nthreads);
     if (tid == 0) {
       profile->copy_cycles += clock64() - copy_start;
       ++profile->slice_count;
     }
-    if ((roles & kRolePostRecv) && v2LoadError(error) == 0) {
+    if ((roles & kRolePostRecv) && loadError(error) == 0) {
       const unsigned long long post_start = clock64();
 #if SHARDSTREAM_HAS_GIN
       ncclGin gin{args.dev_comm, static_cast<int>(channel % args.dev_comm.ginContextCount)};
@@ -530,7 +530,7 @@ __device__ __forceinline__ void v2RunRelay(const KernelArgs& args, const Work& w
                      GinCreditSignalAdd{ginCreditSignal(args, args.local_rank, channel), returned_credits});
         }
       } else {
-        v2Publish(&input_slot->consumed_step, input_step);
+        publish(&input_slot->consumed_step, input_step);
       }
 
       // The input is no longer needed after the fused local copy. Release it
@@ -542,16 +542,16 @@ __device__ __forceinline__ void v2RunRelay(const KernelArgs& args, const Work& w
           cursor + slice_bytes == work.nbytes, ncclCoopThread{});
       } else {
         output_slot->bytes = static_cast<std::uint32_t>(slice_bytes);
-        v2Publish(&output_slot->ready_step, output_step);
+        publish(&output_slot->ready_step, output_step);
       }
 #else
-      v2Publish(&input_slot->consumed_step, input_step);
+      publish(&input_slot->consumed_step, input_step);
       output_slot->bytes = static_cast<std::uint32_t>(slice_bytes);
-      v2Publish(&output_slot->ready_step, output_step);
+      publish(&output_slot->ready_step, output_step);
 #endif
       profile->post_cycles += clock64() - post_start;
     }
-    if (v2LoadError(error) != 0) return;
+    if (loadError(error) != 0) return;
     cursor += slice_bytes;
     ++input_step;
     ++output_step;
@@ -568,16 +568,16 @@ __device__ __forceinline__ void v2RunRelay(const KernelArgs& args, const Work& w
 #endif
       {
         FifoSlot* final_slot =
-          v2FifoSlot(args, args.local_rank, work.forward_peer, channel, output_step - 1, work.fifo_depth, true);
-        *ready = v2WaitConsumed(final_slot, output_step - 1, output_cache, error, args.timeout_cycles);
+          fifoSlot(args, args.local_rank, work.forward_peer, channel, output_step - 1, work.fifo_depth, true);
+        *ready = waitConsumed(final_slot, output_step - 1, output_cache, error, args.timeout_cycles);
       }
       profile->final_wait_cycles += clock64() - wait_start;
     }
-    v2GroupBarrier(barrier, nthreads);
+    groupBarrier(barrier, nthreads);
   }
 }
 
-__device__ __forceinline__ void v2RunBatch(const KernelArgs& args, const WorkBatch& batch,
+__device__ __forceinline__ void runBatch(const KernelArgs& args, const WorkBatch& batch,
                                            std::uint32_t channel) {
   __shared__ BatchShared shared;
   const int tid = threadIdx.x;
@@ -599,7 +599,7 @@ __device__ __forceinline__ void v2RunBatch(const KernelArgs& args, const WorkBat
       shared.forward_step_cache[group] = 0;
       shared.copy_completed[group] = 0;
     }
-    v2GroupBarrier(main_barrier, subthreads);
+    groupBarrier(main_barrier, subthreads);
 
     const Work& work = args.works[batch.work_begin + group];
     KernelProfile* profile = args.profiles + static_cast<std::size_t>(blockIdx.x) * kMaxWorksPerBatch + group;
@@ -619,7 +619,7 @@ __device__ __forceinline__ void v2RunBatch(const KernelArgs& args, const WorkBat
       } else
 #endif
       {
-      v2RunRelay(args, work, channel, subtid, subthreads, main_barrier, wait_barrier, &shared.ready[group],
+      runRelay(args, work, channel, subtid, subthreads, main_barrier, wait_barrier, &shared.ready[group],
                  &shared.forward_ready[group],
                  &shared.step_cache[group], &shared.forward_step_cache[group], profile);
       }
@@ -636,13 +636,13 @@ __device__ __forceinline__ void v2RunBatch(const KernelArgs& args, const WorkBat
         auto* error = &reinterpret_cast<WindowHeader*>(args.local_window)->error;
         atomicCAS(error, 0U, 5U);
       }
-      v2GroupBarrier(main_barrier, subthreads);
+      groupBarrier(main_barrier, subthreads);
 #endif
     } else if (args.direction == Direction::kSend) {
-      v2RunSend(args, work, channel, subtid, subthreads, main_barrier, wait_barrier, &shared.ready[group],
+      runSend(args, work, channel, subtid, subthreads, main_barrier, wait_barrier, &shared.ready[group],
                 &shared.step_cache[group], profile);
     } else {
-      v2RunRecv(args, work, channel, subtid, subthreads, main_barrier, &shared.ready[group],
+      runRecv(args, work, channel, subtid, subthreads, main_barrier, &shared.ready[group],
                 &shared.step_cache[group], profile);
     }
   }
@@ -651,7 +651,7 @@ __device__ __forceinline__ void v2RunBatch(const KernelArgs& args, const WorkBat
 
 __global__ void __launch_bounds__(kThreadsPerBlock, 1) transport_kernel(KernelArgs args) {
   auto* local_header = reinterpret_cast<WindowHeader*>(args.local_window);
-  if (blockIdx.x == 0 && threadIdx.x == 0) v2Publish(&local_header->epoch, args.epoch);
+  if (blockIdx.x == 0 && threadIdx.x == 0) publish(&local_header->epoch, args.epoch);
 
   __shared__ int peers_ready;
   if (threadIdx.x == 0) {
@@ -661,7 +661,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 1) transport_kernel(KernelAr
       if (args.peer_transports[peer] == static_cast<std::uint8_t>(Transport::kGin)) continue;
       auto* remote_header = reinterpret_cast<WindowHeader*>(args.peer_windows[peer]);
       unsigned long long cache = 0;
-      peers_ready = v2WaitReady(&remote_header->epoch, args.epoch, &cache, &local_header->error,
+      peers_ready = waitReady(&remote_header->epoch, args.epoch, &cache, &local_header->error,
                                 args.timeout_cycles);
     }
     if (!peers_ready) atomicExch_system(&local_header->error, 4U);
@@ -672,7 +672,7 @@ __global__ void __launch_bounds__(kThreadsPerBlock, 1) transport_kernel(KernelAr
   const std::uint32_t channel = args.channel_ids[blockIdx.x];
   const ChannelQueue queue = args.channels[blockIdx.x];
   for (std::uint32_t index = 0; index < queue.batch_count; ++index) {
-    v2RunBatch(args, args.batches[queue.first_batch + index], channel);
+    runBatch(args, args.batches[queue.first_batch + index], channel);
   }
 #if SHARDSTREAM_HAS_GIN
   if (args.gin_enabled != 0) {
