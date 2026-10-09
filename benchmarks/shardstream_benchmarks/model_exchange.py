@@ -794,7 +794,9 @@ def _destroy_process_group(timeout: float = 5.0) -> None:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run ShardStream real-model weight exchange")
+    parser = argparse.ArgumentParser(
+        description="Run ShardStream real-model weight exchange"
+    )
     parser.add_argument("--join-after", type=_positive_int, nargs="*", default=[])
     parser.add_argument("--target-engines", type=_positive_int, nargs="*", default=[])
     parser.add_argument(
