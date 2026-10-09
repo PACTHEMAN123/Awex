@@ -98,68 +98,57 @@
     {
       "source": "awex/transfer/nccl_device_v2/device_v2_kernel.cuh",
       "destination": "include/shardstream/kernel.cuh",
-      "source_sha256": "7e82b0560dfef0b99210a65d7e82e2d007ab66494346c0046a0cc5993a22473b",
-      "renamed_sha256": "bce6289514792340f23c9b0837cb055c23b36b4582c9135266891144506b4c5e"
+      "source_sha256": "7e82b0560dfef0b99210a65d7e82e2d007ab66494346c0046a0cc5993a22473b"
     },
     {
       "source": "awex/transfer/nccl_device_v2/device_v2_launch.cuh",
       "destination": "include/shardstream/launch.cuh",
-      "source_sha256": "34d98c1b71859bbf28483bc53e0c4fa58703462706fab77bb19eb01f6880c979",
-      "renamed_sha256": "0b4105f0d837948ba0b18c61c90a309363312ee1a7c1321e7436461085e8f659"
+      "source_sha256": "34d98c1b71859bbf28483bc53e0c4fa58703462706fab77bb19eb01f6880c979"
     },
     {
       "source": "awex/transfer/nccl_device_v2/device_v2_gin.cuh",
       "destination": "include/shardstream/gin.cuh",
-      "source_sha256": "3a936f9359242e101b305b44de80bbd15899e80304c7ce3ccd04540205fc60f6",
-      "renamed_sha256": "192107045277c79169ab2cc02c0abaf261b015a749558a93334dc7eac357df36"
+      "source_sha256": "3a936f9359242e101b305b44de80bbd15899e80304c7ce3ccd04540205fc60f6"
     },
     {
       "source": "awex/transfer/nccl_device_v2/device_v2_fp8.cuh",
       "destination": "include/shardstream/fp8.cuh",
-      "source_sha256": "47b09339650f405a8d4e270cc42e6eeecf9d4db0265326b6d39d06218432f399",
-      "renamed_sha256": "37fc83a39dff1613a5b6d0f4215973924e200063670ebcf0edd36fa1e8b66ce5"
+      "source_sha256": "47b09339650f405a8d4e270cc42e6eeecf9d4db0265326b6d39d06218432f399"
     },
     {
       "source": "awex/transfer/nccl_device_v2/device_v2_types.cuh",
       "destination": "include/shardstream/types.cuh",
-      "source_sha256": "628dcad112260f228f72e03954a60e7b3219882e501388c1b9f69a56c3d11da7",
-      "renamed_sha256": "64144f8499f36524deb6d66694cdfd3e0b78a5ed68152016675cdc17062640bd"
+      "source_sha256": "628dcad112260f228f72e03954a60e7b3219882e501388c1b9f69a56c3d11da7"
     },
     {
       "source": "awex/transfer/nccl_device_v2/nccl_device_v2_ext.cu",
       "destination": "bindings/torch/bindings.cu",
-      "source_sha256": "14c907005957939e4cde5143eabb3992d7f76e6125d826b1cdd62e3585c4e9f6",
-      "renamed_sha256": "3e50cd1031765f27c52a6a5fef8e587a808f4682003c7b357c270e3466b45cc1"
+      "source_sha256": "14c907005957939e4cde5143eabb3992d7f76e6125d826b1cdd62e3585c4e9f6"
     },
     {
       "source": "awex/transfer/nccl_device_v2/device_v2_launch.cu",
       "destination": "src/launch.cu",
-      "source_sha256": "a490bb7786e05ff3271d983158165ae41e961d4cf63ee5252361858d8239d10e",
-      "renamed_sha256": "4a8448a45f63444ddf6fad7b483770e2c49348f51102313a20dbbdcfc9c1135a"
+      "source_sha256": "a490bb7786e05ff3271d983158165ae41e961d4cf63ee5252361858d8239d10e"
     },
     {
       "source": "awex/transfer/nccl_device_v2/device_v2_gin_config.h",
       "destination": "include/shardstream/gin_config.h",
-      "source_sha256": "3822704f28eee58fa7412e4fe3e25bd4607c289551004fa3ffbac0737a867a6b",
-      "renamed_sha256": "0dc6428edc456b032942a62d2e0f9c872031e09ef184fd19c3231ae62f28bded"
+      "source_sha256": "3822704f28eee58fa7412e4fe3e25bd4607c289551004fa3ffbac0737a867a6b"
     },
     {
       "source": "awex/transfer/nccl_device_v2/device_v2_primitives.cuh",
       "destination": "include/shardstream/primitives.cuh",
-      "source_sha256": "bd8135c9a9bfce35848bcf3b7314dc2dd9935ca0a9720c27d76b23f4379b3ad1",
-      "renamed_sha256": "10c00e6d5c8a8df5a10cbe40ff07b443aa82a171b3765cd76d7e9465c1a39d13"
+      "source_sha256": "bd8135c9a9bfce35848bcf3b7314dc2dd9935ca0a9720c27d76b23f4379b3ad1"
     },
     {
       "source": "awex/transfer/nccl_device_v2/device_v2_lowering.h",
       "destination": "include/shardstream/lowering.h",
-      "source_sha256": "e64c161bdafeb497210dfff8beb6b43efba9c9a81e94a196b37ff278ffe2bbfb",
-      "renamed_sha256": "1511a9ca216390026051fdae3f1307b746fa41ca2319b7747089f3f812dae9a9"
+      "source_sha256": "e64c161bdafeb497210dfff8beb6b43efba9c9a81e94a196b37ff278ffe2bbfb"
     },
     {
       "source": "awex/transfer/nccl_device_v2/device_v2_topology.h",
       "destination": "include/shardstream/topology.h",
-      "source_sha256": "de37dc022a88493f5b04d4dd6f34391970ccae81161d650c41ddc9688156e414",
-      "renamed_sha256": "a336e07fe3886f71ae58caaf98aaa29e10a95471e6455e4e733376ae60204fbf"
+      "source_sha256": "de37dc022a88493f5b04d4dd6f34391970ccae81161d650c41ddc9688156e414"
     }
   ],
   "python_modules": {
@@ -194,5 +183,6 @@
     "util/profile.py": "_utils/profile.py",
     "util/system_util.py": "_utils/system.py",
     "util/tensor_util.py": "_utils/tensor.py"
-  }
+  },
+  "native_migration_notes": "Kernel/protocol files retain original expressions and PTX under renamed identifiers; audit with scripts/audit_protocol.py. Host runtime is extracted from the original extension into src/runtime.cu with a 98-line torch binding; its behavior requires GPU acceptance."
 }
