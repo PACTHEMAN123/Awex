@@ -30,7 +30,7 @@ struct BatchShared {
   unsigned long long copy_completed[kMaxWorksPerBatch];
 };
 
-__device__ __forceinline__ std::uint32_t roles(Direction direction, int tid, int nthreads, int* nworkers) {
+__device__ __forceinline__ std::uint32_t threadRoles(Direction direction, int tid, int nthreads, int* nworkers) {
   const bool send = direction == Direction::kSend;
   *nworkers = nthreads - (nthreads >= 3 * kWarpSize ? kWarpSize : 0);
   std::uint32_t roles = tid < *nworkers ? kRoleWorker : 0;
@@ -46,7 +46,7 @@ __device__ __forceinline__ void runSend(const KernelArgs& args, const Work& work
                                           int nthreads, int main_barrier, int wait_barrier, int* ready,
                                           unsigned long long* step_cache, KernelProfile* profile) {
   int nworkers = 0;
-  const std::uint32_t roles = roles(Direction::kSend, tid, nthreads, &nworkers);
+  const std::uint32_t roles = threadRoles(Direction::kSend, tid, nthreads, &nworkers);
   auto* error = &reinterpret_cast<WindowHeader*>(args.local_window)->error;
   std::uint64_t cursor = 0;
   std::uint64_t step = work.step_begin;
@@ -103,7 +103,7 @@ __device__ __forceinline__ void runRecv(const KernelArgs& args, const Work& work
                                           int nthreads, int barrier, int* ready,
                                           unsigned long long* step_cache, KernelProfile* profile) {
   int nworkers = 0;
-  const std::uint32_t roles = roles(Direction::kRecv, tid, nthreads, &nworkers);
+  const std::uint32_t roles = threadRoles(Direction::kRecv, tid, nthreads, &nworkers);
   auto* error = &reinterpret_cast<WindowHeader*>(args.local_window)->error;
   std::uint64_t cursor = 0;
   std::uint64_t step = work.step_begin;
@@ -432,7 +432,7 @@ __device__ __forceinline__ void runRelay(const KernelArgs& args, const Work& wor
   // NCCL SIMPLE's waitPeer/genericOp: separate receive/send wait owners,
   // worker-only pre-copy synchronization, then the all-thread post barrier.
   // Source: NVIDIA NCCL src/device/prims_simple.h (Apache-2.0).
-  std::uint32_t roles = roles(Direction::kRecv, tid, nthreads, &nworkers);
+  std::uint32_t roles = threadRoles(Direction::kRecv, tid, nthreads, &nworkers);
   if (tid == 1) roles |= kRoleWaitSend;
   auto* error = &reinterpret_cast<WindowHeader*>(args.local_window)->error;
   const bool input_gin = args.peer_transports[work.peer] == static_cast<std::uint8_t>(Transport::kGin);
