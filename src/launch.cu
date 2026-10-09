@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include "transport_kernel.cuh"
+#include "kernel.cuh"
 #include "launch.cuh"
 
 namespace shardstream {

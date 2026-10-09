@@ -73,7 +73,7 @@ inline std::uint32_t powerOfTwoDown(std::uint32_t value) {
   return result;
 }
 
-inline std::uint32_t powerOfTwoUp(std::uint32_t value) {
+inline std::uint32_t topologyPowerOfTwoUp(std::uint32_t value) {
   std::uint32_t result = 1;
   while (result < value && result < kMaxChannels) result *= 2;
   return result;
@@ -368,7 +368,7 @@ inline Topology discoverTopology(ncclComm_t comm, int world_size, int rank, int 
       path.nvlink_count = links;
       path.bandwidth_gbps = links * link_bw;
       path.raw_channels = links == 0 ? 2 : 2 * std::max(1, static_cast<int>(path.bandwidth_gbps / link_bw));
-      path.channels = std::min(channel_ceiling, powerOfTwoUp(path.raw_channels));
+      path.channels = std::min(channel_ceiling, topologyPowerOfTwoUp(path.raw_channels));
       topology.peer_paths[peer] = path;
     }
 
@@ -391,7 +391,7 @@ inline Topology discoverTopology(ncclComm_t comm, int world_size, int rank, int 
     // NCCL's internal comm->nChannels is not exposed by its public API and is
     // not a suitable execution cap for this backend's different CTA shape.
     communicator_raw_channels = std::max<std::uint32_t>(1, communicator_raw_channels);
-    topology.requested_channels_per_peer = powerOfTwoUp(communicator_raw_channels);
+    topology.requested_channels_per_peer = topologyPowerOfTwoUp(communicator_raw_channels);
     topology.channels_per_peer = std::min(topology.total_channels, topology.requested_channels_per_peer);
     for (int peer = 0; peer < world_size; ++peer) {
       if (peer != rank) {
