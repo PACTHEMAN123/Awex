@@ -1,0 +1,521 @@
+// Licensed to the Awex developers under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+#pragma once
+
+#include "types.cuh"
+
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <stdexcept>
+#include <utility>
+#include <vector>
+
+namespace shardstream {
+namespace transport {
+
+struct LoweringConfig {
+  std::uint32_t local_rank = 0;
+  std::uint32_t world_size = 0;
+  std::uint32_t total_channels = 0;
+  std::uint32_t fifo_depth = kDefaultFifoDepth;
+  std::size_t chunk_bytes = kDefaultChunkBytes;
+  std::size_t step_bytes = kDefaultStepBytes;
+  std::uint32_t gin_fifo_depth = kDefaultFifoDepth;
+  std::size_t gin_chunk_bytes = kDefaultChunkBytes;
+  std::size_t network_step_bytes = kDefaultNetworkStepBytes;
+  // Ring lanes are derived from GIN queue multiplicity. Zero preserves the
+  // legacy eight-lane fallback for transports without GIN topology data.
+  std::uint32_t ring_channels = 0;
+  // Topology-derived upper bound for each peer, indexed by rank.
+  std::vector<std::uint32_t> peer_channels;
+  // Transport selection for each peer, indexed by rank.
+  std::vector<std::uint8_t> peer_transports;
+  // Indexed by peer * total_channels + channel.
+  std::vector<std::uint64_t> initial_steps;
+};
+
+struct LoweringTask {
+  std::uintptr_t tensor_ptr = 0;
+  std::uint64_t nbytes = 0;
+  std::uint64_t tensor_offset = 0;
+  std::uint64_t tensor_row_bytes = 0;
+  std::uint64_t tensor_row_stride = 0;
+  std::uint32_t peer = 0;
+  std::uint32_t ordinal = 0;
+  std::uint32_t forward_peer = kNoPeer;
+  std::uint32_t ring_id = kNoRing;
+  std::uintptr_t scale_ptr = 0;
+  std::uint64_t scale_row_stride = 0;
+  std::uint32_t block_rows = 0;
+  std::uint32_t block_cols = 0;
+};
+
+struct Schedule {
+  std::vector<Work> works;
+  std::vector<Fragment> fragments;
+  std::vector<WorkBatch> batches;
+  std::vector<ChannelQueue> channels;
+  std::vector<std::uint32_t> channel_ids;
+  std::vector<std::uint32_t> peer_channel_counts;
+  std::uint32_t channel_count = 0;
+  std::uint32_t chunk_count = 0;
+  std::uint32_t ring_channel_collision_count = 0;
+  std::uint64_t next_step = 1;
+  std::vector<std::uint64_t> next_steps;
+};
+
+inline WindowLayout makeWindowLayout(std::uint32_t world_size, std::uint32_t channel_count,
+                                         std::uint32_t fifo_depth, std::size_t slot_bytes,
+                                         std::uint32_t payload_peer_count) {
+  if (world_size == 0 || channel_count == 0 || fifo_depth == 0 || slot_bytes == 0) {
+    throw std::invalid_argument("invalid v2 window dimensions");
+  }
+  if (payload_peer_count > world_size) {
+    throw std::invalid_argument("invalid v2 payload peer count");
+  }
+  const std::size_t state_connection_count = static_cast<std::size_t>(world_size) * channel_count;
+  const std::size_t state_slot_count = state_connection_count * fifo_depth;
+  const std::size_t payload_connection_count = static_cast<std::size_t>(payload_peer_count) * channel_count;
+  const std::size_t payload_slot_count = payload_connection_count * fifo_depth;
+  const std::size_t state_offset = ((sizeof(WindowHeader) + kFifoAlignment - 1) / kFifoAlignment) * kFifoAlignment;
+  const std::size_t payload_offset =
+    ((state_offset + state_slot_count * sizeof(FifoSlot) + kFifoAlignment - 1) / kFifoAlignment) * kFifoAlignment;
+  const std::size_t window_bytes =
+    ((payload_offset + payload_slot_count * slot_bytes + kWindowAlignment - 1) / kWindowAlignment) *
+    kWindowAlignment;
+  return WindowLayout{
+    state_offset, payload_offset, slot_bytes, fifo_depth, channel_count, world_size, payload_peer_count, window_bytes,
+  };
+}
+
+inline std::uint64_t v2DivUp(std::uint64_t value, std::uint64_t divisor) {
+  return value == 0 ? 0 : (value - 1) / divisor + 1;
+}
+
+inline std::uint64_t v2AlignUp(std::uint64_t value, std::uint64_t alignment) {
+  return v2DivUp(value, alignment) * alignment;
+}
+
+// Match ncclP2pPartBounds so vector alignment survives channel partitioning.
+inline std::pair<std::uint64_t, std::uint64_t> v2PartBounds(std::uint32_t parts, std::uint32_t part,
+                                                            std::uint64_t bytes) {
+  if (parts == 0 || part >= parts) {
+    throw std::invalid_argument("invalid v2 channel partition");
+  }
+  const std::uint64_t part_bytes = v2AlignUp(v2DivUp(bytes, parts), 4 * 1024);
+  return {
+    std::min<std::uint64_t>(static_cast<std::uint64_t>(part) * part_bytes, bytes),
+    std::min<std::uint64_t>(static_cast<std::uint64_t>(part + 1) * part_bytes, bytes),
+  };
+}
+
+inline std::uint32_t v2ChannelsForBytes(std::uint64_t bytes, std::uint32_t min_channels, std::uint32_t max_channels,
+                                        std::size_t step_bytes, bool network) {
+  if (bytes == 0) return 1;
+
+  // Match NCCL addP2pToPlan: network P2P uses a much tighter part range than
+  // intra-node SIMPLE traffic so large messages spread across available rails.
+  const std::uint64_t min_part_bytes =
+    std::max<std::uint64_t>(1, network ? step_bytes / 2 : step_bytes / 8);
+  const std::uint64_t max_part_bytes =
+    network ? step_bytes : static_cast<std::uint64_t>(step_bytes) * 32;
+  const std::uint64_t initial_channels = std::min<std::uint64_t>(min_channels, v2DivUp(bytes, min_part_bytes));
+  std::uint32_t channels = std::max<std::uint32_t>(1, static_cast<std::uint32_t>(initial_channels));
+  std::uint64_t part_bytes = std::max<std::uint64_t>(min_part_bytes, v2DivUp(bytes, channels));
+  while (part_bytes > max_part_bytes && channels <= max_channels / 2) {
+    channels *= 2;
+    part_bytes = v2DivUp(bytes, channels);
+  }
+  return channels;
+}
+
+inline std::size_t v2TransferStepBytes(std::uint64_t bytes, std::size_t step_bytes, bool network) {
+  if (!network) return step_bytes;
+  // Match NCCL's SIMPLE network chunk tuning after channel selection.
+  if (bytes < step_bytes) return std::max<std::size_t>(1, step_bytes / 4);
+  if (bytes < 8 * step_bytes) return std::max<std::size_t>(1, step_bytes / 2);
+  return step_bytes;
+}
+
+inline std::uint32_t v2Log2(std::uint32_t value) {
+  std::uint32_t bits = 0;
+  while ((1U << bits) < value) ++bits;
+  return bits;
+}
+
+inline std::uint32_t v2ReverseBits(std::uint64_t value, std::uint32_t bits) {
+  std::uint32_t result = 0;
+  for (std::uint32_t bit = 0; bit < bits; ++bit) {
+    result = (result << 1) | static_cast<std::uint32_t>((value >> bit) & 1ULL);
+  }
+  return result;
+}
+
+inline std::uint32_t v2LsaChannelBase(std::uint32_t local_rank, std::uint32_t peer,
+                                      std::uint32_t world_size, std::uint32_t total_channels) {
+  const std::uint32_t low = std::min(local_rank, peer);
+  const std::uint32_t high = std::max(local_rank, peer);
+  const std::uint64_t pair = static_cast<std::uint64_t>(low) * world_size + high;
+  return v2ReverseBits(pair, v2Log2(total_channels));
+}
+
+inline std::uint32_t ginChannelBase(std::uint32_t local_rank, std::uint32_t peer,
+                                      std::uint32_t total_channels, std::uint32_t peer_channels) {
+  // This symmetric edge coloring gives consecutive peers disjoint channel
+  // groups until the per-rank channel budget is exhausted. Keeping a peer's
+  // channels contiguous also preserves the context/connection round robin.
+  const std::uint32_t group_count = std::max<std::uint32_t>(1, total_channels / peer_channels);
+  const std::uint32_t group = (local_rank + peer) % group_count;
+  return group * peer_channels;
+}
+
+inline std::uint32_t v2RingChannelBase(std::uint32_t ring_id, std::uint32_t total_channels,
+                                       std::uint32_t ring_channels) {
+  const std::uint32_t group_count = total_channels / ring_channels;
+  if (group_count <= 1) return 0;
+  std::uint32_t group = 0;
+  std::uint32_t value = ring_id;
+  while (value != 0) {
+    group ^= value % group_count;
+    value /= group_count;
+  }
+  return (group % group_count) * ring_channels;
+}
+
+struct StreamSpan {
+  const LoweringTask* task;
+  std::uint64_t begin;
+  std::uint64_t end;
+};
+
+inline void v2AppendFragments(const std::vector<StreamSpan>& spans, std::uint64_t work_begin, std::uint64_t work_end,
+                              Schedule* schedule, Work* work) {
+  work->fragment_begin = static_cast<std::uint32_t>(schedule->fragments.size());
+  for (const StreamSpan& span : spans) {
+    if (span.end <= work_begin || work_end <= span.begin) continue;
+    const std::uint64_t begin = std::max(span.begin, work_begin);
+    const std::uint64_t end = std::min(span.end, work_end);
+    const LoweringTask& task = *span.task;
+    schedule->fragments.push_back(Fragment{
+      task.tensor_ptr,
+      end - begin,
+      task.tensor_offset + begin - span.begin,
+      task.tensor_row_bytes,
+      task.tensor_row_stride,
+      begin - work_begin,
+      task.scale_ptr,
+      task.scale_row_stride,
+      task.block_rows,
+      task.block_cols,
+    });
+  }
+  const std::size_t fragment_count = schedule->fragments.size() - work->fragment_begin;
+  if (fragment_count == 0 || fragment_count > std::numeric_limits<std::uint32_t>::max()) {
+    throw std::invalid_argument("v2 work has an invalid fragment range");
+  }
+  work->fragment_count = static_cast<std::uint32_t>(fragment_count);
+}
+
+// Treat each peer's ordered TransferPlan spans as one virtual tensor. Channel
+// partitioning happens on that complete stream; only then are channel parts
+// divided into transport chunks and FIFO steps.
+inline Schedule lowerFixedTasks(const std::vector<LoweringTask>& tasks,
+                                  const std::vector<std::uint32_t>& active_peers, Direction direction,
+                                  const LoweringConfig& config) {
+  if (config.world_size == 0 || config.world_size > 256 || config.local_rank >= config.world_size) {
+    throw std::invalid_argument("invalid v2 rank configuration");
+  }
+  if (config.total_channels == 0 || config.total_channels > kMaxChannels ||
+      (config.total_channels & (config.total_channels - 1)) != 0) {
+    throw std::invalid_argument("v2 total channel count must be a power of two");
+  }
+  if (config.peer_channels.size() != config.world_size) {
+    throw std::invalid_argument("v2 peer channel table does not match world size");
+  }
+  if (config.peer_transports.size() != config.world_size) {
+    throw std::invalid_argument("v2 peer transport table does not match world size");
+  }
+  if (config.fifo_depth == 0 || config.gin_fifo_depth == 0 || config.step_bytes == 0 ||
+      config.network_step_bytes == 0 ||
+      config.step_bytes > std::numeric_limits<std::uint32_t>::max() ||
+      config.network_step_bytes > std::numeric_limits<std::uint32_t>::max()) {
+    throw std::invalid_argument("v2 FIFO depth and step sizes must be positive and fit in Work");
+  }
+  if ((config.chunk_bytes != 0 && config.chunk_bytes < config.step_bytes) ||
+      (config.gin_chunk_bytes != 0 && config.gin_chunk_bytes < config.network_step_bytes)) {
+    throw std::invalid_argument("v2 transport chunk_bytes must be zero or at least its step_bytes");
+  }
+
+  const std::size_t step_count = static_cast<std::size_t>(config.world_size) * config.total_channels;
+  if (!config.initial_steps.empty() && config.initial_steps.size() != step_count) {
+    throw std::invalid_argument("invalid v2 initial step table");
+  }
+
+  Schedule schedule;
+  schedule.next_steps = config.initial_steps.empty() ? std::vector<std::uint64_t>(step_count, 1) : config.initial_steps;
+  schedule.peer_channel_counts.assign(config.world_size, 0);
+
+  std::vector<std::int32_t> peer_index(config.world_size, -1);
+  for (std::size_t index = 0; index < active_peers.size(); ++index) {
+    const std::uint32_t peer = active_peers[index];
+    if (peer >= config.world_size || peer == config.local_rank || peer_index[peer] != -1) {
+      throw std::invalid_argument("v2 active peer list is invalid");
+    }
+    peer_index[peer] = static_cast<std::int32_t>(index);
+  }
+
+  struct RouteTasks {
+    std::uint32_t peer;
+    std::uint32_t forward_peer;
+    std::uint32_t ring_id;
+    std::vector<const LoweringTask*> tasks;
+  };
+  std::vector<RouteTasks> routes;
+  std::vector<std::uint32_t> peer_task_counts(config.world_size, 0);
+  for (const LoweringTask& task : tasks) {
+    if (task.peer >= config.world_size || peer_index[task.peer] < 0) {
+      throw std::invalid_argument("v2 task peer is not active");
+    }
+    if (task.tensor_row_bytes == 0 || task.tensor_row_stride < task.tensor_row_bytes) {
+      throw std::invalid_argument("invalid v2 tensor row layout");
+    }
+    if (task.ordinal != peer_task_counts[task.peer]++) {
+      throw std::invalid_argument("v2 task order is not dense within its peer stream");
+    }
+    if (task.forward_peer != kNoPeer &&
+        (task.ring_id == kNoRing || task.forward_peer >= config.world_size ||
+         task.forward_peer == config.local_rank || peer_index[task.forward_peer] < 0)) {
+      throw std::invalid_argument("v2 ring forward peer is invalid");
+    }
+    auto route = std::find_if(routes.begin(), routes.end(), [&](const RouteTasks& candidate) {
+      return candidate.peer == task.peer && candidate.forward_peer == task.forward_peer &&
+        candidate.ring_id == task.ring_id;
+    });
+    if (route == routes.end()) {
+      routes.push_back(RouteTasks{task.peer, task.forward_peer, task.ring_id, {}});
+      route = routes.end() - 1;
+    }
+    route->tasks.push_back(&task);
+  }
+  if (std::any_of(routes.begin(), routes.end(), [](const RouteTasks& route) { return route.ring_id != kNoRing; })) {
+    std::stable_sort(routes.begin(), routes.end(), [](const RouteTasks& left, const RouteTasks& right) {
+      if (left.ring_id != right.ring_id) return left.ring_id < right.ring_id;
+      if (left.peer != right.peer) return left.peer < right.peer;
+      return left.forward_peer < right.forward_peer;
+    });
+  }
+
+  using PeerWorkQueues = std::vector<std::vector<Work>>;
+  std::vector<PeerWorkQueues> channel_work(config.total_channels, PeerWorkQueues(config.world_size));
+  std::vector<std::uint64_t> send_steps(step_count, 1);
+  std::vector<std::uint64_t> recv_steps(step_count, 1);
+  for (const RouteTasks& route : routes) {
+    const std::uint32_t peer = route.peer;
+    const bool ring = route.ring_id != kNoRing;
+    std::vector<StreamSpan> spans;
+    std::uint64_t stream_bytes = 0;
+    for (const LoweringTask* task : route.tasks) {
+      if (task->nbytes > std::numeric_limits<std::uint64_t>::max() - stream_bytes) {
+        throw std::invalid_argument("v2 peer stream size overflows");
+      }
+      if (task->nbytes != 0) {
+        spans.push_back(StreamSpan{task, stream_bytes, stream_bytes + task->nbytes});
+      }
+      stream_bytes += task->nbytes;
+    }
+    if (stream_bytes == 0) continue;
+
+    const bool network = ring ||
+      config.peer_transports[peer] == static_cast<std::uint8_t>(Transport::kGin);
+    const std::size_t planning_step_bytes = network ? config.network_step_bytes : config.step_bytes;
+    const std::size_t transport_chunk_bytes = network ? config.gin_chunk_bytes : config.chunk_bytes;
+    const std::uint32_t transport_fifo_depth = network ? config.gin_fifo_depth : config.fifo_depth;
+    const std::size_t transfer_step_bytes = v2TransferStepBytes(stream_bytes, planning_step_bytes, network);
+    // Match ring lanes to GIN queue multiplicity. When roots outnumber channel
+    // groups, the scheduler below globally orders colliding routes.
+    const std::uint32_t ring_channels =
+      config.ring_channels == 0 ? 8 : config.ring_channels;
+    const std::uint32_t max_channels = ring ? std::max<std::uint32_t>(
+      1, std::min(ring_channels, config.total_channels)) :
+      std::max<std::uint32_t>(1, std::min(config.peer_channels[peer], config.total_channels));
+    std::uint32_t min_channels = max_channels;
+    while (static_cast<std::uint64_t>(min_channels) * config.world_size > config.total_channels && min_channels > 1) {
+      min_channels /= 2;
+    }
+    const std::uint32_t channel_count =
+      v2ChannelsForBytes(stream_bytes, min_channels, max_channels, planning_step_bytes, network);
+    schedule.peer_channel_counts[peer] = channel_count;
+    const std::uint32_t channel_base = ring
+      ? v2RingChannelBase(route.ring_id, config.total_channels, channel_count)
+      : network
+      ? ginChannelBase(config.local_rank, peer, config.total_channels, channel_count)
+      : v2LsaChannelBase(config.local_rank, peer, config.world_size, config.total_channels);
+
+    for (std::uint32_t part = 0; part < channel_count; ++part) {
+      const auto bounds = v2PartBounds(channel_count, part, stream_bytes);
+      if (bounds.first == bounds.second) continue;
+      const std::uint32_t channel = (channel_base + part) & (config.total_channels - 1);
+      const std::uint64_t part_bytes = bounds.second - bounds.first;
+      const std::uint64_t effective_chunk_bytes = transport_chunk_bytes == 0 ? part_bytes : transport_chunk_bytes;
+      const std::uint64_t chunk_count = v2DivUp(part_bytes, effective_chunk_bytes);
+      if (chunk_count > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::invalid_argument("v2 channel part has too many chunks");
+      }
+
+      auto& queue = channel_work[channel][peer];
+      for (std::uint64_t chunk = 0; chunk < chunk_count; ++chunk) {
+        const std::uint64_t chunk_begin = bounds.first + chunk * effective_chunk_bytes;
+        const std::uint64_t chunk_end = std::min<std::uint64_t>(chunk_begin + effective_chunk_bytes, bounds.second);
+        Work work{};
+        work.peer = peer;
+        work.forward_peer = route.forward_peer;
+        work.ring_id = route.ring_id;
+        work.chunk_ordinal = static_cast<std::uint32_t>(chunk);
+        work.chunk_count = static_cast<std::uint32_t>(chunk_count);
+        work.step_bytes = static_cast<std::uint32_t>(transfer_step_bytes);
+        work.fifo_depth = transport_fifo_depth;
+        work.stream_offset = chunk_begin;
+        work.nbytes = chunk_end - chunk_begin;
+        const std::uint64_t work_steps = v2DivUp(work.nbytes, transfer_step_bytes);
+        const std::size_t connection = static_cast<std::size_t>(peer) * config.total_channels + channel;
+        auto& input_steps = direction == Direction::kSend ? send_steps : recv_steps;
+        work.step_begin = input_steps[connection];
+        input_steps[connection] += work_steps;
+        if (route.forward_peer != kNoPeer) {
+          const std::size_t forward_connection =
+            static_cast<std::size_t>(route.forward_peer) * config.total_channels + channel;
+          work.forward_step_begin = send_steps[forward_connection];
+          send_steps[forward_connection] += work_steps;
+        }
+        v2AppendFragments(spans, chunk_begin, chunk_end, &schedule, &work);
+        queue.push_back(work);
+        ++schedule.chunk_count;
+      }
+      queue.back().final = 1;
+    }
+  }
+
+  // Each batch contains at most one work per input and forward peer, so
+  // concurrent warp groups never race on a (peer, channel) FIFO step stream.
+  for (std::uint32_t channel = 0; channel < config.total_channels; ++channel) {
+    std::size_t remaining = 0;
+    std::vector<std::size_t> cursors(config.world_size, 0);
+    for (const std::uint32_t peer : active_peers) remaining += channel_work[channel][peer].size();
+    if (remaining == 0) continue;
+
+    schedule.channel_ids.push_back(channel);
+    ChannelQueue channel_queue{};
+    channel_queue.first_batch = static_cast<std::uint32_t>(schedule.batches.size());
+    std::vector<Work> colliding_ring_work;
+    std::vector<std::uint32_t> ring_ids;
+    for (const std::uint32_t peer : active_peers) {
+      for (const Work& work : channel_work[channel][peer]) {
+        if (work.ring_id == kNoRing) continue;
+        colliding_ring_work.push_back(work);
+        if (std::find(ring_ids.begin(), ring_ids.end(), work.ring_id) == ring_ids.end()) {
+          ring_ids.push_back(work.ring_id);
+        }
+      }
+    }
+    if (ring_ids.size() > 1 && colliding_ring_work.size() == remaining) {
+      schedule.ring_channel_collision_count += static_cast<std::uint32_t>(ring_ids.size() - 1);
+      // NCCL diversifies ring starting offsets across parallel lanes. Split
+      // colliding roots' first-service priority across channels, so one entire
+      // root group does not occupy every lane before another group can inject.
+      // Each channel keeps a global order, and drains whole roots as before;
+      // no chunk-boundary flush, receive storage, or extra launch is needed.
+      const bool reverse_roots = (channel & 1U) != 0;
+      std::stable_sort(colliding_ring_work.begin(), colliding_ring_work.end(), [reverse_roots](const Work& left,
+                                                                                 const Work& right) {
+        if (left.ring_id != right.ring_id) {
+          return reverse_roots ? left.ring_id > right.ring_id : left.ring_id < right.ring_id;
+        }
+        if (left.chunk_ordinal != right.chunk_ordinal) return left.chunk_ordinal < right.chunk_ordinal;
+        return left.peer < right.peer;
+      });
+      std::vector<std::uint64_t> ordered_send_steps(config.world_size, 1);
+      std::vector<std::uint64_t> ordered_recv_steps(config.world_size, 1);
+      for (Work& work : colliding_ring_work) {
+        const std::uint64_t work_steps = v2DivUp(work.nbytes, work.step_bytes);
+        auto& input_steps = direction == Direction::kSend ? ordered_send_steps : ordered_recv_steps;
+        work.step_begin = input_steps[work.peer];
+        input_steps[work.peer] += work_steps;
+        if (work.forward_peer != kNoPeer) {
+          work.forward_step_begin = ordered_send_steps[work.forward_peer];
+          ordered_send_steps[work.forward_peer] += work_steps;
+        }
+        WorkBatch batch{};
+        batch.work_begin = static_cast<std::uint32_t>(schedule.works.size());
+        batch.work_count = 1;
+        schedule.works.push_back(work);
+        schedule.batches.push_back(batch);
+        ++channel_queue.batch_count;
+      }
+      schedule.channels.push_back(channel_queue);
+      continue;
+    }
+    std::size_t peer_cursor = 0;
+    while (remaining != 0) {
+      WorkBatch batch{};
+      batch.work_begin = static_cast<std::uint32_t>(schedule.works.size());
+      std::vector<std::uint8_t> used_forward_peers(config.world_size, 0);
+      const std::size_t batch_peer_begin = peer_cursor;
+      std::size_t last_peer_index = batch_peer_begin;
+      std::size_t scanned = 0;
+      while (scanned < active_peers.size() && batch.work_count < kMaxWorksPerBatch) {
+        const std::size_t index = (batch_peer_begin + scanned) % active_peers.size();
+        const std::uint32_t peer = active_peers[index];
+        auto& queue = channel_work[channel][peer];
+        if (cursors[peer] < queue.size()) {
+          const Work& candidate = queue[cursors[peer]];
+          if (candidate.forward_peer != kNoPeer && used_forward_peers[candidate.forward_peer]) {
+            ++scanned;
+            continue;
+          }
+          schedule.works.push_back(candidate);
+          ++cursors[peer];
+          if (candidate.forward_peer != kNoPeer) used_forward_peers[candidate.forward_peer] = 1;
+          ++batch.work_count;
+          --remaining;
+          last_peer_index = index;
+        }
+        ++scanned;
+      }
+      if (batch.work_count == 0) {
+        throw std::logic_error("v2 channel scheduler made no progress");
+      }
+      peer_cursor = (last_peer_index + 1) % active_peers.size();
+      schedule.batches.push_back(batch);
+      ++channel_queue.batch_count;
+    }
+    schedule.channels.push_back(channel_queue);
+  }
+
+  schedule.channel_count = static_cast<std::uint32_t>(schedule.channel_ids.size());
+  for (std::size_t index = 0; index < step_count; ++index) {
+    schedule.next_steps[index] = std::max(send_steps[index], recv_steps[index]);
+  }
+  for (const std::uint64_t step : schedule.next_steps) schedule.next_step = std::max(schedule.next_step, step);
+  (void)direction;
+  return schedule;
+}
+
+}  // namespace transport
+}  // namespace shardstream
