@@ -31,7 +31,6 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
 
   std::vector<shardstream::TensorView> views;
   views.reserve(tensors.size());
-  int device = -1;
   for (const auto& object : tensors) {
     const auto tensor = object.cast<torch::Tensor>();
     shardstream::TensorView view;
@@ -41,12 +40,14 @@ py::dict launch(int64_t handle, const py::list& tensors, const std::vector<int64
     if (tensor.scalar_type() == at::ScalarType::Float8_e4m3fn) view.dtype = shardstream::ScalarType::Float8E4M3;
     view.item_bytes = tensor.element_size();
     view.elements = tensor.numel();
-    view.dimensions = tensor.sizes().vec();
-    view.strides = tensor.strides().vec();
-    if (device < 0) device = view.device;
+    view.rank = tensor.dim();
+    for (int axis = 0; axis < std::min<int64_t>(2, tensor.dim()); ++axis) {
+      view.dimensions[axis] = tensor.size(axis);
+      view.strides[axis] = tensor.stride(axis);
+    }
     views.push_back(std::move(view));
   }
-  auto stream = at::cuda::getCurrentCUDAStream(device).stream();
+  auto stream = at::cuda::getCurrentCUDAStream(shardstream::device(handle)).stream();
   shardstream::Metrics metrics;
   {
     py::gil_scoped_release release;

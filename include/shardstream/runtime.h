@@ -17,6 +17,7 @@
 
 #pragma once
 #include <cuda_runtime_api.h>
+#include <array>
 #include <cstdint>
 #include <map>
 #include <string>
@@ -32,12 +33,13 @@ struct TensorView {
   ScalarType dtype = ScalarType::Other;
   int64_t item_bytes = 0;
   int64_t elements = 0;
-  std::vector<int64_t> dimensions;
-  std::vector<int64_t> strides;
+  int64_t rank = 0;
+  std::array<int64_t, 2> dimensions{};
+  std::array<int64_t, 2> strides{};
   bool is_cuda() const { return device >= 0; }
   int get_device() const { return device; }
   void* data_ptr() const { return pointer; }
-  int64_t dim() const { return dimensions.size(); }
+  int64_t dim() const { return rank; }
   int64_t size(int axis) const { return dimensions.at(axis); }
   int64_t stride(int axis) const { return strides.at(axis); }
   int64_t element_size() const { return item_bytes; }
@@ -53,6 +55,7 @@ int64_t create(const std::string& id, int world_size, int rank, int device,
                int64_t gin_chunk_bytes, int gin_context_count,
                const std::vector<int64_t>& logical_to_communicator);
 void destroy(int64_t handle);
+int device(int64_t handle);
 Metrics launch(int64_t handle, const std::vector<TensorView>& tensors, const std::vector<int64_t>& lengths,
                 const std::vector<int64_t>& tensor_offsets, const std::vector<int64_t>& tensor_row_bytes,
                 const std::vector<int64_t>& tensor_row_strides, const std::vector<int64_t>& peers,

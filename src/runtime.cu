@@ -1043,6 +1043,11 @@ int64_t create(const std::string& id, int world_size, int rank, int device,
   return reinterpret_cast<int64_t>(state.release());
 }
 
+int device(int64_t handle) {
+  if (!handle) throw std::invalid_argument("null transport handle");
+  return reinterpret_cast<DeviceState*>(handle)->device;
+}
+
 void destroy(int64_t handle) {
   auto* state = reinterpret_cast<DeviceState*>(handle);
   if (state == nullptr) return;
