@@ -1,4 +1,4 @@
-# Licensed to the ShardStream developers under one
+# Licensed to the Awex developers under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
 # regarding copyright ownership.  The ASF licenses this file
@@ -62,7 +62,7 @@ def get_mcore_rank_info() -> RankInfo:
     cp_size = int(get_cp_size()) if callable(get_cp_size) else 1
     get_cp_rank = getattr(mpu, "get_context_parallel_rank", None)
     cp_rank = int(get_cp_rank()) if callable(get_cp_rank) else 0
-    cp_mode = os.environ.get("AWEX_CP_MODE")
+    cp_mode = os.environ.get("SHARDSTREAM_CP_MODE")
     if not cp_mode:
         cp_mode = "ring" if cp_size > 1 else "none"
     world_size = dist.get_world_size()

@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""Host configuration for the NCCL Device v2 GIN transport."""
+"""Host configuration for the NCCL Transport GIN transport."""
 
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ from dataclasses import dataclass
 
 
 class TransportUnavailableError(RuntimeError):
-    """Raised when the NCCL Device v2 transport cannot be initialized."""
+    """Raised when the NCCL Transport transport cannot be initialized."""
 
 
 @dataclass(frozen=True, slots=True)

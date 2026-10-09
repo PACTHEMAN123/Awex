@@ -408,7 +408,7 @@ class TransferPlanBuilder:
         for inf_replica_idx in range(num_inference_replicas):
             if self.group_replicated_inference:
                 # Equivalent logical replicas across inference engines must use
-                # the same source replica so Device v2 can lower one root
+                # the same source replica so Transport can lower one root
                 # injection followed by a replica ring.
                 logical_replica_idx = inf_replica_idx % replicas_per_engine
                 train_replica_idx = (

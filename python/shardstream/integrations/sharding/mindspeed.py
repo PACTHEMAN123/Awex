@@ -1,4 +1,4 @@
-# Licensed to the ShardStream developers under one
+# Licensed to the Awex developers under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
 # regarding copyright ownership.  The ASF licenses this file
@@ -35,7 +35,7 @@ def ensure_mindspeed_patched(reason: str | None = None) -> bool:
     if _PATCHED:
         return True
 
-    use_mindspeed = os.environ.get("AWEX_USE_MINDSPEED", "").strip().lower() in {
+    use_mindspeed = os.environ.get("SHARDSTREAM_USE_MINDSPEED", "").strip().lower() in {
         "1",
         "true",
         "yes",

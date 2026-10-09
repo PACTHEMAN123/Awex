@@ -1,4 +1,4 @@
-# Licensed to the ShardStream developers under one
+# Licensed to the Awex developers under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
 # regarding copyright ownership.  The ASF licenses this file
@@ -415,7 +415,7 @@ class McoreToHFWeightConverter:
             conf_backend = conf_backend.strip().lower()
             if conf_backend in {"cuda", "npu", "cpu"}:
                 return conf_backend
-        env_backend = os.environ.get("AWEX_DEVICE_TYPE", "").strip().lower()
+        env_backend = os.environ.get("SHARDSTREAM_DEVICE_TYPE", "").strip().lower()
         if env_backend in {"cuda", "npu", "cpu"}:
             return env_backend
         infer_engine_config = infer_conf.get("infer_engine_config")

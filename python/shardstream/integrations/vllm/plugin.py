@@ -1,0 +1,716 @@
+# Licensed to the Awex developers under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+import asyncio
+import logging
+import os
+from typing import Any
+
+from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse
+
+from shardstream.integrations.config import InferenceConfig
+from shardstream.integrations.verl.environment import configure_ray_locality
+
+configure_ray_locality()
+
+from shardstream.integrations.publication.vllm import (  # noqa: E402
+    PublicationVLLMServerAdapter,  # noqa: E402
+)
+from shardstream.integrations.vllm.server import (  # noqa: E402
+    ShardStreamVLLMServerAdapter,  # noqa: E402
+)
+
+logger = logging.getLogger(__name__)
+
+# Newer vLLM moved OpenAIBaseModel and removed the shared module-level router.
+# Try new paths first, fall back to legacy.
+try:
+    from vllm.entrypoints.openai.engine.protocol import OpenAIBaseModel
+except ImportError:
+    from vllm.entrypoints.openai.protocol import OpenAIBaseModel
+
+try:
+    from vllm.entrypoints.openai.api_server import router  # type: ignore[attr-defined]
+
+    _USING_LEGACY_VLLM_ROUTER = True
+except ImportError:
+    router = APIRouter()
+    _USING_LEGACY_VLLM_ROUTER = False
+
+_shardstream_build_app_patched = False
+
+_shardstream_plugin_registered = False
+_SHARDSTREAM_WORKER_METHODS = {
+    "_get_model_param_info": (
+        "shardstream.integrations.metadata.inference",
+        "InferParamMetaResolver._get_model_param_info",
+    ),
+    "_init_in_tp_worker": (
+        "shardstream.integrations.reader.base",
+        "WeightsReader._init_in_tp_worker",
+    ),
+    "_update_parameters_in_tp_worker": (
+        "shardstream.integrations.reader.base",
+        "WeightsReader._update_parameters_in_tp_worker",
+    ),
+    "_pre_update_weights_in_tp_worker": (
+        "shardstream.integrations.reader.base",
+        "WeightsReader._pre_update_weights_in_tp_worker",
+    ),
+    "_pre_validate_weights_on_tp_worker": (
+        "shardstream.integrations.reader.base",
+        "WeightsReader._pre_validate_weights_on_tp_worker",
+    ),
+    "_verify_weights_on_tp_worker": (
+        "shardstream.integrations.reader.base",
+        "WeightsReader._verify_weights_on_tp_worker",
+    ),
+    # Optional test helper (kept as a template):
+    # "get_weights_from_tp_worker": (
+    #     "awex.tests.weights_exchange_it",
+    #     "get_weights_from_tp_worker",
+    # ),
+}
+_SHARDSTREAM_WORKER_SIGNATURES = {
+    "_get_model_param_info": {
+        "required": ["engine_name", "infer_engine_config"],
+        "optional": ["convert_params", "engine_rank"],
+    },
+    "_init_in_tp_worker": {
+        "required": [
+            "infer_conf_bytes",
+            "parameters_meta_bytes",
+            "training_params_meta_bytes",
+            "engine_rank",
+            "num_engines",
+            "meta_server_addr",
+            "weights_comm_backend",
+            "debug_mode_config",
+            "disable_pipeline",
+            "enable_colocate_mode",
+            "ipc_backend",
+        ],
+        "optional": [
+            "enable_debug_mode",
+            "weights_comm_nccl_group_size",
+            "membership_specification",
+        ],
+    },
+    "_update_parameters_in_tp_worker": {"required": ["step_id"], "optional": []},
+    "_pre_update_weights_in_tp_worker": {"required": ["step_id"], "optional": []},
+    "_pre_validate_weights_on_tp_worker": {"required": ["step_id"], "optional": []},
+    "_verify_weights_on_tp_worker": {
+        "required": ["step_id"],
+        "optional": [
+            "dump_weights_list_for_validation",
+            "dump_weights_dir_for_validation",
+        ],
+    },
+}
+
+
+class ShardStreamInitRequest(OpenAIBaseModel):
+    meta_server_addr: str
+    engine_rank: int = 0
+    num_engines: int = 1
+    comm_backend: str = "transport"
+    enable_debug_mode: bool = False
+    debug_mode_config: dict[str, Any] | None = None
+    disable_weights_exchange_pipeline: bool = False
+    enable_colocate_mode: bool = False
+    weights_exchange_ipc_backend: str = "cuda"
+    weights_comm_nccl_group_size: int = 1
+    nnodes: int | None = None
+    node_rank: int | None = None
+    weights_validation_steps: int = 0
+    validate_weights_every_n_steps: int = 1
+    dump_weights_list_for_validation: list[str] | None = None
+    dump_weights_dir_for_validation: str | None = None
+
+
+class ShardStreamUpdateRequest(OpenAIBaseModel):
+    step_id: int
+    kwargs: dict[str, Any] | None = None
+
+
+class ShardStreamMembershipRequest(OpenAIBaseModel):
+    epoch: int
+    num_engines: int
+
+
+class ShardStreamModelProfileRequest(OpenAIBaseModel):
+    operation: str
+    version: int = 0
+
+
+class PublicationInitRequest(OpenAIBaseModel):
+    mechanism: str
+    config: dict[str, Any]
+
+
+class PublicationUpdateRequest(OpenAIBaseModel):
+    step_id: int
+
+
+def _to_json_response(success: bool, message: str):
+    content = {"success": success, "message": message}
+    status_code = 200 if success else 400
+    return JSONResponse(content, status_code=status_code)
+
+
+def _to_json_error(message: str, status_code: int = 500):
+    content = {"success": False, "message": message}
+    return JSONResponse(content, status_code=status_code)
+
+
+def _sanitize_for_ipc(obj):
+    # Ensure objects are msgpack-serializable for vLLM EngineCore IPC.
+    try:
+        import torch
+
+        if isinstance(obj, torch.dtype):
+            return str(obj).replace("torch.", "")
+        if isinstance(obj, torch.device):
+            return str(obj)
+    except Exception:
+        pass
+    if isinstance(obj, dict):
+        return {k: _sanitize_for_ipc(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_for_ipc(v) for v in obj]
+    return obj
+
+
+def _get_shardstream_adapter(raw_request):
+    adapter = getattr(raw_request.app.state, "shardstream_adapter", None)
+    if adapter is None:
+        raise RuntimeError(
+            "ShardStream adapter not initialized. Call /areal_shardstream_init first."
+        )
+    return adapter
+
+
+def _get_publication_adapter(raw_request):
+    adapter = getattr(raw_request.app.state, "publication_adapter", None)
+    if adapter is None:
+        raise RuntimeError(
+            "Publication adapter not initialized. Call /publication_init first."
+        )
+    return adapter
+
+
+def _patch_shardstream_worker() -> None:
+    try:
+        from vllm.distributed.parallel_state import (
+            get_dp_group,
+            get_ep_group,
+            get_pp_group,
+            get_tp_group,
+        )
+        from vllm.v1.worker.worker_base import WorkerBase
+    except Exception as exc:
+        logger.warning("Failed to patch vLLM worker for ShardStream: %s", exc)
+        return
+
+    def _shardstream_rank_info(
+        self, infer_engine_config: InferenceConfig | None = None
+    ):
+        parallel_config = self.model_runner.vllm_config.parallel_config
+        external_engine_rank = 0
+        if infer_engine_config is not None:
+            external_engine_rank = int(
+                getattr(infer_engine_config, "engine_rank", 0) or 0
+            )
+        try:
+            tp_group = get_tp_group()
+            tp_rank = tp_group.rank_in_group
+            tp_size = tp_group.world_size
+        except AssertionError:
+            tp_rank, tp_size = 0, 1
+        try:
+            pp_group = get_pp_group()
+            pp_rank = pp_group.rank_in_group
+            pp_size = pp_group.world_size
+        except AssertionError:
+            pp_rank, pp_size = 0, 1
+        try:
+            dp_group = get_dp_group()
+            dp_rank = dp_group.rank_in_group
+            dp_size = dp_group.world_size
+        except AssertionError:
+            dp_rank = parallel_config.data_parallel_rank
+            dp_size = parallel_config.data_parallel_size
+        try:
+            ep_group = get_ep_group()
+            ep_rank = ep_group.rank_in_group
+            ep_size = ep_group.world_size
+        except AssertionError:
+            ep_rank, ep_size = 0, 1
+
+        local_world_size = int(getattr(parallel_config, "world_size", 1) or 1)
+        local_rank = int(getattr(parallel_config, "rank", 0) or 0)
+        cp_size = int(getattr(parallel_config, "prefill_context_parallel_size", 1) or 1)
+        cp_rank = 0
+        if cp_size > 1:
+            try:
+                from vllm.distributed import parallel_state as _ps
+
+                get_pcp_group = getattr(_ps, "get_pcp_group", None)
+                if callable(get_pcp_group):
+                    pcp_group = get_pcp_group()
+                    cp_rank = int(getattr(pcp_group, "rank_in_group", 0))
+                    cp_size = int(getattr(pcp_group, "world_size", cp_size))
+                else:
+                    cp_rank = local_rank % cp_size
+            except Exception:
+                cp_rank = local_rank % cp_size
+        cp_mode = os.environ.get("SHARDSTREAM_CP_MODE")
+        if not cp_mode:
+            cp_mode = "ring" if cp_size > 1 else "none"
+        # In internal DP mode, each core process commonly uses rank in [0, TP*PP*CP),
+        # so compose a world-size-across-dp global rank with dp_rank.
+        if 0 <= local_rank < local_world_size:
+            global_rank = dp_rank * local_world_size + local_rank
+        else:
+            # Fallback for launchers that already expose a fully global rank.
+            global_rank = local_rank
+
+        reported_local_rank = getattr(self, "local_rank", local_rank)
+        return {
+            "tp_rank": tp_rank,
+            "tp_size": tp_size,
+            "pp_rank": pp_rank,
+            "pp_size": pp_size,
+            "dp_rank": dp_rank,
+            "dp_size": dp_size,
+            "ep_rank": ep_rank,
+            "ep_size": ep_size,
+            "ep_tp_rank": 0,
+            "ep_tp_size": 1,
+            "local_rank": reported_local_rank,
+            "global_rank": global_rank,
+            "world_size": parallel_config.world_size_across_dp,
+            # engine_rank is AWEX external instance index, not vLLM internal DP rank.
+            "engine_rank": external_engine_rank,
+            "is_infer": True,
+            "attn_tp_rank": tp_rank,
+            "attn_tp_size": tp_size,
+            "attn_dp_rank": 0,
+            "cp_rank": cp_rank,
+            "cp_size": cp_size,
+            "cp_mode": cp_mode,
+        }
+
+    def _shardstream_model_context(
+        self, infer_engine_config: InferenceConfig | None = None
+    ):
+        if not hasattr(self, "_shardstream_infer_engine_config"):
+            parallel_config = self.model_runner.vllm_config.parallel_config
+            nnodes = getattr(parallel_config, "nnodes", 1)
+            node_rank = getattr(parallel_config, "node_rank", 0)
+            enable_expert_parallel = bool(
+                getattr(parallel_config, "enable_expert_parallel", False)
+            )
+            pcp_size = int(
+                getattr(parallel_config, "prefill_context_parallel_size", 1) or 1
+            )
+            inferred_ep_size = (
+                parallel_config.tensor_parallel_size
+                * parallel_config.data_parallel_size
+                * pcp_size
+                if enable_expert_parallel
+                else 1
+            )
+            external_num_engines = 1
+            external_engine_rank = 0
+            if infer_engine_config is not None:
+                external_num_engines = int(
+                    getattr(infer_engine_config, "num_engines", 1) or 1
+                )
+                external_engine_rank = int(
+                    getattr(infer_engine_config, "engine_rank", 0) or 0
+                )
+            comm_backend = (
+                getattr(infer_engine_config, "comm_backend", None)
+                if infer_engine_config is not None
+                else None
+            )
+            if not comm_backend:
+                comm_backend = os.environ.get("SHARDSTREAM_COMM_BACKEND", "transport")
+            self._shardstream_infer_engine_config = InferenceConfig(
+                tp_size=parallel_config.tensor_parallel_size,
+                pp_size=parallel_config.pipeline_parallel_size,
+                dp_size=parallel_config.data_parallel_size,
+                ep_size=inferred_ep_size,
+                enable_dp_attention=False,
+                enable_dp_lm_head=False,
+                moe_dense_tp_size=None,
+                nnodes=nnodes,
+                node_rank=node_rank,
+                # AWEX num_engines/engine_rank describe external inference instances.
+                # Do not derive them from vLLM internal DP.
+                num_engines=external_num_engines,
+                engine_rank=external_engine_rank,
+                comm_backend=comm_backend,
+            )
+        base_config = self._shardstream_infer_engine_config
+        if infer_engine_config is not None:
+            merged = InferenceConfig.from_dict(base_config.__dict__, False)
+            for field in InferenceConfig.__dataclass_fields__:
+                value = getattr(infer_engine_config, field, None)
+                if value is not None:
+                    setattr(merged, field, value)
+            base_config = merged
+        model_context = _shardstream_rank_info(self, base_config)
+        model_context["scheduler"] = self
+        model_context["infer_engine_config"] = base_config
+        return model_context
+
+    def shardstream_get_model_context(self):
+        return _shardstream_rank_info(self, None)
+
+    def shardstream_execute(
+        self, task_module: str, task_qualname: str, task_kwargs: dict | None = None
+    ):
+        parallel_config = self.model_runner.vllm_config.parallel_config
+        configure_ray_locality(
+            worker_local_rank=int(getattr(parallel_config, "rank", 0) or 0)
+        )
+        module = __import__(task_module, fromlist=["__dummy__"])
+        target = module
+        for attr in task_qualname.split("."):
+            target = getattr(target, attr)
+        task_kwargs = task_kwargs or {}
+        infer_engine_config = task_kwargs.get("infer_engine_config")
+        if isinstance(infer_engine_config, dict):
+            infer_engine_config = InferenceConfig.from_dict(infer_engine_config)
+            task_kwargs["infer_engine_config"] = infer_engine_config
+        task_kwargs["model"] = self.model_runner.model
+        task_kwargs["model_context"] = _shardstream_model_context(
+            self, infer_engine_config
+        )
+        result = target(**task_kwargs)
+        return _sanitize_for_ipc(result)
+
+    def publication_init(self, mechanism: str, config: dict):
+        from shardstream.integrations.publication.registry import (
+            create_vllm_publication_receiver,
+        )
+
+        current = getattr(self, "_publication_receiver", None)
+        if current is not None:
+            current.close()
+        rank_info = _shardstream_rank_info(self, None)
+        receiver = create_vllm_publication_receiver(
+            mechanism,
+            config,
+            worker_rank=int(rank_info["global_rank"]),
+        )
+        self._publication_receiver = receiver
+        return _sanitize_for_ipc(receiver.initialize())
+
+    def publication_update(self, step_id: int):
+        receiver = getattr(self, "_publication_receiver", None)
+        if receiver is None:
+            raise RuntimeError("Publication receiver is not initialized")
+        result = receiver.update(self.model_runner.model, step_id)
+        return _sanitize_for_ipc(result)
+
+    def publication_close(self):
+        receiver = getattr(self, "_publication_receiver", None)
+        if receiver is None:
+            return {"closed": True}
+        try:
+            return _sanitize_for_ipc(receiver.close())
+        finally:
+            self._publication_receiver = None
+
+    WorkerBase.shardstream_get_model_context = shardstream_get_model_context
+    WorkerBase.shardstream_execute = shardstream_execute
+    WorkerBase.shardstream_update_weights_from_disk = (
+        shardstream_update_weights_from_disk
+    )
+    WorkerBase.flush_cache = flush_cache
+    WorkerBase.publication_init = publication_init
+    WorkerBase.publication_update = publication_update
+    WorkerBase.publication_close = publication_close
+
+    def _make_shardstream_worker_method(task_module: str, task_qualname: str):
+        method_name = task_qualname.split(".")[-1]
+
+        def _method(self, **kwargs):
+            filtered_kwargs = _filter_shardstream_kwargs(method_name, kwargs)
+            return shardstream_execute(
+                self, task_module, task_qualname, filtered_kwargs
+            )
+
+        return _method
+
+    for method_name, (
+        task_module,
+        task_qualname,
+    ) in _SHARDSTREAM_WORKER_METHODS.items():
+        setattr(
+            WorkerBase,
+            method_name,
+            _make_shardstream_worker_method(task_module, task_qualname),
+        )
+
+
+def _filter_shardstream_kwargs(method_name: str, kwargs: dict) -> dict:
+    signature = _SHARDSTREAM_WORKER_SIGNATURES.get(method_name)
+    if signature is None:
+        return kwargs
+    required = signature.get("required", [])
+    optional = signature.get("optional", [])
+    allowed = set(required) | set(optional)
+    filtered = {k: v for k, v in kwargs.items() if k in allowed}
+    missing = [k for k in required if k not in filtered]
+    if missing:
+        raise ValueError(f"Missing required args for {method_name}: {missing}")
+    return filtered
+
+
+def shardstream_update_weights_from_disk(
+    self, model_path: str, load_format: str | None = None
+):
+    from vllm.model_executor.model_loader import get_model_loader
+
+    self.model_runner.model_config.model = model_path
+    model_loader = get_model_loader(self.model_runner.vllm_config.load_config)
+    model_loader.load_weights(
+        self.model_runner.model, model_config=self.model_runner.model_config
+    )
+    return True
+
+
+def flush_cache(self):
+    flush_fn = getattr(self.model_runner, "flush_cache", None)
+    if callable(flush_fn):
+        return flush_fn()
+    return True
+
+
+def _ensure_router_attached() -> None:
+    """Attach ``router`` to vLLM's FastAPI app on newer vLLM releases.
+
+    Legacy vLLM picked up our routes automatically because we registered them
+    on the shared ``vllm.entrypoints.openai.api_server.router``. Newer vLLM
+    removed that shared router, so we patch ``build_app`` to include our local
+    router on every FastAPI app it constructs.
+    """
+    global _shardstream_build_app_patched
+    if _USING_LEGACY_VLLM_ROUTER or _shardstream_build_app_patched:
+        return
+    try:
+        from vllm.entrypoints.openai import api_server as _api_server_module
+    except ImportError as exc:
+        logger.warning("Cannot patch vLLM build_app for ShardStream routes: %s", exc)
+        return
+    original_build_app = getattr(_api_server_module, "build_app", None)
+    if original_build_app is None:
+        logger.warning(
+            "vLLM api_server has no build_app; ShardStream routes will not be attached."
+        )
+        return
+
+    def _shardstream_build_app(*args, **kwargs):
+        app = original_build_app(*args, **kwargs)
+        try:
+            app.include_router(router)
+            logger.info("Attached ShardStream router to vLLM FastAPI app.")
+        except Exception as exc:
+            logger.exception(
+                "Failed to attach ShardStream router to FastAPI app: %s", exc
+            )
+        return app
+
+    _api_server_module.build_app = _shardstream_build_app
+    _shardstream_build_app_patched = True
+
+
+def register_shardstream_plugin() -> None:
+    """Register ShardStream endpoints and worker patches for vLLM."""
+    global _shardstream_plugin_registered
+    if _shardstream_plugin_registered:
+        return
+    _shardstream_plugin_registered = True
+
+    _patch_shardstream_worker()
+    _ensure_router_attached()
+
+    @router.post("/areal_shardstream_init")
+    async def shardstream_init(request: ShardStreamInitRequest, raw_request: Request):
+        try:
+            logger.info("API server starts shardstream_init")
+            llm = raw_request.app.state.engine_client
+            adapter = ShardStreamVLLMServerAdapter(
+                llm,
+                meta_server_addr=request.meta_server_addr,
+                engine_rank=request.engine_rank,
+                num_engines=request.num_engines,
+                comm_backend=request.comm_backend,
+                enable_debug_mode=request.enable_debug_mode,
+                debug_mode_config=request.debug_mode_config,
+                disable_weights_exchange_pipeline=request.disable_weights_exchange_pipeline,
+                enable_colocate_mode=request.enable_colocate_mode,
+                weights_exchange_ipc_backend=request.weights_exchange_ipc_backend,
+                weights_comm_nccl_group_size=request.weights_comm_nccl_group_size,
+                nnodes=request.nnodes,
+                node_rank=request.node_rank,
+                weights_validation_steps=request.weights_validation_steps,
+                validate_weights_every_n_steps=request.validate_weights_every_n_steps,
+                dump_weights_list_for_validation=request.dump_weights_list_for_validation,
+                dump_weights_dir_for_validation=request.dump_weights_dir_for_validation,
+                loop=asyncio.get_running_loop(),
+            )
+            await asyncio.to_thread(adapter.initialize)
+            raw_request.app.state.shardstream_adapter = adapter
+            return _to_json_response(True, "ShardStream initialized")
+        except Exception as exc:
+            logger.exception("ShardStream init failed")
+            return _to_json_error(f"ShardStream init failed: {exc}")
+
+    @router.post("/areal_shardstream_update")
+    async def shardstream_update(
+        request: ShardStreamUpdateRequest, raw_request: Request
+    ):
+        try:
+            logger.info(
+                "API server starts shardstream_update, step_id=%s", request.step_id
+            )
+            adapter = _get_shardstream_adapter(raw_request)
+            kwargs = request.kwargs or {}
+            await asyncio.to_thread(adapter.update_weights, request.step_id, **kwargs)
+            return _to_json_response(True, "ShardStream update done")
+        except Exception as exc:
+            logger.exception("ShardStream update failed")
+            return _to_json_error(f"ShardStream update failed: {exc}")
+
+    @router.post("/areal_shardstream_model_profile")
+    async def shardstream_model_profile(
+        request: ShardStreamModelProfileRequest, raw_request: Request
+    ):
+        try:
+            if request.operation not in (
+                "clear",
+                "verify",
+                "compute_start",
+                "compute_stop",
+            ):
+                raise ValueError("Unsupported model profile command")
+            from shardstream.profiling.model import model_profile_task
+
+            adapter = _get_shardstream_adapter(raw_request)
+            results = await asyncio.to_thread(
+                adapter.execute_task_in_model_worker,
+                model_profile_task,
+                operation=request.operation,
+                version=request.version,
+            )
+            return JSONResponse(content={"success": True, "ranks": results})
+        except Exception as exc:
+            logger.exception("ShardStream model profile failed")
+            return _to_json_error(f"ShardStream model profile failed: {exc}")
+
+    @router.post("/areal_shardstream_prepare_membership")
+    async def shardstream_prepare_membership(
+        request: ShardStreamMembershipRequest, raw_request: Request
+    ):
+        try:
+            adapter = _get_shardstream_adapter(raw_request)
+            results = await asyncio.to_thread(
+                adapter.weights_exchange_reader.prepare_membership,
+                {"epoch": request.epoch, "num_engines": request.num_engines},
+            )
+            return JSONResponse(content={"success": True, "ranks": results})
+        except Exception as exc:
+            logger.exception("ShardStream membership preparation failed")
+            return _to_json_error(f"ShardStream membership preparation failed: {exc}")
+
+    @router.post("/publication_init")
+    async def publication_init(request: PublicationInitRequest, raw_request: Request):
+        try:
+            logger.info(
+                "API server starts publication_init, mechanism=%s",
+                request.mechanism,
+            )
+            timeout_seconds = int(request.config.get("timeout_seconds", 1800))
+            adapter = PublicationVLLMServerAdapter(
+                raw_request.app.state.engine_client,
+                loop=asyncio.get_running_loop(),
+                timeout_seconds=timeout_seconds,
+            )
+            results = await asyncio.to_thread(
+                adapter.initialize, request.mechanism, request.config
+            )
+            raw_request.app.state.publication_adapter = adapter
+            return JSONResponse(
+                {
+                    "success": True,
+                    "message": "Publication initialized",
+                    "results": _sanitize_for_ipc(results),
+                }
+            )
+        except Exception as exc:
+            logger.exception("Publication init failed")
+            return _to_json_error(f"Publication init failed: {exc}")
+
+    @router.post("/publication_update")
+    async def publication_update(
+        request: PublicationUpdateRequest, raw_request: Request
+    ):
+        try:
+            logger.info(
+                "API server starts publication_update, step_id=%s",
+                request.step_id,
+            )
+            adapter = _get_publication_adapter(raw_request)
+            results = await asyncio.to_thread(adapter.update, request.step_id)
+            return JSONResponse(
+                {
+                    "success": True,
+                    "message": "Publication update done",
+                    "results": _sanitize_for_ipc(results),
+                }
+            )
+        except Exception as exc:
+            logger.exception("Publication update failed")
+            return _to_json_error(f"Publication update failed: {exc}")
+
+    @router.post("/publication_close")
+    async def publication_close(raw_request: Request):
+        try:
+            adapter = _get_publication_adapter(raw_request)
+            results = await asyncio.to_thread(adapter.close)
+            raw_request.app.state.publication_adapter = None
+            return JSONResponse(
+                {
+                    "success": True,
+                    "message": "Publication closed",
+                    "results": _sanitize_for_ipc(results),
+                }
+            )
+        except Exception as exc:
+            logger.exception("Publication close failed")
+            return _to_json_error(f"Publication close failed: {exc}")
+
+
+def register_shardstream_routes() -> None:
+    """Public entrypoint to register ShardStream routes without relying on vLLM plugin system."""
+    register_shardstream_plugin()

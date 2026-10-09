@@ -1,0 +1,825 @@
+# Licensed to the Awex developers under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+
+import os
+import pickle
+import threading
+import time
+from abc import ABC, abstractmethod
+from typing import Any, Dict, List, Optional, Sequence
+
+import torch
+
+from shardstream import logging
+from shardstream._utils import device as device_util
+from shardstream._utils.common import (
+    check_train_infer_params_meta,
+    compute_statistics,
+    simple_hf_config,
+    stripped_env_vars,
+)
+from shardstream._utils.profile import emit_profile, profile_phase
+from shardstream._utils.tensor import (
+    check_and_log_nan_values,
+    compare_and_log_tensor_differences,
+)
+from shardstream.control.store import MetaServerClient
+from shardstream.integrations.metadata.inference import InferParamMetaResolver
+from shardstream.integrations.models.registry import get_infer_weights_converter
+from shardstream.integrations.sharding import get_rank_info_extractor
+from shardstream.metadata.resolver import ParameterMeta
+
+logger = logging.getLogger(__name__)
+
+
+def derive_expected_pp_ranks(
+    infer_params_meta: Sequence[ParameterMeta], local_engine_rank: int
+) -> List[int]:
+    pp_ranks = set()
+    for param in infer_params_meta:
+        for shard in param.shards:
+            if shard.engine_rank == local_engine_rank:
+                pp_ranks.add(shard.pp_rank)
+    if not pp_ranks:
+        raise ValueError(
+            f"No infer shards found for engine_rank={local_engine_rank}; cannot derive expected_pp_ranks"
+        )
+    return sorted(pp_ranks)
+
+
+class WeightExchangeReader(ABC):
+    def __init__(self, inference_engine):
+        self.inference_engine = inference_engine
+        self.enable_colocate_mode = inference_engine.config.enable_colocate_mode
+        self.infer_config = inference_engine.config
+        self.weights_comm_nccl_group_size = (
+            self.infer_config.weights_comm_nccl_group_size
+        )
+
+    @abstractmethod
+    def initialize(self, **kwargs):
+        """Initialize the weight exchange reader."""
+        pass
+
+    @abstractmethod
+    def update_weights(self, step_id, **kwargs):
+        pass
+
+
+class WeightsReader(WeightExchangeReader):
+    parameters_meta: List[ParameterMeta]
+
+    def __init__(self, inference_engine, meta_resolver: InferParamMetaResolver = None):
+        super().__init__(inference_engine)
+        self.infer_engine_config = self.inference_engine.config
+        if meta_resolver is None:
+            meta_resolver = InferParamMetaResolver(
+                inference_engine,
+                num_engines=inference_engine.num_engines,
+                engine_rank=inference_engine.engine_rank,
+                convert_params=True,
+            )
+        self.meta_resolver = meta_resolver
+        self.parameters_meta = []
+        self.hf_config = inference_engine.hf_config
+        config = inference_engine.config
+        self.model_arch_name = meta_resolver.get_model_arch_name()
+        self.meta_server_addr = config.meta_server_addr
+        logger.info(f"Meta server address: {self.meta_server_addr}")
+        self.meta_server_client = MetaServerClient(*self.meta_server_addr.split(":"))
+        self.num_engines = config.num_engines
+        logger.info("Put number of inference engines to meta server")
+        self.engine_rank = self.inference_engine.engine_rank
+        self.tp_size = config.tp_size
+        self.pp_size = config.pp_size
+        self.dp_size = max(1, int(getattr(config, "dp_size", 1) or 1))
+        self.infer_world_size = (
+            self.num_engines * self.tp_size * self.pp_size * self.dp_size
+        )
+        self.validated_steps = 0
+        self.start_step = -1
+        self.weights_validation_steps = config.weights_validation_steps
+        self.validate_weights_every_n_steps = config.validate_weights_every_n_steps
+        self.dump_weights_list_for_validation = config.dump_weights_list_for_validation
+        self.dump_weights_dir_for_validation = (
+            config.dump_weights_dir_for_validation or os.getcwd()
+        )
+        self.debug_mode_config = config.debug_mode_config or {}
+        self.raise_on_validation_fail = self.debug_mode_config.get(
+            "raise_on_validation_fail", False
+        )
+        self.ipc_backend = config.weights_exchange_ipc_backend
+        if device_util.get_device_type() == "npu" and self.ipc_backend == "cuda":
+            logger.info("Switching IPC backend from cuda to cpu for NPU runtime.")
+            self.ipc_backend = "cpu"
+        self.timeout = 10000
+        self.lock = threading.Lock()
+        self.initialized = False
+        self.expected_pp_ranks: List[int] = []
+        logger.info(
+            f"DP rank id: {self.engine_rank}, num_engines: {self.num_engines}, engine_rank: {self.engine_rank}, infer_world_size: {self.infer_world_size}, tp={self.tp_size}, pp={self.pp_size}, dp={self.dp_size}"
+        )
+
+    def initialize(self, **kwargs):
+        self.meta_server_client.put_object("num_infer_engines", self.num_engines)
+        if self.enable_colocate_mode:
+            logger.info("Start to release memory after inference engine initialized")
+            self.inference_engine.release_memory_occupation()
+            logger.info("Finished releasing memory after inference engine initialized")
+        self.meta_server_client.add_object_to_set(
+            "num_inited_inference_engines", self.engine_rank
+        )
+
+    def _initialize(self):
+        logger.info(
+            f"Initializing weights exchange reader for engine rank {self.engine_rank}"
+        )
+        self.parameters_meta = self.meta_resolver.get_parameters_meta()
+        logger.info(
+            "Finished querying and building parameters meta from all tp workers"
+        )
+        self.expected_pp_ranks = derive_expected_pp_ranks(
+            self.parameters_meta, self.engine_rank
+        )
+        logger.info(
+            "Derived expected_pp_ranks for engine %s: %s",
+            self.engine_rank,
+            self.expected_pp_ranks,
+        )
+        self.infer_conf = {
+            "engine_name": self.inference_engine.engine_name,
+            "infer_atten_tp_size": self.meta_resolver.rank0_info.attn_tp_size,
+            "router_dtype": getattr(self.hf_config, "router_dtype", "bf16"),
+            "infer_engine_config": self.infer_engine_config,
+            "hf_config": simple_hf_config(self.hf_config),
+            "infer_world_size": self.infer_world_size,
+            "expected_pp_ranks": self.expected_pp_ranks,
+            "device_backend": device_util.get_device_type(),
+        }
+        self.meta_server_client.put_object("infer_conf", self.infer_conf)
+        logger.info(f"Put inference config {self.infer_conf} to meta server")
+        if self.engine_rank == 0:
+            self.meta_server_client.put_object(
+                "infer_params_meta", self.parameters_meta
+            )
+            logger.info("Put inference parameters meta to meta server")
+        logger.info(
+            f"Start to get training parameters meta from meta server for engine rank {self.engine_rank}"
+        )
+        self.training_params_meta = self.meta_server_client.get_object(
+            "training_params_meta", timeout=self.timeout
+        )
+        logger.info("Finished getting training parameters meta from meta server")
+        self.training_world_size = self.training_params_meta[0].shards[0].world_size
+        config = self.inference_engine.config
+        check_train_infer_params_meta(
+            self.training_params_meta,
+            self.parameters_meta,
+            raise_exception=not config.enable_debug_mode,
+        )
+        logger.info("Start to send parameters meta to tp workers")
+        infer_parameters_meta_bytes = pickle.dumps(self.parameters_meta)
+        train_parameters_meta_bytes = pickle.dumps(self.training_params_meta)
+        infer_conf_bytes = pickle.dumps(self.infer_conf)
+        self._preparation_results = self.inference_engine.execute_task_in_model_worker(
+            self._init_in_tp_worker,
+            infer_conf_bytes=infer_conf_bytes,
+            parameters_meta_bytes=infer_parameters_meta_bytes,
+            training_params_meta_bytes=train_parameters_meta_bytes,
+            engine_rank=self.engine_rank,
+            num_engines=self.num_engines,
+            meta_server_addr=self.meta_server_addr,
+            weights_comm_backend=config.comm_backend,
+            enable_debug_mode=config.enable_debug_mode,
+            debug_mode_config=config.debug_mode_config,
+            disable_pipeline=config.disable_weights_exchange_pipeline,
+            enable_colocate_mode=self.enable_colocate_mode,
+            ipc_backend=self.ipc_backend,
+            weights_comm_nccl_group_size=self.weights_comm_nccl_group_size,
+            membership_specification=getattr(self, "_pending_membership", None),
+        )
+        logger.info(
+            f"Finished full initialization of weights reader for engine rank {self.engine_rank}"
+        )
+
+    @staticmethod
+    def _init_in_tp_worker(
+        infer_conf_bytes: bytes,
+        parameters_meta_bytes: bytes,
+        training_params_meta_bytes: bytes,
+        engine_rank: int,
+        num_engines: int,
+        meta_server_addr: str,
+        weights_comm_backend: str,
+        debug_mode_config: Dict[str, Any],
+        disable_pipeline: bool,
+        enable_colocate_mode: bool,
+        ipc_backend: str,
+        **kwargs,
+    ):
+        """Cache meta to avoid send to to worker everytime when update weights"""
+        model = kwargs["model"]
+        model_context = kwargs["model_context"]
+        scheduler = model_context["scheduler"]
+        infer_conf = pickle.loads(infer_conf_bytes)
+        parameters_meta = pickle.loads(parameters_meta_bytes)
+        training_params_meta = pickle.loads(training_params_meta_bytes)
+        infer_engine_config = model_context.get("infer_engine_config")
+        if infer_engine_config is not None:
+            if isinstance(infer_engine_config, dict):
+                infer_engine_config["comm_backend"] = weights_comm_backend
+            else:
+                infer_engine_config.comm_backend = weights_comm_backend
+        from shardstream.integrations.reader.worker import TransportWorkerReader
+
+        cls = TransportWorkerReader
+        scheduler.shardstream_weights_reader = cls(
+            engine_name=infer_conf.get("engine_name", "sglang"),
+            model=model,
+            model_context=model_context,
+            infer_conf=infer_conf,
+            engine_rank=engine_rank,
+            num_engines=num_engines,
+            meta_server_addr=meta_server_addr,
+            parameters_meta=parameters_meta,
+            training_params_meta=training_params_meta,
+            enable_debug_mode=kwargs.get("enable_debug_mode", False),
+            debug_mode_config=debug_mode_config,
+            disable_pipeline=disable_pipeline,
+            enable_colocate_mode=enable_colocate_mode,
+            ipc_backend=ipc_backend,
+            weights_comm_nccl_group_size=kwargs.get("weights_comm_nccl_group_size"),
+        )
+        specification = kwargs.get("membership_specification")
+        if specification is None:
+            scheduler.shardstream_weights_reader.initialize()
+        else:
+            from shardstream.integrations.membership import prepare_model_membership
+
+            if False or enable_colocate_mode:
+                raise ValueError("Model joins require non-colocated transport")
+            WorkerWeightsReader.initialize(scheduler.shardstream_weights_reader)
+            scheduler.shardstream_weights_reader._set_device()
+            scheduler.shardstream_weights_reader.deserialized_weights = {}
+            return prepare_model_membership(
+                scheduler.shardstream_weights_reader, specification, sender=False
+            )
+
+    def prepare_membership(self, specification: dict):
+        with self.lock:
+            if False or self.enable_colocate_mode:
+                raise ValueError("Model joins require non-colocated transport")
+            engines = specification["num_engines"]
+            if engines < self.num_engines or (
+                self.initialized and engines == self.num_engines
+            ):
+                raise ValueError("Existing model readers must add engines")
+            self.num_engines = engines
+            self.infer_engine_config.num_engines = engines
+            self.infer_world_size = engines * self.tp_size * self.pp_size * self.dp_size
+            if not self.initialized:
+                self._pending_membership = specification
+                self._initialize()
+                self.initialized = True
+                return self._preparation_results
+            return self.inference_engine.execute_task_in_model_worker(
+                self._prepare_membership_in_tp_worker, specification=specification
+            )
+
+    @staticmethod
+    def _prepare_membership_in_tp_worker(specification: dict, **kwargs):
+        from shardstream.integrations.membership import prepare_model_membership
+
+        worker = kwargs["model_context"]["scheduler"].shardstream_weights_reader
+        return prepare_model_membership(worker, specification, sender=False)
+
+    def update_weights(self, step_id, **kwargs):
+        with self.lock:
+            if not self.initialized:
+                logger.info(
+                    f"Start to initialize weights exchange reader for engine rank {self.engine_rank}"
+                )
+                self._initialize()
+                self.initialized = True
+                logger.info(
+                    f"Finished initializing weights exchange reader for engine rank {self.engine_rank}"
+                )
+            self._pre_validate_weights(step_id, **kwargs)
+            start_time = time.time()
+            logger.info(
+                f"Start to update weights for step {step_id} for engine rank {self.engine_rank}"
+            )
+            if self.enable_colocate_mode:
+                self.inference_engine.release_memory_occupation()
+                self._pre_update_weights(step_id=step_id)
+            self.inference_engine.execute_task_in_model_worker(
+                self._update_parameters_in_tp_worker, step_id=step_id
+            )
+            duration = time.time() - start_time
+            logger.info(
+                f"Finished updating weights for step {step_id} for engine rank {self.engine_rank}, took {duration} seconds"
+            )
+            self._validate_weights(
+                step_id,
+                dump_weights_list_for_validation=self.dump_weights_list_for_validation,
+                dump_weights_dir_for_validation=self.dump_weights_dir_for_validation,
+                **kwargs,
+            )
+            if self.enable_colocate_mode:
+                self._resume_kvcache_memory_occupation()
+
+    def _resume_weights_memory_occupation(self):
+        assert self.enable_colocate_mode
+        logger.info(
+            "Start to resume weights memory occupation, waiting for all train ranks to offload optimizer"
+        )
+        self.meta_server_client.get_object(
+            "all_training_offloaded_optimizers", timeout=self.timeout
+        )
+        logger.info(
+            "All train ranks have offloaded optimizer states, start to resume weights memory occupation"
+        )
+        self.inference_engine.resume_memory_occupation("weights")
+        logger.info("Finished resuming weights memory occupation")
+
+    def _resume_kvcache_memory_occupation(self):
+        assert self.enable_colocate_mode
+        self.meta_server_client.add_object_to_set(
+            "finished_weights_update_engines", self.engine_rank
+        )
+        self.inference_engine.resume_memory_occupation("kv_cache")
+        logger.info(
+            f"Finished resuming kvcache memory occupation for engine rank {self.engine_rank}"
+        )
+
+    def _pre_validate_weights(self, step_id, **kwargs):
+        if self.validated_steps == 0:
+            self.start_step = step_id
+        if self.validated_steps >= self.weights_validation_steps:
+            return
+        if (step_id - self.start_step) % self.validate_weights_every_n_steps != 0:
+            return
+        model_path = kwargs.get("path")
+        if not model_path:
+            self.inference_engine.execute_task_in_model_worker(
+                self._pre_validate_weights_on_tp_worker, step_id=step_id
+            )
+            return
+        logger.info(f"Start to pre-validate weights for step {step_id}")
+        start_time = time.time()
+        last_log_time = time.time()
+        load_key = "weights_ready_for_load"
+        while not self.meta_server_client.has_key(load_key):
+            current_time = time.time()
+            if current_time - last_log_time >= 10:
+                logger.info(
+                    f"Reader is waiting {current_time - start_time} seconds for {load_key} to be ready for validation for step {step_id}, model_path: {model_path}"
+                )
+                last_log_time = current_time
+            time.sleep(0.5)
+        logger.info(
+            f"Weights for step {step_id} are ready for reader, model_path: {model_path}"
+        )
+        if self.enable_colocate_mode:
+            self._resume_weights_memory_occupation()
+        self.inference_engine.update_weights_from_disk(
+            model_path, kwargs.get("load_format")
+        )
+        logger.info(
+            f"Finished updating weights from disk for step {step_id}, model_path: {model_path}"
+        )
+        self.weights_meta = self.inference_engine.execute_task_in_model_worker(
+            self._pre_validate_weights_on_tp_worker, step_id=step_id
+        )
+        send_key = "weights_ready_for_send"
+        self.meta_server_client.add_object_to_set(send_key, self.engine_rank)
+        ready_engines = self.meta_server_client.get_object(send_key)
+        logger.info(
+            f"Inference engine instances has read weights for step {step_id} from {model_path}: {ready_engines}"
+        )
+        start_time = time.time()
+        last_log_time = time.time()
+        while len(ready_engines) != self.num_engines:
+            current_time = time.time()
+            if current_time - last_log_time >= 10:
+                logger.info(
+                    f"Waiting {current_time - start_time} seconds for all inference engine instances to read weights for step {step_id}, model_path: {model_path}"
+                )
+                last_log_time = current_time
+            new_ready_engines = self.meta_server_client.get_object(send_key)
+            if new_ready_engines is None or len(new_ready_engines) == 0:
+                break
+            if new_ready_engines != ready_engines:
+                logger.info(
+                    f"Inference engine instances has read weights for step {step_id} from {model_path}: {new_ready_engines}"
+                )
+                ready_engines = new_ready_engines
+            time.sleep(0.5)
+        logger.info(
+            f"All inference engine instances has read weights for step {step_id} from {model_path}"
+        )
+        if self.enable_colocate_mode:
+            self.inference_engine.release_memory_occupation()
+
+    @classmethod
+    def _pre_validate_weights_on_tp_worker(cls, step_id, **kwargs):
+        model = kwargs["model"]
+        scheduler = kwargs["model_context"]["scheduler"]
+        logger.info(
+            f"Start to copy parameters for step {step_id} for consistency check"
+        )
+        device_util.synchronize()
+        scheduler._asystem_copied_parameters = {}
+        for name, param in model.named_parameters():
+            scheduler._asystem_copied_parameters[name] = (
+                param.detach().cpu().contiguous()
+            )
+        logger.info(
+            f"Finished copying parameters for step {step_id} for consistency check"
+        )
+        for name, param in model.named_parameters():
+            param.data.fill_(0)
+            logger.debug(f"Set parameter {name} to 0")
+        device_util.synchronize()
+
+    def _validate_weights(
+        self,
+        step_id,
+        dump_weights_list_for_validation: Optional[List[str]] = None,
+        dump_weights_dir_for_validation: str = ".",
+        **kwargs,
+    ):
+        if self.validated_steps == 0:
+            self.start_step = step_id
+        if self.validated_steps >= self.weights_validation_steps:
+            return
+        if (step_id - self.start_step) % self.validate_weights_every_n_steps != 0:
+            return
+        self.validated_steps += 1
+        logger.info(f"Start to validate weights for step {step_id}")
+        verify_results = self.inference_engine.execute_task_in_model_worker(
+            self._verify_weights_on_tp_worker,
+            step_id=step_id,
+            dump_weights_list_for_validation=dump_weights_list_for_validation,
+            dump_weights_dir_for_validation=dump_weights_dir_for_validation,
+        )
+        all_ok = True
+        total_bad = 0
+        for tp_rank, tp_results in enumerate(verify_results):
+            if not all(tp_results.values()):
+                not_consistent_weights = [
+                    name for (name, result) in tp_results.items() if not result
+                ]
+                total_bad += len(not_consistent_weights)
+                all_ok = False
+                logger.error(
+                    f"Weights for step {step_id} is not consistent for tp rank {tp_rank}: {not_consistent_weights}, total {len(tp_results)} weights"
+                )
+            else:
+                logger.info(
+                    f"Weights for step {step_id} is consistent for tp rank {tp_rank}, total {len(tp_results)} weights"
+                )
+        if all_ok:
+            logger.info(
+                f"[Validation] step {step_id} PASSED across {len(verify_results)} tp ranks"
+            )
+        else:
+            logger.error(
+                f"[Validation] step {step_id} FAILED: {total_bad} inconsistent weights"
+            )
+            if self.raise_on_validation_fail:
+                raise RuntimeError(
+                    f"ShardStream validation failed for step {step_id} with {total_bad} inconsistent weights"
+                )
+
+    @classmethod
+    def _verify_weights_on_tp_worker(
+        cls,
+        step_id,
+        dump_weights_list_for_validation=None,
+        dump_weights_dir_for_validation=".",
+        **kwargs,
+    ):
+        model = kwargs["model"]
+        scheduler = kwargs["model_context"]["scheduler"]
+        logger.info("Start to verify parameters")
+        device_util.synchronize()
+        results = {}
+        dump_weights_list_for_validation = set(dump_weights_list_for_validation or [])
+        for name, tensor_from_hg in scheduler._asystem_copied_parameters.items():
+            if name in dump_weights_list_for_validation:
+                abs_path = os.path.abspath(
+                    os.path.join(
+                        dump_weights_dir_for_validation,
+                        f"reader_{os.getpid()}_from_hg_{step_id}.{name}.pt",
+                    )
+                )
+                torch.save(tensor_from_hg, abs_path)
+                logger.info(
+                    f"[Reader] Saved parameter {name} loaded from hg to {abs_path}"
+                )
+        for name, tensor_from_commu in model.named_parameters():
+            if name in dump_weights_list_for_validation:
+                abs_path = os.path.abspath(
+                    os.path.join(
+                        dump_weights_dir_for_validation,
+                        f"reader_{os.getpid()}_from_commu_{step_id}.{name}.pt",
+                    )
+                )
+                torch.save(tensor_from_commu.detach().cpu().contiguous(), abs_path)
+                logger.info(
+                    f"[Reader] Saved parameter {name} loaded from communication to {abs_path}"
+                )
+        for name, param in model.named_parameters():
+            copied_param = scheduler._asystem_copied_parameters.pop(name, None)
+            if copied_param is None:
+                logger.error(f"Parameter {name} not found in copied parameters")
+                results[name] = False
+                continue
+            hg_param = copied_param
+            param = param.detach().cpu()
+            param_has_nan = check_and_log_nan_values(param, name)
+            copied_param_has_nan = check_and_log_nan_values(
+                hg_param, f"copied param {name}"
+            )
+            if param_has_nan or copied_param_has_nan:
+                results[name] = False
+                continue
+            if not compare_and_log_tensor_differences(
+                param, hg_param, name, exact_match=True
+            ):
+                results[name] = False
+            else:
+                logger.debug(f"Weights for {name} is consistent")
+                results[name] = True
+        scheduler._asystem_copied_parameters.clear()
+        if all(results.values()):
+            logger.info(f"Weights for step {step_id} is consistent")
+        else:
+            not_consistent_weights = [
+                name for (name, result) in results.items() if not result
+            ]
+            logger.error(
+                f"Weights for step {step_id} is not consistent: {not_consistent_weights}, total {len(results)} weights"
+            )
+        logger.info("Finished verifying parameters")
+        return results
+
+    def _pre_update_weights(self, step_id, **kwargs):
+        if not self.enable_colocate_mode:
+            return
+        self.inference_engine.execute_task_in_model_worker(
+            self._pre_update_weights_in_tp_worker, step_id=step_id
+        )
+        self.meta_server_client.wait_set_until_size(
+            "all_training_offloaded_weights",
+            self.training_world_size,
+            timeout=self.timeout,
+        )
+        self.inference_engine.resume_memory_occupation("weights")
+        logger.info(
+            f"Finished pre-updating weights for step {step_id} in colocate mode on engine rank {self.engine_rank}"
+        )
+
+    @classmethod
+    def _pre_update_weights_in_tp_worker(cls, **kwargs):
+        model_context = kwargs["model_context"]
+        scheduler = model_context["scheduler"]
+        weights_reader = scheduler.shardstream_weights_reader
+        weights_reader.pre_update_weights(**kwargs)
+
+    @classmethod
+    def _update_parameters_in_tp_worker(cls, **kwargs):
+        model_context = kwargs["model_context"]
+        scheduler = model_context["scheduler"]
+        weights_reader = scheduler.shardstream_weights_reader
+        weights_reader.update_weights(**kwargs)
+
+
+class WorkerWeightsReader:
+    def __init__(
+        self,
+        engine_name,
+        model,
+        model_context,
+        infer_conf,
+        engine_rank,
+        num_engines,
+        meta_server_addr: str,
+        parameters_meta: List[ParameterMeta],
+        training_params_meta: List[ParameterMeta],
+        enable_debug_mode: bool = False,
+        debug_mode_config: Dict[str, Any] = None,
+        disable_pipeline: bool = False,
+        enable_colocate_mode: bool = False,
+        ipc_backend: str = "cuda",
+        weights_comm_nccl_group_size: int = None,
+    ):
+        self.engine_name = engine_name
+        self.model = model
+        self.model_context = model_context
+        self.infer_conf = infer_conf
+        self.hf_config = infer_conf["hf_config"]
+        self.model_arch_name = self.hf_config.architectures[0]
+        self.scheduler = model_context["scheduler"]
+        self.infer_engine_config = model_context["infer_engine_config"]
+        self.comm_backend = getattr(self.infer_engine_config, "comm_backend", "nccl")
+        self.engine_rank = engine_rank
+        self.num_engines = num_engines
+        self.enable_debug_mode = enable_debug_mode
+        self.debug_mode_config = debug_mode_config or {}
+        self.enable_nccl_debug_mode = self.debug_mode_config.get(
+            "enable_nccl_debug_mode", False
+        )
+        self.raise_on_validation_fail = self.debug_mode_config.get(
+            "raise_on_validation_fail", False
+        )
+        self.disable_pipeline = disable_pipeline
+        self.enable_colocate_mode = enable_colocate_mode
+        self.ipc_backend = ipc_backend
+        self.weights_comm_nccl_group_size = weights_comm_nccl_group_size
+        self.train_to_infer_device_mapping = None
+        self.infer_to_train_device_mapping = None
+        logger.info(
+            f"Disable pipeline for weights reader: {self.disable_pipeline} enable_colocate_mode {enable_colocate_mode}"
+        )
+        self.parameters_meta = parameters_meta
+        self.training_params_meta = training_params_meta
+        self.training_world_size = training_params_meta[0].shards[0].world_size
+        self.infer_instance_world_size = parameters_meta[0].shards[0].world_size
+        self.infer_world_size = num_engines * self.infer_instance_world_size
+        self.transfer_world_size = self.training_world_size + self.infer_world_size
+        self.rank_info = get_rank_info_extractor(engine_name)(
+            model_context, engine_rank
+        )
+        logger.info(f"Reader rank info: {self.rank_info}")
+        self.transfer_rank = (
+            +self.engine_rank * self.infer_instance_world_size
+            + self.rank_info.global_rank
+        )
+        self.meta_server_addr = meta_server_addr
+        self.meta_server_client = MetaServerClient(*self.meta_server_addr.split(":"))
+        self.weight_converter = get_infer_weights_converter(
+            self.engine_name,
+            self.model_arch_name,
+            hf_config=self.model.config,
+            infer_engine_config=self.infer_engine_config,
+            rank_info=self.rank_info,
+        )
+        self.current_worker_parameters_meta = [
+            p.to_local_parameter_meta(self.rank_info.global_rank)
+            for p in self.parameters_meta
+        ]
+        self.total_local_num_elements = sum(
+            (
+                shard.numel
+                for p in self.current_worker_parameters_meta
+                for shard in p.shards
+            )
+        )
+        self.total_local_param_size = sum(
+            (
+                shard.numel * shard.dtype.itemsize
+                for p in self.current_worker_parameters_meta
+                for shard in p.shards
+            )
+        )
+        logger.info(
+            f"[Reader {self.transfer_rank}] Total local number of elements: {self.total_local_num_elements}, total local parameter size: {self.total_local_param_size}"
+        )
+        self.timeout = 10000
+        self._history_update_weights_time = {}
+        self._noncontiguous_parameter_views: Dict[str, torch.Tensor] = {}
+        self.already_initialized = False
+        self.destroy_pg_after_update = (
+            os.getenv("SHARDSTREAM_DESTROY_PG_AFTER_UPDATE", "0") == "1"
+        )
+        self.use_batch_send_recv = (
+            os.getenv("SHARDSTREAM_USE_BATCH_SEND_RECV", "1") == "1"
+        )
+        self.parameters = {}
+        logger.info(f"Env varabbles for weights reader: {stripped_env_vars()}")
+        logger.info(
+            f"Created weights reader for rank {self.rank_info.global_rank}, engine rank {self.engine_rank}"
+        )
+
+    def initialize(self):
+        self.parameters = {
+            hf_name: hf_param
+            for (name, param) in self.model.named_parameters()
+            for (hf_name, hf_param) in self.weight_converter.convert_param(name, param)
+        }
+        if (
+            getattr(self.hf_config, "tie_word_embeddings", False)
+            and self.rank_info.pp_rank == self.rank_info.pp_size - 1
+            and ("lm_head.weight" not in self.parameters)
+            and ("model.embed_tokens.weight" in self.parameters)
+        ):
+            self.parameters["lm_head.weight"] = self.parameters[
+                "model.embed_tokens.weight"
+            ]
+            logger.info(
+                "WeightsReader: added lm_head.weight alias for tied embeddings."
+            )
+
+    def pre_update_weights(self, step_id, **kwargs):
+        pass
+
+    def update_weights(self, step_id, **kwargs):
+        start_time = time.perf_counter()
+        pre_update_sync_start = time.perf_counter()
+        device_util.synchronize()
+        pre_update_device_sync_time_ms = (
+            time.perf_counter() - pre_update_sync_start
+        ) * 1000.0
+        update_body_start = time.perf_counter()
+        if self.enable_colocate_mode:
+            self._update_weights_in_colocate_mode(step_id, **kwargs)
+        else:
+            self._update_weights(step_id, **kwargs)
+        update_body_time_ms = (time.perf_counter() - update_body_start) * 1000.0
+        logger.info(
+            f"Start to flush cache for step {step_id} for rank {self.transfer_rank}"
+        )
+        flush_cache_start = time.perf_counter()
+        flush_cache_call_start = time.perf_counter()
+        flash_cache_success = self.scheduler.flush_cache()
+        flush_cache_call_time_ms = (
+            time.perf_counter() - flush_cache_call_start
+        ) * 1000.0
+        assert flash_cache_success, "Cache flush failed after updating weights"
+        logger.info(
+            f"Finished flushing cache for step {step_id} for rank {self.transfer_rank}"
+        )
+        post_flush_sync_start = time.perf_counter()
+        device_util.synchronize()
+        post_flush_device_sync_time_ms = (
+            time.perf_counter() - post_flush_sync_start
+        ) * 1000.0
+        flush_cache_time_ms = (time.perf_counter() - flush_cache_start) * 1000.0
+        duration = time.perf_counter() - start_time
+        compute_statistics(
+            self._history_update_weights_time, step_id, duration, "Update weights"
+        )
+        emit_profile(
+            logger,
+            event="reader_worker_update",
+            role="reader_worker",
+            backend=self.comm_backend,
+            phase=profile_phase(step_id),
+            step_id=int(step_id),
+            rank=int(self.transfer_rank),
+            pre_update_device_sync_time_ms=pre_update_device_sync_time_ms,
+            update_body_time_ms=update_body_time_ms,
+            flush_cache_call_time_ms=flush_cache_call_time_ms,
+            post_flush_device_sync_time_ms=post_flush_device_sync_time_ms,
+            flush_cache_time_ms=flush_cache_time_ms,
+            worker_update_time_ms=duration * 1000.0,
+        )
+
+    def _update_weights(self, step_id, **kwargs):
+        logger.info(
+            f"Start to update weights for step {step_id} for rank {self.engine_rank}-{self.rank_info.global_rank}"
+        )
+        tensor_pairs = []
+        for parameter_meta in self.current_worker_parameters_meta:
+            name = parameter_meta.name
+            parameter = self.parameters[name]
+            if len(parameter_meta.shards) != 1:
+                raise ValueError(f"Current shard is None for parameter: {name}")
+            tensor_pairs.append(
+                (name, parameter, parameter_meta.shards[0], parameter_meta)
+            )
+        self.read_tensors(step_id, tensor_pairs, **kwargs)
+        self.finish_step(step_id)
+        logger.info(
+            f"Finished updating weights for step {step_id} for rank {self.engine_rank}-{self.rank_info.global_rank}"
+        )
+
+    def _update_weights_in_colocate_mode(self, step_id, **kwargs):
+        self._update_weights(step_id, **kwargs)
+
+    def finish_step(self, step_id):
+        pass
+
+    def read_tensors(self, step_id: int, tensor_pairs: List, **kwargs):
+        pass
+
+
+def get_weights_exchange_reader(inference_engine) -> WeightExchangeReader:
+    return WeightsReader(inference_engine)

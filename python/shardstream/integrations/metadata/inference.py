@@ -1,4 +1,4 @@
-# Licensed to the ShardStream developers under one
+# Licensed to the Awex developers under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
 # regarding copyright ownership.  The ASF licenses this file
@@ -263,7 +263,7 @@ class InferParamMetaResolver(ParamMetaResolver):
                             "embeddings on %s",
                             engine_name,
                         )
-        if os.environ.get("AWEX_DEBUG_INFER_META", "0") == "1":
+        if os.environ.get("SHARDSTREAM_DEBUG_INFER_META", "0") == "1":
             names = [n for n, _ in params]
             has_lm_head = any(
                 n.endswith("lm_head.weight")

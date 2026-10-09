@@ -1,4 +1,4 @@
-# Licensed to the ShardStream developers under one
+# Licensed to the Awex developers under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
 # regarding copyright ownership.  The ASF licenses this file
@@ -21,11 +21,11 @@ from typing import Any
 
 
 def profile_enabled() -> bool:
-    return os.environ.get("AWEX_PROFILE", "0").lower() in {"1", "true", "yes"}
+    return os.environ.get("SHARDSTREAM_PROFILE", "0").lower() in {"1", "true", "yes"}
 
 
 def profile_phase(step_id: int) -> str:
-    warmup_updates = int(os.environ.get("AWEX_PROFILE_WARMUP_UPDATES", "0"))
+    warmup_updates = int(os.environ.get("SHARDSTREAM_PROFILE_WARMUP_UPDATES", "0"))
     update_index = int(step_id) + 1
     return "warmup" if update_index < warmup_updates else "measure"
 
@@ -34,7 +34,7 @@ def emit_profile(logger, **values: Any) -> None:
     if not profile_enabled():
         return
     record = (
-        "AWEX_PROFILE "
+        "SHARDSTREAM_PROFILE "
         + json.dumps(values, sort_keys=True, separators=(",", ":"))
         + "\n"
     ).encode()

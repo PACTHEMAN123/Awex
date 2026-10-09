@@ -13,9 +13,13 @@ dependencies = ["torch"]
 
 [project.optional-dependencies]
 dev = ["pytest", "ruff"]
+integrations = ["requests", "transformers", "ray", "fastapi"]
+
+[project.entry-points."vllm.general_plugins"]
+shardstream_adapter = "shardstream.integrations.vllm.entrypoint:register_shardstream_plugin"
 
 [tool.scikit-build]
-wheel.packages = ["python/shardstream"]
+wheel.packages = ["python/shardstream", "benchmarks/shardstream_benchmarks"]
 cmake.build-type = "Release"
 
 [tool.scikit-build.cmake.define]
@@ -23,7 +27,7 @@ SHARDSTREAM_BUILD_PYTHON = "ON"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["python"]
+pythonpath = ["python", "benchmarks"]
 
 [tool.ruff]
 line-length = 88

@@ -29,7 +29,7 @@ class RolloutMembership:
         if len(set(self.engine_ids)) != len(self.engine_ids):
             raise ValueError("Engine IDs must be unique")
         if not 2 <= self.world_size <= 256:
-            raise ValueError("Device v2 requires 2–256 transfer ranks")
+            raise ValueError("Transport requires 2–256 transfer ranks")
 
     @property
     def inference_world_size(self) -> int:
@@ -124,7 +124,7 @@ class RolloutJoinCoordinator:
                 + (pending_count + len(self._queued) + 1) * inference_tp_size
                 > 256
             ):
-                raise ValueError("Device v2 requires at most 256 transfer ranks")
+                raise ValueError("Transport requires at most 256 transfer ranks")
             self._queued.append(engine_id)
             return True
 

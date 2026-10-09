@@ -1,4 +1,4 @@
-# Licensed to the ShardStream developers under one
+# Licensed to the Awex developers under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
 # regarding copyright ownership.  The ASF licenses this file
@@ -25,9 +25,7 @@ class InferenceConfigValidationError(ValueError):
     pass
 
 
-_VALID_COMM_BACKENDS: frozenset = frozenset(
-    {"file", "nccl", "nccl_device", "nccl_device_v2", "hccl", "astate"}
-)
+_VALID_COMM_BACKENDS: frozenset = frozenset({"transport"})
 _VALID_IPC_BACKENDS: frozenset = frozenset({"cpu", "cuda"})
 
 
@@ -58,15 +56,15 @@ class InferenceConfig:
     node_rank: Optional[int] = None
 
     local_rank: Optional[int] = None
-    # awex specific config
+    # Weight exchange configuration
     # the number of all sglang engines in the cluster
     num_engines: int = 1
     # the rank of the current engine
     engine_rank: int = 0
     # the address of the meta server: `ip:port`
     meta_server_addr: Optional[str] = None
-    # weights exchange communication backend (file/nccl/nccl_device/nccl_device_v2/hccl/astate)
-    comm_backend: str = "file"
+    # The single CUDA transport backend
+    comm_backend: str = "transport"
     # how much steps with weights validation, if enabled, weights update will use both file and transfer and
     # compare the weights
     weights_validation_steps: int = 0
@@ -104,10 +102,7 @@ class InferenceConfig:
                 f"comm_backend must be one of {sorted(_VALID_COMM_BACKENDS)}, got {self.comm_backend!r}"
             )
 
-        if (
-            self.comm_backend in ("nccl_device", "nccl_device_v2")
-            and self.enable_colocate_mode
-        ):
+        if self.comm_backend in ("transport",) and self.enable_colocate_mode:
             errors.append(
                 f"comm_backend={self.comm_backend!r} does not support colocate mode yet"
             )

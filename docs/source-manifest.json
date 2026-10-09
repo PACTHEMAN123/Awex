@@ -182,7 +182,34 @@
     "util/gpu.py": "_utils/gpu.py",
     "util/profile.py": "_utils/profile.py",
     "util/system_util.py": "_utils/system.py",
-    "util/tensor_util.py": "_utils/tensor.py"
+    "util/tensor_util.py": "_utils/tensor.py",
+    "engine/core.py": "integrations/engine/base.py",
+    "engine/mcore.py": "integrations/engine/megatron.py",
+    "engine/vllm.py": "integrations/engine/vllm.py",
+    "reader/weights_reader.py": "integrations/reader/base.py",
+    "reader/nccl_reader.py": "integrations/reader/worker.py",
+    "writer/weights_writer.py": "integrations/writer/base.py",
+    "writer/nccl_writer.py": "integrations/writer/worker.py",
+    "transfer/model_membership.py": "integrations/membership.py",
+    "verl_checkpoint_engine.py": "integrations/verl/checkpoint.py",
+    "verl_environment.py": "integrations/verl/environment.py",
+    "vllm_awex_adapter.py": "integrations/vllm/server.py",
+    "vllm_plugin.py": "integrations/vllm/plugin.py",
+    "vllm_plugin_entrypoint.py": "integrations/vllm/entrypoint.py",
+    "publication/registry.py": "integrations/publication/registry.py",
+    "publication/awex.py": "integrations/publication/transport.py",
+    "publication/vllm_adapter.py": "integrations/publication/vllm.py",
+    "publication/__init__.py": "integrations/publication/__init__.py",
+    "awex_vllm_server.py": "integrations/vllm/serve.py",
+    "mbridge_loader.py": "integrations/mbridge_loader.py",
+    "tests/experimental/model_weight_profile.py": "profiling/model.py",
+    "tests/experimental/model_background_compute.py": "profiling/compute.py"
   },
-  "native_migration_notes": "Kernel/protocol files retain original expressions and PTX under renamed identifiers; audit with scripts/audit_protocol.py. Host runtime is extracted from the original extension into src/runtime.cu with a 98-line torch binding; its behavior requires GPU acceptance."
+  "native_migration_notes": "Kernel/protocol files retain original expressions and PTX under renamed identifiers; audit with scripts/audit_protocol.py. Host runtime is extracted from the original extension into src/runtime.cu with a 98-line torch binding; its behavior requires GPU acceptance.",
+  "benchmark_modules": {
+    "tests/weights_exchange_multi_vllm_it.py": "model_exchange.py",
+    "tests/megatron_parallel.py": "parallel.py",
+    "tests/test_utils.py": "model_loader.py",
+    "tests/experimental/fp8_transfer_config.py": "fp8_config.py"
+  }
 }
