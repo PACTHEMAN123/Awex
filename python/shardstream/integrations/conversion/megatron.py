@@ -16,16 +16,20 @@
 # under the License.
 
 
-from typing import Dict, List, Optional, Tuple
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
-from megatron.core.transformer.transformer_config import TransformerConfig
 from torch import distributed as dist
 from transformers import PretrainedConfig
 
 from shardstream import logging
 from shardstream._utils.common import divide
 from shardstream.metadata.rank import RankInfo
+
+if TYPE_CHECKING:
+    from megatron.core.transformer.transformer_config import TransformerConfig
 
 logger = logging.getLogger(__name__)
 
