@@ -115,6 +115,7 @@ class TransportWorkerReader(WorkerWeightsReader):
             infer_instance_world_size=self.infer_instance_world_size,
             num_infer_engines=self.num_engines,
         )
+        self.device_transport.resolve_rollout_topology()
         if self.model_arch_name in ("Qwen3ForCausalLM", "Qwen3MoeForCausalLM"):
             self.device_transport.prepare_recv(
                 self.parameters, self.transfer_plan, allow_staging=False

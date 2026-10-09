@@ -38,11 +38,11 @@ original steady-call GIL ownership and keeps explicit prepare releasing GIL.
 The cleanup wheel was installed at `3dd7325` on all four H20 nodes;
 its extension SHA-256 is unchanged and full integration imports pass. Four real BF16
 GRPO configurations now qualify this cleanup; both PP1 FP8 cases also pass
-10-step real GRPO. All 21 standalone cases pass full-checkpoint correctness, cache and generation. Restoring original kernel-call GIL ownership brings FP8 naive to +8.5%/+4.6% against the current original, with full real-weight checks passed; final packaged-build checks remain. PP4 is excluded by explicit user request.
+10-step real GRPO. All 21 standalone cases pass full-checkpoint correctness, cache and generation. Original kernel-call GIL ownership is restored; explicit prepare still releases GIL. The isolated prototype is near baseline, but the final package repeats slower on FP8 naive, so that performance anomaly remains unresolved. Final BF16 swizzle and FP8 GRPO core updates are near baseline, with all full-weight/cache/resource checks passed. PP4 is excluded by explicit user request.
 
 At revision `3b69d74`, real Qwen3 BF16 Elastic correctness and adjacent original
 transfer comparisons pass; preparation timing is recorded independently of
 core weight updates. Current qualification and pending experiment coverage are
 recorded in `acceptance.md`. Experiments 8, 9, 11 and 12 have their required coverage. Experiment 10 has
-complete real-model correctness coverage and a qualified FP8 naive binding
-correction; final packaged-build checks remain.
+complete real-model correctness coverage; its independent FP8 naive performance
+anomaly remains under diagnosis despite final packaged-build correctness passing.

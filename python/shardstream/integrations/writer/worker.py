@@ -142,6 +142,7 @@ class TransportWriter(WeightsExchangeShardingWriter):
             infer_instance_world_size=self.infer_instance_world_size,
             num_infer_engines=self.num_infer_engines,
         )
+        self.device_transport.resolve_rollout_topology()
         if self.device_parameters is not None:
             self.device_transport.prepare_send(
                 self.device_parameters, self.transfer_plan, allow_staging=False

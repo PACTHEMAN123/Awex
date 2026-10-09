@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
+import json
 import os
 import socket
 import threading
@@ -217,7 +218,7 @@ def _ring_order(
     rollout_node_ids: tuple[Any, ...] | None = None,
 ) -> list[int]:
     ordered = sorted(peers)
-    if strategy is _RingOrderStrategy.FIXED or len(ordered) < 2:
+    if len(ordered) < 2:
         return ordered
 
     if rollout_node_ids is not None:
@@ -229,6 +230,8 @@ def _ring_order(
                 rollout_node_ids[peer // infer_instance_world_size], []
             ).append(peer)
         node_groups = list(groups.values())
+        if strategy is _RingOrderStrategy.FIXED:
+            return [peer for group in node_groups for peer in group]
         node_offset = int(root) % len(node_groups)
         member_offset = int(root) // len(node_groups)
         swizzled = []
@@ -262,6 +265,8 @@ def _ring_order(
             engine = peer // instance_world_size
             node_groups[engine % node_count].append(peer)
         if all(node_groups):
+            if strategy is _RingOrderStrategy.FIXED:
+                return [peer for group in node_groups for peer in group]
             node_offset = int(root) % node_count
             member_offset = (int(root) // node_count) % max(
                 len(group) for group in node_groups
@@ -273,6 +278,8 @@ def _ring_order(
                 swizzled.extend(group[offset:] + group[:offset])
             return swizzled
 
+    if strategy is _RingOrderStrategy.FIXED:
+        return ordered
     offset = int(root) % len(ordered)
     return ordered[offset:] + ordered[:offset]
 
@@ -996,6 +1003,31 @@ class Transport:
             os.environ.get("NCCL_IB_HCA", "topology"),
         )
 
+    @_serialized_transport_call
+    def resolve_rollout_topology(self) -> None:
+        """Collect actual placement before building rings, once per membership.
+
+        All transfer ranks call this after setting their CUDA device. Explicit
+        membership topology already supplies this information. Node groups use
+        their first engine's order; node identity values never determine order.
+        """
+        if not self.ring_broadcast or self.rollout_node_ids is not None:
+            return
+        nodes = [None] * self.world_size
+        dist.all_gather_object(nodes, _local_node_id(), group=self.group)
+        engine_nodes = []
+        for engine in range(self.num_infer_engines):
+            members = nodes[
+                engine * self.infer_instance_world_size : (engine + 1)
+                * self.infer_instance_world_size
+            ]
+            if not members or len(set(members)) != 1:
+                raise TransportUnavailableError(
+                    "Each rollout TP instance must reside on one node"
+                )
+            engine_nodes.append(members[0])
+        self.rollout_node_ids = tuple(engine_nodes)
+
     def _ensure_initialized(self) -> float:
         if self._reconfiguration_failed:
             raise TransportUnavailableError(
@@ -1111,6 +1143,22 @@ class Transport:
     def _run(self, batch: _Batch, sender: bool, sequence: int) -> dict[str, float]:
         run_start = time.perf_counter()
         if not self._logged_batch_shape:
+            if os.environ.get("SHARDSTREAM_PROFILE", "0") == "1":
+                routes = sorted(
+                    set(zip(batch.ring_ids, batch.peers, batch.forward_peers))
+                )
+                print(
+                    "SHARDSTREAM_RING_ROUTES "
+                    + json.dumps(
+                        {
+                            "rank": self.rank,
+                            "sender": sender,
+                            "rollout_node_ids": self.rollout_node_ids,
+                            "routes": routes,
+                        }
+                    ),
+                    flush=True,
+                )
             strided_spans = [
                 (length, row_bytes)
                 for length, row_bytes, row_stride in zip(

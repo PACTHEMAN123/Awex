@@ -8,7 +8,7 @@ Historical baseline results are comparison evidence, never new-library passes.
 |---|---|---|
 | 8 | Real veRL GRPO BF16, historical NCCL controls, main plus three PP1 topologies; PP4 excluded by user | At `3dd7325`: main TP2/CP2/EP8→TP4×4 (40 steps), TP4/CP2/EP8→TP2×8 (40 steps), TP4/CP2/EP8→TP4×4 (40 steps), and TP4/CP2/EP8→TP8×2 (10 steps) pass; BF16 coverage complete |
 | 9 | Real model weight exchange, three fanout topologies, off/naive/swizzle routes with controls | All nine required BF16 topology/route cases pass full parameters, cache and generation; TP4×4/naive and TP2×8/off current original/candidate controls show no basic regression; slow historical/main-matrix samples remain preserved, between-run variation cause unproven |
-| 10 | Three fanouts × three routes, paired BF16/FP8, weight bytes/scales/cache/generation | All nine BF16 and nine FP8 cases pass full checkpoint checks, cache and generation; FP8 TP2×8/swizzle is within +2.3%/+2.4% of current original; restoring original steady-call GIL ownership gives naive +8.5%/+4.6%, with full HF/cache/generation checks passed; final packaged-build checks remain |
+| 10 | Three fanouts × three routes, paired BF16/FP8, weight bytes/scales/cache/generation | All nine BF16 and nine FP8 cases pass full checkpoint checks, cache and generation; FP8 TP2×8/swizzle is within +2.3%/+2.4% of current original; naive performance remains under diagnosis after the final package repeats at 1968.28/2329.06 ms despite the earlier binding prototype's 1283.32/1325.96 ms |
 | 11 | Real veRL FP8, training TP2/TP4 to inference TP2×8, historical paired controls | Both TP2/TP4 complete 10 steps, each with 256 cached worker transfers: full updates 314.19/323.15 and 309.85/315.17 ms; historical comparisons recorded |
 | 12 | Real Qwen3-30B-A3B BF16, 2→4→8 model instances, full equality, first publication cache hit, background preparation timeline | At `3b69d74`: real-model correctness, cache, background compute and steady transfer comparison pass; prepare timing recorded separately |
 
@@ -64,9 +64,9 @@ claimed. The subsequent removal of uncalled helpers is installed at `3dd7325` on
 four nodes with an unchanged native extension hash. Its four required BF16
 GRPO configurations and both FP8 configurations pass. The standalone model
 matrix passes all 21 full-checkpoint, cache and generation checks. The FP8
-TP2×8 naive update-latency anomaly is reduced to +8.5%/+4.6% against the current
-original after restoring its steady-call GIL ownership. Final packaged-build
-checks remain; no transfer resource settings changed.
+TP2×8 naive update-latency anomaly remains under diagnosis. Restoring original
+GIL ownership produced one near-baseline prototype sample, but the final package
+repeats slower. All samples are retained; no transfer resource settings changed.
 
 Original experimental reports remain outside the library in `../results/`:
 
@@ -99,8 +99,8 @@ Sources: `../results/awex-weightrail-vs-verl-nccl-h20-20261006-summary.csv`,
 `../results/shardstream-refactor-20261009/historical-grpo-comparison.json`.
 All six required PP1 GRPO raw archives are local and SHA-256 verified, as are
 all 21 standalone model cases. Correctness coverage is complete; the binding
-correction is qualified on real FP8 weights, with final packaged-build checks
-remaining.
+correction is qualified on real FP8 weights. Final packaged-build correctness
+and cache checks also pass, but naive FP8 performance remains unresolved.
 
 The initial naive FP8 standalone update p50/p95 was 2490.84/2760.59 ms.
 A fresh candidate recheck reports 1502.32/1839.14 ms, versus the current original
@@ -113,8 +113,10 @@ geometry. These checks exclude those differences; they do not prove the cause
 of the latency anomaly. A separate same-process native diagnostic executes both
 unchanged backends on each real HF payload, with alternating order. Its combined
 publication timing is not comparable to a single-backend update. Its full
-checkpoint and cache checks pass, but both communicators substantially inflate
-latency; it is excluded from performance acceptance.
+checkpoint and cache checks pass, but its timing is excluded from acceptance.
+A later audit also finds eight inference HCA bindings differ from the normal
+recipe because the diagnostic eagerly imported transport. The contributions
+of that binding error and the two communicators are not isolated.
 
 The isolated single-backend binding correction restores original steady
 kernel-call GIL ownership, while explicit prepare still releases GIL. It passes
@@ -130,6 +132,32 @@ ownership explains every historical slow sample. The source preserves this
 binding correction; C++ runtime, kernel, plan lowering and resource geometry
 remain unchanged. The raw archive is locally SHA-256 verified and independently
 audited under `../results/shardstream-refactor-20261009/binding-policy-diagnostics/`.
+
+The final `fbce854` package has the same executable binding tokens as that
+prototype, and identical transfer SASS. Nevertheless its naive FP8 repeat is
+1968.28/2329.06 ms, so the prototype does not resolve the performance gate or
+prove GIL ownership caused the earlier anomaly. All 224 rank/step pairs have
+identical non-time fields between the prototype and final package. Both pass
+full HF/scale/BF16/generation/cache checks. Final BF16 TP4×4 swizzle is
+618.56/645.57 ms against historical original 584.55/657.44 ms (+5.82%/−1.81%).
+Final FP8 GRPO TP2→TP2×8 updates are 321.74/327.75 ms versus preceding candidate
+314.19/323.15 ms (+2.40%/+1.42%), with all 256 cached transfers and 23 resource
+fields matched. Trainer-step p50/p95 is 21.74/25.37 s versus 21.66/23.55 s
+(+0.37%/+7.73%). Only the independent naive FP8 anomaly remains under diagnosis.
+
+A fresh original `6dabfbf` control after the final package completes all exact
+HF byte/scale/mixed-BF16, generation and 224 cache checks at 1291.74/1472.39 ms.
+The final package is +52.37%/+58.18% slower; this remains a failed performance gate.
+Its 224 rank/step records match the control on 68 shared non-time fields.
+Both raw archives are locally SHA-256 verified and independently audited.
+Evidence: `../results/shardstream-refactor-20261009/final-naive-vs-fresh-original.json`.
+
+An external single-native isolation attempt eagerly imported transport during
+Python startup. Eight inference ranks consequently inherited the wrong HCA
+binding and communication timed out. That failed diagnostic is preserved and
+excluded from performance/correctness acceptance; it does not explain the
+final-package anomaly. The corrected diagnostic defers replacement until the
+normal transport import, preserving the existing HCA allocation policy.
 
 ## Standalone C++ library qualification
 
@@ -159,7 +187,7 @@ The active PP4→TP2 case was cancelled, and PP4→TP2/TP4/TP8 were removed
 from the launch queue and required acceptance coverage. Their old controls
 remain historical records; the cancelled case is not a new-library pass.
 The two PP1 FP8 configurations subsequently completed. No additional
-Elastic rerun is queued; standalone real-model matrix qualification remains pending.
+Elastic rerun is queued. All 21 standalone cases pass correctness, cache and generation checks; final-package FP8 naive performance remains unresolved.
 
 ## Real FP8 GRPO qualification at `3dd7325`
 
@@ -178,3 +206,19 @@ to the refactor. The largest step change is +3.70% p95 in the TP4 case.
 
 Evidence: `../results/shardstream-refactor-20261009/historical-fp8-grpo-comparison.json`
 and both `grpo-fp8-matrix1/*/native-audit.json` records.
+
+## User-defined naive routing revision
+
+The user clarified naive as a shared fixed entry instance followed by relays
+within each node, then the next node. Previously fixed engine-ID order alternated
+nodes under round-robin placement. Naive now groups actual placement without
+source-dependent rotation. Ordinary writer/reader setup collects actual node IDs
+before preparing its host plan, including partially occupied rollout nodes.
+Swizzle also consumes actual placement; off stays direct. All native sources and
+resource configuration defaults remain unchanged. The earlier naive results
+measure the previous route definition and are retained as historical evidence.
+
+A new complete 21-case standalone BF16/FP8 × off/naive/swizzle matrix is pending.
+Each worker records actual ring edges for path audit, in addition to full loaded
+HF weights, exact FP8 byte/scale checks, cache and generation validation. PP4 and
+additional Elastic runs remain excluded. CPU regressions: 79 pass.

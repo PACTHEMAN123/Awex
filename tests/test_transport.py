@@ -16,6 +16,7 @@
 # under the License.
 
 import os
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -154,6 +155,63 @@ def test_v2_swizzle_rotates_ring_by_root(monkeypatch):
     )
     assert last_batch.peers == [3]
     assert last_batch.forward_peers == [-1]
+
+
+@pytest.mark.parametrize("root", [8, 9, 10, 11])
+def test_naive_ring_has_fixed_entry_and_groups_actual_nodes(monkeypatch, root):
+    monkeypatch.setattr(transport, "_ensure_cuda_tensor", lambda *_: None)
+    tensor = torch.arange(8, dtype=torch.int32)
+    topology = (20, 10, 20, 10)
+    targets = [0, 2, 4, 6]
+    common = dict(
+        world_size=24,
+        chunk_bytes=16,
+        infer_instance_world_size=2,
+        num_infer_engines=4,
+        ring_broadcast=True,
+        rollout_node_ids=topology,
+    )
+    send = _build_send_batch(
+        {"weight": tensor},
+        TransferPlan(operations={p: [_replica_operation(root, p)] for p in targets}),
+        rank=root,
+        **common,
+    )
+    assert send.peers == [0]
+    # Engine IDs alternate nodes; the actual chain groups them as 0,2,1,3.
+    for rank, source, forward in ((0, root, 4), (4, 0, 2), (2, 4, 6), (6, 2, -1)):
+        recv = _build_recv_batch(
+            {"weight": torch.empty_like(tensor)},
+            TransferPlan(operations={root: [_replica_operation(root, rank)]}),
+            rank=rank,
+            **common,
+        )
+        assert recv.peers == [source]
+        assert recv.forward_peers == [forward]
+        assert recv.ring_ids == send.ring_ids
+
+
+def test_resolve_rollout_topology_uses_group_placement_once(monkeypatch):
+    instance = transport.Transport.__new__(transport.Transport)
+    instance._operation_lock = threading.RLock()
+    instance.ring_broadcast = True
+    instance.rollout_node_ids = None
+    instance.world_size = 24
+    instance.infer_instance_world_size = 2
+    instance.num_infer_engines = 4
+    instance.group = object()
+    calls = []
+
+    def gather(result, node, *, group):
+        assert group is instance.group
+        calls.append(node)
+        result[:] = [20, 20, 10, 10, 20, 20, 10, 10] + [30] * 16
+
+    monkeypatch.setattr(transport.dist, "all_gather_object", gather)
+    instance.resolve_rollout_topology()
+    instance.resolve_rollout_topology()
+    assert instance.rollout_node_ids == (20, 10, 20, 10)
+    assert len(calls) == 1
 
 
 def test_v2_swizzle_groups_round_robin_engines_by_node(monkeypatch):
