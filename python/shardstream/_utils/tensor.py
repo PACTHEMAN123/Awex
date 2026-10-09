@@ -21,7 +21,6 @@ import torch
 from shardstream import logging
 
 logger = logging.getLogger(__name__)
-_REDUCE_TENSOR_ARG_DEVICE_INDEX = 6
 
 
 def check_and_log_nan_values(tensor, tensor_name, stage_info="", max_indices=20):

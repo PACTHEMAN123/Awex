@@ -27,5 +27,15 @@ This cleanup changes no files under `include/`, `src/`, or `bindings/`, and no
 CMake compiler settings. All 72 regression tests pass locally and in the H20
 runtime. Kernel/protocol audit and full integration imports pass without loading
 the old `awex` package.
-Real GPU correctness and timing acceptance remain pending; the cleanup does not
-constitute evidence of unchanged measured transfer performance.
+The second cleanup removes another 584 lines and 24 definitions: an uncalled HF
+loader, pairwise NCCL subgroup creation, an unused PP layout inference chain
+(the actual model-derived PP map remains), Python FP8 conversion, unused transfer
+chunk/rank-axis helpers, descriptor-count tooling and IPC serialization constants.
+Library and benchmark Python code now has 13,931 lines and 605 definitions.
+All 74 local regression tests pass. Native files and compiler settings remain
+unchanged; the installed H20 wheel must be refreshed before counting GPU runs
+as acceptance of this second cleanup.
+
+At revision `3b69d74`, real Qwen3 BF16 Elastic correctness and adjacent original
+transfer comparisons pass; details and outstanding preparation timing questions
+are recorded in `acceptance.md`. Experiments 8–11 remain incomplete.

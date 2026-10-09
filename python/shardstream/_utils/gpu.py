@@ -44,10 +44,6 @@ def get_gpu_status() -> str:
         return "nvidia-smi not found; GPU status unavailable."
 
 
-def print_gpu_status(stage):
-    logger.info(f"GPU status for {stage}:\n{get_gpu_status()}")
-
-
 def print_current_gpu_status(stage):
     device_type = device_util.get_device_type()
     allocated = torch.cuda.memory_allocated()

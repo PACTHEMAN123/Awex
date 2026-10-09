@@ -25,10 +25,6 @@ from typing import Iterator
 import torch
 
 
-def is_cuda_available() -> bool:
-    return torch.cuda.is_available()
-
-
 def get_device_type() -> str:
     override = os.environ.get("SHARDSTREAM_DEVICE_TYPE", "").strip().lower()
     if override and override not in {"cuda", "cpu"}:
@@ -97,22 +93,6 @@ def visible_devices_env_value() -> str:
         if value:
             return value
     return ""
-
-
-def get_stream_class() -> type | None:
-    device_type = get_device_type()
-    if device_type == "cuda":
-        return torch.cuda.Stream
-    return None
-
-
-def create_stream(device_id: int | None = None):
-    stream_cls = get_stream_class()
-    if stream_cls is None:
-        return None
-    if device_id is None:
-        return stream_cls()
-    return stream_cls(device=device_id)
 
 
 @contextmanager

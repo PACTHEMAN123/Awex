@@ -16,7 +16,6 @@
 # under the License.
 
 
-import json
 import math
 import os
 import pickle
@@ -54,14 +53,6 @@ def _is_allowed_infer_only_alias(
         weight_key = extra_key.removesuffix("_scale_inv")
         return weight_key in infer_keys and weight_key in train_keys
     return False
-
-
-def configure_logging(level=logging.INFO, force=True):
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s\t%(levelname)s %(filename)s:%(lineno)s -- %(process)d -- %(message)s",
-        force=force,
-    )
 
 
 def ensure_divisibility(numerator, denominator):
@@ -140,11 +131,6 @@ def to_dict(param_meta, ignore_keys=None) -> dict:
 
     param_dict = convert_value(param_meta)
     return param_dict
-
-
-def to_json(param_meta, ignore_keys=None) -> str:
-    """Convert the parameter meta to a json string."""
-    return json.dumps(to_dict(param_meta, ignore_keys), indent=2)
 
 
 def compute_statistics(stage_history: dict, step_id: int, duration: float, stage: str):

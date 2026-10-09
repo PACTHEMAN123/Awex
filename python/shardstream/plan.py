@@ -59,37 +59,6 @@ class CommunicationOperation:
     send_tensor_span_numels: Tuple[int, ...] = ()
 
 
-@dataclass(frozen=True, slots=True)
-class TransferChunk:
-    """A contiguous byte range in a lowered device transfer plan."""
-
-    byte_offset: int
-    nbytes: int
-
-
-def build_transfer_chunks(total_bytes: int, chunk_bytes: int) -> List[TransferChunk]:
-    """Split one contiguous transfer into deterministic fixed-size chunks.
-
-    A non-positive ``chunk_bytes`` value preserves the original one-task-per-
-    tensor behavior. Sender and receiver use this pure helper independently,
-    so identical operation byte lengths always produce matching task ordinals.
-    """
-
-    if total_bytes < 0:
-        raise ValueError("total_bytes must be non-negative")
-    if total_bytes == 0:
-        return []
-    if chunk_bytes <= 0:
-        return [TransferChunk(byte_offset=0, nbytes=total_bytes)]
-    return [
-        TransferChunk(
-            byte_offset=byte_offset,
-            nbytes=min(chunk_bytes, total_bytes - byte_offset),
-        )
-        for byte_offset in range(0, total_bytes, chunk_bytes)
-    ]
-
-
 @dataclass(slots=True)
 class TransferPlan:
     """Represents a transfer plan for a specific rank.
@@ -154,39 +123,6 @@ class NormalizedAxes:
     ep_tp_size: int
     attn_tp_rank: int
     attn_tp_size: int
-
-
-def normalize_rank_axes(
-    param_class: str, rank_info: Any, shard_meta: Any = None
-) -> NormalizedAxes:
-    """Map rank axes to a single normalized view.
-
-    `param_class` can be one of: `attention`, `expert`, `dense_other`.
-    For attention we prioritize `attn_tp_*`; for expert we preserve both
-    `ep_*` and `ep_tp_*`; for dense we use generic `tp_*`.
-    """
-
-    def get(obj: Any, key: str, default: Any) -> Any:
-        return getattr(obj, key, default) if obj is not None else default
-
-    pp_rank = get(shard_meta, "pp_rank", get(rank_info, "pp_rank", 0))
-    if param_class == "attention":
-        tp_rank = get(rank_info, "attn_tp_rank", get(rank_info, "tp_rank", 0))
-        tp_size = get(rank_info, "attn_tp_size", get(rank_info, "tp_size", 1))
-    else:
-        tp_rank = get(rank_info, "tp_rank", 0)
-        tp_size = get(rank_info, "tp_size", 1)
-    return NormalizedAxes(
-        pp_rank=pp_rank,
-        tp_rank=tp_rank,
-        tp_size=tp_size,
-        ep_rank=get(rank_info, "ep_rank", 0),
-        ep_size=get(rank_info, "ep_size", 1),
-        ep_tp_rank=get(rank_info, "ep_tp_rank", 0),
-        ep_tp_size=get(rank_info, "ep_tp_size", 1),
-        attn_tp_rank=get(rank_info, "attn_tp_rank", tp_rank),
-        attn_tp_size=get(rank_info, "attn_tp_size", tp_size),
-    )
 
 
 class TransferPlanBuilder:

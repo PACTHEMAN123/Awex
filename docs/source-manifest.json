@@ -180,7 +180,6 @@
     "sharding/mcore_sharding.py": "integrations/sharding/megatron.py",
     "util/gpu.py": "_utils/gpu.py",
     "util/profile.py": "_utils/profile.py",
-    "util/system_util.py": "_utils/system.py",
     "util/tensor_util.py": "_utils/tensor.py",
     "engine/core.py": "integrations/engine/base.py",
     "engine/mcore.py": "integrations/engine/megatron.py",
@@ -200,7 +199,6 @@
     "publication/vllm_adapter.py": "integrations/publication/vllm.py",
     "publication/__init__.py": "integrations/publication/__init__.py",
     "awex_vllm_server.py": "integrations/vllm/serve.py",
-    "mbridge_loader.py": "integrations/mbridge_loader.py",
     "tests/experimental/model_weight_profile.py": "profiling/model.py",
     "tests/experimental/model_background_compute.py": "profiling/compute.py"
   },
