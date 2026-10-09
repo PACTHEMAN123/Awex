@@ -175,6 +175,24 @@
     "util/common.py": "_utils/common.py",
     "util/device.py": "_utils/device.py",
     "util/process_group.py": "_utils/process_group.py",
-    "logging.py": "logging.py"
+    "logging.py": "logging.py",
+    "config.py": "integrations/config.py",
+    "converter/weights_converter.py": "integrations/conversion/base.py",
+    "converter/mcore_converter.py": "integrations/conversion/megatron.py",
+    "converter/vllm_converter.py": "integrations/conversion/vllm.py",
+    "converter/sglang_converter.py": "integrations/conversion/fused.py",
+    "models/qwen3.py": "integrations/models/qwen3.py",
+    "models/qwen3_moe.py": "integrations/models/qwen3_moe.py",
+    "models/registry.py": "integrations/models/registry.py",
+    "meta/infer_meta_resolver.py": "integrations/metadata/inference.py",
+    "meta/train_meta_resolver.py": "integrations/metadata/training.py",
+    "meta/meta_server.py": "control/store.py",
+    "sharding/vllm_sharding.py": "integrations/sharding/vllm.py",
+    "sharding/mcore_sharding.py": "integrations/sharding/megatron.py",
+    "util/mindspeed.py": "integrations/sharding/mindspeed.py",
+    "util/gpu.py": "_utils/gpu.py",
+    "util/profile.py": "_utils/profile.py",
+    "util/system_util.py": "_utils/system.py",
+    "util/tensor_util.py": "_utils/tensor.py"
   }
 }
