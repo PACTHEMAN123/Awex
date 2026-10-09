@@ -124,7 +124,7 @@ __device__ __forceinline__ void groupBarrier(int barrier, int nthreads) {
 
 __device__ __forceinline__ Pack128 load128(const void* address) {
   Pack128 value;
-  asm volatile("ld.volatile.global.transport.u64 {%0,%1}, [%2];"
+  asm volatile("ld.volatile.global.v2.u64 {%0,%1}, [%2];"
                : "=l"(value.first), "=l"(value.second)
                : "l"(address)
                : "memory");
@@ -138,7 +138,7 @@ __device__ __forceinline__ std::uint8_t load8(const void* address) {
 }
 
 __device__ __forceinline__ void store128(void* address, const Pack128& value) {
-  asm volatile("st.global.transport.u64 [%0], {%1,%2};" : : "l"(address), "l"(value.first), "l"(value.second) : "memory");
+  asm volatile("st.global.v2.u64 [%0], {%1,%2};" : : "l"(address), "l"(value.first), "l"(value.second) : "memory");
 }
 
 __device__ __forceinline__ void store8(void* address, std::uint8_t value) {
