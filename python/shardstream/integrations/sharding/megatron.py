@@ -25,7 +25,7 @@ from shardstream.metadata.rank import RankInfo
 
 
 def get_mcore_sharding_strategy(model_name: str, rank_info: RankInfo, **kwargs):
-    from shardstream.integrations.models import get_sharding_strategy
+    from shardstream.integrations.models.registry import get_sharding_strategy
 
     cls = get_sharding_strategy(model_name)
     return cls(

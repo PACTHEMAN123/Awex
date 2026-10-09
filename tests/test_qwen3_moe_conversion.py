@@ -361,3 +361,20 @@ def test_vllm_routed_expert_container_matches_hf_names():
     }
     assert converted_names == expected_names
     assert not any("routed_experts" in name for name in converted_names)
+
+
+@pytest.mark.parametrize("model_name", ["Qwen3ForCausalLM", "Qwen3MoeForCausalLM"])
+def test_sharding_helpers_resolve_model_registry(model_name):
+    from shardstream.integrations.config import InferenceConfig
+    from shardstream.integrations.sharding.megatron import get_mcore_sharding_strategy
+    from shardstream.integrations.sharding.vllm import get_vllm_sharding_strategy
+
+    rank_info = SimpleNamespace(tp_size=2, ep_size=1, ep_tp_size=1)
+    infer_config = InferenceConfig(tp_size=2, ep_size=1)
+    for strategy in (
+        get_vllm_sharding_strategy(
+            model_name, infer_config, rank_info, hf_config=_model_config()
+        ),
+        get_mcore_sharding_strategy(model_name, rank_info, hf_config=_model_config()),
+    ):
+        assert isinstance(strategy, Qwen3ShardingStrategy)

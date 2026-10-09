@@ -151,8 +151,10 @@ class TransportWriter(WeightsExchangeShardingWriter):
         )
 
     def close(self) -> None:
-        self.device_transport.close()
-        self.device_transport = None
+        transport = getattr(self, "device_transport", None)
+        if transport is not None:
+            transport.close()
+            self.device_transport = None
 
     def _shake_hands_with_reader(self):
         if self.transfer_rank == self.transfer_world_size - 1:
