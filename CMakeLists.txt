@@ -14,7 +14,7 @@ find_library(NCCL_LIBRARY nccl HINTS "${SHARDSTREAM_NCCL_ROOT}/lib" "${SHARDSTRE
 if(NOT EXISTS "${NCCL_INCLUDE_DIR}/nccl_device.h")
   message(FATAL_ERROR "ShardStream requires NCCL Device API headers (NCCL 2.30.4+ for GIN)")
 endif()
-add_library(shardstream STATIC src/launch.cu src/runtime.cpp)
+add_library(shardstream STATIC src/launch.cu src/runtime.cu)
 add_library(ShardStream::shardstream ALIAS shardstream)
 target_compile_features(shardstream PUBLIC cxx_std_17 cuda_std_17)
 set_target_properties(shardstream PROPERTIES POSITION_INDEPENDENT_CODE ON)

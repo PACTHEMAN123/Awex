@@ -762,8 +762,8 @@ Metrics launch(int64_t handle, const std::vector<TensorView>& tensors, const std
                 const std::vector<int64_t>& tensor_row_strides, const std::vector<int64_t>& peers,
                 const std::vector<int64_t>& ordinals, const std::vector<int64_t>& expected_counts,
                 const std::vector<int64_t>& forward_peers, const std::vector<int64_t>& ring_ids, bool sender,
-                int64_t sequence, const std::vector<std::vector<int64_t>>& quantization = {},
-                bool prepare_only = false) {
+                int64_t sequence, const std::vector<std::vector<int64_t>>& quantization,
+                bool prepare_only, cudaStream_t stream) {
   using Clock = std::chrono::steady_clock;
   const auto launch_start = Clock::now();
   auto* state = reinterpret_cast<DeviceState*>(handle);
