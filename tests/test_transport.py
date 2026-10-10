@@ -64,6 +64,28 @@ def test_node_major_communicator_ranks_join_split_physical_nodes():
     assert sorted(mapping) == list(range(32))
 
 
+def test_interleaved_bias_vectors_stage_and_preserve_neighbor_values(monkeypatch):
+    monkeypatch.setattr(transport, "_ensure_cuda_tensor", lambda *_: None)
+    backing = torch.full((16,), -1.0)
+    parameters = {"gate": backing[::2], "up": backing[1::2]}
+    operations = []
+    for name in parameters:
+        operation = _replica_operation(4, 1)
+        operation.recv_shard_meta.name = name
+        operations.append(operation)
+    plan = TransferPlan(operations={4: operations})
+    batch = _build_recv_batch(parameters, plan, 1, 5, 0)
+    assert len(batch.copybacks) == 2
+    for index, (destination, staging) in enumerate(batch.copybacks):
+        assert staging.is_contiguous()
+        staging.copy_(torch.arange(8) + 100 * (index + 1))
+        destination.copy_(staging)
+    assert torch.equal(backing[::2], torch.arange(8) + 100)
+    assert torch.equal(backing[1::2], torch.arange(8) + 200)
+    with pytest.raises(transport.TransportUnavailableError, match="strided vector"):
+        _build_recv_batch(parameters, plan, 1, 5, 0, allow_staging=False)
+
+
 def test_v2_ring_broadcast_is_disabled_by_default(monkeypatch):
     monkeypatch.setattr(transport, "_ensure_cuda_tensor", lambda *_: None)
     tensor = torch.arange(8, dtype=torch.int32)

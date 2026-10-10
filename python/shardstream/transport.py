@@ -457,8 +457,13 @@ def _ensure_cuda_tensor(tensor: torch.Tensor, description: str) -> None:
 def _tensor_copy_layout(tensor: torch.Tensor, name: str) -> tuple[int, int]:
     element_size = int(tensor.element_size())
     total_bytes = int(tensor.numel()) * element_size
-    if tensor.is_contiguous() or tensor.dim() < 2:
+    if tensor.is_contiguous():
         return total_bytes, total_bytes
+    if tensor.dim() < 2:
+        raise TransportUnavailableError(
+            f"Transport requires staging for a strided vector: parameter={name}, "
+            f"shape={tuple(tensor.shape)}, stride={tuple(tensor.stride())}"
+        )
     if int(tensor.stride(-1)) != 1:
         raise TransportUnavailableError(
             "Transport only supports views contiguous in their innermost dimension: "
