@@ -1,0 +1,128 @@
+{
+  "recipes": [
+    {
+      "id": "qwen3.5-9b",
+      "model": "Qwen/Qwen3.5-9B",
+      "source": {
+        "repo": "THUDM/slime",
+        "revision": "c9337875b917da4263ec5c55308e75a266334c63",
+        "path": "examples/fully_async/run-qwen3.5-9B-fully_async.sh",
+        "sha256": "99386bfa30d31beffa70245919ae193ba9db1509b8b9046b0ba9ba8b43fb10f3",
+        "snapshot": "benchmarks/recipes/upstream/qwen3.5-9b/run-qwen3.5-9B-fully_async.sh"
+      },
+      "training": {
+        "tp": 2,
+        "pp": 1,
+        "cp": 1,
+        "ep": 1,
+        "etp": 1,
+        "world_size": 4
+      },
+      "rollout": {
+        "engine": "vllm",
+        "tp": 2,
+        "attention_dp": 1,
+        "ep": 1,
+        "instances": 2,
+        "world_size": 4,
+        "dp": 1
+      },
+      "mtp": false,
+      "separate_nodes": true,
+      "max_total_gpus": 32
+    },
+    {
+      "id": "qwen2.5-vl-7b",
+      "model": "Qwen/Qwen2.5-VL-7B-Instruct",
+      "source": {
+        "repo": "verl-project/verl",
+        "revision": "5eb4826694f35d8453ad465b67e3e02cb6b34f07",
+        "path": "verl/experimental/fully_async_policy/shell/geo3k_qwen25vl_7b_megatron_4_4.sh",
+        "sha256": "ad784015256c9cb0e26ea3f09924f61afeac3fcc93453826f4a76ecfd875cf51",
+        "snapshot": "benchmarks/recipes/upstream/qwen2.5-vl-7b/geo3k_qwen25vl_7b_megatron_4_4.sh"
+      },
+      "training": {
+        "tp": 2,
+        "pp": 1,
+        "cp": 1,
+        "ep": 1,
+        "etp": 2,
+        "world_size": 4
+      },
+      "rollout": {
+        "engine": "vllm",
+        "tp": 1,
+        "attention_dp": 1,
+        "ep": 1,
+        "instances": 4,
+        "world_size": 4,
+        "dp": 1
+      },
+      "mtp": false,
+      "separate_nodes": true,
+      "max_total_gpus": 32
+    },
+    {
+      "id": "gpt-oss-20b",
+      "model": "openai/gpt-oss-20b",
+      "source": {
+        "repo": "verl-project/verl-recipe",
+        "revision": "242c73fcadf331e7214c4b48f67423f45239cea8",
+        "path": "dapo/test_dapo_gptoss_20b_megatron.sh",
+        "sha256": "dad5517d0cdd68eda71ab5be730e63ca1974879037bd44f3d262c3c88659ecfd",
+        "snapshot": "benchmarks/recipes/upstream/gpt-oss-20b/test_dapo_gptoss_20b_megatron.sh"
+      },
+      "training": {
+        "tp": 4,
+        "pp": 1,
+        "cp": 1,
+        "ep": 8,
+        "etp": 1,
+        "world_size": 8
+      },
+      "rollout": {
+        "engine": "vllm",
+        "tp": 4,
+        "attention_dp": 1,
+        "ep": 1,
+        "instances": 1,
+        "world_size": 4,
+        "dp": 1
+      },
+      "mtp": false,
+      "separate_nodes": true,
+      "max_total_gpus": 32
+    },
+    {
+      "id": "glm-4.7-flash",
+      "model": "zai-org/GLM-4.7-Flash",
+      "source": {
+        "repo": "THUDM/slime",
+        "revision": "c9337875b917da4263ec5c55308e75a266334c63",
+        "path": "scripts/run-glm4.7-30B-A3B.sh",
+        "sha256": "179358dcea66442e5edc338e38ce91232554323f48f08d2906c211d8e27cbe14",
+        "snapshot": "benchmarks/recipes/upstream/glm-4.7-flash/run-glm4.7-30B-A3B.sh"
+      },
+      "training": {
+        "tp": 2,
+        "pp": 2,
+        "cp": 2,
+        "ep": 8,
+        "etp": 1,
+        "world_size": 16
+      },
+      "rollout": {
+        "engine": "vllm",
+        "tp": 1,
+        "attention_dp": 8,
+        "ep": 8,
+        "instances": 1,
+        "world_size": 8,
+        "dp": 8
+      },
+      "mtp": true,
+      "separate_nodes": true,
+      "max_total_gpus": 32
+    }
+  ]
+}

@@ -371,7 +371,7 @@ def _patch_shardstream_worker() -> None:
         if isinstance(infer_engine_config, dict):
             infer_engine_config = InferenceConfig.from_dict(infer_engine_config)
             task_kwargs["infer_engine_config"] = infer_engine_config
-        task_kwargs["model"] = self.model_runner.model
+        task_kwargs["model"] = _shardstream_transfer_model(self.model_runner)
         task_kwargs["model_context"] = _shardstream_model_context(
             self, infer_engine_config
         )
@@ -450,6 +450,21 @@ def _filter_shardstream_kwargs(method_name: str, kwargs: dict) -> dict:
     if missing:
         raise ValueError(f"Missing required args for {method_name}: {missing}")
     return filtered
+
+
+def _shardstream_transfer_model(model_runner):
+    model = model_runner.model
+    config = model_runner.vllm_config.model_config.hf_config
+    if "Glm4MoeLiteForCausalLM" not in getattr(config, "architectures", []):
+        return model
+    if model_runner.vllm_config.speculative_config is None:
+        return model
+    draft = getattr(getattr(model_runner, "drafter", None), "model", None)
+    if draft is None:
+        raise RuntimeError("GLM MTP is enabled but its draft model is unavailable")
+    from shardstream.integrations.models.glm4_moe_lite import GLM47FlashTransferModel
+
+    return GLM47FlashTransferModel(model, draft, config.num_hidden_layers)
 
 
 def flush_cache(self):

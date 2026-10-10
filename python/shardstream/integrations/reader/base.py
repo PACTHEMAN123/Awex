@@ -611,6 +611,9 @@ class WorkerWeightsReader:
         ) * 1000.0
         update_body_start = time.perf_counter()
         self._update_weights(step_id, **kwargs)
+        post_update = getattr(self.weight_converter, "post_update", None)
+        if callable(post_update):
+            post_update(self.model)
         update_body_time_ms = (time.perf_counter() - update_body_start) * 1000.0
         logger.info(
             f"Start to flush cache for step {step_id} for rank {self.transfer_rank}"
