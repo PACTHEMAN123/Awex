@@ -85,6 +85,10 @@ def test_rollout_process_uses_only_its_reserved_ray_gpus(tmp_path, monkeypatch):
     actor.launch("rollout", ["-c", "pass"], {"SHARDSTREAM_RECIPE_GPU_INDICES": "2,3"})
     assert launched["env"]["CUDA_VISIBLE_DEVICES"] == "6,7"
     assert launched["start_new_session"] is True
+    rollout_sync = launched["env"]["SHARDSTREAM_PROFILE_SYNC_START"]
+    actor.launch("training", ["-c", "pass"], {})
+    # Both roles must enter the same collective before starting the transfer.
+    assert launched["env"]["SHARDSTREAM_PROFILE_SYNC_START"] == rollout_sync == "1"
 
 
 def test_fp32_state_survives_checkpoint_loading_into_bf16_model():
