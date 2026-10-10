@@ -6,7 +6,7 @@ import argparse
 import hashlib
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from shardstream_benchmarks.parallel import resolve_megatron_parallelism
@@ -22,6 +22,20 @@ class ModelRecipe:
     mtp: bool
     separate_nodes: bool
     max_total_gpus: int
+
+    def with_rollout_replicas(self, replicas: int | None) -> ModelRecipe:
+        if replicas is None:
+            return self
+        if replicas < 1:
+            raise ValueError("Rollout replicas must be positive")
+        rollout = {
+            **self.rollout,
+            "instances": replicas,
+            "world_size": replicas * self.rollout["tp"] * self.rollout["dp"],
+        }
+        if self.training["world_size"] + rollout["world_size"] > self.max_total_gpus:
+            raise ValueError(f"{self.id}: training plus rollout exceeds GPU budget")
+        return replace(self, rollout=rollout)
 
     @property
     def provider_overrides(self) -> dict:
@@ -150,8 +164,9 @@ def main() -> None:
     parser.add_argument("model", choices=tuple(load_recipes()))
     parser.add_argument("--training-hosts", nargs="+", required=True)
     parser.add_argument("--rollout-hosts", nargs="+", required=True)
+    parser.add_argument("--rollout-replicas", type=int)
     args = parser.parse_args()
-    recipe = load_recipes()[args.model]
+    recipe = load_recipes()[args.model].with_rollout_replicas(args.rollout_replicas)
     recipe.validate_placement(args.training_hosts, args.rollout_hosts)
     print(
         json.dumps(

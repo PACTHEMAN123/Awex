@@ -139,6 +139,11 @@ def main():
     parser.add_argument("--ray-address", required=True)
     parser.add_argument("--training-hosts", nargs="+", required=True)
     parser.add_argument("--rollout-hosts", nargs="+", required=True)
+    parser.add_argument(
+        "--rollout-replicas",
+        type=int,
+        help="Override replica count while retaining the recipe's per-replica TP/DP/EP",
+    )
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--source", default="/tmp/shardstream-model-recipes-1010")
     parser.add_argument("--runtime", default="/tmp/model-recipes-1010-runtime")
@@ -156,7 +161,8 @@ def main():
 
     signal.signal(signal.SIGTERM, terminate)
     signal.signal(signal.SIGINT, terminate)
-    recipe = load_recipes()[args.recipe]
+    pinned_recipe = load_recipes()[args.recipe]
+    recipe = pinned_recipe.with_rollout_replicas(args.rollout_replicas)
     recipe.validate_placement(args.training_hosts, args.rollout_hosts)
     import ray
     from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
@@ -176,6 +182,8 @@ def main():
         "source": recipe.source,
         "training": recipe.training,
         "rollout": recipe.rollout,
+        "pinned_rollout": pinned_recipe.rollout,
+        "rollout_replicas_override": args.rollout_replicas,
         "training_hosts": args.training_hosts,
         "rollout_hosts": args.rollout_hosts,
         "run_dir": run_dir,
@@ -282,6 +290,8 @@ def main():
         ]
         for engine, host, port in endpoints:
             train_args.extend(["--inference-endpoint", f"{engine},{host},{port}"])
+        if args.rollout_replicas is not None:
+            train_args.extend(["--rollout-replicas", str(args.rollout_replicas)])
         for node_rank, actor in enumerate(training):
             torchrun = [
                 "-m",

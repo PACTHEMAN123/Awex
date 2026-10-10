@@ -66,6 +66,32 @@ def test_qwen35_recipe_does_not_enable_mtp_in_either_engine():
     )
 
 
+@pytest.mark.parametrize("model,replicas", [("qwen3.5-9b", 4), ("qwen2.5-vl-7b", 8)])
+def test_replica_scaling_retains_recipe_axes_and_pinned_defaults(model, replicas):
+    pinned = load_recipes()[model]
+    scaled = pinned.with_rollout_replicas(replicas)
+    assert scaled.training == pinned.training
+    assert scaled.source == pinned.source
+    assert scaled.rollout["world_size"] == 8
+    assert scaled.rollout["instances"] == replicas
+    for axis in ("tp", "dp", "ep", "attention_dp"):
+        assert scaled.rollout[axis] == pinned.rollout[axis]
+    assert pinned.rollout["world_size"] == 4
+    scaled.validate_placement(["train0"], ["infer0"])
+    with pytest.raises(ValueError, match="does not fit"):
+        scaled.with_rollout_replicas(replicas * 2).validate_placement(
+            ["train0"], ["infer0"]
+        )
+
+
+def test_replica_override_rejects_zero_and_combined_gpu_budget_overflow():
+    recipe = load_recipes()["qwen3.5-9b"]
+    with pytest.raises(ValueError, match="positive"):
+        recipe.with_rollout_replicas(0)
+    with pytest.raises(ValueError, match="GPU budget"):
+        recipe.with_rollout_replicas(15)
+
+
 def test_rollout_process_uses_only_its_reserved_ray_gpus(tmp_path, monkeypatch):
     from shardstream_benchmarks.recipe_runner import NodeProcesses
 

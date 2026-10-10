@@ -68,3 +68,13 @@ the baseline before publication to check whether its output is repeatable.
 Process groups and logs belong to that invocation; failed runs retain their logs
 and a result containing the error. The result qualifies weight transfer and
 generation, not an entire RL optimizer/training loop.
+
+Use `--rollout-replicas N` to scale the number of independent vLLM replicas.
+This retains the pinned training axes and each replica's TP/DP/EP settings,
+recomputes the rollout GPU count, and enforces the combined 32-GPU budget.
+The result records both the pinned rollout and the override. The same flag is
+available in the placement validator and real-model exchange harness.
+For one full 8-GPU rollout node, use four replicas for Qwen3.5-9B (TP2 each)
+or eight replicas for Qwen2.5-VL-7B (TP1 each), with four training GPUs on a
+different node in either case. All replicas receive full weight validation and
+text generation checks.

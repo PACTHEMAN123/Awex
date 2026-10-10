@@ -688,7 +688,9 @@ def main(args):
     if args.recipe:
         from shardstream_benchmarks.recipes import load_recipes
 
-        recipe = load_recipes()[args.recipe]
+        recipe = load_recipes()[args.recipe].with_rollout_replicas(
+            args.rollout_replicas
+        )
         if not args.remote_inference:
             raise ValueError("Model recipes require disaggregated remote inference")
         if int(os.environ.get("WORLD_SIZE", "1")) != recipe.training["world_size"]:
@@ -826,6 +828,7 @@ if __name__ == "__main__":
         "--recipe",
         choices=("qwen3.5-9b", "qwen2.5-vl-7b", "gpt-oss-20b", "glm-4.7-flash"),
     )
+    parser.add_argument("--rollout-replicas", type=_positive_int)
     parser.add_argument("--join-after", type=_positive_int, nargs="*", default=[])
     parser.add_argument("--target-engines", type=_positive_int, nargs="*", default=[])
     parser.add_argument(
@@ -1038,6 +1041,8 @@ if __name__ == "__main__":
         help="Directory to dump validation tensors.",
     )
     args = parser.parse_args()
+    if args.rollout_replicas is not None and args.recipe is None:
+        parser.error("--rollout-replicas requires --recipe")
     targets = [args.num_engines, *args.target_engines]
     if len(args.join_after) != len(args.target_engines) or any(
         a >= b for a, b in zip(targets, targets[1:])
