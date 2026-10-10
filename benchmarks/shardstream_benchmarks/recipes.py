@@ -57,6 +57,9 @@ class ModelRecipe:
         ]
         if rollout["ep"] > 1:
             args.append("--enable-expert-parallel")
+        if self.id in ("qwen3.5-9b", "qwen2.5-vl-7b"):
+            # This benchmark submits text requests, so encoder profiling is unnecessary.
+            args.append("--skip-mm-profiling")
         if self.mtp:
             args.extend(
                 [

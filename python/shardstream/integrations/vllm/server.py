@@ -128,6 +128,13 @@ class ShardStreamVLLMServerAdapter:
         if not self._initialized:
             raise RuntimeError("ShardStream adapter not initialized.")
         self.weights_exchange_reader.update_weights(step_id=step_id, **kwargs)
+        # Scheduler caches live outside model workers on vLLM V1.
+        if self._call_engine_async("reset_prefix_cache") is False:
+            raise RuntimeError(
+                "vLLM prefix cache reset failed after weight publication"
+            )
+        if hasattr(self._engine_client, "reset_encoder_cache"):
+            self._call_engine_async("reset_encoder_cache")
 
     def release_memory_occupation(self, tags=None) -> None:
         logger.info("Release memory occupation via vLLM sleep.")
