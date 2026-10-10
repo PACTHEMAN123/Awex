@@ -162,6 +162,17 @@ class WeightsReader(WeightExchangeReader):
             "expected_pp_ranks": self.expected_pp_ranks,
             "device_backend": device_util.get_device_type(),
         }
+        if self.model_arch_name == "Glm4MoeLiteForCausalLM":
+            # The draft may share embedding/head storage with the main model.
+            # Publish only distinct targets discovered from its actual weights.
+            self.infer_conf["mtp_alias_targets"] = [
+                parameter.name
+                for parameter in self.parameters_meta
+                if parameter.name.startswith("model.layers.")
+                and parameter.name.endswith(
+                    ("embed_tokens.weight", "shared_head.head.weight")
+                )
+            ]
         self.meta_server_client.put_object("infer_conf", self.infer_conf)
         logger.info(f"Put inference config {self.infer_conf} to meta server")
         if self.engine_rank == 0:

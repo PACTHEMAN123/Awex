@@ -4,6 +4,10 @@ from types import SimpleNamespace as NS
 
 import pytest
 import torch
+from shardstream.integrations.metadata.training import (
+    _build_pp_stage_layer_id_map,
+    _canonicalize_pp_layer_names_in_global_meta,
+)
 from shardstream.integrations.models.glm4_moe_lite import (
     GLM47FlashShardingStrategy,
     GLM47FlashTransferModel,
@@ -393,6 +397,45 @@ def test_glm_standalone_norms_keep_storage_and_resolve_main_or_mtp_pp_ids(
     )
     assert name == f"model.layers.{47 if mtp else 24}.{target_norm}.weight"
     assert view.data_ptr() == tensor.data_ptr()
+
+
+def test_glm_global_mtp_and_alias_ids_do_not_shift_main_pipeline_layers():
+    train = glm_train()
+    metadata = []
+    for rank in (0, 1):
+        params = [{"name": f"model.layers.{i}.input_layernorm.weight"} for i in (0, 1)]
+        name = "model.layers.47.embed_tokens.weight"
+        params.append(
+            {"name": name, "layer_id_is_global": train.is_global_layer_name(name)}
+        )
+        metadata.append(
+            {
+                "rank_info": NS(pp_size=2, pp_rank=rank, global_rank=rank),
+                "params_meta": params,
+            }
+        )
+    mapping = _build_pp_stage_layer_id_map(metadata)
+    assert mapping == {(0, 0): {0: 0, 1: 1}, (1, 0): {0: 2, 1: 3}}
+    _canonicalize_pp_layer_names_in_global_meta(metadata, mapping)
+    assert (
+        metadata[1]["params_meta"][0]["name"] == "model.layers.2.input_layernorm.weight"
+    )
+    assert all(m["params_meta"][-1]["name"] == name for m in metadata)
+
+
+@pytest.mark.parametrize("distinct", [False, True])
+def test_glm_mtp_aliases_follow_actual_distinct_inference_targets(distinct):
+    train = glm_train()
+    alias = "model.layers.47.embed_tokens.weight"
+    train._mtp_alias_targets = [alias] if distinct else []
+    parameter = torch.ones(8, 8)
+    names = dict(
+        train.convert_param_to_device_layout(
+            "embedding.word_embeddings.weight", parameter
+        )
+    )
+    assert (alias in names) == distinct
+    assert names["model.embed_tokens.weight"].data_ptr() == parameter.data_ptr()
 
 
 def glm_infer():

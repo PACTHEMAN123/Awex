@@ -159,6 +159,7 @@ def _build_mcore_converter_glm47_flash():
             super().__init__(
                 config, rank_info, {**infer_conf, "router_dtype": "fp32"}, tf_config
             )
+            self._mtp_alias_targets = infer_conf.get("mtp_alias_targets")
 
         def _convert_attention_param(self, name, parameter, layer_number):
             suffix = name.removeprefix("self_attention.")
@@ -171,6 +172,10 @@ def _build_mcore_converter_glm47_flash():
 
         def convert_param_to_device_layout(self, name, parameter, vp_stage=None):
             return self.convert_param(name, parameter, vp_stage)
+
+        def is_global_layer_name(self, name):
+            match = re.match(r"model\.layers\.(\d+)\.", name)
+            return bool(match and int(match[1]) >= self.hf_config.num_hidden_layers)
 
         def _convert_decoder_param(self, name, parameter, vp_stage=None):
             canonical = self._canonicalize_source_name(name, vp_stage)
@@ -220,12 +225,12 @@ def _build_mcore_converter_glm47_flash():
                             if target.startswith("model.")
                             else "shared_head.head.weight"
                         )
-                        aliases.append(
-                            (
-                                f"model.layers.{self.hf_config.num_hidden_layers + layer}.{suffix}",
-                                tensor,
-                            )
-                        )
+                        alias = f"model.layers.{self.hf_config.num_hidden_layers + layer}.{suffix}"
+                        if (
+                            self._mtp_alias_targets is None
+                            or alias in self._mtp_alias_targets
+                        ):
+                            aliases.append((alias, tensor))
             return converted + aliases
 
     return GLM47FlashMcoreWeightConverter
