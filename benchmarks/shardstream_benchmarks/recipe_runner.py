@@ -34,6 +34,7 @@ class NodeProcesses:
                 assigned[int(index)] for index in gpu_indices.split(",")
             )
         env["PYTHONPATH"] = str(self.stage)
+        env["SHARDSTREAM_RECIPE_REPOSITORY"] = str(self.source)
         env["PATH"] = f"{self.runtime}/bin:/usr/local/cuda/bin:" + env.get("PATH", "")
         libs = [
             "/usr/local/cuda/lib64",

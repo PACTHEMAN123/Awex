@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -118,7 +119,11 @@ class ModelRecipe:
 
 
 def load_recipes(repository: Path | None = None) -> dict[str, ModelRecipe]:
-    repository = repository or Path(__file__).resolve().parents[2]
+    repository = repository or Path(
+        os.environ.get(
+            "SHARDSTREAM_RECIPE_REPOSITORY", Path(__file__).resolve().parents[2]
+        )
+    )
     raw = json.loads((repository / "benchmarks/recipes/models.json").read_text())
     recipes = {}
     for entry in raw["recipes"]:

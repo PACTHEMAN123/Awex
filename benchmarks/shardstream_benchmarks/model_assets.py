@@ -37,7 +37,7 @@ def snapshot_files(model):
     ]
 
 
-def download_file(model, file, output):
+def download_file(model, file, output, source_url=None):
     path = output / file["Path"]
     expected_size, expected_sha = file["Size"], file["Sha256"]
     if not expected_sha or len(expected_sha) != 64:
@@ -58,6 +58,8 @@ def download_file(model, file, output):
         {"Revision": file["Revision"], "FilePath": file["Path"]}
     )
     url = f"https://modelscope.cn/api/v1/models/{model}/repo?{query}"
+    if source_url:
+        url = source_url.rstrip("/") + "/" + urllib.parse.quote(file["Path"])
     for attempt in range(3):
         try:
             offset = temporary.stat().st_size if temporary.exists() else 0
@@ -104,8 +106,21 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--metadata-only", action="store_true")
+    parser.add_argument(
+        "--source-url",
+        help="Copy the same pinned, checksummed snapshot from another node",
+    )
     args = parser.parse_args()
-    files = snapshot_files(args.model)
+    if args.source_url:
+        with urllib.request.urlopen(
+            args.source_url.rstrip("/") + "/modelscope-source.json", timeout=30
+        ) as response:
+            saved_source = json.load(response)
+        if saved_source["model"] != args.model:
+            raise ValueError("Source URL belongs to a different model")
+        files = saved_source["files"]
+    else:
+        files = snapshot_files(args.model)
     if not any(file["Path"].endswith(".safetensors") for file in files):
         raise RuntimeError("Snapshot has no safetensors checkpoint")
     args.output.mkdir(parents=True, exist_ok=True)
@@ -133,7 +148,12 @@ def main():
         return
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         verified = list(
-            pool.map(lambda file: download_file(args.model, file, args.output), files)
+            pool.map(
+                lambda file: download_file(
+                    args.model, file, args.output, args.source_url
+                ),
+                files,
+            )
         )
     (args.output / "verified-assets.json").write_text(
         json.dumps({"model": args.model, "files": verified}, indent=2) + "\n"
