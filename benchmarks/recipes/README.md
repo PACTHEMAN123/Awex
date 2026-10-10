@@ -37,3 +37,24 @@ PYTHONPATH=python:benchmarks python -m shardstream_benchmarks.recipes \
 CPU layout and placement checks do not constitute GPU end-to-end qualification.
 GPU acceptance requires full weight equality after transfer, generation, and
 the selected recipe's actual parallel topology on separate hosts.
+
+Run a recipe against an already prepared Ray cluster, with the source checkout,
+container-local runtime and installed ShardStream stage available on each node:
+
+```bash
+SHARDSTREAM_RECIPE_REPOSITORY=/path/to/ShardStream \
+PYTHONPATH=/path/to/local/stage python -m shardstream_benchmarks.recipe_runner \
+  qwen3.5-9b --ray-address HEAD:PORT \
+  --training-hosts TRAIN_IP --rollout-hosts ROLLOUT_IP \
+  --model-path /path/to/checkpoint --source /path/to/ShardStream \
+  --runtime /path/to/local/environment --stage /path/to/local/stage \
+  --output /path/to/result.json
+```
+
+The runner reserves the recipe GPU counts on separate Ray nodes. It uses the
+recipe's training provider settings and vLLM TP/DP/EP configuration, checks all
+loaded parameters after three publications, and compares deterministic text
+generation before and after publication. It does not submit image requests.
+Process groups and logs belong to that invocation; failed runs retain their logs
+and a result containing the error. The result qualifies weight transfer and
+generation, not an entire RL optimizer/training loop.

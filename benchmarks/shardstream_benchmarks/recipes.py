@@ -54,7 +54,6 @@ class ModelRecipe:
             "--gpu-memory-utilization",
             "0.7",
             "--enforce-eager",
-            "--disable-log-requests",
         ]
         if rollout["ep"] > 1:
             args.append("--enable-expert-parallel")
