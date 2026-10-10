@@ -58,6 +58,9 @@ class NodeProcesses:
                 "SHARDSTREAM_RING_BROADCAST": "1",
                 "SHARDSTREAM_RING_SWIZZLE": "1",
                 "SHARDSTREAM_FP8_BLOCKWISE": "0",
+                "SHARDSTREAM_PROFILE": "1",
+                "SHARDSTREAM_PROFILE_WARMUP_UPDATES": "1",
+                "SHARDSTREAM_PROFILE_SYNC_START": "1",
                 "HF_HUB_OFFLINE": "1",
                 "TRANSFORMERS_OFFLINE": "1",
             }
@@ -141,6 +144,12 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--timeout", type=int, default=3600)
     args = parser.parse_args()
+    # Ensure task-owned children are cleaned up when the driver is interrupted.
+    def terminate(signum, frame):
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGTERM, terminate)
+    signal.signal(signal.SIGINT, terminate)
     recipe = load_recipes()[args.recipe]
     recipe.validate_placement(args.training_hosts, args.rollout_hosts)
     import ray
