@@ -63,6 +63,8 @@ The runner reserves the recipe GPU counts on separate Ray nodes. It uses the
 recipe's training provider settings and vLLM TP/DP/EP configuration, checks all
 loaded parameters after three publications, and compares deterministic text
 generation before and after publication. It does not submit image requests.
+Generation requests explicitly select DP rank zero; a DP recipe also repeats
+the baseline before publication to check whether its output is repeatable.
 Process groups and logs belong to that invocation; failed runs retain their logs
 and a result containing the error. The result qualifies weight transfer and
 generation, not an entire RL optimizer/training loop.

@@ -95,9 +95,11 @@ class NodeProcesses:
                 process.wait(timeout=15)
 
 
-def request(url, payload=None, timeout=120):
+def request(url, payload=None, timeout=120, headers=None):
     data = None if payload is None else json.dumps(payload).encode()
-    headers = {} if data is None else {"Content-Type": "application/json"}
+    headers = dict(headers or {})
+    if data is not None:
+        headers["Content-Type"] = "application/json"
     with urllib.request.urlopen(
         urllib.request.Request(url, data=data, headers=headers), timeout=timeout
     ) as response:
@@ -115,6 +117,9 @@ def generation(endpoint, model_path):
             "seed": 42,
             "max_tokens": 64,
         },
+        # Keep DP8 before/after requests on the same model replica. The vLLM
+        # load balancer may otherwise route them to different DP ranks.
+        headers={"X-data-parallel-rank": "0"},
     )
     if (
         not response.get("choices")
@@ -144,6 +149,7 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--timeout", type=int, default=3600)
     args = parser.parse_args()
+
     # Ensure task-owned children are cleaned up when the driver is interrupted.
     def terminate(signum, frame):
         raise SystemExit(128 + signum)
@@ -174,6 +180,7 @@ def main():
         "rollout_hosts": args.rollout_hosts,
         "run_dir": run_dir,
         "passed": False,
+        "generation_dp_rank": 0,
     }
     try:
         for role, hosts, world in [
@@ -237,6 +244,16 @@ def main():
                     time.sleep(3)
         urls = [f"http://{host}:{port}" for _, host, port in endpoints]
         record["generation_before"] = [generation(url, args.model_path) for url in urls]
+        if recipe.rollout["dp"] > 1:
+            record["generation_before_repeat"] = [
+                generation(url, args.model_path) for url in urls
+            ]
+            if [r["message"] for r in record["generation_before"]] != [
+                r["message"] for r in record["generation_before_repeat"]
+            ]:
+                raise RuntimeError(
+                    "Generation baseline is not repeatable before weight transfer"
+                )
         train_args = [
             "-m",
             "shardstream_benchmarks.model_exchange",
