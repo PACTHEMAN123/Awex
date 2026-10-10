@@ -172,6 +172,18 @@ def _build_mcore_converter_glm47_flash():
         def convert_param_to_device_layout(self, name, parameter, vp_stage=None):
             return self.convert_param(name, parameter, vp_stage)
 
+        def _convert_decoder_param(self, name, parameter, vp_stage=None):
+            canonical = self._canonicalize_source_name(name, vp_stage)
+            if canonical.startswith("decoder.layers."):
+                layer, suffix = canonical.removeprefix("decoder.layers.").split(".", 1)
+                norms = {
+                    "input_layernorm.weight": "input_layernorm.weight",
+                    "pre_mlp_layernorm.weight": "post_attention_layernorm.weight",
+                }
+                if suffix in norms:
+                    return [(f"model.layers.{layer}.{norms[suffix]}", parameter)]
+            return super().convert_param(name, parameter, vp_stage)
+
         def convert_param(self, name, parameter, vp_stage=None):
             name = name.replace("module.", "")
             if name.startswith("mtp.layers."):
@@ -191,12 +203,12 @@ def _build_mcore_converter_glm47_flash():
                 previous = self._pp_stage_layer_id_map
                 try:
                     self._pp_stage_layer_id_map = {}
-                    return super().convert_param(
+                    return self._convert_decoder_param(
                         f"decoder.layers.{layer}.{suffix}", parameter
                     )
                 finally:
                     self._pp_stage_layer_id_map = previous
-            converted = super().convert_param(name, parameter, vp_stage)
+            converted = self._convert_decoder_param(name, parameter, vp_stage)
             aliases = []
             for target, tensor in converted:
                 if target in {"model.embed_tokens.weight", "lm_head.weight"}:

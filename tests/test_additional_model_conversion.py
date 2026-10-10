@@ -374,6 +374,27 @@ def glm_train():
     )
 
 
+@pytest.mark.parametrize("mtp", [False, True])
+@pytest.mark.parametrize(
+    "source_norm,target_norm",
+    [
+        ("input_layernorm", "input_layernorm"),
+        ("pre_mlp_layernorm", "post_attention_layernorm"),
+    ],
+)
+def test_glm_standalone_norms_keep_storage_and_resolve_main_or_mtp_pp_ids(
+    mtp, source_norm, target_norm
+):
+    train = glm_train()
+    prefix = "mtp.layers.0.mtp_model_layer" if mtp else "decoder.layers.0"
+    tensor = torch.arange(8).float()
+    [(name, view)] = train.convert_param_to_device_layout(
+        f"{prefix}.{source_norm}.weight", tensor
+    )
+    assert name == f"model.layers.{47 if mtp else 24}.{target_norm}.weight"
+    assert view.data_ptr() == tensor.data_ptr()
+
+
 def glm_infer():
     return GLM47FlashVLLMWeightConverter(
         glm_config(), NS(tp_size=1, ep_size=8), NS(tp_rank=0, ep_rank=3)
