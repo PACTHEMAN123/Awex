@@ -286,6 +286,9 @@ class MultiVLLMWeightsExchangeIT:
         self._training_barrier()
 
     def _init_distributed(self):
+        from shardstream.integrations.affinity import configure_rank_affinity
+
+        configure_rank_affinity(self.local_rank)
         if self.world_size == 1:
             os.environ.setdefault("RANK", "0")
             os.environ.setdefault("LOCAL_RANK", "0")

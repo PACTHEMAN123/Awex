@@ -16,17 +16,49 @@ from shardstream_benchmarks.recipes import load_recipes
 class NodeProcesses:
     """Own only the process groups launched by this recipe invocation."""
 
-    def __init__(self, source, runtime, stage, run_dir):
+    def __init__(
+        self,
+        source,
+        runtime,
+        stage,
+        run_dir,
+        gpu_count=None,
+        placement="packed",
+        replica_tp=1,
+        hca_span=1,
+    ):
         self.source = Path(source)
         self.runtime = Path(runtime)
         self.stage = Path(stage)
         self.run_dir = Path(run_dir)
         self.run_dir.mkdir(parents=True, exist_ok=False)
         self.processes = {}
+        self.gpus = None
+        self.affinity = None
+        if placement == "nic-spread":
+            from shardstream_benchmarks.placement import plan_nic_spread
+
+            self.gpus, self.affinity = plan_nic_spread(
+                os.environ["CUDA_VISIBLE_DEVICES"].split(","),
+                gpu_count,
+                replica_tp,
+                hca_span,
+            )
+            (self.run_dir / "placement.json").write_text(
+                json.dumps({"gpus": self.gpus, "affinity": self.affinity}, indent=2)
+            )
+
+    def placement(self):
+        return {"gpus": self.gpus, "affinity": self.affinity}
 
     def launch(self, name, arguments, environment):
         env = os.environ.copy()
         env.update(environment)
+        if self.gpus is not None:
+            env["CUDA_VISIBLE_DEVICES"] = ",".join(self.gpus)
+            env["SHARDSTREAM_RANK_AFFINITY"] = json.dumps(self.affinity)
+            env["SHARDSTREAM_HCA_POLICY"] = "topology"
+            env["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
         gpu_indices = env.pop("SHARDSTREAM_RECIPE_GPU_INDICES", None)
         if gpu_indices is not None:
             assigned = env["CUDA_VISIBLE_DEVICES"].split(",")
@@ -53,6 +85,8 @@ class NodeProcesses:
                 "GLOO_SOCKET_IFNAME": "eth0",
                 "NCCL_IB_DISABLE": "0",
                 "NCCL_IB_GID_INDEX": "3",
+                "NCCL_DEBUG": "INFO",
+                "NCCL_DEBUG_SUBSYS": "INIT,NET,ENV",
                 "NCCL_CUMEM_ENABLE": "1",
                 "CUDA_DEVICE_MAX_CONNECTIONS": "1",
                 "SHARDSTREAM_RING_BROADCAST": "1",
@@ -140,6 +174,9 @@ def main():
     parser.add_argument("--training-hosts", nargs="+", required=True)
     parser.add_argument("--rollout-hosts", nargs="+", required=True)
     parser.add_argument(
+        "--gpu-placement", choices=("packed", "nic-spread"), default="nic-spread"
+    )
+    parser.add_argument(
         "--rollout-replicas",
         type=int,
         help="Override replica count while retaining the recipe's per-replica TP/DP/EP",
@@ -189,6 +226,8 @@ def main():
         "run_dir": run_dir,
         "passed": False,
         "generation_dp_rank": 0,
+        "gpu_placement": args.gpu_placement,
+        "node_placements": {},
     }
     try:
         for role, hosts, world in [
@@ -200,15 +239,31 @@ def main():
                     ray.remote(NodeProcesses)
                     .options(
                         num_cpus=1,
-                        num_gpus=world // len(hosts),
+                        num_gpus=int(nodes[host]["Resources"]["GPU"])
+                        if args.gpu_placement == "nic-spread"
+                        else world // len(hosts),
                         scheduling_strategy=NodeAffinitySchedulingStrategy(
                             nodes[host]["NodeID"], soft=False
                         ),
                     )
-                    .remote(args.source, args.runtime, args.stage, run_dir)
+                    .remote(
+                        args.source,
+                        args.runtime,
+                        args.stage,
+                        run_dir,
+                        world // len(hosts),
+                        args.gpu_placement,
+                        recipe.rollout["tp"] if role == "rollout" else 1,
+                        2
+                        if role == "rollout"
+                        and recipe.id == "qwen3.5-9b"
+                        and world == 4
+                        else 1,
+                    )
                 )
                 actors.append(actor)
                 (training if role == "training" else rollout).append(actor)
+                record["node_placements"][host] = ray.get(actor.placement.remote())
         endpoints = []
         instances_per_host = recipe.rollout["instances"] // len(rollout)
         if instances_per_host < 1 or recipe.rollout["instances"] % len(rollout):

@@ -207,6 +207,33 @@ def _patch_shardstream_worker() -> None:
         logger.warning("Failed to patch vLLM worker for ShardStream: %s", exc)
         return
 
+    # vLLM adjusts local rank for DP inside init_device. Apply the explicit
+    # physical mapping at its distributed-init boundary, after that adjustment
+    # and before the first NCCL communicator caches the HCA filter.
+    from vllm.v1.worker import gpu_worker
+
+    original_init = gpu_worker.init_worker_distributed_environment
+    if not getattr(original_init, "_shardstream_affinity", False):
+
+        def init_with_affinity(
+            vllm_config, rank, distributed_init_method, local_rank, *args, **kwargs
+        ):
+            from shardstream.integrations.affinity import configure_rank_affinity
+
+            physical_ids = getattr(
+                vllm_config.parallel_config, "assigned_physical_gpu_ids", None
+            )
+            physical_gpu = (
+                physical_ids[local_rank] if physical_ids is not None else None
+            )
+            configure_rank_affinity(local_rank, physical_gpu=physical_gpu)
+            return original_init(
+                vllm_config, rank, distributed_init_method, local_rank, *args, **kwargs
+            )
+
+        init_with_affinity._shardstream_affinity = True
+        gpu_worker.init_worker_distributed_environment = init_with_affinity
+
     def _shardstream_rank_info(
         self, infer_engine_config: InferenceConfig | None = None
     ):
