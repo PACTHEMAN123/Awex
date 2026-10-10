@@ -62,8 +62,14 @@ class ShardStreamPublicationMechanism(PublicationMechanism):
             "node_rank": 0,
         }
         if harness.validate:
-            payload["weights_validation_steps"] = 1
+            payload["weights_validation_steps"] = getattr(
+                harness, "weights_validation_steps", 1
+            )
             payload["validate_weights_every_n_steps"] = 1
+            if harness.inference_config.get("debug_mode_config"):
+                payload["debug_mode_config"] = harness.inference_config[
+                    "debug_mode_config"
+                ]
             if harness.dump_weights_list_for_validation:
                 payload["dump_weights_list_for_validation"] = (
                     harness.dump_weights_list_for_validation

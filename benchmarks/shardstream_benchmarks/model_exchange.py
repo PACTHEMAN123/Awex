@@ -140,6 +140,7 @@ class MultiVLLMWeightsExchangeIT:
         publication_bucket_mb=256,
         publication_timeout_seconds=1800,
         inference_endpoints=None,
+        provider_overrides=None,
     ):
         self.comm_backend = comm_backend
         self.publication_mechanism_name = publication_mechanism
@@ -185,6 +186,7 @@ class MultiVLLMWeightsExchangeIT:
         self.dump_weights_list_for_validation = dump_weights_list_for_validation or []
         self.dump_weights_dir_for_validation = dump_weights_dir_for_validation
         self.inference_endpoints = list(inference_endpoints or [])
+        self.provider_overrides = provider_overrides
 
         self.publication = create_publication_mechanism(
             publication_mechanism,
@@ -206,7 +208,9 @@ class MultiVLLMWeightsExchangeIT:
     def _select_devices(self):
         inference_tp = self.inference_config["tp_size"]
         num_engines = self.inference_config["num_engines"]
-        total_inference_gpus = inference_tp * num_engines
+        total_inference_gpus = (
+            inference_tp * self.inference_config.get("dp_size", 1) * num_engines
+        )
 
         visible_env = device_util.visible_devices_env_value().strip()
         if visible_env:
@@ -347,11 +351,13 @@ class MultiVLLMWeightsExchangeIT:
     def _start_vllm_server(self):
         visible_env = device_util.visible_devices_env_names()[0]
         inference_tp = self.inference_config["tp_size"]
+        inference_dp = self.inference_config.get("dp_size", 1)
         num_engines = self.inference_config["num_engines"]
         for engine_rank in range(num_engines):
             env = os.environ.copy()
-            start = engine_rank * inference_tp
-            devices = self.vllm_visible_devices[start : start + inference_tp]
+            engine_gpus = inference_tp * inference_dp
+            start = engine_rank * engine_gpus
+            devices = self.vllm_visible_devices[start : start + engine_gpus]
             env[visible_env] = ",".join(map(str, devices))
             env.setdefault("SHARDSTREAM_DEVICE_TYPE", device_util.get_device_type())
             for name in (
@@ -382,6 +388,8 @@ class MultiVLLMWeightsExchangeIT:
                 str(inference_tp),
                 "--pipeline-parallel-size",
                 str(self.inference_config["pp_size"]),
+                "--data-parallel-size",
+                str(inference_dp),
                 "--disable-log-requests",
                 "--enforce-eager",
             ]
@@ -491,6 +499,7 @@ class MultiVLLMWeightsExchangeIT:
         loaded = megatron_model_from_hf(
             model_path=self.inference_config["model_path"],
             use_mbridge=self.use_mbridge,
+            provider_overrides=self.provider_overrides,
             return_bridge=(
                 self.publication_mechanism_name
                 in ("verl_nccl_broadcast", "verl_native_nccl")
@@ -671,6 +680,26 @@ class MultiVLLMWeightsExchangeIT:
 
 
 def main(args):
+    provider_overrides = None
+    if args.recipe:
+        from shardstream_benchmarks.recipes import load_recipes
+
+        recipe = load_recipes()[args.recipe]
+        if not args.remote_inference:
+            raise ValueError("Model recipes require disaggregated remote inference")
+        if int(os.environ.get("WORLD_SIZE", "1")) != recipe.training["world_size"]:
+            raise ValueError(
+                "WORLD_SIZE must equal the selected recipe's training GPU count"
+            )
+        for axis in ("tp", "pp", "cp", "ep"):
+            setattr(args, f"train_{axis}_size", recipe.training[axis])
+        args.train_expert_tp_size = recipe.training["etp"]
+        args.vllm_tp_size = recipe.rollout["tp"]
+        args.vllm_dp_size = recipe.rollout["dp"]
+        args.num_engines = recipe.rollout["instances"]
+        args.vllm_enable_expert_parallel = recipe.rollout["ep"] > 1
+        args.use_mbridge = True
+        provider_overrides = recipe.provider_overrides
     os.environ.setdefault("NCCL_DEBUG", "WARNING")
     if getattr(args, "nccl_device_chunk_mb", None) is not None:
         os.environ["SHARDSTREAM_CHUNK_BYTES"] = str(
@@ -686,6 +715,7 @@ def main(args):
     if args.model_path:
         inference_config["model_path"] = args.model_path
     inference_config["tp_size"] = args.vllm_tp_size
+    inference_config["dp_size"] = args.vllm_dp_size
     inference_config["num_engines"] = args.num_engines
     inference_config["enable_expert_parallel"] = args.vllm_enable_expert_parallel
     inference_config["gpu_memory_utilization"] = args.vllm_gpu_memory_utilization
@@ -712,8 +742,14 @@ def main(args):
         publication_bucket_mb=args.publication_bucket_mb,
         publication_timeout_seconds=args.publication_timeout_seconds,
         inference_endpoints=args.inference_endpoint,
+        provider_overrides=provider_overrides,
     )
     weights_exchange_it.elastic_enabled = bool(args.join_after)
+    if args.recipe:
+        weights_exchange_it.weights_validation_steps = args.num_updates
+        weights_exchange_it.inference_config["debug_mode_config"] = {
+            "raise_on_validation_fail": True
+        }
     weights_exchange_it.elastic_model_profile = args.elastic_model_profile
     weights_exchange_it.elastic_records = []
     joins = dict(zip(args.join_after, args.target_engines))
@@ -779,6 +815,10 @@ def _destroy_process_group(timeout: float = 5.0) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Run ShardStream real-model weight exchange"
+    )
+    parser.add_argument(
+        "--recipe",
+        choices=("qwen3.5-9b", "qwen2.5-vl-7b", "gpt-oss-20b", "glm-4.7-flash"),
     )
     parser.add_argument("--join-after", type=_positive_int, nargs="*", default=[])
     parser.add_argument("--target-engines", type=_positive_int, nargs="*", default=[])
@@ -875,6 +915,7 @@ if __name__ == "__main__":
         metavar="N",
         help="Number of independent vLLM engines to update.",
     )
+    parser.add_argument("--vllm-dp-size", type=_positive_int, default=1)
     parser.add_argument(
         "--vllm-gpu-memory-utilization",
         type=_unit_interval_float,
@@ -1009,7 +1050,9 @@ if __name__ == "__main__":
     if args.elastic_model_profile and (
         args.train_pp_size != 1 or args.comm_backend != "transport"
     ):
-        parser.error("Full model profiling currently requires PP1 and the ShardStream transport")
+        parser.error(
+            "Full model profiling currently requires PP1 and the ShardStream transport"
+        )
     if args.warmup_updates < 0 or args.warmup_updates >= args.num_updates:
         parser.error("--warmup-updates must be in [0, --num-updates)")
     if args.inference_endpoint:

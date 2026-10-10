@@ -26,6 +26,7 @@ def megatron_model_from_hf(
     model_path: str = "Qwen/Qwen2-1.5B",
     use_mbridge: bool = True,
     return_bridge: bool = False,
+    provider_overrides: dict | None = None,
 ):
     from pathlib import Path
 
@@ -38,7 +39,10 @@ def megatron_model_from_hf(
         raise FileNotFoundError(model_dir)
     hf_config = AutoConfig.from_pretrained(str(model_dir), trust_remote_code=True)
     loaded = initialize_megatron_and_load_hf_with_mbridge(
-        hf_config, str(model_dir), return_bridge=return_bridge
+        hf_config,
+        str(model_dir),
+        return_bridge=return_bridge,
+        provider_overrides=provider_overrides,
     )
     if return_bridge:
         (model, bridge) = loaded
@@ -76,7 +80,7 @@ def _ensure_mbridge_custom_fsdp_shim() -> None:
 
 
 def initialize_megatron_and_load_hf_with_mbridge(
-    hf_config, hf_model_dir, return_bridge=False
+    hf_config, hf_model_dir, return_bridge=False, provider_overrides=None
 ):
     import torch.distributed as dist
     from megatron.core import parallel_state as mpu
@@ -119,11 +123,15 @@ def initialize_megatron_and_load_hf_with_mbridge(
         seed = int(os.environ.get("SHARDSTREAM_MBRIDGE_SEED", "42"))
         model_parallel_cuda_manual_seed(seed)
     _ensure_mbridge_custom_fsdp_shim()
-    try:
-        from mbridge import AutoBridge
-    except ModuleNotFoundError as exc:
-        if exc.name != "mbridge":
-            raise
+    use_provider_api = provider_overrides is not None
+    if not use_provider_api:
+        try:
+            from mbridge import AutoBridge
+        except ModuleNotFoundError as exc:
+            if exc.name != "mbridge":
+                raise
+            use_provider_api = True
+    if use_provider_api:
         from megatron.bridge import AutoBridge
 
         bridge = AutoBridge.from_hf_pretrained(hf_model_dir)
@@ -139,6 +147,10 @@ def initialize_megatron_and_load_hf_with_mbridge(
         for name, value in parallel_overrides.items():
             if hasattr(provider, name):
                 setattr(provider, name, value)
+        for name, value in (provider_overrides or {}).items():
+            if not hasattr(provider, name):
+                raise ValueError(f"Megatron provider does not support {name}")
+            setattr(provider, name, value)
         provider.finalize()
         model = provider.provide_distributed_model(
             wrap_with_ddp=False, fp16=provider.fp16, bf16=provider.bf16

@@ -455,7 +455,7 @@ def _filter_shardstream_kwargs(method_name: str, kwargs: dict) -> dict:
 def _shardstream_transfer_model(model_runner):
     model = model_runner.model
     config = model_runner.vllm_config.model_config.hf_config
-    if "Glm4MoeLiteForCausalLM" not in getattr(config, "architectures", []):
+    if "Glm4MoeLiteForCausalLM" not in (getattr(config, "architectures", None) or []):
         return model
     if model_runner.vllm_config.speculative_config is None:
         return model

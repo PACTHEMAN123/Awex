@@ -22,6 +22,50 @@ class ModelRecipe:
     separate_nodes: bool
     max_total_gpus: int
 
+    @property
+    def provider_overrides(self) -> dict:
+        overrides = {"mtp_num_layers": 1 if self.mtp else 0}
+        if self.id == "glm-4.7-flash":
+            overrides["num_layers_in_last_pipeline_stage"] = 23
+        return overrides
+
+    def rollout_arguments(self, model_path: str, host: str, port: int) -> list[str]:
+        rollout = self.rollout
+        args = [
+            "-m",
+            "shardstream.integrations.vllm.serve",
+            "--model",
+            model_path,
+            "--host",
+            host,
+            "--port",
+            str(port),
+            "--tensor-parallel-size",
+            str(rollout["tp"]),
+            "--data-parallel-size",
+            str(rollout["dp"]),
+            "--dtype",
+            "bfloat16",
+            "--max-model-len",
+            "4096",
+            "--max-num-seqs",
+            "4",
+            "--gpu-memory-utilization",
+            "0.7",
+            "--enforce-eager",
+            "--disable-log-requests",
+        ]
+        if rollout["ep"] > 1:
+            args.append("--enable-expert-parallel")
+        if self.mtp:
+            args.extend(
+                [
+                    "--speculative-config",
+                    json.dumps({"method": "mtp", "num_speculative_tokens": 3}),
+                ]
+            )
+        return args
+
     def validate(self, repository: Path) -> None:
         source = repository / self.source["snapshot"]
         if hashlib.sha256(source.read_bytes()).hexdigest() != self.source["sha256"]:
