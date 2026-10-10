@@ -64,7 +64,7 @@ def test_node_major_communicator_ranks_join_split_physical_nodes():
     assert sorted(mapping) == list(range(32))
 
 
-def test_interleaved_bias_vectors_stage_and_preserve_neighbor_values(monkeypatch):
+def test_interleaved_bias_vectors_bind_original_storage_without_copyback(monkeypatch):
     monkeypatch.setattr(transport, "_ensure_cuda_tensor", lambda *_: None)
     backing = torch.full((16,), -1.0)
     parameters = {"gate": backing[::2], "up": backing[1::2]}
@@ -74,16 +74,40 @@ def test_interleaved_bias_vectors_stage_and_preserve_neighbor_values(monkeypatch
         operation.recv_shard_meta.name = name
         operations.append(operation)
     plan = TransferPlan(operations={4: operations})
-    batch = _build_recv_batch(parameters, plan, 1, 5, 0)
-    assert len(batch.copybacks) == 2
-    for index, (destination, staging) in enumerate(batch.copybacks):
-        assert staging.is_contiguous()
-        staging.copy_(torch.arange(8) + 100 * (index + 1))
-        destination.copy_(staging)
+    batch = _build_recv_batch(parameters, plan, 1, 5, 0, allow_staging=False)
+    assert batch.copybacks == []
+    assert batch.tensor_row_bytes == [4, 4]
+    assert batch.tensor_row_strides == [8, 8]
+    for index, destination in enumerate(batch.tensors):
+        assert destination.data_ptr() == parameters[("gate", "up")[index]].data_ptr()
+        destination.copy_(torch.arange(8) + 100 * (index + 1))
     assert torch.equal(backing[::2], torch.arange(8) + 100)
     assert torch.equal(backing[1::2], torch.arange(8) + 200)
-    with pytest.raises(transport.TransportUnavailableError, match="strided vector"):
-        _build_recv_batch(parameters, plan, 1, 5, 0, allow_staging=False)
+
+
+def test_prepared_send_observes_inplace_updates_without_new_storage(monkeypatch):
+    monkeypatch.setattr(transport, "_ensure_cuda_tensor", lambda *_: None)
+    comm = transport.Transport(object(), 4, 5, chunk_bytes=0, ring_broadcast=False)
+    plan = TransferPlan(operations={1: [_replica_operation(4, 1)]})
+    source = torch.arange(8).float()
+    parameters = {"weight": source}
+    comm.prepare_send(parameters, plan, allow_staging=False)
+    observed = []
+
+    def launch(batch, **kwargs):
+        observed.append(
+            (id(batch), batch.tensors[0].data_ptr(), batch.tensors[0].clone())
+        )
+        assert batch.copybacks == []
+        return {}
+
+    monkeypatch.setattr(comm, "_run", launch)
+    comm.send(parameters, plan, -1)
+    source.add_(20)
+    comm.send(parameters, plan, 0)
+    assert observed[0][:2] == observed[1][:2]
+    assert observed[0][1] == source.data_ptr()
+    assert torch.equal(observed[1][2], torch.arange(8).float() + 20)
 
 
 def test_v2_ring_broadcast_is_disabled_by_default(monkeypatch):

@@ -27,6 +27,14 @@ vLLM's expert down bias stays zero outside TP rank zero.
 Qwen3.5's selected recipe leaves MTP disabled. Qwen2.5-VL uses the Megatron
 Bridge provider's replicated Transformers vision tower and vLLM vision TP1.
 
+All four recipes bind fixed plans to views of the original Megatron parameters
+and writable vLLM parameters. Updates do not repack whole weights, gather TP
+shards, or allocate weight staging/copyback buffers. Interleaved GPT-OSS bias
+vectors use the native row stride. Qwen3.5's direct layout currently requires
+equal training and inference TP (both are two in the selected recipe). Its GDN
+norm alone needs a numerical convention change: the receiver adds one in place
+after overwriting it with Megatron's zero-centered gamma.
+
 Validate a planned placement before launching:
 
 ```bash

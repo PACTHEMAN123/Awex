@@ -23,6 +23,7 @@ sizes. The selected Qwen3.5 RL recipe does not train MTP, so its unused draft
 weights are excluded; this exclusion does not apply to other model recipes.
 """
 
+from math import prod
 from types import SimpleNamespace
 from typing import List, Tuple
 
@@ -33,7 +34,56 @@ from shardstream.integrations.models.qwen3_moe import (
     _build_mcore_converter_qwen3_moe,
 )
 from shardstream.integrations.models.vision import Qwen3VLShardingStrategy
+from shardstream.layout import StaticTensorLayout
 from shardstream.metadata.sharding import ShardingType, get_default_sharding_dim
+
+
+def _gated_qkv_spans(parameter, config):
+    """Read local Megatron Q/G/K/V groups in vLLM's head order."""
+    config = _Qwen3_5Layout.text_config(config)
+    head_dim = _Qwen3_5Layout.head_dim(config)
+    heads_per_group = config.num_attention_heads // config.num_key_value_heads
+    query_rows = heads_per_group * head_dim
+    group_rows = 2 * query_rows + 2 * head_dim
+    if parameter.shape[0] % group_rows:
+        raise ValueError("Gated QKV shard must contain complete KV groups")
+    groups = parameter.shape[0] // group_rows
+    query_gate = tuple(
+        parameter.narrow(0, group * group_rows + head * head_dim + offset, head_dim)
+        for group in range(groups)
+        for head in range(heads_per_group)
+        for offset in (0, query_rows)
+    )
+    key_value = tuple(
+        parameter.narrow(0, group * group_rows + offset, head_dim)
+        for offset in (2 * query_rows, 2 * query_rows + head_dim)
+        for group in range(groups)
+    )
+    return StaticTensorLayout(tuple(parameter.shape), query_gate + key_value)
+
+
+def annotate_qwen35_transfer_plan(plan, hf_config):
+    """Match sender span boundaries on both sides of the fixed plan."""
+    count = 0
+    config = _Qwen3_5Layout.text_config(hf_config)
+    for operations in plan.operations.values():
+        for operation in operations:
+            name = operation.send_shard_meta.name
+            shape = operation.send_shard_meta.shape
+            if ".self_attn.qkv_proj." in name:
+                head_dim = _Qwen3_5Layout.head_dim(config)
+            elif name.startswith("model.visual.") and ".attn.qkv." in name:
+                vision = hf_config.vision_config
+                head_dim = vision.hidden_size // vision.num_heads
+            else:
+                continue
+            if shape[0] % head_dim:
+                raise ValueError(f"QKV shard does not contain complete heads: {name}")
+            operation.send_tensor_span_numels = (head_dim * prod(shape[1:]),) * (
+                shape[0] // head_dim
+            )
+            count += 1
+    return count
 
 
 class _Qwen3_5Layout:
@@ -331,6 +381,15 @@ class Qwen3_5VLLMWeightConverter(Qwen3FusedWeightConverter):
     def _fuse_qkv(self, name: str) -> bool:
         return True
 
+    @torch.no_grad()
+    def post_update(self, model):
+        # The direct wire carries Megatron's zero-centered GDN gamma. Ordinary
+        # decoder Gemma norms use that same convention; only GDN needs +1.
+        # Every receive overwrites the raw value before this in-place shift.
+        for name, parameter in model.named_parameters():
+            if name.endswith("linear_attn.norm.weight"):
+                parameter.add_(1.0)
+
     @staticmethod
     def _normalize_shared_expert(name: str) -> str:
         return name.replace(".shared_experts.", ".shared_expert.")
@@ -511,8 +570,84 @@ class _Qwen3_5McoreConverterFactory:
                 return super()._convert_attention_param(name, parameter, layer_number)
 
             def convert_param_to_device_layout(self, name, parameter, vp_stage=None):
-                # Gated QKV and GDN are reordered by this converter; ordinary
-                # Qwen3 copy-only QKV spans do not describe their source layout.
+                name = name.replace("module.", "")
+                if name.startswith(("language_model.mtp.", "model.mtp.", "mtp.")):
+                    return []
+                train_tp = max(1, int(self.rank_info.attn_tp_size))
+                if train_tp != int(self.infer_atten_tp_size):
+                    raise ValueError(
+                        "Qwen3.5 direct layout currently requires equal train/inference TP"
+                    )
+                if name.startswith("vision_model."):
+                    if "self_attention.linear_qkv." not in name or name.endswith(
+                        ("layer_norm_weight", "layer_norm_bias")
+                    ):
+                        return self._convert_visual_param(name, parameter)
+                    from shardstream.integrations.models.qwen3 import (
+                        build_qwen3_dense_qkv_layouts,
+                    )
+
+                    vision = self.vision_config
+                    config = SimpleNamespace(
+                        hidden_size=vision.hidden_size,
+                        num_attention_heads=vision.num_heads,
+                        num_key_value_heads=vision.num_heads,
+                    )
+                    layouts = build_qwen3_dense_qkv_layouts(parameter, config)
+                    # Q, K, V source groups are each one head wide.
+                    spans = tuple(
+                        span
+                        for projection in ("q", "k", "v")
+                        for span in layouts[projection].spans
+                    )
+                    layer, suffix = name.removeprefix(
+                        "vision_model.decoder.layers."
+                    ).split(".", 1)
+                    target = self._vision_layer_mapping[suffix]
+                    return [
+                        (
+                            f"model.visual.blocks.{layer}.{target}",
+                            StaticTensorLayout(tuple(parameter.shape), spans),
+                        )
+                    ]
+                name = name.removeprefix("language_model.")
+                canonical = self._canonicalize_source_name(name, vp_stage)
+                if canonical.startswith("decoder.layers."):
+                    layer, suffix = canonical.removeprefix("decoder.layers.").split(
+                        ".", 1
+                    )
+                    prefix = f"model.layers.{layer}."
+                    if suffix in {
+                        "self_attention.linear_qkv.weight",
+                        "self_attention.linear_qkv.bias",
+                    }:
+                        kind = suffix.rsplit(".", 1)[-1]
+                        return [
+                            (
+                                prefix + f"self_attn.qkv_proj.{kind}",
+                                _gated_qkv_spans(parameter, self.hf_config),
+                            )
+                        ]
+                    if suffix == "self_attention.in_proj.weight":
+                        cfg = self.hf_config
+                        ba_rows = 2 * cfg.linear_num_value_heads // train_tp
+                        split = parameter.shape[0] - ba_rows
+                        return [
+                            (
+                                prefix + "linear_attn.in_proj_qkvz.weight",
+                                parameter[:split],
+                            ),
+                            (
+                                prefix + "linear_attn.in_proj_ba.weight",
+                                parameter[split:],
+                            ),
+                        ]
+                    direct = {
+                        "self_attention.conv1d.weight": "linear_attn.conv1d.weight",
+                        "self_attention.out_norm.weight": "linear_attn.norm.weight",
+                    }
+                    if suffix in direct:
+                        return [(prefix + direct[suffix], parameter)]
                 return self.convert_param(name, parameter, vp_stage=vp_stage)
 
             def _convert_mlp_param(self, name, parameter, layer_number):

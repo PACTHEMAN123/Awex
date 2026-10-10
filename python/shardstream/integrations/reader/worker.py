@@ -27,6 +27,10 @@ from shardstream import logging
 from shardstream._utils import device as device_util
 from shardstream._utils.common import compute_statistics, get_free_port, get_ip_address
 from shardstream._utils.profile import emit_profile, profile_phase
+from shardstream.integrations.models.device_layout import (
+    STATIC_DEVICE_LAYOUT_ARCHITECTURES,
+    annotate_device_transfer_plan,
+)
 from shardstream.integrations.reader.base import WorkerWeightsReader
 from shardstream.plan import (
     TransferPlanBuilder,
@@ -60,16 +64,12 @@ class TransportWorkerReader(WorkerWeightsReader):
         self.transfer_plan = plan_builder.build_local_transfer_plan(
             self.parameters_meta, self.training_params_meta, self.transfer_rank
         )
-        if self.model_arch_name == "Qwen3ForCausalLM":
-            from shardstream.integrations.models.qwen3 import (
-                annotate_qwen3_dense_transfer_plan,
-            )
-
-            annotated = annotate_qwen3_dense_transfer_plan(
-                self.transfer_plan, self.hf_config
+        if self.model_arch_name in STATIC_DEVICE_LAYOUT_ARCHITECTURES:
+            annotated = annotate_device_transfer_plan(
+                self.transfer_plan, self.model_arch_name, self.hf_config
             )
             logger.info(
-                "Reader rank %s annotated %s Qwen3 dense device operations",
+                "Reader rank %s annotated %s source layout operations",
                 self.transfer_rank,
                 annotated,
             )
@@ -116,7 +116,7 @@ class TransportWorkerReader(WorkerWeightsReader):
             num_infer_engines=self.num_engines,
         )
         self.device_transport.resolve_rollout_topology()
-        if self.model_arch_name in ("Qwen3ForCausalLM", "Qwen3MoeForCausalLM"):
+        if self.model_arch_name in STATIC_DEVICE_LAYOUT_ARCHITECTURES:
             self.device_transport.prepare_recv(
                 self.parameters, self.transfer_plan, allow_staging=False
             )

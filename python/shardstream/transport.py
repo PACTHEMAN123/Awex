@@ -459,11 +459,9 @@ def _tensor_copy_layout(tensor: torch.Tensor, name: str) -> tuple[int, int]:
     total_bytes = int(tensor.numel()) * element_size
     if tensor.is_contiguous():
         return total_bytes, total_bytes
-    if tensor.dim() < 2:
-        raise TransportUnavailableError(
-            f"Transport requires staging for a strided vector: parameter={name}, "
-            f"shape={tuple(tensor.shape)}, stride={tuple(tensor.stride())}"
-        )
+    if tensor.dim() == 1 and tensor.stride(0) > 0:
+        # One element per row describes interleaved gate/up biases directly.
+        return element_size, int(tensor.stride(0)) * element_size
     if int(tensor.stride(-1)) != 1:
         raise TransportUnavailableError(
             "Transport only supports views contiguous in their innermost dimension: "

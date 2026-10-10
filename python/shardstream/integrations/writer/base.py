@@ -287,11 +287,11 @@ class WeightsExchangeShardingWriter(WeightExchangeWriter):
                         )
                     ):
                         raise ValueError(
-                            f"Qwen3 device plan only supports copy-only conversions, but {source_name} -> {target_name} materialized new storage"
+                            f"Device plan must bind original parameter storage, but {source_name} -> {target_name} materialized new storage"
                         )
                     if any((not tensor.is_contiguous() for tensor in tensors)):
                         raise ValueError(
-                            f"Qwen3 device plan requires contiguous source spans: {source_name} -> {target_name}"
+                            f"Device plan requires contiguous source spans: {source_name} -> {target_name}"
                         )
                     compiled[target_name] = target
         if (

@@ -20,10 +20,12 @@ from shardstream.integrations.models.qwen2_5_vl import (
     _build_mcore_converter_qwen25_vl,
 )
 from shardstream.integrations.models.qwen3_5 import (
+    _MCORE_CONVERTER_FACTORY,
     Qwen3_5VLLMWeightConverter,
     _Qwen3_5Layout,
 )
 from shardstream.integrations.models.registry import get_infer_weights_converter
+from shardstream.layout import StaticTensorLayout
 from shardstream.metadata.sharding import ShardingType
 
 
@@ -93,6 +95,67 @@ def test_gated_attention_reorders_queries_and_gates_per_head():
     result = _Qwen3_5Layout.pack_output_gated_qkv(source, config(), 2)
     expected = [0, 1, 4, 5, 2, 3, 6, 7, 8, 9, 10, 11]
     assert result[:, 0].tolist() == expected + [x + 12 for x in expected]
+
+
+@pytest.mark.parametrize("tp", [1, 2])
+@pytest.mark.parametrize("kind", ["qkv", "gdn", "conv"])
+def test_qwen35_direct_layout_matches_reference_and_keeps_source_storage(tp, kind):
+    converter = mcore(_MCORE_CONVERTER_FACTORY)
+    converter.rank_info.attn_tp_size = tp
+    converter.infer_atten_tp_size = tp
+    rows, suffix = {
+        "qkv": (24, "linear_qkv.weight"),
+        "gdn": (32, "in_proj.weight"),
+        "conv": (16, "conv1d.weight"),
+    }[kind]
+    source = torch.arange(rows * 8).reshape(rows, 8).float()
+    for rank, local in enumerate(source.chunk(tp)):
+        converter.rank_info.attn_tp_rank = rank
+        direct = converter.convert_param_to_device_layout(
+            f"decoder.layers.0.self_attention.{suffix}", local
+        )
+        if kind == "qkv":
+            expected = [
+                _Qwen3_5Layout.pack_output_gated_qkv(source, config(), tp).chunk(tp)[
+                    rank
+                ]
+            ]
+        elif kind == "gdn":
+            expected = [
+                value.chunk(tp)[rank]
+                for value in _Qwen3_5Layout.pack_gdn_input(source, config(), tp, tp)
+            ]
+        else:
+            expected = [
+                _Qwen3_5Layout.pack_gdn_conv(source, config(), tp, tp).chunk(tp)[rank]
+            ]
+        for (_, target), reference in zip(direct, expected, strict=True):
+            spans = (
+                target.spans if isinstance(target, StaticTensorLayout) else (target,)
+            )
+            assert all(
+                span.untyped_storage().data_ptr() == source.untyped_storage().data_ptr()
+                for span in spans
+            )
+            value = torch.cat([span.reshape(-1) for span in spans]).reshape(
+                reference.shape
+            )
+            assert torch.equal(value, reference)
+
+
+def test_qwen35_gdn_norm_shift_is_inplace_after_each_raw_receive():
+    model = torch.nn.Module()
+    model.linear_attn = torch.nn.Module()
+    model.linear_attn.norm = torch.nn.Linear(8, 1, bias=False)
+    parameter = model.linear_attn.norm.weight
+    address = parameter.data_ptr()
+    converter = infer(Qwen3_5VLLMWeightConverter)
+    for value in (0.25, -0.5):
+        with torch.no_grad():
+            parameter.fill_(value)
+        converter.post_update(model)
+        assert parameter.data_ptr() == address
+        assert torch.all(parameter == value + 1)
 
 
 def test_gdn_rank_local_categories_reshard_without_interleaving_b_a():

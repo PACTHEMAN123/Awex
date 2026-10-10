@@ -32,6 +32,10 @@ from shardstream._utils.process_group import (
     setup_batch_isend_irecv,
 )
 from shardstream._utils.profile import emit_profile, profile_phase
+from shardstream.integrations.models.device_layout import (
+    STATIC_DEVICE_LAYOUT_ARCHITECTURES,
+    annotate_device_transfer_plan,
+)
 from shardstream.integrations.writer.base import WeightsExchangeShardingWriter
 from shardstream.plan import (
     TransferPlanBuilder,
@@ -41,7 +45,6 @@ from shardstream.plan import (
 from shardstream.transport import Transport
 
 logger = logging.getLogger(__name__)
-_QWEN3_STATIC_DEVICE_LAYOUT_ARCHITECTURES = {"Qwen3ForCausalLM", "Qwen3MoeForCausalLM"}
 
 
 class TransportWriter(WeightsExchangeShardingWriter):
@@ -68,16 +71,12 @@ class TransportWriter(WeightsExchangeShardingWriter):
         ).build_local_transfer_plan(
             self.infer_params_meta, self.parameters_meta, self.transfer_rank
         )
-        if self.model_arch_name in _QWEN3_STATIC_DEVICE_LAYOUT_ARCHITECTURES:
-            from shardstream.integrations.models.qwen3 import (
-                annotate_qwen3_dense_transfer_plan,
-            )
-
-            annotated = annotate_qwen3_dense_transfer_plan(
-                self.transfer_plan, self.hf_config
+        if self.model_arch_name in STATIC_DEVICE_LAYOUT_ARCHITECTURES:
+            annotated = annotate_device_transfer_plan(
+                self.transfer_plan, self.model_arch_name, self.hf_config
             )
             logger.info(
-                "Writer rank %s annotated %s Qwen3 device operations",
+                "Writer rank %s annotated %s source layout operations",
                 self.transfer_rank,
                 annotated,
             )
@@ -97,7 +96,7 @@ class TransportWriter(WeightsExchangeShardingWriter):
             for op in ops
         }
         self.device_parameters = None
-        if self.model_arch_name in _QWEN3_STATIC_DEVICE_LAYOUT_ARCHITECTURES:
+        if self.model_arch_name in STATIC_DEVICE_LAYOUT_ARCHITECTURES:
             self.device_parameters = self.compile_device_parameters(
                 self.required_param_names
             )
@@ -242,7 +241,7 @@ class TransportWriter(WeightsExchangeShardingWriter):
                 parameters = self.device_parameters
                 parameters_are_static = True
                 logger.info(
-                    "Writer: using compiled Qwen3 device parameters; skipping format conversion"
+                    "Writer: using original parameter storage; skipping format conversion"
                 )
             else:
                 if self.enable_mem_debug:

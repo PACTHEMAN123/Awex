@@ -65,6 +65,8 @@ def _build_mcore_converter_qwen25_vl():
         def convert_param_to_device_layout(self, name, parameter, vp_stage=None):
             # Strip the VLM prefix before the base Qwen GQA span builder.
             name = name.replace("module.", "")
+            if name.startswith("visual."):
+                return [("model." + name, parameter)]
             if name.startswith("language_model."):
                 name = name[len("language_model.") :]
             return super().convert_param_to_device_layout(name, parameter, vp_stage)
