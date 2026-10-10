@@ -21,5 +21,8 @@ def annotate_device_transfer_plan(plan, architecture, hf_config):
     from .qwen3 import annotate_qwen3_dense_transfer_plan
 
     return annotate_qwen3_dense_transfer_plan(
-        plan, getattr(hf_config, "text_config", hf_config)
+        plan,
+        hf_config.get("text_config", hf_config)
+        if isinstance(hf_config, dict)
+        else getattr(hf_config, "text_config", hf_config),
     )

@@ -73,7 +73,13 @@ def annotate_qwen35_transfer_plan(plan, hf_config):
             if ".self_attn.qkv_proj." in name:
                 head_dim = _Qwen3_5Layout.head_dim(config)
             elif name.startswith("model.visual.") and ".attn.qkv." in name:
-                vision = hf_config.vision_config
+                vision = (
+                    hf_config["vision_config"]
+                    if isinstance(hf_config, dict)
+                    else hf_config.vision_config
+                )
+                if isinstance(vision, dict):
+                    vision = SimpleNamespace(**vision)
                 head_dim = vision.hidden_size // vision.num_heads
             else:
                 continue
@@ -97,6 +103,8 @@ class _Qwen3_5Layout:
     @staticmethod
     def text_config(config):
         """Return the language config from either text-only or VLM config."""
+        if isinstance(config, dict):
+            return SimpleNamespace(**config.get("text_config", config))
         return getattr(config, "text_config", config)
 
     @classmethod

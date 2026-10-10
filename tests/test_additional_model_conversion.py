@@ -8,6 +8,7 @@ from shardstream.integrations.metadata.training import (
     _build_pp_stage_layer_id_map,
     _canonicalize_pp_layer_names_in_global_meta,
 )
+from shardstream.integrations.models.device_layout import annotate_device_transfer_plan
 from shardstream.integrations.models.glm4_moe_lite import (
     GLM47FlashShardingStrategy,
     GLM47FlashTransferModel,
@@ -31,6 +32,7 @@ from shardstream.integrations.models.qwen3_5 import (
 from shardstream.integrations.models.registry import get_infer_weights_converter
 from shardstream.layout import StaticTensorLayout
 from shardstream.metadata.sharding import ShardingType
+from shardstream.plan import CommunicationOperation, TransferPlan
 
 
 def config():
@@ -160,6 +162,42 @@ def test_qwen35_gdn_norm_shift_is_inplace_after_each_raw_receive():
         converter.post_update(model)
         assert parameter.data_ptr() == address
         assert torch.all(parameter == value + 1)
+
+
+@pytest.mark.parametrize(
+    "architecture",
+    ["Qwen3_5ForConditionalGeneration", "Qwen2_5_VLForConditionalGeneration"],
+)
+def test_vlm_plan_annotation_accepts_serialized_nested_configs(architecture):
+    gated = architecture.startswith("Qwen3_5")
+    name = (
+        "model.layers.0.self_attn.qkv_proj.weight"
+        if gated
+        else "model.layers.0.self_attn.q_proj.weight"
+    )
+    shape = (24 if gated else 8, 8)
+    shard = NS(name=name, shape=shape)
+    operation = CommunicationOperation(
+        send_rank=1,
+        send_shard_meta=shard,
+        send_offset=(0, 0),
+        recv_rank=0,
+        recv_shard_meta=shard,
+        recv_offset=(0, 0),
+        overlap_shape=shape,
+        train_slices=(slice(None), slice(None)),
+        inf_slices=(slice(None), slice(None)),
+    )
+    plan = TransferPlan(operations={0: [operation]})
+    serialized = {
+        "text_config": vars(config()),
+        "vision_config": {"hidden_size": 8, "num_heads": 4},
+    }
+    assert annotate_device_transfer_plan(plan, architecture, serialized) == 1
+    assert sum(operation.send_tensor_span_numels) == shape[0] * shape[1]
+    if gated:
+        shard.name = "model.visual.blocks.0.attn.qkv.weight"
+        assert annotate_device_transfer_plan(plan, architecture, serialized) == 1
 
 
 def test_gdn_rank_local_categories_reshard_without_interleaving_b_a():

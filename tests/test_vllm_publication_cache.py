@@ -29,3 +29,14 @@ def test_new_weights_invalidate_scheduler_and_encoder_caches():
 def test_failed_cache_reset_does_not_report_successful_update():
     with pytest.raises(RuntimeError, match="prefix cache reset failed"):
         adapter_with_cache([], reset_ok=False).update_weights(7)
+
+
+def test_validation_keeps_failures_from_nonzero_dp_ranks():
+    adapter = adapter_with_cache([])
+    adapter._collective_rpc_all_dp_cores = lambda *args, **kwargs: [
+        [{"expert0": True}],
+        [{"expert1": False}],
+    ]
+    results = adapter.execute_task_in_model_worker("shardstream_execute")
+    assert len(results) == 2
+    assert not all(all(result.values()) for result in results)

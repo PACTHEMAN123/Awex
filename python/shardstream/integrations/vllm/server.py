@@ -260,20 +260,22 @@ class ShardStreamVLLMServerAdapter:
                 "task_qualname": fn.__qualname__,
                 "task_kwargs": kwargs,
             }
+        # vLLM's DP load balancer executes on every core but returns only the
+        # first core's result. Collect each core explicitly so a validation
+        # failure on any expert/DP rank reaches the publication driver.
+        core_results = self._collective_rpc_all_dp_cores(
+            method, args=(), kwargs=payload
+        )
+        merged_results = []
+        for result in core_results:
+            if isinstance(result, list):
+                merged_results.extend(result)
+            else:
+                merged_results.append(result)
         if self._is_meta_collection_call(method, payload):
-            core_results = self._collective_rpc_all_dp_cores(
-                method, args=(), kwargs=payload
-            )
-            merged_results = []
-            for result in core_results:
-                if isinstance(result, list):
-                    merged_results.extend(result)
-                else:
-                    merged_results.append(result)
             logger.info(
                 "Collected model param meta from %s DP core(s), merged %s entries.",
                 len(core_results),
                 len(merged_results),
             )
-            return merged_results
-        return self._collective_rpc(method, args=(), kwargs=payload)
+        return merged_results
