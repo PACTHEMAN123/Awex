@@ -85,3 +85,22 @@ def test_rollout_process_uses_only_its_reserved_ray_gpus(tmp_path, monkeypatch):
     actor.launch("rollout", ["-c", "pass"], {"SHARDSTREAM_RECIPE_GPU_INDICES": "2,3"})
     assert launched["env"]["CUDA_VISIBLE_DEVICES"] == "6,7"
     assert launched["start_new_session"] is True
+
+
+def test_fp32_state_survives_checkpoint_loading_into_bf16_model():
+    import torch
+    from shardstream_benchmarks.model_loader import _preserve_fp32_parameters
+
+    model = torch.nn.Module()
+    model.self_attention = torch.nn.Module()
+    model.self_attention.A_log = torch.nn.Parameter(
+        torch.zeros(3, dtype=torch.bfloat16)
+    )
+    model.weight = torch.nn.Parameter(torch.zeros(3, dtype=torch.bfloat16))
+    checkpoint = torch.tensor([0.1234567, 1.234567, 2.345678], dtype=torch.float32)
+    # Match both bare modules and wrappers, as providers return wrapped models.
+    _preserve_fp32_parameters([model], ("self_attention.A_log",))
+    with torch.no_grad():
+        model.self_attention.A_log.copy_(checkpoint)
+    assert torch.equal(model.self_attention.A_log, checkpoint)
+    assert model.weight.dtype == torch.bfloat16

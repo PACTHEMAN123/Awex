@@ -30,6 +30,14 @@ class ModelRecipe:
             overrides["num_layers_in_last_pipeline_stage"] = 23
         return overrides
 
+    @property
+    def fp32_parameter_suffixes(self) -> tuple[str, ...]:
+        if self.id == "qwen3.5-9b":
+            return (".self_attention.A_log",)
+        if self.id == "glm-4.7-flash":
+            return (".mlp.router.weight", ".mlp.router.bias", ".mlp.router.expert_bias")
+        return ()
+
     def rollout_arguments(self, model_path: str, host: str, port: int) -> list[str]:
         rollout = self.rollout
         args = [

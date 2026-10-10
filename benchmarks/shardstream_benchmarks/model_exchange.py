@@ -141,6 +141,7 @@ class MultiVLLMWeightsExchangeIT:
         publication_timeout_seconds=1800,
         inference_endpoints=None,
         provider_overrides=None,
+        fp32_parameter_suffixes=(),
     ):
         self.comm_backend = comm_backend
         self.publication_mechanism_name = publication_mechanism
@@ -187,6 +188,7 @@ class MultiVLLMWeightsExchangeIT:
         self.dump_weights_dir_for_validation = dump_weights_dir_for_validation
         self.inference_endpoints = list(inference_endpoints or [])
         self.provider_overrides = provider_overrides
+        self.fp32_parameter_suffixes = fp32_parameter_suffixes
 
         self.publication = create_publication_mechanism(
             publication_mechanism,
@@ -500,6 +502,7 @@ class MultiVLLMWeightsExchangeIT:
             model_path=self.inference_config["model_path"],
             use_mbridge=self.use_mbridge,
             provider_overrides=self.provider_overrides,
+            fp32_parameter_suffixes=self.fp32_parameter_suffixes,
             return_bridge=(
                 self.publication_mechanism_name
                 in ("verl_nccl_broadcast", "verl_native_nccl")
@@ -681,6 +684,7 @@ class MultiVLLMWeightsExchangeIT:
 
 def main(args):
     provider_overrides = None
+    fp32_parameter_suffixes = ()
     if args.recipe:
         from shardstream_benchmarks.recipes import load_recipes
 
@@ -700,6 +704,7 @@ def main(args):
         args.vllm_enable_expert_parallel = recipe.rollout["ep"] > 1
         args.use_mbridge = True
         provider_overrides = recipe.provider_overrides
+        fp32_parameter_suffixes = recipe.fp32_parameter_suffixes
     os.environ.setdefault("NCCL_DEBUG", "WARNING")
     if getattr(args, "nccl_device_chunk_mb", None) is not None:
         os.environ["SHARDSTREAM_CHUNK_BYTES"] = str(
@@ -743,6 +748,7 @@ def main(args):
         publication_timeout_seconds=args.publication_timeout_seconds,
         inference_endpoints=args.inference_endpoint,
         provider_overrides=provider_overrides,
+        fp32_parameter_suffixes=fp32_parameter_suffixes,
     )
     weights_exchange_it.elastic_enabled = bool(args.join_after)
     if args.recipe:

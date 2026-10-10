@@ -27,6 +27,7 @@ def megatron_model_from_hf(
     use_mbridge: bool = True,
     return_bridge: bool = False,
     provider_overrides: dict | None = None,
+    fp32_parameter_suffixes: tuple[str, ...] = (),
 ):
     from pathlib import Path
 
@@ -43,6 +44,7 @@ def megatron_model_from_hf(
         str(model_dir),
         return_bridge=return_bridge,
         provider_overrides=provider_overrides,
+        fp32_parameter_suffixes=fp32_parameter_suffixes,
     )
     if return_bridge:
         (model, bridge) = loaded
@@ -79,8 +81,22 @@ def _ensure_mbridge_custom_fsdp_shim() -> None:
     sys.modules["megatron.core.distributed.custom_fsdp"] = shim
 
 
+def _preserve_fp32_parameters(models, suffixes):
+    # Promote before loading the checkpoint so its FP32 values are not rounded.
+    if not suffixes:
+        return
+    for model in models if isinstance(models, list) else [models]:
+        for name, tensor in [*model.named_parameters(), *model.named_buffers()]:
+            if name.endswith(suffixes):
+                tensor.data = tensor.data.float()
+
+
 def initialize_megatron_and_load_hf_with_mbridge(
-    hf_config, hf_model_dir, return_bridge=False, provider_overrides=None
+    hf_config,
+    hf_model_dir,
+    return_bridge=False,
+    provider_overrides=None,
+    fp32_parameter_suffixes=(),
 ):
     import torch.distributed as dist
     from megatron.core import parallel_state as mpu
@@ -155,10 +171,12 @@ def initialize_megatron_and_load_hf_with_mbridge(
         model = provider.provide_distributed_model(
             wrap_with_ddp=False, fp16=provider.fp16, bf16=provider.bf16
         )
+        _preserve_fp32_parameters(model, fp32_parameter_suffixes)
         bridge.load_hf_weights(model, hf_model_dir)
     else:
         bridge = AutoBridge.from_pretrained(hf_model_dir)
         model = bridge.get_model()
+        _preserve_fp32_parameters(model, fp32_parameter_suffixes)
         bridge.load_weights(model, hf_model_dir)
     if return_bridge:
         return (model, bridge)
