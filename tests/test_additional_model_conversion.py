@@ -256,6 +256,32 @@ def test_gpt_oss_sinks_and_router_bias_names_are_preserved():
         assert value.data_ptr() == native.data_ptr()
 
 
+def test_gpt_oss_actual_vllm_attention_and_embedding_names():
+    converter = infer(GPTOSSVLLMWeightConverter)
+    tensor = torch.arange(16 * 8).reshape(16, 8).float()
+    converted = dict(
+        converter.convert_param("model.layers.0.attn.qkv_proj.weight", tensor)
+    )
+    assert set(converted) == {
+        f"model.layers.0.self_attn.{p}_proj.weight" for p in ("q", "k", "v")
+    }
+    [(name, value)] = converter.convert_param("model.embedding.weight", tensor)
+    assert name == "model.embed_tokens.weight"
+    assert value.data_ptr() == tensor.data_ptr()
+    [(name, value)] = converter.convert_param("model.layers.0.attn.sinks", tensor)
+    assert name == "model.layers.0.self_attn.sinks"
+
+
+def test_vllm_allocated_group_does_not_enable_expert_sharding():
+    from shardstream.integrations.sharding.vllm import get_vllm_expert_coordinates
+
+    def group():
+        return NS(rank_in_group=3, world_size=4)
+
+    assert get_vllm_expert_coordinates(False, group) == (0, 1)
+    assert get_vllm_expert_coordinates(True, group) == (3, 4)
+
+
 def glm_config():
     return NS(
         **vars(config()),

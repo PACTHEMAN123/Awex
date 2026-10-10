@@ -19,6 +19,17 @@ from shardstream._utils import device as device_util
 from shardstream.metadata.rank import RankInfo
 
 
+def get_vllm_expert_coordinates(enable_expert_parallel, get_ep_group):
+    # vLLM allocates the group even when experts use TP instead of EP.
+    if not enable_expert_parallel:
+        return 0, 1
+    try:
+        group = get_ep_group()
+        return group.rank_in_group, group.world_size
+    except AssertionError:
+        return 0, 1
+
+
 def get_vllm_sharding_strategy(
     model_name: str, infer_engine_config, rank_info: RankInfo, **kwargs
 ):

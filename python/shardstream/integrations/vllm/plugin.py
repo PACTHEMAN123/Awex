@@ -24,6 +24,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from shardstream.integrations.config import InferenceConfig
+from shardstream.integrations.sharding.vllm import get_vllm_expert_coordinates
 from shardstream.integrations.verl.environment import configure_ray_locality
 
 configure_ray_locality()
@@ -234,12 +235,10 @@ def _patch_shardstream_worker() -> None:
         except AssertionError:
             dp_rank = parallel_config.data_parallel_rank
             dp_size = parallel_config.data_parallel_size
-        try:
-            ep_group = get_ep_group()
-            ep_rank = ep_group.rank_in_group
-            ep_size = ep_group.world_size
-        except AssertionError:
-            (ep_rank, ep_size) = (0, 1)
+        ep_rank, ep_size = get_vllm_expert_coordinates(
+            bool(getattr(parallel_config, "enable_expert_parallel", False)),
+            get_ep_group,
+        )
         local_world_size = int(getattr(parallel_config, "world_size", 1) or 1)
         local_rank = int(getattr(parallel_config, "rank", 0) or 0)
         cp_size = int(getattr(parallel_config, "prefill_context_parallel_size", 1) or 1)

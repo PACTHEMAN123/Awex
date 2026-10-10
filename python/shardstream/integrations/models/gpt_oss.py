@@ -30,6 +30,8 @@ class GPTOSSShardingStrategy(Qwen3ShardingStrategy):
 
 class GPTOSSVLLMWeightConverter(Qwen3FusedWeightConverter):
     def convert_param(self, name, parameter):
+        name = name.replace("model.embedding.", "model.embed_tokens.")
+        name = name.replace(".attn.", ".self_attn.")
         name = name.replace(".experts.routed_experts.", ".experts.")
         if ".mlp.router." in name or name.endswith("self_attn.sinks"):
             return [(name, parameter)]
