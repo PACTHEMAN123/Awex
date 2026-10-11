@@ -1,0 +1,2 @@
+# Validated default for the CUDA 13 H20 setup; keep headers and runtime together.
+nvidia-nccl-cu13==2.31.2

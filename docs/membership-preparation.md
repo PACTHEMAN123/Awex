@@ -22,9 +22,12 @@ after a join must hit the already prepared plan cache.
 
 ## Isolated runtime comparison
 
-The default environment remains supported. To test another NCCL installation,
-build the native extension against that installation's Device API headers and
-load the matching library before PyTorch:
+The validated default for subsequent CUDA 13 H20 runs is NCCL 2.31.2.
+`requirements/nccl-cu13.txt` pins the package and `scripts/nccl-default.sh`
+checks both the headers and library version before exporting the build/runtime
+paths. Build the native extension against that installation's Device API
+headers and load the matching library before PyTorch. For an explicit comparison
+installation:
 
 ```sh
 export SHARDSTREAM_NCCL_LIB=/path/to/nccl/lib

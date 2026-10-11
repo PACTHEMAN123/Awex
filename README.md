@@ -20,9 +20,25 @@ license notices remain intact.
 
 ## Build
 
+The validated default for the CUDA 13 H20 setup is NCCL **2.31.2**. Install
+the pinned package and select its matching headers/runtime before building or
+launching Python:
+
+```sh
+python -m pip install --no-deps --target .deps/nccl-cu13-2.31.2 \
+  -r requirements/nccl-cu13.txt
+export SHARDSTREAM_NCCL_ROOT="$PWD/.deps/nccl-cu13-2.31.2/nvidia/nccl"
+source scripts/nccl-default.sh
+```
+
+For an isolated installation, set `SHARDSTREAM_NCCL_ROOT` to its `nvidia/nccl`
+directory before sourcing the script. Use a fresh build directory when switching
+NCCL versions. CMake defaults to this exported root; an explicit CMake root still
+overrides it. Keep the metadata CTA setting unset.
+
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
-  -DSHARDSTREAM_NCCL_ROOT=/path/to/nccl -DCMAKE_CUDA_ARCHITECTURES=90
+  -DCMAKE_CUDA_ARCHITECTURES=90
 cmake --build build -j2
 cmake --install build --prefix /path/to/install
 ```
@@ -43,7 +59,7 @@ To install the Python extension with the current environment's PyTorch:
 
 ```sh
 pip install --no-build-isolation . \
-  -Ccmake.define.SHARDSTREAM_NCCL_ROOT=/path/to/nccl
+  -Ccmake.define.SHARDSTREAM_NCCL_ROOT="$SHARDSTREAM_NCCL_ROOT"
 ```
 
 This requires scikit-build-core, PyTorch, CUDA and NCCL development files.
