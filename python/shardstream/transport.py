@@ -1058,14 +1058,14 @@ class Transport:
             dtype=torch.int32,
             device=device,
         )
-        phase(
+        feature_sums = phase(
             "feature_validation",
             lambda: (
                 dist.all_reduce(feature_sums, op=dist.ReduceOp.SUM, group=self.group),
                 feature_sums.cpu().tolist(),
-            ),
+            )[1],
         )
-        feature_sums = [int(value) for value in feature_sums.cpu().tolist()]
+        feature_sums = [int(value) for value in feature_sums]
         if any(value not in (0, self.world_size) for value in feature_sums):
             raise TransportUnavailableError(
                 "transport ring feature flags must match on every rank: "
