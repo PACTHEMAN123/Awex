@@ -2,7 +2,7 @@
 
 CUDA communication for sharded model weight streams. The single Python backend
 is `shardstream.Transport`. Plans and prepared tensor descriptors are reusable
-across weight publications; membership epochs support preparing expanded rollout
+across weight publications; membership epochs support preparing resized rollout
 groups before the next publication.
 
 The initial extraction comes from the validated `device-v2-dynamic-rollout`

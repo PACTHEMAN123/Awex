@@ -124,3 +124,57 @@ def test_membership_copies_mutable_engine_ids_and_rejects_over_capacity_join():
     assert coordinator.request_join("b", 1)
     with pytest.raises(ValueError, match="256"):
         coordinator.request_join("c", 1)
+
+
+def test_leave_waits_for_publication_and_all_retirement_acks_before_commit():
+    coordinator = RolloutJoinCoordinator(RolloutMembership(0, 2, 2, ("a", "b", "c")))
+    coordinator.begin_publication(0)
+    assert coordinator.request_leave("b")
+    assert not coordinator.request_leave("b")
+    with pytest.raises(RuntimeError, match="boundary"):
+        coordinator.prepare_change()
+    for participant in coordinator.membership.participants:
+        coordinator.acknowledge_updated(participant, 0, 0)
+    coordinator.finish_publication()
+    pending = coordinator.prepare_change()
+    assert pending.engine_ids == ("a", "c")
+    assert pending.rank(("rollout", "c", 0)) == 2
+    assert pending.rank(("training", "", 0)) == 4
+    assert coordinator.serving_engine_ids == ("a", "c")
+    for participant in pending.participants:
+        coordinator.acknowledge_prepared(participant, 1)
+    with pytest.raises(RuntimeError, match="leaving rank"):
+        coordinator.commit_change()
+    with pytest.raises(ValueError, match="epoch"):
+        coordinator.acknowledge_retired(("rollout", "b", 0), 0)
+    with pytest.raises(ValueError, match="Unknown"):
+        coordinator.acknowledge_retired(("rollout", "a", 0), 1)
+    coordinator.acknowledge_retired(("rollout", "b", 0), 1)
+    coordinator.acknowledge_retired(("rollout", "b", 0), 1)
+    with pytest.raises(RuntimeError, match="leaving rank"):
+        coordinator.commit_change()
+    coordinator.acknowledge_retired(("rollout", "b", 1), 1)
+    coordinator.commit_change()
+    with pytest.raises(ValueError, match="epoch"):
+        coordinator.acknowledge_retired(("rollout", "b", 1), 1)
+    publish(coordinator, 1)
+    assert coordinator.request_join("b", 2)
+    rejoined = coordinator.prepare_change()
+    for participant in rejoined.participants:
+        coordinator.acknowledge_prepared(participant, 2)
+    coordinator.commit_change()
+    assert coordinator.serving_engine_ids == ("a", "c")
+    publish(coordinator, 2)
+    assert coordinator.serving_engine_ids == ("a", "c", "b")
+
+
+def test_removing_last_engine_and_unknown_engine_preserves_current_membership():
+    coordinator = RolloutJoinCoordinator(RolloutMembership(0, 1, 1, ("a", "b")))
+    publish(coordinator, 0)
+    with pytest.raises(ValueError, match="Unknown"):
+        coordinator.request_leave("missing")
+    coordinator.request_leave("b")
+    with pytest.raises(ValueError, match="remain"):
+        coordinator.request_leave("a")
+    assert coordinator.membership.engine_ids == ("a", "b")
+    assert coordinator.prepare_change().engine_ids == ("a",)

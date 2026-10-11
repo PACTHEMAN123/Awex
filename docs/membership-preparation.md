@@ -20,6 +20,40 @@ The same loaded model storage survives a join. Preparation never launches a
 weight transfer kernel or advances a weight version. The first publication
 after a join must hit the already prepared plan cache.
 
+## Graceful rollout shrink and rejoin
+
+The real-model Elastic benchmark supports both directions with
+`--resize-after` (the existing `--join-after` spelling remains an alias) and
+`--target-engines`. For example, start with `--num-engines 2` and use
+`--resize-after 6 12 18 24 30 --target-engines 4 8 4 2 4 --num-updates 36`.
+Explicit inference endpoints must cover the maximum count in the schedule.
+
+Model integration keeps contiguous engine ranks: shrinking removes the highest
+engine ranks, while the training cohort and inference TP stay fixed. Every
+change occurs after a full publication. Invoke
+`areal_shardstream_prepare_membership` on the new rollout cohort concurrently
+with writer preparation; during shrink also invoke
+`areal_shardstream_retire_membership` on leaving rollout engines. Leaving ranks
+drain GPU work and release the old native resources and borrowed process group.
+Stop their servers only after all preparation and retirement responses arrive.
+Survivors retain their model storage and last complete snapshot. Rejoining
+engines restart their server and receive a new complete snapshot before serving.
+This is coordinated graceful removal, not recovery from a dead participant.
+
+The benchmark launcher handshake uses `elastic/launch/{epoch}` and
+`elastic/launched/{epoch}` for additions. After retirement completes, the driver
+publishes `elastic/retire/{epoch}`; the launcher stops the leaving servers,
+checks their GPU slots have no compute processes, and acknowledges
+`elastic/retired/{epoch}`. Launchers must implement both directions to run mixed
+schedules. Preparation, retirement, server stop, and full transition time are
+recorded separately; model startup stays outside preparation.
+
+The CPU `RolloutJoinCoordinator` also supports `request_leave`,
+`prepare_change`, `acknowledge_retired`, and `commit_change`. Commit requires
+both preparation acknowledgements from the new membership and retirement
+acknowledgements from every leaving rank. Removing every rollout engine is
+rejected. The existing join entry points remain compatible.
+
 ## Isolated runtime comparison
 
 The validated default for subsequent CUDA 13 H20 runs is NCCL 2.31.2.

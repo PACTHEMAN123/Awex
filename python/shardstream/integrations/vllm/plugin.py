@@ -634,6 +634,21 @@ def register_shardstream_plugin() -> None:
             logger.exception("ShardStream membership preparation failed")
             return _to_json_error(f"ShardStream membership preparation failed: {exc}")
 
+    @router.post("/areal_shardstream_retire_membership")
+    async def shardstream_retire_membership(
+        request: ShardStreamMembershipRequest, raw_request: Request
+    ):
+        try:
+            adapter = _get_shardstream_adapter(raw_request)
+            results = await asyncio.to_thread(
+                adapter.weights_exchange_reader.retire_membership,
+                {"epoch": request.epoch, "num_engines": request.num_engines},
+            )
+            return JSONResponse(content={"success": True, "ranks": results})
+        except Exception as exc:
+            logger.exception("ShardStream membership retirement failed")
+            return _to_json_error(f"ShardStream membership retirement failed: {exc}")
+
     @router.post("/publication_init")
     async def publication_init(request: PublicationInitRequest, raw_request: Request):
         try:

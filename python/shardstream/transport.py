@@ -1489,7 +1489,7 @@ class Transport:
         plan: TransferPlan,
         rollout_node_ids: tuple[Any, ...] | None = None,
     ) -> None:
-        """Bind an expanded epoch without replacing model tensors or the kernel.
+        """Bind a changed epoch without replacing model tensors or the kernel.
 
         All old participants must first finish their previous publication. The
         application creates a new process group containing old and new ranks,
@@ -1518,9 +1518,9 @@ class Transport:
             raise TransportUnavailableError(
                 "Changing training size or inference TP is not supported"
             )
-        if len(membership.engine_ids) <= self.num_infer_engines:
+        if len(membership.engine_ids) == self.num_infer_engines:
             raise TransportUnavailableError(
-                "Dynamic reconfiguration only supports adding engines"
+                "Dynamic reconfiguration requires changing the engine count"
             )
         # Custom transfer groups are independent of the training default group;
         # dist.get_rank(group) may map the default rank instead of this PG rank.

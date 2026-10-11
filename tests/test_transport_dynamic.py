@@ -75,6 +75,50 @@ def test_expansion_releases_old_fifo_rebuilds_ring_and_preserves_weights(prepare
         transport.send(params, old_plan, 4)
 
 
+def test_shrink_rebuilds_rank_routes_and_rejoin_keeps_model_storage(prepared):
+    transport, params, _, destroyed, expanded, expanded_group = prepared
+    pointer = params["weight"].data_ptr()
+    expanded_plan = make_plan(2, expanded)
+    transport.reconfigure(
+        expanded_group, expanded, ("training", "", 0), params, expanded_plan
+    )
+    transport._handle = 43
+    transport._initialized = True
+    reduced = expanded.shrink(("new",))
+    group = SimpleNamespace(rank=lambda: 1, size=lambda: 2)
+    plan = make_plan(1, reduced)
+    transport.reconfigure(group, reduced, ("training", "", 0), params, plan)
+    assert destroyed == [42, 43]
+    assert transport.rank == 1 and transport.world_size == 2
+    assert transport.membership_epoch == 2 and transport.num_infer_engines == 1
+    assert len(transport._prepared_send[2].expected_counts) == 2
+    with pytest.raises(RuntimeError, match="Stale"):
+        transport.send(params, expanded_plan, 5)
+    rejoined = reduced.grow(("new",))
+    transport.reconfigure(
+        expanded_group, rejoined, ("training", "", 0), params, make_plan(2, rejoined)
+    )
+    assert transport.membership_epoch == 3
+    assert params["weight"].data_ptr() == pointer
+
+
+def test_departing_reader_cannot_enter_the_surviving_group(prepared):
+    transport, params, _, destroyed, expanded, expanded_group = prepared
+    transport.reconfigure(
+        expanded_group, expanded, ("training", "", 0), params, make_plan(2, expanded)
+    )
+    reduced = expanded.shrink(("new",))
+    with pytest.raises(ValueError, match="Unknown participant"):
+        transport.reconfigure(
+            expanded_group,
+            reduced,
+            ("rollout", "new", 0),
+            params,
+            make_plan(0, reduced, False),
+        )
+    assert destroyed == [42]
+
+
 def test_previous_rank_plan_is_rejected_without_closing_old_transport(prepared):
     transport, params, old_plan, destroyed, members, group = prepared
     with pytest.raises(RuntimeError, match="previous epoch"):

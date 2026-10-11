@@ -597,26 +597,33 @@ class MultiVLLMWeightsExchangeIT:
             endpoints,
         )
 
-    def join_rollout_models(self, epoch, target):
+    def resize_rollout_models(self, epoch, target):
         from shardstream.profiling.compute import (
             BackgroundBF16Compute,
         )
 
         version = int(self.megatron_engine.global_step)
+        previous = self.inference_config["num_engines"]
+        growing = target > previous
         old_endpoints = self.publication_endpoints()
         started_ns = time.time_ns()
         weight = next(p for p in self.mcore_model.parameters() if p.ndim == 2)
         compute = BackgroundBF16Compute(weight[:1024, :1024], batch=512, repeats=256)
         compute.start(300)
         inference_compute = {}
+        inference_retired = {}
+        retirement_compute = {}
+        stop_ms = 0.0
         try:
             if self.is_driver:
                 self.model_profile("compute_start", version, old_endpoints)
                 client = self.megatron_engine.weights_exchange_writer.meta_server_client
                 launch_start_ns = time.time_ns()
-                client.put_object(f"elastic/launch/{epoch}", {"num_engines": target})
-                client.get_object(f"elastic/launched/{epoch}", timeout=600)
-                previous = self.inference_config["num_engines"]
+                if growing:
+                    client.put_object(
+                        f"elastic/launch/{epoch}", {"num_engines": target}
+                    )
+                    client.get_object(f"elastic/launched/{epoch}", timeout=600)
                 self.inference_config["num_engines"] = target
                 new_endpoints = [
                     e for e in self.publication_endpoints() if e[0] >= previous
@@ -624,10 +631,16 @@ class MultiVLLMWeightsExchangeIT:
                 for endpoint in new_endpoints:
                     self._wait_for_health(endpoint, timeout=600)
                     self.publication._initialize_endpoint(endpoint)
+                leaving_endpoints = [e for e in old_endpoints if e[0] >= target]
+                if leaving_endpoints:
+                    # Finish old GPU work before deregistering its windows.
+                    retirement_compute = self.model_profile(
+                        "compute_stop", version, leaving_endpoints
+                    )
             self._training_barrier()
             specification = {"epoch": epoch, "num_engines": target}
             prepare_start_ns = time.time_ns()
-            with ThreadPoolExecutor(max_workers=1) as executor:
+            with ThreadPoolExecutor(max_workers=2) as executor:
                 future = (
                     executor.submit(
                         self.endpoint_command,
@@ -637,6 +650,16 @@ class MultiVLLMWeightsExchangeIT:
                     if self.is_driver
                     else None
                 )
+                retiring = (
+                    executor.submit(
+                        self.endpoint_command,
+                        "areal_shardstream_retire_membership",
+                        specification,
+                        leaving_endpoints,
+                    )
+                    if self.is_driver and leaving_endpoints
+                    else None
+                )
                 prepared = (
                     self.megatron_engine.weights_exchange_writer.prepare_membership(
                         specification
@@ -644,12 +667,21 @@ class MultiVLLMWeightsExchangeIT:
                 )
                 if future is not None:
                     inference_prepared = future.result()
+                if retiring is not None:
+                    inference_retired = retiring.result()
             self._training_barrier()
             ready_ns = time.time_ns()
             if self.is_driver:
                 # Old engines must still hold their last full snapshot here.
                 self.model_profile("verify", version, old_endpoints)
                 inference_compute = self.model_profile("compute_stop", version)
+                if leaving_endpoints:
+                    stop_start = time.perf_counter()
+                    client.put_object(
+                        f"elastic/retire/{epoch}", {"num_engines": target}
+                    )
+                    client.get_object(f"elastic/retired/{epoch}", timeout=600)
+                    stop_ms = (time.perf_counter() - stop_start) * 1000
         finally:
             compute_events = compute.stop(300)
         training_result = {"prepare": prepared, "compute_events": compute_events}
@@ -660,8 +692,9 @@ class MultiVLLMWeightsExchangeIT:
             gathered = [training_result]
         if self.is_driver:
             record = {
-                "event": "join",
+                "event": "join" if growing else "leave",
                 "epoch": epoch,
+                "previous_num_engines": previous,
                 "num_engines": target,
                 "start_ns": started_ns,
                 "launch_start_ns": launch_start_ns,
@@ -673,16 +706,22 @@ class MultiVLLMWeightsExchangeIT:
                 "training_ranks": gathered,
                 "inference_ranks": inference_prepared,
                 "inference_compute": inference_compute,
+                "inference_retired": inference_retired,
+                "retirement_compute": retirement_compute,
+                "server_stop_ms": stop_ms,
+                "transition_ms": (time.time_ns() - started_ns) / 1e6,
             }
             self.elastic_records.append(record)
             logger.info(
-                "Elastic model join ready: epoch=%s engines=%s join_ms=%.3f prepare_ms=%.3f",
+                "Elastic model resize ready: epoch=%s engines=%s join_ms=%.3f prepare_ms=%.3f",
                 epoch,
                 target,
                 record["join_ms"],
                 record["prepare_ms"],
             )
         self._training_barrier()
+        # Keep every training rank's cohort count consistent for the next resize.
+        self.inference_config["num_engines"] = target
 
 
 def main(args):
@@ -780,7 +819,9 @@ def main(args):
             weights_exchange_it.exchange_weights()
             if update_index + 1 in joins:
                 epoch += 1
-                weights_exchange_it.join_rollout_models(epoch, joins[update_index + 1])
+                weights_exchange_it.resize_rollout_models(
+                    epoch, joins[update_index + 1]
+                )
         if weights_exchange_it.is_driver and args.elastic_output:
             Path(args.elastic_output).write_text(
                 json.dumps(
@@ -832,12 +873,20 @@ if __name__ == "__main__":
         choices=("qwen3.5-9b", "qwen2.5-vl-7b", "gpt-oss-20b", "glm-4.7-flash"),
     )
     parser.add_argument("--rollout-replicas", type=_positive_int)
-    parser.add_argument("--join-after", type=_positive_int, nargs="*", default=[])
+    parser.add_argument(
+        "--resize-after",
+        "--join-after",
+        dest="join_after",
+        type=_positive_int,
+        nargs="*",
+        default=[],
+        help="Completed-publication boundaries for increasing or decreasing rollout count",
+    )
     parser.add_argument("--target-engines", type=_positive_int, nargs="*", default=[])
     parser.add_argument(
         "--elastic-model-profile",
         action="store_true",
-        help="Exact full-model GPU validation and BF16 compute during joins (extra reference model storage)",
+        help="Exact full-model GPU validation and BF16 compute during resizes (extra reference model storage)",
     )
     parser.add_argument("--elastic-output")
     parser.add_argument(
@@ -1048,9 +1097,9 @@ if __name__ == "__main__":
         parser.error("--rollout-replicas requires --recipe")
     targets = [args.num_engines, *args.target_engines]
     if len(args.join_after) != len(args.target_engines) or any(
-        a >= b for a, b in zip(targets, targets[1:])
+        a == b for a, b in zip(targets, targets[1:])
     ):
-        parser.error("Join boundaries require strictly increasing engine counts")
+        parser.error("Resize boundaries require a different positive engine count")
     if sorted(set(args.join_after)) != args.join_after or any(
         not 1 <= n < args.num_updates for n in args.join_after
     ):
@@ -1073,7 +1122,7 @@ if __name__ == "__main__":
         if not args.remote_inference:
             parser.error("--inference-endpoint requires --remote-inference")
         endpoint_ranks = sorted(endpoint[0] for endpoint in args.inference_endpoint)
-        if endpoint_ranks != list(range(targets[-1])):
+        if endpoint_ranks != list(range(max(targets))):
             parser.error(
                 "--inference-endpoint ranks must cover every engine rank in "
                 "[0, --num-engines) exactly once"

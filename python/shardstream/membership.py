@@ -1,4 +1,4 @@
-"""Append-only rollout membership at complete weight-publication boundaries.
+"""Rollout membership changes at complete weight-publication boundaries.
 
 The coordinator belongs to one driver. Participants acknowledge preparation and
 publication through the application's RPC layer; it never transmits weights.
@@ -61,9 +61,19 @@ class RolloutMembership:
             self, epoch=self.epoch + 1, engine_ids=self.engine_ids + tuple(engine_ids)
         )
 
+    def shrink(self, engine_ids: Iterable[str]) -> "RolloutMembership":
+        removed = set(engine_ids)
+        if not removed or not removed <= set(self.engine_ids):
+            raise ValueError("Removal requires known rollout engine IDs")
+        return replace(
+            self,
+            epoch=self.epoch + 1,
+            engine_ids=tuple(i for i in self.engine_ids if i not in removed),
+        )
+
 
 class RolloutJoinCoordinator:
-    """Keep new engines unavailable until all ranks publish their first snapshot.
+    """Apply joins and graceful leaves at a complete publication boundary.
 
     Join requests may arrive during an update. Applying them requires an idle
     publication boundary. Old engines may serve their previous complete version
@@ -76,8 +86,11 @@ class RolloutJoinCoordinator:
         self.membership = membership
         self.last_version = -1
         self._queued = []
+        self._queued_leaves = set()
         self._pending = None
         self._prepared = set()
+        self._retired = set()
+        self._retiring = set()
         self._updated = set()
         self._version = None
         self._ready = False
@@ -121,14 +134,28 @@ class RolloutJoinCoordinator:
             )
             if (
                 self.membership.training_world_size
-                + (pending_count + len(self._queued) + 1) * inference_tp_size
+                + (pending_count + len(self._queued) - len(self._queued_leaves) + 1)
+                * inference_tp_size
                 > 256
             ):
                 raise ValueError("Transport requires at most 256 transfer ranks")
             self._queued.append(engine_id)
             return True
 
-    def prepare_join(self) -> RolloutMembership:
+    def request_leave(self, engine_id: str) -> bool:
+        with self._lock:
+            self._check()
+            base = self._pending or self.membership
+            if engine_id not in base.engine_ids:
+                raise ValueError("Unknown rollout engine requested to leave")
+            if engine_id in self._queued_leaves:
+                return False
+            if len(base.engine_ids) + len(self._queued) - len(self._queued_leaves) <= 1:
+                raise ValueError("At least one rollout engine must remain")
+            self._queued_leaves.add(engine_id)
+            return True
+
+    def prepare_change(self) -> RolloutMembership:
         with self._lock:
             self._check()
             if (
@@ -136,13 +163,36 @@ class RolloutJoinCoordinator:
                 or self._pending is not None
                 or not self._ready
             ):
-                raise RuntimeError("Joining requires a completed publication boundary")
-            if not self._queued:
-                raise ValueError("No engines requested to join")
-            self._pending = self.membership.grow(self._queued)
+                raise RuntimeError(
+                    "Membership changes require a completed publication boundary"
+                )
+            if not self._queued and not self._queued_leaves:
+                raise ValueError("No engines requested a membership change")
+            self._pending = replace(
+                self.membership,
+                epoch=self.membership.epoch + 1,
+                engine_ids=tuple(
+                    i
+                    for i in self.membership.engine_ids
+                    if i not in self._queued_leaves
+                )
+                + tuple(self._queued),
+            )
+            self._retiring = set(self.membership.participants) - set(
+                self._pending.participants
+            )
+            self._serving_cohort = tuple(
+                i for i in self._serving_cohort if i in self._pending.engine_ids
+            )
             self._queued.clear()
+            self._queued_leaves.clear()
             self._prepared.clear()
+            self._retired.clear()
             return self._pending
+
+    def prepare_join(self) -> RolloutMembership:
+        """Compatibility entry point for append-only callers."""
+        return self.prepare_change()
 
     def acknowledge_prepared(self, participant: Participant, epoch: int) -> None:
         with self._lock:
@@ -153,17 +203,32 @@ class RolloutJoinCoordinator:
                 raise ValueError("Unknown preparation participant")
             self._prepared.add(participant)
 
-    def commit_join(self) -> RolloutMembership:
+    def acknowledge_retired(self, participant: Participant, epoch: int) -> None:
+        with self._lock:
+            self._check()
+            if self._pending is None or epoch != self._pending.epoch:
+                raise ValueError("Stale or unknown membership epoch")
+            if participant not in self._retiring:
+                raise ValueError("Unknown retirement participant")
+            self._retired.add(participant)
+
+    def commit_change(self) -> RolloutMembership:
         with self._lock:
             self._check()
             if self._pending is None or self._prepared != set(
                 self._pending.participants
             ):
                 raise RuntimeError("Every old and new rank must prepare before commit")
+            if self._retired != self._retiring:
+                raise RuntimeError("Every leaving rank must retire before commit")
             self.membership = self._pending
             self._pending = None
             self._ready = False
             return self.membership
+
+    def commit_join(self) -> RolloutMembership:
+        """Compatibility entry point for append-only callers."""
+        return self.commit_change()
 
     def begin_publication(self, version: int) -> RolloutMembership:
         with self._lock:

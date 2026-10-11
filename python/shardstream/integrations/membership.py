@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import time
 
+import torch
 import torch.distributed as dist
 
 from shardstream._utils.common import get_free_port, get_ip_address
@@ -21,7 +22,11 @@ from shardstream.transport import Transport, _local_node_id
 
 
 def prepare_model_membership(worker, specification: dict, sender: bool) -> dict:
-    """Collectively prepare a larger homogeneous cohort on every live rank."""
+    """Prepare the next homogeneous cohort on surviving and joining ranks.
+
+    Model integration uses contiguous engine ranks. Shrinks remove the suffix;
+    those workers must concurrently call retire_model_membership before exit.
+    """
     if worker.comm_backend != "transport":
         raise ValueError("Model membership requires the transport backend")
     if worker.model_arch_name not in ("Qwen3ForCausalLM", "Qwen3MoeForCausalLM"):
@@ -31,9 +36,9 @@ def prepare_model_membership(worker, specification: dict, sender: bool) -> dict:
     if transport is not None:
         if (
             epoch != transport.membership_epoch + 1
-            or engines <= transport.num_infer_engines
+            or engines == transport.num_infer_engines
         ):
-            raise ValueError("Model membership must advance one epoch and add engines")
+            raise ValueError("Model membership must advance one epoch and change count")
     elif epoch < 1:
         raise ValueError("New model workers require an explicit join epoch")
     membership = RolloutMembership(
@@ -225,4 +230,40 @@ def prepare_model_membership(worker, specification: dict, sender: bool) -> dict:
         "phases": phases,
         "preparation_metrics": metrics,
         "rollout_node_ids": rollout_node_ids,
+    }
+
+
+def retire_model_membership(worker, specification: dict) -> dict:
+    """Release a leaving rank's old transport/group after its last publication.
+
+    The coordinator invokes this concurrently with preparation on survivors and
+    stops the server only after every old rank has released its resources.
+    """
+    transport = worker.device_transport
+    epoch, engines = specification["epoch"], specification["num_engines"]
+    if (
+        transport is None
+        or epoch != transport.membership_epoch + 1
+        or not 1 <= engines < transport.num_infer_engines
+        or worker.engine_rank < engines
+    ):
+        raise ValueError("Retirement requires a leaving rank in the next shrink epoch")
+    started = time.perf_counter()
+    pointers = {name: p.data_ptr() for name, p in worker.model.named_parameters()}
+    torch.cuda.synchronize()
+    transport.close()
+    if worker.weights_update_group is not None:
+        dist.destroy_process_group(worker.weights_update_group)
+    worker.device_transport = None
+    worker.weights_update_group = None
+    worker.transfer_plan = None
+    worker.already_initialized = False
+    if pointers != {name: p.data_ptr() for name, p in worker.model.named_parameters()}:
+        raise AssertionError("Retiring transport replaced model storage")
+    return {
+        "pid": os.getpid(),
+        "pointers": pointers,
+        "epoch": epoch,
+        "retired": True,
+        "retire_ms": (time.perf_counter() - started) * 1000,
     }

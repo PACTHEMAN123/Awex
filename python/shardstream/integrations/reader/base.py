@@ -276,11 +276,15 @@ class WeightsReader(WeightExchangeReader):
 
     def prepare_membership(self, specification: dict):
         with self.lock:
+            if getattr(self, "_retired", False):
+                raise RuntimeError("Restart a retired reader before rejoining")
             engines = specification["num_engines"]
-            if engines < self.num_engines or (
-                self.initialized and engines == self.num_engines
+            if (
+                not 1 <= engines
+                or self.engine_rank >= engines
+                or (self.initialized and engines == self.num_engines)
             ):
-                raise ValueError("Existing model readers must add engines")
+                raise ValueError("Model readers require a changed surviving cohort")
             self.num_engines = engines
             self.infer_engine_config.num_engines = engines
             self.infer_world_size = engines * self.tp_size * self.pp_size * self.dp_size
@@ -293,6 +297,23 @@ class WeightsReader(WeightExchangeReader):
                 self._prepare_membership_in_tp_worker, specification=specification
             )
 
+    def retire_membership(self, specification: dict):
+        with self.lock:
+            if not self.initialized or self.engine_rank < specification["num_engines"]:
+                raise ValueError("Only initialized leaving readers can retire")
+            self._retired = True
+            results = self.inference_engine.execute_task_in_model_worker(
+                self._retire_membership_in_tp_worker, specification=specification
+            )
+            return results
+
+    @staticmethod
+    def _retire_membership_in_tp_worker(specification: dict, **kwargs):
+        from shardstream.integrations.membership import retire_model_membership
+
+        worker = kwargs["model_context"]["scheduler"].shardstream_weights_reader
+        return retire_model_membership(worker, specification)
+
     @staticmethod
     def _prepare_membership_in_tp_worker(specification: dict, **kwargs):
         from shardstream.integrations.membership import prepare_model_membership
@@ -302,6 +323,8 @@ class WeightsReader(WeightExchangeReader):
 
     def update_weights(self, step_id, **kwargs):
         with self.lock:
+            if getattr(self, "_retired", False):
+                raise RuntimeError("A retired reader cannot receive publications")
             if not self.initialized:
                 logger.info(
                     f"Start to initialize weights exchange reader for engine rank {self.engine_rank}"
