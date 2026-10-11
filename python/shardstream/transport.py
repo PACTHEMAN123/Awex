@@ -22,6 +22,7 @@ from __future__ import annotations
 import ctypes
 import hashlib
 import json
+import math
 import os
 import socket
 import threading
@@ -120,12 +121,44 @@ class _RingOrderStrategy(Enum):
     ROOT_SWIZZLE = "root_swizzle"
 
 
-def _node_major_communicator_ranks(node_ids: list[int]) -> list[int]:
-    """Map logical ranks to node-contiguous communicator ranks."""
+def _node_major_communicator_ranks(
+    node_ids: list[int],
+    *,
+    inference_tp_size: int = 0,
+    num_infer_engines: int = 0,
+) -> list[int]:
+    """Keep colocated replicas of a TP shard in the same NCCL LSA team.
+
+    NCCL splits uneven node populations into contiguous teams whose size is
+    their greatest common divisor. Engine-major order can separate colocated
+    copies into different teams, making the local ring hop use GIN. Interleave
+    those copies when complete TP instances fit evenly into each local team.
+    """
 
     ranks_by_node: dict[int, list[int]] = {}
     for logical_rank, node_id in enumerate(node_ids):
         ranks_by_node.setdefault(int(node_id), []).append(logical_rank)
+    lsa_size = (
+        math.gcd(*(len(ranks) for ranks in ranks_by_node.values())) if node_ids else 0
+    )
+    inference_world_size = inference_tp_size * num_infer_engines
+    for logical_ranks in ranks_by_node.values():
+        if (
+            inference_tp_size > 0
+            and lsa_size < len(logical_ranks)
+            and all(rank < inference_world_size for rank in logical_ranks)
+        ):
+            replicas, remainder = divmod(len(logical_ranks), inference_tp_size)
+            counts = [
+                sum(rank % inference_tp_size == tp_rank for rank in logical_ranks)
+                for tp_rank in range(inference_tp_size)
+            ]
+            if (
+                not remainder
+                and counts == [replicas] * inference_tp_size
+                and lsa_size % replicas == 0
+            ):
+                logical_ranks.sort(key=lambda rank: (rank % inference_tp_size, rank))
     logical_to_communicator = [0] * len(node_ids)
     communicator_rank = 0
     for logical_ranks in ranks_by_node.values():
@@ -1107,7 +1140,11 @@ class Transport:
                 "Membership epoch and inference geometry must match on every rank"
             )
         node_ids = [int(value[0]) for value in identities]
-        self._logical_to_communicator = _node_major_communicator_ranks(node_ids)
+        self._logical_to_communicator = _node_major_communicator_ranks(
+            node_ids,
+            inference_tp_size=self.infer_instance_world_size,
+            num_infer_engines=self.num_infer_engines,
+        )
         communicator_rank = self._logical_to_communicator[self.rank]
         unique_id_size = int(self._extension.unique_id_size())
         unique_id_tensor = torch.empty(unique_id_size, dtype=torch.uint8, device=device)

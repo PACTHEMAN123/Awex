@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
+import math
 import os
 import threading
 from types import SimpleNamespace
@@ -62,6 +63,38 @@ def test_node_major_communicator_ranks_join_split_physical_nodes():
     assert [mapping[rank] for rank in range(4, 8)] == [8, 9, 10, 11]
     assert [mapping[rank] for rank in range(12, 16)] == [12, 13, 14, 15]
     assert sorted(mapping) == list(range(32))
+
+
+@pytest.mark.parametrize("engines", range(1, 7))
+def test_colocated_tp_replicas_share_lsa_team_with_uneven_node_sizes(engines):
+    node_ids = [
+        10 + engine % 3 for engine in range(engines) for _ in range(4)
+    ] + [40] * 8
+    mapping = _node_major_communicator_ranks(
+        node_ids, inference_tp_size=4, num_infer_engines=engines
+    )
+    populations = [node_ids.count(node) for node in set(node_ids)]
+    lsa_size = math.gcd(*populations)
+
+    assert sorted(mapping) == list(range(engines * 4 + 8))
+    for node in set(node_ids):
+        ranks = sorted(mapping[rank] for rank, n in enumerate(node_ids) if n == node)
+        assert ranks == list(range(ranks[0], ranks[0] + len(ranks)))
+    for engine in range(3, engines):
+        for tp_rank in range(4):
+            first = mapping[(engine - 3) * 4 + tp_rank]
+            second = mapping[engine * 4 + tp_rank]
+            assert first // lsa_size == second // lsa_size
+    assert mapping[engines * 4 :] == list(range(engines * 4, engines * 4 + 8))
+    if engines in (1, 2, 3, 6):
+        assert mapping == _node_major_communicator_ranks(node_ids)
+
+
+def test_incomplete_tp_instances_keep_original_communicator_order():
+    node_ids = [10, 10, 20, 20, 10, 10, 20, 20] + [30] * 8
+    assert _node_major_communicator_ranks(
+        node_ids, inference_tp_size=4, num_infer_engines=2
+    ) == _node_major_communicator_ranks(node_ids)
 
 
 def test_interleaved_bias_vectors_bind_original_storage_without_copyback(monkeypatch):
