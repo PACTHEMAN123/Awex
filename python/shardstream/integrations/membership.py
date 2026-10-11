@@ -77,7 +77,10 @@ def prepare_model_membership(worker, specification: dict, sender: bool) -> dict:
             rank,
         ),
     )
-    annotate_qwen3_dense_transfer_plan(plan, worker.hf_config)
+    phase(
+        "model_plan_annotate",
+        lambda: annotate_qwen3_dense_transfer_plan(plan, worker.hf_config),
+    )
     if sender:
         required = {
             op.send_shard_meta.name
@@ -173,7 +176,9 @@ def prepare_model_membership(worker, specification: dict, sender: bool) -> dict:
         dist.destroy_process_group(group)
         raise
     if old_group is not None:
-        dist.destroy_process_group(old_group)
+        phase(
+            "old_process_group_release", lambda: dist.destroy_process_group(old_group)
+        )
     if pointers != {
         f"{stage}/{name}": parameter.data_ptr()
         for (stage, model) in enumerate(models)

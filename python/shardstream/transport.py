@@ -1039,7 +1039,15 @@ class Transport:
         if self._initialized:
             return 0.0
         start_time = time.perf_counter()
-        self._extension = _load_extension()
+        self._initialization_phases_ms = {}
+
+        def phase(name, call):
+            begin = time.perf_counter()
+            result = call()
+            self._initialization_phases_ms[name] = (time.perf_counter() - begin) * 1000
+            return result
+
+        self._extension = phase("extension_load", _load_extension)
         device = torch.device(device_util.get_torch_device())
         feature_sums = torch.tensor(
             [
@@ -1050,7 +1058,13 @@ class Transport:
             dtype=torch.int32,
             device=device,
         )
-        dist.all_reduce(feature_sums, op=dist.ReduceOp.SUM, group=self.group)
+        phase(
+            "feature_validation",
+            lambda: (
+                dist.all_reduce(feature_sums, op=dist.ReduceOp.SUM, group=self.group),
+                feature_sums.cpu().tolist(),
+            ),
+        )
         feature_sums = [int(value) for value in feature_sums.cpu().tolist()]
         if any(value not in (0, self.world_size) for value in feature_sums):
             raise TransportUnavailableError(
@@ -1081,8 +1095,13 @@ class Transport:
         gathered_node_ids = [
             torch.empty_like(local_node_id) for _ in range(self.world_size)
         ]
-        dist.all_gather(gathered_node_ids, local_node_id, group=self.group)
-        identities = [value.cpu().tolist() for value in gathered_node_ids]
+        identities = phase(
+            "identity_exchange",
+            lambda: (
+                dist.all_gather(gathered_node_ids, local_node_id, group=self.group),
+                [value.cpu().tolist() for value in gathered_node_ids],
+            )[1],
+        )
         if any(value[1:] != identities[0][1:] for value in identities):
             raise TransportUnavailableError(
                 "Membership epoch and inference geometry must match on every rank"
@@ -1101,24 +1120,32 @@ class Transport:
             unique_id_tensor.copy_(
                 torch.tensor(list(unique_id), dtype=torch.uint8, device=device)
             )
-        dist.broadcast(unique_id_tensor, src=0, group=self.group)
-        unique_id = bytes(unique_id_tensor.cpu().tolist())
+        unique_id = phase(
+            "unique_id_exchange",
+            lambda: (
+                dist.broadcast(unique_id_tensor, src=0, group=self.group),
+                bytes(unique_id_tensor.cpu().tolist()),
+            )[1],
+        )
         self._handle = int(
-            self._extension.create(
-                unique_id,
-                self.world_size,
-                self.rank,
-                int(device.index or 0),
-                self.timeout_ms,
-                self.max_channels,
-                self.fifo_depth,
-                self.step_bytes,
-                self.chunk_bytes,
-                self.gin_fifo_depth,
-                self.network_step_bytes,
-                self.gin_chunk_bytes,
-                self.gin_context_count,
-                self._logical_to_communicator,
+            phase(
+                "native_create",
+                lambda: self._extension.create(
+                    unique_id,
+                    self.world_size,
+                    self.rank,
+                    int(device.index or 0),
+                    self.timeout_ms,
+                    self.max_channels,
+                    self.fifo_depth,
+                    self.step_bytes,
+                    self.chunk_bytes,
+                    self.gin_fifo_depth,
+                    self.network_step_bytes,
+                    self.gin_chunk_bytes,
+                    self.gin_context_count,
+                    self._logical_to_communicator,
+                ),
             )
         )
         self._initialized = True
@@ -1423,6 +1450,11 @@ class Transport:
             self._device_prepared_binding = (parameters, plan, bool(sender))
             metrics.update(
                 transport_init_time_ms=init_time_ms,
+                transport_initialization_phases_ms=dict(
+                    getattr(self, "_initialization_phases_ms", {})
+                )
+                if init_time_ms
+                else {},
                 membership_epoch=self.membership_epoch,
                 preparation_total_time_ms=(time.perf_counter() - started) * 1000,
             )
