@@ -87,7 +87,14 @@ def init_custom_process_group(
 
 
 def init_weights_update_group(
-    master_address, master_port, rank, world_size, group_name, backend="nccl", role=""
+    master_address,
+    master_port,
+    rank,
+    world_size,
+    group_name,
+    backend="nccl",
+    role="",
+    control_ctas=None,
 ):
     """Initialize the Torch process group for model parameter updates."""
     assert torch.distributed.is_initialized(), (
@@ -100,6 +107,20 @@ def init_weights_update_group(
     )
     try:
         options = None
+        if control_ctas is not None:
+            if (
+                backend != "nccl"
+                or not isinstance(control_ctas, int)
+                or control_ctas < 1
+            ):
+                raise ValueError(
+                    "Control group CTAs require NCCL and a positive integer"
+                )
+            # This option is only for a metadata/barrier group. The native
+            # weight transport has its own communicator and resource geometry.
+            options = dist.ProcessGroupNCCL.Options()
+            options.config.min_ctas = control_ctas
+            options.config.max_ctas = control_ctas
         group = init_custom_process_group(
             backend=backend,
             init_method=f"tcp://{master_address}:{master_port}",

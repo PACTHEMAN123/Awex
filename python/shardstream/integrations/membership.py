@@ -114,6 +114,11 @@ def prepare_model_membership(worker, specification: dict, sender: bool) -> dict:
             group_name=f"weights_exchange_epoch_{epoch}",
             backend="nccl",
             role="train" if sender else "inference",
+            control_ctas=(
+                int(os.environ["SHARDSTREAM_CONTROL_GROUP_CTAS"])
+                if "SHARDSTREAM_CONTROL_GROUP_CTAS" in os.environ
+                else None
+            ),
         ),
     )
     old_group = worker.weights_update_group
