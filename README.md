@@ -61,3 +61,6 @@ with full-weight, cache, generation and actual path checks. See
 and original GRPO/Elastic evidence, and [routing](docs/ring-routing.md) for the
 fixed-entry, node-local naive chain. CPU checks alone do not establish GPU
 performance equivalence.
+
+For dynamic join timing scopes and the matching NCCL runtime comparison, see
+[membership preparation](docs/membership-preparation.md).
