@@ -106,6 +106,11 @@ class NodeProcesses:
                 "TRANSFORMERS_OFFLINE": "1",
             }
         )
+        if environment.get("SHARDSTREAM_BENCH_NATIVE_MULTIRAIL") == "1":
+            # NCCL caches environment options at its first initialization,
+            # including the vLLM/Megatron groups created before publication.
+            env.update(NCCL_NET_GDR_LEVEL="SYS", NCCL_MIN_NCHANNELS="32",
+                       NCCL_MAX_NCHANNELS="64", NCCL_CROSS_NIC="1")
         command = [str(self.runtime / "bin/python"), *arguments]
         (self.run_dir / f"{name}-command.json").write_text(
             json.dumps(command, indent=2)
