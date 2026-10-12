@@ -100,6 +100,7 @@ class InferParamMetaResolver(ParamMetaResolver):
             self._model_arch_name,
             self.infer_engine_config,
             self.rank0_info,
+            hf_config=self.hf_config,
         )
         self._params_meta = self._build_params_meta()
         if self._inference_engine.config.enable_debug_mode:
@@ -201,7 +202,7 @@ class InferParamMetaResolver(ParamMetaResolver):
         model_context = kwargs["model_context"]
         params_meta = []
         rank_info = get_rank_info_extractor(engine_name)(model_context, engine_rank)
-        model_arch_name = type(model).__name__
+        model_arch_name = (getattr(model.config, "architectures", None) or [type(model).__name__])[0]
         meta = {
             "rank_info": rank_info,
             "params_meta": params_meta,

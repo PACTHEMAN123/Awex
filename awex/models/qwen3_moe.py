@@ -138,3 +138,16 @@ CONFIG = {
     "mcore_converter": _build_mcore_converter_qwen3_moe,
     "sglang_converter": SGlangToHFWeightConverterQwen3Moe,
 }
+
+
+def _benchmark_vllm_converter():
+    from awex.models.canonical_vllm import Qwen3FusedWeightConverter
+    return Qwen3FusedWeightConverter
+
+
+def _benchmark_sharding_strategy(*args, **kwargs):
+    from awex.models.canonical_vllm import Qwen3ShardingStrategy
+    return Qwen3ShardingStrategy(*args, **kwargs)
+
+CONFIG.update(vllm_converter=_benchmark_vllm_converter,
+              sharding_strategy=_benchmark_sharding_strategy)

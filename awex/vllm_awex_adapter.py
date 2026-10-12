@@ -134,6 +134,10 @@ class AwexVLLMServerAdapter:
         if not self._initialized:
             raise RuntimeError("Awex adapter not initialized.")
         self.weights_exchange_reader.update_weights(step_id=step_id, **kwargs)
+        if self._call_engine_async("reset_prefix_cache") is False:
+            raise RuntimeError("vLLM prefix cache reset failed after Awex update")
+        if hasattr(self._engine_client, "reset_encoder_cache"):
+            self._call_engine_async("reset_encoder_cache")
 
     def update_weights_from_disk(self, model_path: str, load_format: str | None = None):
         logger.info("Updating vLLM weights from disk: %s", model_path)
@@ -282,7 +286,7 @@ class AwexVLLMServerAdapter:
                 "task_qualname": fn.__qualname__,
                 "task_kwargs": kwargs,
             }
-        if self._is_meta_collection_call(method, payload):
+        if self._is_meta_collection_call(method, payload) or method == "awex_execute":
             core_results = self._collective_rpc_all_dp_cores(
                 method, args=(), kwargs=payload
             )

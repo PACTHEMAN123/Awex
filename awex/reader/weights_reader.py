@@ -759,6 +759,9 @@ class WorkerWeightsReader:
         logger.info(
             f"Start to flush cache for step {step_id} for rank {self.transfer_rank}"
         )
+        post_update = getattr(self.weight_converter, "post_update", None)
+        if callable(post_update):
+            post_update(self.model)
         flash_cache_success = self.scheduler.flush_cache()
         assert flash_cache_success, "Cache flush failed after updating weights"
         logger.info(
