@@ -147,13 +147,14 @@ def request(url, payload=None, timeout=120, headers=None):
         return json.load(response) if payload is not None else response.status
 
 
-def generation(endpoint, model_path):
+def generation(endpoint, model_path, base_model=False):
     content = "Compute 2 + 3. Answer briefly."
     response = request(
-        endpoint + "/v1/chat/completions",
+        endpoint + ("/v1/completions" if base_model else "/v1/chat/completions"),
         {
             "model": model_path,
-            "messages": [{"role": "user", "content": content}],
+            **({"prompt": content + "\nAnswer:"} if base_model else
+               {"messages": [{"role": "user", "content": content}]}),
             "temperature": 0,
             "seed": 42,
             "max_tokens": 64,
@@ -169,7 +170,8 @@ def generation(endpoint, model_path):
         raise RuntimeError("Generation did not produce tokens")
     # Reasoning models can spend the short smoke budget entirely in reasoning.
     return {
-        "message": response["choices"][0]["message"],
+        "message": ({"role": "assistant", "content": response["choices"][0]["text"]}
+                    if base_model else response["choices"][0]["message"]),
         "usage": response.get("usage"),
     }
 
@@ -265,6 +267,7 @@ def main():
     try:
         environment = {
             "SHARDSTREAM_BENCH_ENABLE_AWEX": "1" if args.publication_mechanism == "awex_native_nccl" else "0",
+            "SHARDSTREAM_BENCH_NATIVE_MULTIRAIL": "1" if args.publication_mechanism.startswith("verl_native_") else "0",
             "SHARDSTREAM_BENCH_EXTRA_PYTHONPATH": args.extra_python_path,
             "SHARDSTREAM_BENCH_EXTRA_LIBRARY_PATH": args.extra_library_path,
             "SHARDSTREAM_BENCH_WARMUP": str(args.warmup_updates),
@@ -347,10 +350,11 @@ def main():
                         raise TimeoutError("vLLM health timeout")
                     time.sleep(3)
         urls = [f"http://{host}:{port}" for _, host, port in endpoints]
-        record["generation_before"] = [generation(url, args.model_path) for url in urls]
+        record["generation_before"] = [generation(url, args.model_path,
+                                                  recipe.id == 'moonlight-16b-a3b') for url in urls]
         if recipe.rollout["dp"] > 1:
             record["generation_before_repeat"] = [
-                generation(url, args.model_path) for url in urls
+                generation(url, args.model_path, recipe.id == 'moonlight-16b-a3b') for url in urls
             ]
             if [r["message"] for r in record["generation_before"]] != [
                 r["message"] for r in record["generation_before_repeat"]
@@ -425,7 +429,8 @@ def main():
             if time.monotonic() >= deadline:
                 raise TimeoutError("Transfer timeout")
             time.sleep(3)
-        record["generation_after"] = [generation(url, args.model_path) for url in urls]
+        record["generation_after"] = [generation(url, args.model_path,
+                                                 recipe.id == 'moonlight-16b-a3b') for url in urls]
         if [result["message"] for result in record["generation_before"]] != [
             result["message"] for result in record["generation_after"]
         ]:

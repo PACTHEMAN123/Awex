@@ -23,7 +23,14 @@ def configure_rank_affinity(local_rank, *, physical_gpu=None):
             os.sched_setaffinity(int(thread.name), cpus)
         except ProcessLookupError:
             pass
-    os.environ["NCCL_IB_HCA"] = entry["hca"]
+    hca = entry["hca"]
+    if os.environ.get("SHARDSTREAM_BENCH_NATIVE_MULTIRAIL") == "1":
+        from shardstream.topology import _active_rdma_endpoints
+        endpoints = _active_rdma_endpoints()
+        if len(endpoints) != 4:
+            raise RuntimeError("Native baseline requires four selected RDMA ports")
+        hca = "=" + ",".join(f"{endpoint.name}:{endpoint.port}" for endpoint in endpoints)
+    os.environ["NCCL_IB_HCA"] = hca
     os.environ["SHARDSTREAM_HCA_POLICY"] = "topology"
     print(
         "SHARDSTREAM_RANK_AFFINITY "
@@ -31,7 +38,7 @@ def configure_rank_affinity(local_rank, *, physical_gpu=None):
             {
                 "pid": os.getpid(),
                 "physical_gpu": physical_gpu,
-                "hca": entry["hca"],
+                "hca": hca,
                 "numa": entry["numa"],
                 "cpus": sorted(os.sched_getaffinity(0)),
                 "before_nccl_init": True,

@@ -12,6 +12,7 @@ import importlib
 import inspect
 import multiprocessing
 import os
+from pathlib import Path
 import pickle
 import threading
 import time
@@ -127,6 +128,24 @@ def _engine_class(backend):
 
 
 def _new_engine(backend, config, master):
+    from shardstream.topology import _active_rdma_endpoints
+    ports = [f'{endpoint.name}:{endpoint.port}' for endpoint in _active_rdma_endpoints()]
+    if len(ports) != 4:
+        raise RuntimeError(f'Expected four RDMA ports, found {ports}')
+    if backend == 'nccl':
+        os.environ.update(NCCL_IB_HCA='='+','.join(ports), NCCL_NET_GDR_LEVEL='SYS',
+                          NCCL_MIN_NCHANNELS='32', NCCL_MAX_NCHANNELS='64', NCCL_CROSS_NIC='1')
+    elif backend == 'nixl':
+        os.environ.update(UCX_NET_DEVICES=','.join(ports), UCX_MAX_RMA_RAILS='4',
+                          UCX_MAX_RNDV_RAILS='4', UCX_MAX_EAGER_RAILS='4',
+                          UCX_RNDV_SCHEME='get_zcopy', UCX_IB_GID_INDEX='3')
+    elif backend == 'mooncake' and master:
+        names = [port.split(':')[0] for port in ports]
+        topology = {f'cuda:{i}': [names, []] for i in range(8)}
+        topology.update({f'cpu:{i}': [names, []] for i in range(2)})
+        path = Path('/tmp') / ('mooncake-' + config['group_name'] + '.json')
+        path.write_text(__import__('json').dumps(topology))
+        os.environ['MC_CUSTOM_TOPO_JSON'] = str(path)
     engine_class = _engine_class(backend)
     if backend in ("nccl", "nixl"):
         import cupy
@@ -304,7 +323,7 @@ class NativePublication(PublicationMechanism):
             return {key: value[rank] for key, value in mapping.items() if key != "method"}
         rollout_kwargs = [kwargs_at(rollout, rank) for rank in range(len(metadata))]
         future = self.control.submit(_request_endpoints, endpoints, "publication_configure", {
-            engine: {"rank_kwargs": _encode(rollout_kwargs)}
+            engine: {"config": {"rank_kwargs": _encode(rollout_kwargs)}}
             for engine, _, _ in endpoints}, self.timeout_seconds)
         self.engine.init_process_group(**kwargs_at(actors, 0))
         self.preparation = future.result()
