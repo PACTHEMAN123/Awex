@@ -23,6 +23,20 @@ class ModelRecipe:
     separate_nodes: bool
     max_total_gpus: int
 
+    def with_layout(self, layout: str | None) -> ModelRecipe:
+        if layout is None:
+            return self
+        repository = recipe_repository()
+        layouts = json.loads((repository / "benchmarks/recipes/layouts.json").read_text())["layouts"]
+        matches = [entry for entry in layouts if entry["id"] == layout and entry["model"] == self.id]
+        if len(matches) != 1:
+            raise ValueError(f"Unknown layout {layout} for {self.id}")
+        entry = matches[0]
+        recipe = replace(self, training={**self.training, **entry["training"]},
+                         rollout={**self.rollout, **entry["rollout"]})
+        recipe.validate(repository)
+        return recipe
+
     def with_rollout_replicas(self, replicas: int | None) -> ModelRecipe:
         if replicas is None:
             return self
@@ -145,12 +159,16 @@ class ModelRecipe:
                 )
 
 
-def load_recipes(repository: Path | None = None) -> dict[str, ModelRecipe]:
-    repository = repository or Path(
+def recipe_repository() -> Path:
+    return Path(
         os.environ.get(
             "SHARDSTREAM_RECIPE_REPOSITORY", Path(__file__).resolve().parents[2]
         )
     )
+
+
+def load_recipes(repository: Path | None = None) -> dict[str, ModelRecipe]:
+    repository = repository or recipe_repository()
     raw = json.loads((repository / "benchmarks/recipes/models.json").read_text())
     recipes = {}
     for entry in raw["recipes"]:

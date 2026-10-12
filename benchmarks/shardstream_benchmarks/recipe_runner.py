@@ -200,6 +200,7 @@ def main():
     parser.add_argument("--num-updates", type=int, default=3)
     parser.add_argument("--warmup-updates", type=int, default=1)
     parser.add_argument("--publication-mechanism", default="shardstream")
+    parser.add_argument("--layout")
     parser.add_argument("--publication-bucket-mb", type=int, default=256)
     parser.add_argument("--model-weight-profile", action="store_true")
     parser.add_argument("--extra-python-path", default="")
@@ -218,7 +219,7 @@ def main():
     signal.signal(signal.SIGTERM, terminate)
     signal.signal(signal.SIGINT, terminate)
     pinned_recipe = load_recipes()[args.recipe]
-    recipe = pinned_recipe.with_rollout_replicas(args.rollout_replicas)
+    recipe = pinned_recipe.with_layout(args.layout).with_rollout_replicas(args.rollout_replicas)
     recipe.validate_placement(args.training_hosts, args.rollout_hosts)
     import ray
     from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
@@ -241,6 +242,7 @@ def main():
     training = []
     record = {
         "recipe": recipe.id,
+        "layout": args.layout,
         "source": recipe.source,
         "training": recipe.training,
         "rollout": recipe.rollout,
@@ -392,6 +394,8 @@ def main():
             train_args.extend(["--inference-endpoint", f"{engine},{host},{port}"])
         if args.rollout_replicas is not None:
             train_args.extend(["--rollout-replicas", str(args.rollout_replicas)])
+        if args.layout is not None:
+            train_args.extend(["--layout", args.layout])
         for node_rank, actor in enumerate(training):
             torchrun = [
                 "-m",

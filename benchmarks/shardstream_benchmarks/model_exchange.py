@@ -780,7 +780,7 @@ def main(args):
     provider_overrides = None
     fp32_parameter_suffixes = ()
     if args.recipe:
-        recipe = load_recipes()[args.recipe].with_rollout_replicas(
+        recipe = load_recipes()[args.recipe].with_layout(args.layout).with_rollout_replicas(
             args.rollout_replicas
         )
         if not args.remote_inference:
@@ -925,6 +925,7 @@ if __name__ == "__main__":
         "--recipe",
         choices=tuple(load_recipes()),
     )
+    parser.add_argument("--layout")
     parser.add_argument("--rollout-replicas", type=_positive_int)
     parser.add_argument(
         "--resize-after",

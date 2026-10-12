@@ -15,6 +15,34 @@ def test_recipe_gpu_counts_and_cross_node_placement():
         recipe.validate_placement(hosts, rollout_hosts)
 
 
+def test_expanded_layouts_fit_budget_and_preserve_model_semantics():
+    import json
+    from pathlib import Path
+
+    repository = Path(__file__).resolve().parents[1]
+    layouts = json.loads((repository / "benchmarks/recipes/layouts.json").read_text())["layouts"]
+    for entry in layouts:
+        base = load_recipes()[entry["model"]]
+        recipe = base.with_layout(entry["id"])
+        assert recipe.training["world_size"] + recipe.rollout["world_size"] <= 32
+        assert recipe.provider_overrides == base.provider_overrides
+        assert recipe.fp32_parameter_suffixes == base.fp32_parameter_suffixes
+        recipe.validate_placement(
+            ["train0", "train1"] if recipe.training["world_size"] == 16 else ["train0"],
+            ["infer0", "infer1"] if recipe.rollout["world_size"] == 16 else
+            (["infer0", "infer1", "infer2"] if recipe.rollout["world_size"] == 24 else ["infer0"]),
+        )
+
+
+def test_layout_cannot_be_applied_to_another_model_or_overbooked():
+    recipes = load_recipes()
+    with pytest.raises(ValueError, match="Unknown layout"):
+        recipes["glm-4.7-flash"].with_layout("qwen8-tp2-pp2-r4tp4")
+    recipe = recipes["qwen3-8b"].with_layout("qwen8-tp2-pp2-r2tp8")
+    with pytest.raises(ValueError, match="GPU budget"):
+        recipe.with_rollout_replicas(3)
+
+
 def test_glm_vllm_dp_expert_group_uses_eight_rollout_gpus():
     recipe = load_recipes()["glm-4.7-flash"]
     assert recipe.rollout["attention_dp"] == 8
