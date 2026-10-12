@@ -154,6 +154,37 @@
       "mtp": false,
       "separate_nodes": true,
       "max_total_gpus": 32
+    },
+    {
+      "id": "moonlight-16b-a3b",
+      "model": "moonshotai/Moonlight-16B-A3B",
+      "source": {
+        "repo": "THUDM/slime",
+        "revision": "c9337875b917da4263ec5c55308e75a266334c63",
+        "path": "scripts/run-moonlight-16B-A3B.sh",
+        "sha256": "c27ae09b5edd2058524c25a6860036b2b0f00c487d29c5f672b54094deb734bc",
+        "snapshot": "benchmarks/recipes/upstream/moonlight-16b-a3b/run-moonlight-16B-A3B.sh"
+      },
+      "training": {
+        "tp": 4,
+        "pp": 1,
+        "cp": 1,
+        "ep": 8,
+        "etp": 1,
+        "world_size": 8
+      },
+      "rollout": {
+        "engine": "vllm",
+        "tp": 4,
+        "attention_dp": 1,
+        "ep": 1,
+        "instances": 6,
+        "world_size": 24,
+        "dp": 1
+      },
+      "mtp": false,
+      "separate_nodes": true,
+      "max_total_gpus": 32
     }
   ]
 }

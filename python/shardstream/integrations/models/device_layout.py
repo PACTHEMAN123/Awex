@@ -8,6 +8,7 @@ STATIC_DEVICE_LAYOUT_ARCHITECTURES = {
     "Qwen3_5ForConditionalGeneration",
     "GptOssForCausalLM",
     "Glm4MoeLiteForCausalLM",
+    "DeepseekV3ForCausalLM",
 }
 
 
@@ -16,7 +17,7 @@ def annotate_device_transfer_plan(plan, architecture, hf_config):
         from .qwen3_5 import annotate_qwen35_transfer_plan
 
         return annotate_qwen35_transfer_plan(plan, hf_config)
-    if architecture == "Glm4MoeLiteForCausalLM":
+    if architecture in ("Glm4MoeLiteForCausalLM", "DeepseekV3ForCausalLM"):
         return 0
     from .qwen3 import annotate_qwen3_dense_transfer_plan
 

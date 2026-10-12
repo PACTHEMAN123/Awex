@@ -48,7 +48,7 @@ class ModelRecipe:
     def fp32_parameter_suffixes(self) -> tuple[str, ...]:
         if self.id == "qwen3.5-9b":
             return (".self_attention.A_log",)
-        if self.id == "glm-4.7-flash":
+        if self.id in ("glm-4.7-flash", "moonlight-16b-a3b"):
             return (".mlp.router.weight", ".mlp.router.bias", ".mlp.router.expert_bias")
         return ()
 
@@ -79,6 +79,9 @@ class ModelRecipe:
         ]
         if rollout["ep"] > 1:
             args.append("--enable-expert-parallel")
+        if self.id == "moonlight-16b-a3b":
+            # This pinned local checkpoint includes its tokenizer implementation.
+            args.append("--trust-remote-code")
         if self.id in ("qwen3.5-9b", "qwen2.5-vl-7b"):
             # This benchmark submits text requests, so encoder profiling is unnecessary.
             args.append("--skip-mm-profiling")

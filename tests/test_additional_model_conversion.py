@@ -20,6 +20,11 @@ from shardstream.integrations.models.gpt_oss import (
     GPTOSSVLLMWeightConverter,
     _build_mcore_converter_gpt_oss,
 )
+from shardstream.integrations.models.moonlight import (
+    MoonlightShardingStrategy,
+    MoonlightVLLMWeightConverter,
+    _build_mcore_converter_moonlight,
+)
 from shardstream.integrations.models.qwen2_5_vl import (
     Qwen25VLVLLMWeightConverter,
     _build_mcore_converter_qwen25_vl,
@@ -80,6 +85,7 @@ def mcore(factory, ep=1, ep_rank=0):
         ("Qwen3_5ForConditionalGeneration", Qwen3_5VLLMWeightConverter),
         ("Qwen2_5_VLForConditionalGeneration", Qwen25VLVLLMWeightConverter),
         ("GptOssForCausalLM", GPTOSSVLLMWeightConverter),
+        ("DeepseekV3ForCausalLM", MoonlightVLLMWeightConverter),
     ],
 )
 def test_registry_selects_vllm_model_converter(architecture, converter):
@@ -87,7 +93,7 @@ def test_registry_selects_vllm_model_converter(architecture, converter):
         get_infer_weights_converter(
             "vllm",
             architecture,
-            config(),
+            moonlight_config() if architecture == "DeepseekV3ForCausalLM" else config(),
             NS(tp_rank=0, ep_rank=0),
             NS(tp_size=1, ep_size=1),
         ),
@@ -414,6 +420,62 @@ def glm_train():
         {"infer_atten_tp_size": 1, "train_pp_stage_layer_id_map": {"1:0": {0: 24}}},
         NS(),
     )
+
+
+def moonlight_config():
+    cfg = glm_config()
+    cfg.q_lora_rank = None
+    cfg.num_hidden_layers = 27
+    cfg.num_nextn_predict_layers = 0
+    return cfg
+
+
+def test_moonlight_uncompressed_query_and_shared_experts_match_inference_storage():
+    cfg = moonlight_config()
+    train = _build_mcore_converter_moonlight()(
+        cfg,
+        NS(tp_size=2, attn_tp_size=2, attn_tp_rank=0, ep_size=8,
+           ep_rank=3, pp_size=1, pp_rank=0),
+        {"infer_atten_tp_size": 2},
+        NS(),
+    )
+    converter = MoonlightVLLMWeightConverter(
+        cfg, NS(tp_size=2, ep_size=1), NS(tp_rank=0, ep_rank=0)
+    )
+    query = torch.arange(32).reshape(4, 8).float()
+    [(name, value)] = train.convert_param(
+        "decoder.layers.1.self_attention.linear_q_proj.weight", query
+    )
+    assert name == "model.layers.1.self_attn.q_proj.weight"
+    assert dict(converter.convert_param(name, value))[name].data_ptr() == query.data_ptr()
+    fused = torch.arange(64).reshape(8, 8).float()
+    outputs = dict(train.convert_param(
+        "decoder.layers.1.mlp.shared_experts.linear_fc1.weight", fused
+    ))
+    assert set(outputs) == {
+        "model.layers.1.mlp.shared_experts.gate_proj.weight",
+        "model.layers.1.mlp.shared_experts.up_proj.weight",
+    }
+    assert torch.equal(outputs["model.layers.1.mlp.shared_experts.gate_proj.weight"], fused[:4])
+    assert torch.equal(outputs["model.layers.1.mlp.shared_experts.up_proj.weight"], fused[4:])
+    assert all(value.untyped_storage().data_ptr() == fused.untyped_storage().data_ptr()
+               for value in outputs.values())
+
+
+def test_moonlight_replicated_mla_projection_and_shared_expert_tp_are_distinct():
+    strategy = MoonlightShardingStrategy(
+        engine_name="vllm", enable_dp_attention=False, enable_dp_lm_head=False,
+        moe_dense_tp_size=2, tp_size=2, ep_size=1, ep_tp_size=1,
+        rank_info=NS(tp_size=2, attn_tp_size=2), hf_config=moonlight_config(),
+    )
+    assert strategy.get_sharding_strategy(
+        "model.layers.1.self_attn.kv_a_proj_with_mqa.weight",
+        param_meta={"shape": [6, 8]},
+    ) == (ShardingType.NO_SHARDING, 0, 1)
+    assert strategy.get_sharding_strategy(
+        "model.layers.1.mlp.shared_experts.gate_proj.weight",
+        param_meta={"shape": [4, 8]},
+    ) == (ShardingType.TP_SHARDING, 0, 2)
 
 
 @pytest.mark.parametrize("mtp", [False, True])
