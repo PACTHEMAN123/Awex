@@ -13,8 +13,15 @@ import torch
 from shardstream.profiling.compute import BackgroundBF16Compute
 
 
+def version_marker_factor(version, period=None):
+    if period is not None and period < 1:
+        raise ValueError("Marker period must be positive")
+    index = version + 2
+    return 1 + (index if period is None else index % period) / 64
+
+
 class ModelWeightProfile:
-    def __init__(self, model, marker_mode="constant"):
+    def __init__(self, model, marker_mode="constant", marker_period=None):
         self.parameters = dict(model.named_parameters())
         if not self.parameters or any(
             p.dtype not in (torch.bfloat16, torch.float32)
@@ -24,6 +31,8 @@ class ModelWeightProfile:
         if marker_mode not in ("constant", "scale"):
             raise ValueError("Unknown final norm marker mode")
         self.marker_mode = marker_mode
+        version_marker_factor(0, marker_period)
+        self.marker_period = marker_period
         self.references = {
             name: parameter.detach().clone()
             for name, parameter in self.parameters.items()
@@ -54,7 +63,7 @@ class ModelWeightProfile:
             for name, parameter in self.parameters.items():
                 expected = self.references[name]
                 if name == self.norm_name:
-                    factor = 1 + (version + 2) / 64
+                    factor = version_marker_factor(version, self.marker_period)
                     expected = (
                         expected * factor if self.marker_mode == "scale"
                         else torch.full_like(expected, factor)
@@ -70,6 +79,7 @@ class ModelWeightProfile:
                 "version": version,
                 "parameter_count": len(self.parameters),
                 "marker_mode": self.marker_mode,
+                "marker_period": self.marker_period,
                 "allocated_bytes": torch.cuda.memory_allocated() if torch.cuda.is_available() else 0,
                 "peak_allocated_bytes": torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0,
                 "model_bytes": sum(
@@ -99,13 +109,13 @@ class ModelWeightProfile:
         }
 
 
-def model_profile_task(operation: str, version: int, marker_mode="constant", **kwargs):
+def model_profile_task(operation: str, version: int, marker_mode="constant", marker_period=None, **kwargs):
     scheduler = kwargs["model_context"]["scheduler"]
     profile = getattr(scheduler, "_shardstream_model_weight_profile", None)
     if profile is None:
-        profile = ModelWeightProfile(kwargs["model"], marker_mode)
+        profile = ModelWeightProfile(kwargs["model"], marker_mode, marker_period)
         scheduler._shardstream_model_weight_profile = profile
-    elif profile.marker_mode != marker_mode:
+    elif profile.marker_mode != marker_mode or profile.marker_period != marker_period:
         raise ValueError("Cannot change marker mode after taking model references")
     result = profile.command(operation, version)
     reader = getattr(scheduler, "shardstream_weights_reader", None)

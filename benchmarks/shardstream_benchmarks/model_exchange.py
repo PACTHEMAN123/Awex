@@ -552,7 +552,8 @@ class MultiVLLMWeightsExchangeIT:
                         "Expected the main final norm on the last pipeline stage"
                     )
                 if markers:
-                    factor = 1 + (version + 2) / 64
+                    from shardstream.profiling.model import version_marker_factor
+                    factor = version_marker_factor(version, getattr(self, "marker_period", None))
                     if getattr(self, "marker_mode", "constant") == "scale":
                         if not hasattr(self, "_original_final_norm"):
                             self._original_final_norm = markers[0].detach().clone()
@@ -658,7 +659,8 @@ class MultiVLLMWeightsExchangeIT:
         return self.endpoint_command(
             "areal_shardstream_model_profile",
             {"operation": operation, "version": version,
-             "marker_mode": getattr(self, "marker_mode", "constant")},
+             "marker_mode": getattr(self, "marker_mode", "constant"),
+             "marker_period": getattr(self, "marker_period", None)},
             endpoints,
         )
 
@@ -867,6 +869,9 @@ def main(args):
         args.elastic_model_profile or args.model_weight_profile
     )
     weights_exchange_it.marker_mode = "scale" if args.model_weight_profile else "constant"
+    # Keep all versions distinct, with the final publication restoring the
+    # original checkpoint for the deterministic before/after generation check.
+    weights_exchange_it.marker_period = args.num_updates if args.model_weight_profile else None
     weights_exchange_it.elastic_records = []
     joins = dict(zip(args.join_after, args.target_engines))
     epoch = 0
@@ -896,6 +901,7 @@ def main(args):
                         "model_path": args.model_path,
                         "dtype": "bfloat16",
                         "real_model_weights": True,
+                        "marker_period": weights_exchange_it.marker_period,
                         "train_world_size": weights_exchange_it.world_size,
                         "inference_tp_size": args.vllm_tp_size,
                         "initialization_phases": weights_exchange_it.initialization_phases,

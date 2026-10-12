@@ -138,6 +138,7 @@ class ShardStreamModelProfileRequest(OpenAIBaseModel):
     operation: str
     version: int = 0
     marker_mode: str = "constant"
+    marker_period: int | None = None
 
 
 class PublicationInitRequest(OpenAIBaseModel):
@@ -633,6 +634,7 @@ def register_shardstream_plugin() -> None:
                 operation=request.operation,
                 version=request.version,
                 marker_mode=request.marker_mode,
+                marker_period=request.marker_period,
             )
             return JSONResponse(content={"success": True, "ranks": results})
         except Exception as exc:
