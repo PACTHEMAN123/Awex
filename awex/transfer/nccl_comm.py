@@ -14,6 +14,9 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+import faulthandler
+import hashlib
+import json
 import math
 import os
 import subprocess
@@ -541,6 +544,30 @@ def _run_p2p_op(op: dist.P2POp, async_op: bool) -> Optional[dist.Work]:
     raise ValueError(f"Unsupported P2P op type: {op.op}")
 
 
+def _p2p_wire_contracts(ops: Sequence[dist.P2POp]) -> dict:
+    """Describe each ordered wire sequence without reading tensor contents.
+
+    A sender's send digest must equal its peer's recv digest. Shape is omitted
+    because NCCL matches element count and dtype, including flattened views.
+    This is used only for explicitly enabled failure diagnostics.
+    """
+    sequences = {}
+    for op in ops:
+        direction = "send" if op.op in (dist.isend, dist.send) else "recv"
+        sequences.setdefault((op.peer, direction), []).append(
+            (str(op.tensor.dtype), op.tensor.numel(), op.tensor.element_size())
+        )
+    contracts = {}
+    for (peer, direction), sequence in sorted(sequences.items()):
+        payload = json.dumps(sequence, separators=(",", ":")).encode()
+        contracts.setdefault(str(peer), {})[direction] = {
+            "count": len(sequence),
+            "bytes": sum(count * size for _, count, size in sequence),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        }
+    return contracts
+
+
 def batch_send_recv(
     send_ops: Optional[Sequence[dist.P2POp]],
     recv_ops: Optional[Sequence[dist.P2POp]],
@@ -575,13 +602,32 @@ def batch_send_recv(
     # Grouped execution path using batch_isend_irecv.
     if use_group:
         all_ops = _interleave_p2p_ops_by_peer(send_ops + recv_ops)
-        works = dist.batch_isend_irecv(all_ops)
-        if not blocking:
-            return works
-        for work in works:
-            work.wait()
-        device_util.synchronize()
-        return []
+        diagnostics = os.environ.get("AWEX_P2P_DIAGNOSTICS") == "1"
+        if diagnostics:
+            logger.info(
+                "P2P diagnostic submit_start contracts=%s",
+                _p2p_wire_contracts(all_ops),
+            )
+            faulthandler.dump_traceback_later(60, repeat=True)
+        try:
+            works = dist.batch_isend_irecv(all_ops)
+            if diagnostics:
+                logger.info(
+                    "P2P diagnostic submit_returned work_count=%s", len(works)
+                )
+            if not blocking:
+                return works
+            for work in works:
+                work.wait()
+            if diagnostics:
+                logger.info("P2P diagnostic wait_returned")
+            device_util.synchronize()
+            if diagnostics:
+                logger.info("P2P diagnostic synchronize_returned")
+            return []
+        finally:
+            if diagnostics:
+                faulthandler.cancel_dump_traceback_later()
 
     # Manual execution path with explicit interleaving and CUDA streams.
     streams = _get_comm_streams() if use_stream else []
