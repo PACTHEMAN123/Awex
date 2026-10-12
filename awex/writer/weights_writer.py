@@ -41,7 +41,6 @@ from awex.util.common import (
     check_train_infer_params_meta,
     compute_statistics,
     from_binary,
-    stripped_env_vars,
 )
 from awex.util.gpu import get_gpu_status
 from awex.util.tensor_util import check_and_log_nan_values
@@ -124,7 +123,6 @@ class WeightsExchangeShardingWriter(WeightExchangeWriter):
             logger.info("Switching IPC backend from cuda to cpu for NPU runtime.")
             self.config["weights_exchange_ipc_backend"] = "cpu"
         logger.info(f"Disable pipeline for weights writer: {self.disable_pipeline}")
-        logger.info(f"Env variables for weights writer: {stripped_env_vars()}")
         self.lock = threading.Lock()
         self.timeout = 10000
         self.initialized = False

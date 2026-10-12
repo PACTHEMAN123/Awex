@@ -39,7 +39,6 @@ from awex.util.common import (
     check_train_infer_params_meta,
     compute_statistics,
     simple_hf_config,
-    stripped_env_vars,
 )
 from awex.util.tensor_util import (
     check_and_log_nan_values,
@@ -719,7 +718,6 @@ class WorkerWeightsReader:
         )
         self.use_batch_send_recv = os.getenv("AWEX_USE_BATCH_SEND_RECV", "1") == "1"
         self.parameters = {}
-        logger.info(f"Env varabbles for weights reader: {stripped_env_vars()}")
         logger.info(
             f"Created weights reader for rank {self.rank_info.global_rank}, engine rank {self.engine_rank}"
         )
