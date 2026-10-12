@@ -167,6 +167,16 @@ def test_fp32_state_survives_checkpoint_loading_into_bf16_model():
     assert model.weight.dtype == torch.bfloat16
 
 
+def test_moonlight_checkpoint_gate_is_not_promoted_by_glm_recipe():
+    recipes = load_recipes()
+    name = "decoder.layers.1.mlp.router.weight"
+    assert name.endswith(recipes["glm-4.7-flash"].fp32_parameter_suffixes)
+    assert not name.endswith(recipes["moonlight-16b-a3b"].fp32_parameter_suffixes)
+    assert "decoder.layers.1.mlp.router.expert_bias".endswith(
+        recipes["moonlight-16b-a3b"].fp32_parameter_suffixes
+    )
+
+
 def test_moonlight_query_spec_keeps_kv_norm_and_original_layer_spec():
     pytest.importorskip("megatron.core")
     from types import SimpleNamespace as NS

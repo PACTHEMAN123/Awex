@@ -62,8 +62,10 @@ class ModelRecipe:
     def fp32_parameter_suffixes(self) -> tuple[str, ...]:
         if self.id == "qwen3.5-9b":
             return (".self_attention.A_log",)
-        if self.id in ("glm-4.7-flash", "moonlight-16b-a3b"):
+        if self.id == "glm-4.7-flash":
             return (".mlp.router.weight", ".mlp.router.bias", ".mlp.router.expert_bias")
+        if self.id == "moonlight-16b-a3b":
+            return (".mlp.router.bias", ".mlp.router.expert_bias")
         return ()
 
     def rollout_arguments(self, model_path: str, host: str, port: int) -> list[str]:

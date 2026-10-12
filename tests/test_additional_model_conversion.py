@@ -478,6 +478,28 @@ def test_moonlight_replicated_mla_projection_and_shared_expert_tp_are_distinct()
     ) == (ShardingType.TP_SHARDING, 0, 2)
 
 
+def test_moonlight_gate_stays_bf16_while_correction_bias_uses_fp32():
+    train = _build_mcore_converter_moonlight()(
+        moonlight_config(),
+        NS(tp_size=1, attn_tp_size=1, attn_tp_rank=0, ep_size=1,
+           ep_rank=0, pp_size=1, pp_rank=0),
+        {"infer_atten_tp_size": 1},
+        NS(),
+    )
+    gate = torch.arange(16, dtype=torch.bfloat16).reshape(2, 8)
+    [(name, value)] = train.convert_param("decoder.layers.1.mlp.router.weight", gate)
+    assert name == "model.layers.1.mlp.gate.weight"
+    assert value.dtype == torch.bfloat16
+    assert value.data_ptr() == gate.data_ptr()
+    bias = torch.tensor([0.5, -0.25], dtype=torch.float32)
+    [(name, value)] = train.convert_param(
+        "decoder.layers.1.mlp.router.expert_bias", bias
+    )
+    assert name == "model.layers.1.mlp.gate.e_score_correction_bias"
+    assert value.dtype == torch.float32
+    assert torch.equal(value, bias)
+
+
 @pytest.mark.parametrize("mtp", [False, True])
 @pytest.mark.parametrize(
     "source_norm,target_norm",

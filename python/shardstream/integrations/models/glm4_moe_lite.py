@@ -141,6 +141,7 @@ def _build_mcore_converter_glm47_flash():
     base = _build_mcore_converter_qwen3_moe()
 
     class GLM47FlashMcoreWeightConverter(base):
+        _router_dtype = "fp32"
         _mla_names = {
             "linear_q_down_proj.weight": "q_a_proj.weight",
             "linear_q_up_proj.weight": "q_b_proj.weight",
@@ -157,7 +158,10 @@ def _build_mcore_converter_glm47_flash():
             config = SimpleNamespace(**vars(hf_config))
             config.num_experts = hf_config.n_routed_experts
             super().__init__(
-                config, rank_info, {**infer_conf, "router_dtype": "fp32"}, tf_config
+                config,
+                rank_info,
+                {**infer_conf, "router_dtype": self._router_dtype},
+                tf_config,
             )
             self._mtp_alias_targets = infer_conf.get("mtp_alias_targets")
 

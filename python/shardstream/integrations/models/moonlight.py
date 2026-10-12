@@ -19,6 +19,9 @@ def _build_mcore_converter_moonlight():
     base = _build_mcore_converter_glm47_flash()
 
     class MoonlightMcoreWeightConverter(base):
+        # Moonlight's vLLM gate and checkpoint are BF16; only the correction
+        # bias uses FP32. GLM's FP32 gate rule must not leak into this adapter.
+        _router_dtype = "bf16"
         # Moonlight has q_lora_rank=None: Megatron emits linear_q_proj instead
         # of the Q-LoRA down/up pair used by GLM. The remaining MLA, shared
         # expert, routed expert and correction-bias mappings are identical.
