@@ -573,6 +573,13 @@ class MultiVLLMWeightsExchangeIT:
         self.publication.publish()
         device_util.synchronize()
         publication_ms = (time.perf_counter() - end_to_end_start) * 1000
+        if (getattr(self, "marker_mode", "constant") == "scale"
+                and version == -1 and self.publication_mechanism_name == "shardstream"):
+            from shardstream.profiling.model import preparation_snapshot
+            emit_profile(logger, event="preparation_snapshot", rank=int(self.rank),
+                         role="writer", step_id=version,
+                         metrics=preparation_snapshot(
+                             self.megatron_engine.weights_exchange_writer, True))
         telemetry_after = (
             self.publication_telemetry() if telemetry_before is not None else None
         )

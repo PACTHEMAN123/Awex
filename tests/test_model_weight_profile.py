@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from shardstream.profiling.model import ModelWeightProfile, version_marker_factor
+from shardstream.profiling.model import ModelWeightProfile, preparation_snapshot, version_marker_factor
 
 
 class TinyMixedModel(torch.nn.Module):
@@ -42,6 +42,28 @@ def test_validation_rejects_replaced_parameters(monkeypatch):
     model.router.data = model.router.detach().clone()
     with pytest.raises(AssertionError, match="replaced"):
         profile.command("clear", 0)
+
+
+@pytest.mark.parametrize("cached", [True, False])
+def test_preparation_snapshot_requires_completed_device_plan(cached):
+    from types import SimpleNamespace
+
+    parameters, plan = {}, object()
+    def prepare(actual_parameters, actual_plan, sender):
+        assert actual_parameters is parameters and actual_plan is plan and sender
+        return {"plan_cache_hit": cached, "native_preparation_phases_ms": {"communicator": 20}}
+    worker = SimpleNamespace(
+        device_parameters=parameters, transfer_plan=plan,
+        device_transport=SimpleNamespace(initialize_prepared_plan=prepare,
+                                        _initialization_phases_ms={"native_create": 30}),
+    )
+    if cached:
+        result = preparation_snapshot(worker, True)
+        assert result["native_preparation_phases_ms"] == {"communicator": 20}
+        assert result["transport_initialization_phases_ms"] == {"native_create": 30}
+    else:
+        with pytest.raises(AssertionError, match="new device plan"):
+            preparation_snapshot(worker, True)
 
 
 @pytest.mark.parametrize("updates", [3, 35])

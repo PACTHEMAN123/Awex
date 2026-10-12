@@ -13,6 +13,24 @@ import torch
 from shardstream.profiling.compute import BackgroundBF16Compute
 
 
+def preparation_snapshot(worker, sender):
+    """Read retained native phase timings after a completed first publication.
+
+    The existing prepare API returns the cached communicator/window timings
+    without launching a transfer or advancing its sequence number.
+    """
+    transport = getattr(worker, "device_transport", None)
+    parameters = getattr(worker, "device_parameters" if sender else "parameters", None)
+    if transport is None or parameters is None:
+        return {"available": False, "reason": "No static device plan"}
+    metrics = transport.initialize_prepared_plan(parameters, worker.transfer_plan, sender)
+    if not metrics.get("plan_cache_hit"):
+        raise AssertionError("Preparation snapshot unexpectedly built a new device plan")
+    return {"available": True, **metrics,
+            "transport_initialization_phases_ms": dict(
+                getattr(transport, "_initialization_phases_ms", {}))}
+
+
 def version_marker_factor(version, period=None):
     if period is not None and period < 1:
         raise ValueError("Marker period must be positive")
@@ -121,4 +139,6 @@ def model_profile_task(operation: str, version: int, marker_mode="constant", mar
     reader = getattr(scheduler, "shardstream_weights_reader", None)
     if reader is not None and operation == "verify":
         result["transfer_metrics"] = getattr(reader, "last_transfer_metrics", {})
+        if version == -1:
+            result["preparation_snapshot"] = preparation_snapshot(reader, False)
     return result
