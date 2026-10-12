@@ -6,6 +6,7 @@ from awex.models.glm4_moe_lite import (GLM47FlashShardingStrategy, GLM47FlashVLL
 from awex.models.gpt_oss import (GPTOSSShardingStrategy, GPTOSSVLLMWeightConverter, _build_mcore_converter_gpt_oss)
 from awex.models.moonlight import (MoonlightShardingStrategy, MoonlightVLLMWeightConverter, _build_mcore_converter_moonlight)
 from awex.sharding.param_sharding import ShardingType
+from awex.meta.train_meta_resolver import _build_pp_stage_layer_id_map, _canonicalize_pp_layer_names_in_global_meta
 
 def config():
     return NS(

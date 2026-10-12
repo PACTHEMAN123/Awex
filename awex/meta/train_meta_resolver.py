@@ -175,6 +175,10 @@ class McoreParamMetaResolver(ParamMetaResolver):
                             "shape": tuple(param.shape),
                             "dtype": param.dtype,
                             "vp_stage": vp_stage,
+                            "layer_id_is_global": bool(
+                                convert_params
+                                and getattr(mcore_to_hf_weight_converter, "is_global_layer_name", lambda name: False)(name)
+                            ),
                         }
                     )
         # use all gather to get the global meta
@@ -248,6 +252,8 @@ def _build_pp_stage_layer_id_map(
         if pp_size is None:
             pp_size = int(rank_info.pp_size)
         for param_meta in rank_meta["params_meta"]:
+            if param_meta.get("layer_id_is_global", False):
+                continue
             local_layer_id = _extract_layer_id_from_param_name(param_meta["name"])
             if local_layer_id is None:
                 continue
@@ -288,6 +294,8 @@ def _canonicalize_pp_layer_names_in_global_meta(
         rank_info: RankInfo = rank_meta["rank_info"]
         pp_rank = int(rank_info.pp_rank)
         for param_meta in rank_meta["params_meta"]:
+            if param_meta.get("layer_id_is_global", False):
+                continue
             local_layer_id = _extract_layer_id_from_param_name(param_meta["name"])
             if local_layer_id is None:
                 continue

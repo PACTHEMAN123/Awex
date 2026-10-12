@@ -177,6 +177,14 @@ def _build_mcore_converter_glm47_flash():
             match = re.match(r"model\.layers\.(\d+)\.", name)
             return bool(match and int(match[1]) >= self.hf_config.num_hidden_layers)
 
+        def _canonicalize_source_name(self, name, vp_stage=None):
+            from awex.converter.mcore_converter import _process_mcore_pp_name
+            return _process_mcore_pp_name(
+                name.replace("module.", ""), self.rank_info, self.hf_config,
+                self.tf_config, vp_stage=vp_stage,
+                pp_stage_layer_id_map=self._pp_stage_layer_id_map,
+            )
+
         def _convert_decoder_param(self, name, parameter, vp_stage=None):
             canonical = self._canonicalize_source_name(name, vp_stage)
             if canonical.startswith("decoder.layers."):
