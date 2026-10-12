@@ -82,6 +82,7 @@ struct DeviceState {
   ncclTeam_t world_team{};
   ncclTeam_t lsa_team{};
   int nccl_version = 0;
+  int host_rma_support = -1;
   int logical_rank = 0;
   int rank = 0;
   int world_size = 0;
@@ -201,12 +202,26 @@ std::unique_ptr<DeviceState> make_state(const std::string& unique_id_bytes, int 
   std::memcpy(&unique_id, unique_id_bytes.data(), sizeof(unique_id));
   try {
     time_preparation(state.get(), "nccl_communicator", [&] {
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 29, 0)
+      // This communicator serves Device API kernels and metadata collectives,
+      // never host RMA calls. Host RMA otherwise registers extra signal windows
+      // with COLL_SYMMETRIC at the first FIFO registration, initializing unused
+      // symmetric collective resources as well. Device GIN remains enabled.
+      ncclConfig_t config = NCCL_CONFIG_INITIALIZER;
+      config.numRmaCtx = 0;
+      SHARDSTREAM_NCCL_CHECK(ncclCommInitRankConfig(&state->comm, world_size, unique_id,
+                                                  state->rank, &config));
+#else
       SHARDSTREAM_NCCL_CHECK(ncclCommInitRank(&state->comm, world_size, unique_id, state->rank));
+#endif
       return 0;
     });
 
     ncclCommProperties_t properties = NCCL_COMM_PROPERTIES_INITIALIZER;
     SHARDSTREAM_NCCL_CHECK(ncclCommQueryProperties(state->comm, &properties));
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 31, 0)
+    state->host_rma_support = properties.hostRmaSupport ? 1 : 0;
+#endif
     if (!properties.deviceApiSupport) {
       throw std::runtime_error("The loaded NCCL communicator does not support the Device API");
     }
@@ -846,6 +861,8 @@ Metrics launch(int64_t handle, const std::vector<TensorView>& tensors, const std
     metrics["native_preparation_phases_ms"] = phases;
   }
   metrics["communicator_rank"] = std::int64_t(state->rank);
+  // -1 means the compiled NCCL header cannot report this property.
+  metrics["host_rma_support"] = std::int64_t(state->host_rma_support);
   metrics["lsa_team_size"] = std::int64_t(state->lsa_team.nRanks);
   metrics["work_count"] = std::int64_t(schedule.works.size());
   metrics["fragment_count"] = std::int64_t(schedule.fragments.size());
