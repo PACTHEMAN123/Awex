@@ -558,6 +558,9 @@ def register_shardstream_plugin() -> None:
     _shardstream_plugin_registered = True
     _patch_shardstream_worker()
     _ensure_router_attached()
+    if os.environ.get("SHARDSTREAM_BENCH_ENABLE_AWEX") == "1":
+        from awex.vllm_plugin import register_awex_plugin
+        register_awex_plugin()
 
     @router.post("/areal_shardstream_init")
     async def shardstream_init(request: ShardStreamInitRequest, raw_request: Request):
@@ -620,6 +623,8 @@ def register_shardstream_plugin() -> None:
             from shardstream.profiling.model import model_profile_task
 
             adapter = getattr(raw_request.app.state, "shardstream_adapter", None)
+            if adapter is None:
+                adapter = getattr(raw_request.app.state, "awex_adapter", None)
             if adapter is None:
                 adapter = _get_publication_adapter(raw_request)
             results = await asyncio.to_thread(

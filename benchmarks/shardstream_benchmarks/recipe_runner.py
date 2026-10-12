@@ -262,6 +262,7 @@ def main():
     }
     try:
         environment = {
+            "SHARDSTREAM_BENCH_ENABLE_AWEX": "1" if args.publication_mechanism == "awex_native_nccl" else "0",
             "SHARDSTREAM_BENCH_EXTRA_PYTHONPATH": args.extra_python_path,
             "SHARDSTREAM_BENCH_EXTRA_LIBRARY_PATH": args.extra_library_path,
             "SHARDSTREAM_BENCH_WARMUP": str(args.warmup_updates),

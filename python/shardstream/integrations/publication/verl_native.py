@@ -10,12 +10,13 @@ import asyncio
 import base64
 import importlib
 import inspect
+import multiprocessing
 import os
 import pickle
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
 import requests
 import torch
@@ -28,6 +29,24 @@ from shardstream.integrations.publication.registry import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _request_endpoints(endpoints, route, payloads, timeout_seconds):
+    # CuPy's blocking NCCL communicator constructor can hold the training
+    # process's GIL. A persistent control process keeps HTTP requests progressing
+    # while that constructor waits for the rollout ranks. Model tensors remain
+    # in the original training/rollout processes throughout the native transfer.
+    with ThreadPoolExecutor(max_workers=len(endpoints)) as executor:
+        futures = [executor.submit(requests.post, f"http://{host}:{port}/{route}",
+                                   json=payloads[engine], timeout=timeout_seconds)
+                   for engine, host, port in endpoints]
+        result = []
+        for endpoint, future in zip(endpoints, futures):
+            response = future.result()
+            if response.status_code != 200:
+                raise RuntimeError(f"Engine {endpoint[0]} {route}: {response.text}")
+            result.extend(_rows(response.json()["results"]))
+        return result
 
 
 def _encode(value):
@@ -245,6 +264,7 @@ class NativePublication(PublicationMechanism):
         self.metadata = None
         self.timeout_seconds = timeout_seconds
         self.last_metrics = {}
+        self.control = None
 
     def initialize_training(self):
         # Bridge uses the same canonical full-tensor export/gather as the
@@ -257,24 +277,16 @@ class NativePublication(PublicationMechanism):
             self.metadata = self.engine.prepare()
 
     def _requests(self, route, payloads):
-        endpoints = publication_endpoints(self.harness)
-        with ThreadPoolExecutor(max_workers=len(endpoints)) as executor:
-            futures = [executor.submit(requests.post, f"http://{host}:{port}/{route}",
-                                       json=payloads[engine], timeout=self.timeout_seconds)
-                       for engine, host, port in endpoints]
-            result = []
-            for endpoint, future in zip(endpoints, futures):
-                response = future.result()
-                if response.status_code != 200:
-                    raise RuntimeError(f"Engine {endpoint[0]} {route}: {response.text}")
-                result.extend(_rows(response.json()["results"]))
-            return result
+        return self.control.submit(_request_endpoints, publication_endpoints(self.harness),
+                                   route, payloads, self.timeout_seconds).result()
 
     def initialize_driver(self):
         harness = self.harness
         world_per_engine = int(harness.inference_config["tp_size"]) * int(
             harness.inference_config.get("dp_size", 1))
         endpoints = publication_endpoints(harness)
+        self.control = ProcessPoolExecutor(max_workers=1,
+                                           mp_context=multiprocessing.get_context('spawn'))
         metadata = []
         # HTTP endpoint order defines the original veRL rollout rank ordering.
         for engine, host, port in endpoints:
@@ -291,12 +303,11 @@ class NativePublication(PublicationMechanism):
         def kwargs_at(mapping, rank):
             return {key: value[rank] for key, value in mapping.items() if key != "method"}
         rollout_kwargs = [kwargs_at(rollout, rank) for rank in range(len(metadata))]
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(self._requests, "publication_configure", {
-                engine: {"rank_kwargs": _encode(rollout_kwargs)}
-                for engine, _, _ in endpoints})
-            self.engine.init_process_group(**kwargs_at(actors, 0))
-            self.preparation = future.result()
+        future = self.control.submit(_request_endpoints, endpoints, "publication_configure", {
+            engine: {"rank_kwargs": _encode(rollout_kwargs)}
+            for engine, _, _ in endpoints}, self.timeout_seconds)
+        self.engine.init_process_group(**kwargs_at(actors, 0))
+        self.preparation = future.result()
 
     def _requests_one(self, host, port, route, payload):
         response = requests.post(f"http://{host}:{port}/{route}", json=payload,
@@ -329,10 +340,10 @@ class NativePublication(PublicationMechanism):
                 count += 1
                 total += weight.numel() * weight.element_size()
                 yield name, weight
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(self._requests, "publication_update", payloads)
-            asyncio.run(self.engine.send_weights(counted(), global_steps=version))
-            receivers = future.result()
+        future = self.control.submit(_request_endpoints, publication_endpoints(harness),
+                                     "publication_update", payloads, self.timeout_seconds)
+        asyncio.run(self.engine.send_weights(counted(), global_steps=version))
+        receivers = future.result()
         torch.cuda.synchronize()
         expected = int(harness.inference_config["tp_size"]) * int(
             harness.inference_config.get("dp_size", 1)) * len(publication_endpoints(harness))
@@ -360,6 +371,9 @@ class NativePublication(PublicationMechanism):
             module = importlib.import_module("verl.checkpoint_engine.nccl_checkpoint_engine")
             module.collective.destroy_collective_group(self.config["group_name"])
         self.engine = None
+        if self.control is not None:
+            self.control.shutdown(wait=True, cancel_futures=True)
+            self.control = None
 
 
 for _backend in ("nccl", "nixl", "mooncake"):
