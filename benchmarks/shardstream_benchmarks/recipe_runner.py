@@ -214,7 +214,13 @@ def main():
     import ray
     from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
-    ray.init(address=args.ray_address)
+    # Ray workers do not inherit the driver's PYTHONPATH when joining a running
+    # cluster. Their imports must resolve against the same pinned node-local
+    # stage used by the child training and inference processes.
+    ray.init(
+        address=args.ray_address,
+        runtime_env={"env_vars": {"PYTHONPATH": args.stage}},
+    )
     nodes = {node["NodeManagerAddress"]: node for node in ray.nodes() if node["Alive"]}
     for host in args.training_hosts + args.rollout_hosts:
         if host not in nodes:
