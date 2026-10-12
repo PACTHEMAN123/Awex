@@ -222,6 +222,7 @@ def main():
     parser.add_argument("--extra-python-path", default="")
     parser.add_argument("--extra-library-path", default="")
     parser.add_argument("--transport-gin-connections", type=int, choices=(1, 2, 4))
+    parser.add_argument("--transport-gin-contexts", type=int, choices=(2, 4, 8, 16))
     parser.add_argument("--transport-max-channels", type=int, choices=(16, 32, 64))
     parser.add_argument("--transport-gin-fifo-depth", type=int, choices=(4, 8, 16))
     parser.add_argument(
@@ -234,6 +235,7 @@ def main():
         name: str(value) for name, value in (
             ("SHARDSTREAM_GIN_CONNECTIONS", args.transport_gin_connections),
             ("NCCL_GIN_NCONNECTIONS", args.transport_gin_connections),
+            ("SHARDSTREAM_GIN_CONTEXTS", args.transport_gin_contexts),
             ("SHARDSTREAM_MAX_CHANNELS", args.transport_max_channels),
             ("SHARDSTREAM_GIN_FIFO_DEPTH", args.transport_gin_fifo_depth),
         ) if value is not None

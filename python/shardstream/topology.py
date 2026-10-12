@@ -327,6 +327,23 @@ def _resolve_gin_connections(gin_connections: int | None) -> int:
     return gin_connections
 
 
+def _resolve_gin_context_count(gin_connections: int, max_channels: int) -> int:
+    configured = os.environ.get("SHARDSTREAM_GIN_CONTEXTS")
+    if configured is None:
+        return min(max_channels, 2 * gin_connections) if gin_connections else 1
+    try:
+        count = int(configured)
+    except ValueError as exc:
+        raise TransportUnavailableError(
+            "SHARDSTREAM_GIN_CONTEXTS must be an integer"
+        ) from exc
+    if count < 1 or count > min(64, max_channels):
+        raise TransportUnavailableError(
+            "transport GIN contexts must be in [1, max_channels], at most 64"
+        )
+    return count
+
+
 def _resolve_gin_fifo_depth(gin_fifo_depth: int | None = None) -> int:
     if gin_fifo_depth is None:
         configured = os.environ.get("SHARDSTREAM_GIN_FIFO_DEPTH")
