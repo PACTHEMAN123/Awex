@@ -68,6 +68,9 @@ class NodeProcesses:
                 assigned[int(index)] for index in gpu_indices.split(",")
             )
         env["PYTHONPATH"] = str(self.stage)
+        extra_pythonpath = env.pop("SHARDSTREAM_BENCH_EXTRA_PYTHONPATH", "")
+        if extra_pythonpath:
+            env["PYTHONPATH"] += ":" + extra_pythonpath
         env["SHARDSTREAM_RECIPE_REPOSITORY"] = str(self.source)
         env["PATH"] = f"{self.runtime}/bin:/usr/local/cuda/bin:" + env.get("PATH", "")
         libs = [
@@ -78,7 +81,8 @@ class NodeProcesses:
             str(self.runtime / "lib/python3.12/site-packages/nvidia/cu13/lib"),
             str(self.runtime / "lib/python3.12/site-packages/torch/lib"),
         ]
-        env["LD_LIBRARY_PATH"] = ":".join(libs) + ":" + env.get("LD_LIBRARY_PATH", "")
+        extra_libs = env.pop("SHARDSTREAM_BENCH_EXTRA_LIBRARY_PATH", "")
+        env["LD_LIBRARY_PATH"] = ":".join(libs) + ":" + extra_libs + ":" + env.get("LD_LIBRARY_PATH", "")
         env.update(
             {
                 "VLLM_PLUGINS": "shardstream_adapter",
@@ -96,7 +100,7 @@ class NodeProcesses:
                 "SHARDSTREAM_RING_SWIZZLE": "1",
                 "SHARDSTREAM_FP8_BLOCKWISE": "0",
                 "SHARDSTREAM_PROFILE": "1",
-                "SHARDSTREAM_PROFILE_WARMUP_UPDATES": "1",
+                "SHARDSTREAM_PROFILE_WARMUP_UPDATES": str(environment.get("SHARDSTREAM_BENCH_WARMUP", 1)),
                 "SHARDSTREAM_PROFILE_SYNC_START": "1",
                 "HF_HUB_OFFLINE": "1",
                 "TRANSFORMERS_OFFLINE": "1",
@@ -195,6 +199,11 @@ def main():
     parser.add_argument("--timeout", type=int, default=3600)
     parser.add_argument("--num-updates", type=int, default=3)
     parser.add_argument("--warmup-updates", type=int, default=1)
+    parser.add_argument("--publication-mechanism", default="shardstream")
+    parser.add_argument("--publication-bucket-mb", type=int, default=256)
+    parser.add_argument("--model-weight-profile", action="store_true")
+    parser.add_argument("--extra-python-path", default="")
+    parser.add_argument("--extra-library-path", default="")
     parser.add_argument(
         "--nccl-lib", default="/tmp/shardstream-prepare-nccl2312/nccl/lib"
     )
@@ -246,9 +255,18 @@ def main():
         "num_updates": args.num_updates,
         "warmup_updates": args.warmup_updates,
         "nccl_lib": args.nccl_lib,
+        "publication_mechanism": args.publication_mechanism,
+        "publication_bucket_mb": args.publication_bucket_mb,
+        "model_weight_profile": args.model_weight_profile,
         "node_placements": {},
     }
     try:
+        environment = {
+            "SHARDSTREAM_BENCH_EXTRA_PYTHONPATH": args.extra_python_path,
+            "SHARDSTREAM_BENCH_EXTRA_LIBRARY_PATH": args.extra_library_path,
+            "SHARDSTREAM_BENCH_WARMUP": str(args.warmup_updates),
+            "SHARDSTREAM_BENCH_RAY_ADDRESS": args.ray_address,
+        }
         for role, hosts, world in [
             ("training", args.training_hosts, recipe.training["world_size"]),
             ("rollout", args.rollout_hosts, recipe.rollout["world_size"]),
@@ -304,7 +322,7 @@ def main():
                     actor.launch.remote(
                         f"rollout-{engine_rank}",
                         recipe.rollout_arguments(args.model_path, host, port),
-                        {"SHARDSTREAM_RECIPE_GPU_INDICES": devices},
+                        {**environment, "SHARDSTREAM_RECIPE_GPU_INDICES": devices},
                     )
                 )
                 endpoints.append((engine_rank, host, port))
@@ -345,7 +363,6 @@ def main():
             "--model-path",
             args.model_path,
             "--remote-inference",
-            "--validate",
             "--num-engines",
             str(recipe.rollout["instances"]),
             "--vllm-tp-size",
@@ -362,7 +379,14 @@ def main():
             args.training_hosts[0],
             "--meta-server-port",
             "18890",
+            "--publication-mechanism", args.publication_mechanism,
+            "--publication-bucket-mb", str(args.publication_bucket_mb),
         ]
+        if args.model_weight_profile:
+            train_args.extend(["--model-weight-profile", "--elastic-output",
+                               str(Path(run_dir) / "training-publications.json")])
+        else:
+            train_args.append("--validate")
         for engine, host, port in endpoints:
             train_args.extend(["--inference-endpoint", f"{engine},{host},{port}"])
         if args.rollout_replicas is not None:
@@ -385,7 +409,7 @@ def main():
                 invocation,
                 *train_args,
             ]
-            ray.get(actor.launch.remote("training", torchrun, {}))
+            ray.get(actor.launch.remote("training", torchrun, environment))
         while True:
             states = ray.get([actor.status.remote() for actor in training])
             codes = [state["training"] for state in states]

@@ -40,3 +40,19 @@ def test_validation_keeps_failures_from_nonzero_dp_ranks():
     results = adapter.execute_task_in_model_worker("shardstream_execute")
     assert len(results) == 2
     assert not all(all(result.values()) for result in results)
+
+
+def test_native_publication_collects_all_dp_results_and_invalidates_caches():
+    from shardstream.integrations.publication.vllm import PublicationVLLMServerAdapter
+
+    events = []
+    adapter = PublicationVLLMServerAdapter(
+        SimpleNamespace(engine_core=SimpleNamespace()), None, 30
+    )
+    adapter.mechanism = "verl_native_nixl"
+    adapter._rpc._collective_rpc_all_dp_cores = lambda *args, **kwargs: [
+        [{"worker_rank": 0}], [{"worker_rank": 1}]
+    ]
+    adapter._rpc._call_engine_async = lambda method: events.append(method)
+    assert adapter.update(2) == [{"worker_rank": 0}, {"worker_rank": 1}]
+    assert events == ["reset_prefix_cache"]

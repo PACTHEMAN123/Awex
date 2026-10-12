@@ -482,7 +482,8 @@ class MultiVLLMWeightsExchangeIT:
             self.train_config, self.mcore_hf_config, self.mcore_model
         )
         self.megatron_engine.publication_bridge = self.mcore_bridge
-        self.megatron_engine.initialize()
+        if self.publication.training_engine_backend is not None:
+            self.megatron_engine.initialize()
         logger.info("Megatron backend initialized")
 
     def setup_megatron(self):
@@ -509,7 +510,7 @@ class MultiVLLMWeightsExchangeIT:
             fp32_parameter_suffixes=self.fp32_parameter_suffixes,
             return_bridge=(
                 self.publication_mechanism_name
-                in ("verl_nccl_broadcast", "verl_native_nccl")
+                in ("verl_native_nccl", "verl_native_nixl", "verl_native_mooncake")
             ),
         )
         if len(loaded) == 3:
@@ -528,13 +529,23 @@ class MultiVLLMWeightsExchangeIT:
                 markers = [
                     p
                     for name, p in self.mcore_model.named_parameters()
-                    if name.endswith("final_layernorm.weight")
+                    if name.endswith("decoder.final_layernorm.weight")
                 ]
-                if len(markers) != 1:
+                from megatron.core import parallel_state as mpu
+
+                expected_count = int(mpu.is_pipeline_last_stage())
+                if len(markers) != expected_count:
                     raise RuntimeError(
-                        "Expected one Megatron final norm version marker (PP1)"
+                        "Expected the main final norm on the last pipeline stage"
                     )
-                markers[0].fill_(1 + (version + 2) / 64)
+                if markers:
+                    factor = 1 + (version + 2) / 64
+                    if getattr(self, "marker_mode", "constant") == "scale":
+                        if not hasattr(self, "_original_final_norm"):
+                            self._original_final_norm = markers[0].detach().clone()
+                        markers[0].copy_(self._original_final_norm * factor)
+                    else:
+                        markers[0].fill_(factor)
             if self.is_driver:
                 self.model_profile("clear", version)
             self._training_barrier()
@@ -566,6 +577,7 @@ class MultiVLLMWeightsExchangeIT:
                     "num_engines": self.inference_config["num_engines"],
                     "ranks": verified,
                     "end_to_end_update_ms": publication_ms,
+                    "backend_metrics": getattr(self.publication, "last_metrics", {}),
                 }
             )
 
@@ -594,7 +606,8 @@ class MultiVLLMWeightsExchangeIT:
     def model_profile(self, operation, version, endpoints=None):
         return self.endpoint_command(
             "areal_shardstream_model_profile",
-            {"operation": operation, "version": version},
+            {"operation": operation, "version": version,
+             "marker_mode": getattr(self, "marker_mode", "constant")},
             endpoints,
         )
 
@@ -799,7 +812,10 @@ def main(args):
         weights_exchange_it.inference_config["debug_mode_config"] = {
             "raise_on_validation_fail": True
         }
-    weights_exchange_it.elastic_model_profile = args.elastic_model_profile
+    weights_exchange_it.elastic_model_profile = (
+        args.elastic_model_profile or args.model_weight_profile
+    )
+    weights_exchange_it.marker_mode = "scale" if args.model_weight_profile else "constant"
     weights_exchange_it.elastic_records = []
     joins = dict(zip(args.join_after, args.target_engines))
     epoch = 0
@@ -882,6 +898,11 @@ if __name__ == "__main__":
         help="Completed-publication boundaries for increasing or decreasing rollout count",
     )
     parser.add_argument("--target-engines", type=_positive_int, nargs="*", default=[])
+    parser.add_argument(
+        "--model-weight-profile",
+        action="store_true",
+        help="Clear and verify every replica outside timing, using scaled final norm versions.",
+    )
     parser.add_argument(
         "--elastic-model-profile",
         action="store_true",

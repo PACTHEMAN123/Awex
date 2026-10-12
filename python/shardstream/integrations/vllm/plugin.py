@@ -137,6 +137,7 @@ class ShardStreamMembershipRequest(OpenAIBaseModel):
 class ShardStreamModelProfileRequest(OpenAIBaseModel):
     operation: str
     version: int = 0
+    marker_mode: str = "constant"
 
 
 class PublicationInitRequest(OpenAIBaseModel):
@@ -146,6 +147,10 @@ class PublicationInitRequest(OpenAIBaseModel):
 
 class PublicationUpdateRequest(OpenAIBaseModel):
     step_id: int
+
+
+class PublicationConfigureRequest(OpenAIBaseModel):
+    config: dict[str, Any]
 
 
 def _to_json_response(success: bool, message: str):
@@ -423,8 +428,14 @@ def _patch_shardstream_worker() -> None:
         receiver = getattr(self, "_publication_receiver", None)
         if receiver is None:
             raise RuntimeError("Publication receiver is not initialized")
-        result = receiver.update(self.model_runner.model, step_id)
+        result = receiver.update(_shardstream_transfer_model(self.model_runner), step_id)
         return _sanitize_for_ipc(result)
+
+    def publication_configure(self, config: dict):
+        receiver = getattr(self, "_publication_receiver", None)
+        if receiver is None:
+            raise RuntimeError("Publication receiver is not initialized")
+        return _sanitize_for_ipc(receiver.configure(config))
 
     def publication_close(self):
         receiver = getattr(self, "_publication_receiver", None)
@@ -440,6 +451,7 @@ def _patch_shardstream_worker() -> None:
     WorkerBase.flush_cache = flush_cache
     WorkerBase.publication_init = publication_init
     WorkerBase.publication_update = publication_update
+    WorkerBase.publication_configure = publication_configure
     WorkerBase.publication_close = publication_close
 
     def _make_shardstream_worker_method(task_module: str, task_qualname: str):
@@ -607,12 +619,15 @@ def register_shardstream_plugin() -> None:
                 raise ValueError("Unsupported model profile command")
             from shardstream.profiling.model import model_profile_task
 
-            adapter = _get_shardstream_adapter(raw_request)
+            adapter = getattr(raw_request.app.state, "shardstream_adapter", None)
+            if adapter is None:
+                adapter = _get_publication_adapter(raw_request)
             results = await asyncio.to_thread(
                 adapter.execute_task_in_model_worker,
                 model_profile_task,
                 operation=request.operation,
                 version=request.version,
+                marker_mode=request.marker_mode,
             )
             return JSONResponse(content={"success": True, "ranks": results})
         except Exception as exc:
@@ -675,6 +690,18 @@ def register_shardstream_plugin() -> None:
         except Exception as exc:
             logger.exception("Publication init failed")
             return _to_json_error(f"Publication init failed: {exc}")
+
+    @router.post("/publication_configure")
+    async def publication_configure(
+        request: PublicationConfigureRequest, raw_request: Request
+    ):
+        try:
+            adapter = _get_publication_adapter(raw_request)
+            results = await asyncio.to_thread(adapter.configure, request.config)
+            return JSONResponse({"success": True, "results": _sanitize_for_ipc(results)})
+        except Exception as exc:
+            logger.exception("Publication topology configuration failed")
+            return _to_json_error(f"Publication topology configuration failed: {exc}")
 
     @router.post("/publication_update")
     async def publication_update(

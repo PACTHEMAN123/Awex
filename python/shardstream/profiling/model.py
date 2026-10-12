@@ -14,12 +14,16 @@ from shardstream.profiling.compute import BackgroundBF16Compute
 
 
 class ModelWeightProfile:
-    def __init__(self, model):
+    def __init__(self, model, marker_mode="constant"):
         self.parameters = dict(model.named_parameters())
         if not self.parameters or any(
-            p.dtype != torch.bfloat16 for p in self.parameters.values()
+            p.dtype not in (torch.bfloat16, torch.float32)
+            for p in self.parameters.values()
         ):
-            raise ValueError("The model-weight benchmark requires all BF16 parameters")
+            raise ValueError("The model-weight benchmark requires BF16/FP32 parameters")
+        if marker_mode not in ("constant", "scale"):
+            raise ValueError("Unknown final norm marker mode")
+        self.marker_mode = marker_mode
         self.references = {
             name: parameter.detach().clone()
             for name, parameter in self.parameters.items()
@@ -28,7 +32,7 @@ class ModelWeightProfile:
         self.compute = None
         self.norm_name = "model.norm.weight"
         if self.norm_name not in self.parameters:
-            raise ValueError("No Qwen3 final norm version marker")
+            raise ValueError("No final norm version marker")
         torch.cuda.synchronize()
 
     def command(self, operation, version):
@@ -48,17 +52,22 @@ class ModelWeightProfile:
             for name, parameter in self.parameters.items():
                 expected = self.references[name]
                 if name == self.norm_name:
-                    expected = torch.full_like(expected, 1 + (version + 2) / 64)
+                    factor = 1 + (version + 2) / 64
+                    expected = (
+                        expected * factor if self.marker_mode == "scale"
+                        else torch.full_like(expected, factor)
+                    )
                 if not torch.equal(parameter, expected):
                     bad.append(name)
             if bad:
                 raise AssertionError(
-                    f"Real model BF16 mismatch at version {version}: {bad[:20]} (total={len(bad)})"
+                    f"Real model mismatch at version {version}: {bad[:20]} (total={len(bad)})"
                 )
             result = {
                 "verified": True,
                 "version": version,
                 "parameter_count": len(self.parameters),
+                "marker_mode": self.marker_mode,
                 "model_bytes": sum(
                     p.numel() * p.element_size() for p in self.parameters.values()
                 ),
@@ -86,12 +95,14 @@ class ModelWeightProfile:
         }
 
 
-def model_profile_task(operation: str, version: int, **kwargs):
+def model_profile_task(operation: str, version: int, marker_mode="constant", **kwargs):
     scheduler = kwargs["model_context"]["scheduler"]
     profile = getattr(scheduler, "_shardstream_model_weight_profile", None)
     if profile is None:
-        profile = ModelWeightProfile(kwargs["model"])
+        profile = ModelWeightProfile(kwargs["model"], marker_mode)
         scheduler._shardstream_model_weight_profile = profile
+    elif profile.marker_mode != marker_mode:
+        raise ValueError("Cannot change marker mode after taking model references")
     result = profile.command(operation, version)
     reader = getattr(scheduler, "shardstream_weights_reader", None)
     if reader is not None and operation == "verify":

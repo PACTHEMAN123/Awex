@@ -69,6 +69,7 @@ def _load_builtin_mechanisms() -> None:
     if _BUILTINS_LOADED:
         return
     importlib.import_module("shardstream.integrations.publication.transport")
+    importlib.import_module("shardstream.integrations.publication.verl_native")
     _BUILTINS_LOADED = True
 
 
