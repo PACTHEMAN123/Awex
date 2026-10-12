@@ -226,6 +226,7 @@ class NativeReceiver:
         count = total = 0
         receive_wait_ms = 0
         started = time.perf_counter()
+        architecture = model.config.architectures[0]
         generator = self.engine.receive_weights(global_steps=step_id)
         async def next_weight():
             return await generator.__anext__()
@@ -242,6 +243,15 @@ class NativeReceiver:
                 receive_wait_ms += (time.perf_counter() - wait_start) * 1000
                 count += 1
                 total += weight.numel() * weight.element_size()
+                if architecture == "GptOssForCausalLM" and name.endswith(
+                    (".down_proj_bias", ".down_proj.bias", ".w2_bias")
+                ):
+                    # vLLM zeros this loader input on nonzero TP ranks. Native
+                    # RDMA engines expose a bucket still being forwarded to
+                    # downstream workers, including later TP-rank-zero owners.
+                    # Keep that shared bucket immutable; only this small bias
+                    # tensor needs a private loader copy.
+                    weight = weight.clone()
                 if hasattr(model, "draft") and name.startswith(
                     f"model.layers.{model.num_hidden_layers}."
                 ):
@@ -255,7 +265,6 @@ class NativeReceiver:
         torch.cuda.synchronize()
         receive_apply_ms = (time.perf_counter() - started) * 1000
         post_started = time.perf_counter()
-        architecture = model.config.architectures[0]
         if architecture in ("Glm4MoeLiteForCausalLM", "DeepseekV3ForCausalLM"):
             from shardstream.integrations.models.glm4_moe_lite import GLM47FlashVLLMWeightConverter
             GLM47FlashVLLMWeightConverter.post_update(None, model)
