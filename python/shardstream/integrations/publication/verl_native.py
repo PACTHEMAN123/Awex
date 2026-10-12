@@ -12,6 +12,7 @@ import importlib
 import inspect
 import os
 import pickle
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -155,6 +156,14 @@ class NativeReceiver:
         started = time.perf_counter()
         self.engine = _new_engine(self.backend, self.config, False)
         metadata = self.engine.prepare()
+        self.loop = asyncio.new_event_loop()
+        device = torch.cuda.current_device()
+        def run_loop():
+            torch.cuda.set_device(device)
+            asyncio.set_event_loop(self.loop)
+            self.loop.run_forever()
+        self.loop_thread = threading.Thread(target=run_loop, daemon=True)
+        self.loop_thread.start()
         return {"worker_rank": self.worker_rank, "metadata": _encode(metadata),
                 "prepare_ms": (time.perf_counter() - started) * 1000}
 
@@ -166,29 +175,48 @@ class NativeReceiver:
                 "group_ms": (time.perf_counter() - started) * 1000}
 
     def update(self, model, step_id):
-        async def receive():
-            count = total = 0
-            load_ms = 0
-            started = time.perf_counter()
-            async for name, weight in self.engine.receive_weights(global_steps=step_id):
-                load_start = time.perf_counter()
-                _load_one(model, name, weight)
-                load_ms += (time.perf_counter() - load_start) * 1000
+        count = total = 0
+        receive_wait_ms = 0
+        started = time.perf_counter()
+        generator = self.engine.receive_weights(global_steps=step_id)
+        async def next_weight():
+            return await generator.__anext__()
+        def weights():
+            nonlocal count, total, receive_wait_ms
+            while True:
+                wait_start = time.perf_counter()
+                try:
+                    name, weight = asyncio.run_coroutine_threadsafe(
+                        next_weight(), self.loop
+                    ).result(timeout=self.config["timeout_seconds"])
+                except StopAsyncIteration:
+                    break
+                receive_wait_ms += (time.perf_counter() - wait_start) * 1000
                 count += 1
                 total += weight.numel() * weight.element_size()
-            torch.cuda.synchronize()
-            post_started = time.perf_counter()
-            architecture = model.config.architectures[0]
-            if architecture in ("Glm4MoeLiteForCausalLM", "DeepseekV3ForCausalLM"):
-                from shardstream.integrations.models.glm4_moe_lite import GLM47FlashVLLMWeightConverter
-                # MLA absorbed weights depend on the transferred kv_b projection.
-                GLM47FlashVLLMWeightConverter.post_update(None, model)
-            torch.cuda.synchronize()
-            return {"worker_rank": self.worker_rank, "received_tensors": count,
-                    "payload_bytes": total, "load_enqueue_ms": load_ms,
-                    "postprocess_ms": (time.perf_counter() - post_started) * 1000,
-                    "receive_apply_ms": (time.perf_counter() - started) * 1000}
-        return asyncio.run(receive())
+                if hasattr(model, "draft") and name.startswith(
+                    f"model.layers.{model.num_hidden_layers}."
+                ):
+                    _load_one(model, name, weight)
+                else:
+                    yield name, weight
+        # Consume each bucket view before advancing the native async iterator;
+        # keep vLLM's original loader initialized once for the full update.
+        target = getattr(model, "target", model)
+        target.load_weights(weights())
+        torch.cuda.synchronize()
+        receive_apply_ms = (time.perf_counter() - started) * 1000
+        post_started = time.perf_counter()
+        architecture = model.config.architectures[0]
+        if architecture in ("Glm4MoeLiteForCausalLM", "DeepseekV3ForCausalLM"):
+            from shardstream.integrations.models.glm4_moe_lite import GLM47FlashVLLMWeightConverter
+            GLM47FlashVLLMWeightConverter.post_update(None, model)
+        torch.cuda.synchronize()
+        return {"worker_rank": self.worker_rank, "received_tensors": count,
+                "payload_bytes": total, "receive_wait_ms": receive_wait_ms,
+                "load_apply_ms": receive_apply_ms - receive_wait_ms,
+                "postprocess_ms": (time.perf_counter() - post_started) * 1000,
+                "receive_apply_ms": (time.perf_counter() - started) * 1000}
 
     def close(self):
         if self.engine is not None:
@@ -197,6 +225,11 @@ class NativeReceiver:
                 module = importlib.import_module("verl.checkpoint_engine.nccl_checkpoint_engine")
                 module.collective.destroy_collective_group(self.config["group_name"])
             self.engine = None
+            self.loop.call_soon_threadsafe(self.loop.stop)
+            self.loop_thread.join(timeout=15)
+            if self.loop_thread.is_alive():
+                raise TimeoutError("Native receiver event loop did not stop")
+            self.loop.close()
         return {"closed": True}
 
 
