@@ -111,6 +111,13 @@ class NodeProcesses:
             # including the vLLM/Megatron groups created before publication.
             env.update(NCCL_NET_GDR_LEVEL="SYS", NCCL_MIN_NCHANNELS="32",
                        NCCL_MAX_NCHANNELS="64", NCCL_CROSS_NIC="1")
+            ports = sorted({row["hca"].lstrip("=") for row in self.affinity.values()})
+            if len(ports) != 4:
+                raise RuntimeError(f"Native baseline requires four actual HCA ports: {ports}")
+            env.update(NCCL_IB_HCA="=" + ",".join(ports),
+                       UCX_NET_DEVICES=",".join(ports), UCX_MAX_RMA_RAILS="4",
+                       UCX_MAX_RNDV_RAILS="4", UCX_MAX_EAGER_RAILS="4",
+                       UCX_RNDV_SCHEME="get_zcopy", UCX_IB_GID_INDEX="3")
         command = [str(self.runtime / "bin/python"), *arguments]
         (self.run_dir / f"{name}-command.json").write_text(
             json.dumps(command, indent=2)
