@@ -39,6 +39,7 @@ from shardstream.integrations.publication import (
 )
 
 from shardstream_benchmarks.parallel import resolve_megatron_parallelism
+from shardstream_benchmarks.recipes import load_recipes
 
 logger = logging.getLogger(__name__)
 
@@ -728,8 +729,6 @@ def main(args):
     provider_overrides = None
     fp32_parameter_suffixes = ()
     if args.recipe:
-        from shardstream_benchmarks.recipes import load_recipes
-
         recipe = load_recipes()[args.recipe].with_rollout_replicas(
             args.rollout_replicas
         )
@@ -870,7 +869,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--recipe",
-        choices=("qwen3.5-9b", "qwen2.5-vl-7b", "gpt-oss-20b", "glm-4.7-flash"),
+        choices=tuple(load_recipes()),
     )
     parser.add_argument("--rollout-replicas", type=_positive_int)
     parser.add_argument(
