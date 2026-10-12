@@ -664,6 +664,12 @@ def register_shardstream_plugin() -> None:
             logger.exception("ShardStream membership retirement failed")
             return _to_json_error(f"ShardStream membership retirement failed: {exc}")
 
+    @router.get("/publication_telemetry")
+    async def publication_telemetry():
+        from shardstream.profiling.telemetry import node_rdma_counters
+
+        return JSONResponse(await asyncio.to_thread(node_rdma_counters))
+
     @router.post("/publication_init")
     async def publication_init(request: PublicationInitRequest, raw_request: Request):
         try:

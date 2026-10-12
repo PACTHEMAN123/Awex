@@ -46,6 +46,8 @@ class ModelWeightProfile:
                 for parameter in self.parameters.values():
                     parameter.zero_()
             torch.cuda.synchronize()
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
             result = {"cleared": True}
         elif operation == "verify":
             bad = []
@@ -68,6 +70,8 @@ class ModelWeightProfile:
                 "version": version,
                 "parameter_count": len(self.parameters),
                 "marker_mode": self.marker_mode,
+                "allocated_bytes": torch.cuda.memory_allocated() if torch.cuda.is_available() else 0,
+                "peak_allocated_bytes": torch.cuda.max_memory_allocated() if torch.cuda.is_available() else 0,
                 "model_bytes": sum(
                     p.numel() * p.element_size() for p in self.parameters.values()
                 ),

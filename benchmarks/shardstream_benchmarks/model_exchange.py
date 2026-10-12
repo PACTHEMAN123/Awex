@@ -550,9 +550,18 @@ class MultiVLLMWeightsExchangeIT:
                 self.model_profile("clear", version)
             self._training_barrier()
 
+        telemetry_before = (
+            self.publication_telemetry() if getattr(self, "marker_mode", "constant") == "scale"
+            else None
+        )
+
         end_to_end_start = time.perf_counter()
         self.publication.publish()
+        device_util.synchronize()
         publication_ms = (time.perf_counter() - end_to_end_start) * 1000
+        telemetry_after = (
+            self.publication_telemetry() if telemetry_before is not None else None
+        )
         logger.info("Update weights finished")
         if self.is_driver:
             step_id = int(self.megatron_engine.global_step)
@@ -565,8 +574,7 @@ class MultiVLLMWeightsExchangeIT:
                 phase=profile_phase(step_id),
                 step_id=step_id,
                 rank=int(self.rank),
-                end_to_end_update_time_ms=(time.perf_counter() - end_to_end_start)
-                * 1000.0,
+                end_to_end_update_time_ms=publication_ms,
             )
         if getattr(self, "elastic_model_profile", False) and self.is_driver:
             verified = self.model_profile("verify", version)
@@ -578,8 +586,38 @@ class MultiVLLMWeightsExchangeIT:
                     "ranks": verified,
                     "end_to_end_update_ms": publication_ms,
                     "backend_metrics": getattr(self.publication, "last_metrics", {}),
+                    "telemetry_before": telemetry_before,
+                    "telemetry_after": telemetry_after,
                 }
             )
+
+    def publication_telemetry(self):
+        from shardstream.profiling.telemetry import node_rdma_counters
+
+        local = node_rdma_counters() if self.local_rank == 0 else {"rdma": {}}
+        local.update(rank=self.rank, cuda_device=device_util.current_device(),
+                     allocated_bytes=torch.cuda.memory_allocated(),
+                     peak_allocated_bytes=torch.cuda.max_memory_allocated())
+        gathered = [None] * self.world_size if self.is_driver else None
+        if self.world_size > 1:
+            dist.gather_object(local, gathered, dst=0)
+        elif self.is_driver:
+            gathered = [local]
+        if not self.is_driver:
+            return {}
+        endpoints = {}
+        for _, host, port in self.publication_endpoints():
+            endpoints.setdefault(host, port)
+        rollout = {}
+        with ThreadPoolExecutor(max_workers=len(endpoints)) as executor:
+            futures = {host: executor.submit(requests.get,
+                       f"http://{host}:{port}/publication_telemetry", timeout=30)
+                       for host, port in endpoints.items()}
+            for host, future in futures.items():
+                response = future.result()
+                response.raise_for_status()
+                rollout[host] = response.json()
+        return {"training_ranks": gathered, "rollout_nodes": rollout}
 
     def endpoint_command(self, route, payload, endpoints=None):
         endpoints = self.publication_endpoints() if endpoints is None else endpoints
