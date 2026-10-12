@@ -258,7 +258,10 @@ class NCCLWeightsWriter(WeightsExchangeShardingWriter):
             # and per-peer stream assignment without relying directly on
             # batch_isend_irecv.
             logger.info(
-                f"Writer: Executing {len(p2p_op_list)} send ops via batch_send_recv"
+                "Writer: Executing %s send ops; AWEX_USE_BATCH_SEND_RECV=%s; mode=%s",
+                len(p2p_op_list),
+                int(self.use_batch_send_recv),
+                "batch" if self.use_batch_send_recv else "one-by-one",
             )
             if self.use_batch_send_recv:
                 batch_send_recv(

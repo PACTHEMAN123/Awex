@@ -362,7 +362,10 @@ class NCCLWorkerWeightsReader(WorkerWeightsReader):
         )
 
         logger.info(
-            f"Reader: Executing {len(p2p_op_list)} recv ops via batch_send_recv"
+            "Reader: Executing %s recv ops; AWEX_USE_BATCH_SEND_RECV=%s; mode=%s",
+            len(p2p_op_list),
+            int(self.use_batch_send_recv),
+            "batch" if self.use_batch_send_recv else "one-by-one",
         )
         if self.use_batch_send_recv:
             batch_send_recv(
