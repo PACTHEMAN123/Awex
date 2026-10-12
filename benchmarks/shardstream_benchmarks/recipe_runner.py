@@ -233,6 +233,7 @@ def main():
     transport_environment = {
         name: str(value) for name, value in (
             ("SHARDSTREAM_GIN_CONNECTIONS", args.transport_gin_connections),
+            ("NCCL_GIN_NCONNECTIONS", args.transport_gin_connections),
             ("SHARDSTREAM_MAX_CHANNELS", args.transport_max_channels),
             ("SHARDSTREAM_GIN_FIFO_DEPTH", args.transport_gin_fifo_depth),
         ) if value is not None
