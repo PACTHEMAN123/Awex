@@ -141,6 +141,46 @@
       }
     },
     {
+      "id": "gptoss16-r2tp4",
+      "model": "gpt-oss-20b",
+      "training": {
+        "world_size": 16,
+        "tp": 4,
+        "pp": 1,
+        "cp": 1,
+        "ep": 8,
+        "etp": 1
+      },
+      "rollout": {
+        "tp": 4,
+        "dp": 1,
+        "attention_dp": 1,
+        "ep": 1,
+        "instances": 2,
+        "world_size": 8
+      }
+    },
+    {
+      "id": "gptoss16-r4tp4",
+      "model": "gpt-oss-20b",
+      "training": {
+        "world_size": 16,
+        "tp": 4,
+        "pp": 1,
+        "cp": 1,
+        "ep": 8,
+        "etp": 1
+      },
+      "rollout": {
+        "tp": 4,
+        "dp": 1,
+        "attention_dp": 1,
+        "ep": 1,
+        "instances": 4,
+        "world_size": 16
+      }
+    },
+    {
       "id": "moonlight-tp4-ep8-r3tp8",
       "model": "moonlight-16b-a3b",
       "training": {
