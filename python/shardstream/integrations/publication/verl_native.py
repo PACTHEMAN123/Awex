@@ -307,6 +307,8 @@ class NativePublication(PublicationMechanism):
         self.control = ProcessPoolExecutor(max_workers=1,
                                            mp_context=multiprocessing.get_context('spawn'))
         metadata = []
+        receiver_prepare = []
+        prepare_started = time.perf_counter()
         # HTTP endpoint order defines the original veRL rollout rank ordering.
         for engine, host, port in endpoints:
             rows = self._requests_one(host, port, "publication_init", {
@@ -316,17 +318,29 @@ class NativePublication(PublicationMechanism):
             if [row["worker_rank"] for row in rows] != list(range(world_per_engine)):
                 raise RuntimeError("Incomplete or duplicated rollout worker metadata")
             metadata.extend(_decode(row["metadata"]) for row in rows)
+            receiver_prepare.extend({"engine": engine, "worker_rank": row["worker_rank"],
+                                     "prepare_ms": row["prepare_ms"]} for row in rows)
+        prepare_ms = (time.perf_counter() - prepare_started) * 1000
+        topology_started = time.perf_counter()
         full_metadata = [self.metadata] + [None] * (harness.world_size - 1) + metadata
         actors, rollout = _engine_class(self.backend).build_topology(
             harness.world_size, len(metadata), full_metadata)
         def kwargs_at(mapping, rank):
             return {key: value[rank] for key, value in mapping.items() if key != "method"}
         rollout_kwargs = [kwargs_at(rollout, rank) for rank in range(len(metadata))]
+        topology_ms = (time.perf_counter() - topology_started) * 1000
+        group_started = time.perf_counter()
         future = self.control.submit(_request_endpoints, endpoints, "publication_configure", {
             engine: {"config": {"rank_kwargs": _encode(rollout_kwargs)}}
             for engine, _, _ in endpoints}, self.timeout_seconds)
         self.engine.init_process_group(**kwargs_at(actors, 0))
-        self.preparation = future.result()
+        driver_group_ms = (time.perf_counter() - group_started) * 1000
+        configured = future.result()
+        self.preparation = {"rollout_prepare_ms": prepare_ms, "topology_ms": topology_ms,
+                            "driver_group_ms": driver_group_ms,
+                            "group_ready_ms": (time.perf_counter() - group_started) * 1000,
+                            "receiver_prepare": receiver_prepare,
+                            "receiver_groups": configured}
 
     def _requests_one(self, host, port, route, payload):
         response = requests.post(f"http://{host}:{port}/{route}", json=payload,
@@ -378,19 +392,21 @@ class NativePublication(PublicationMechanism):
     def close(self):
         if not self.harness.is_driver or self.engine is None:
             return
-        for _, host, port in publication_endpoints(self.harness):
-            try:
-                response = requests.post(f"http://{host}:{port}/publication_close",
-                                         timeout=min(self.timeout_seconds, 60))
-                response.raise_for_status()
-            except requests.RequestException:
-                logger.exception("Closing native receiver failed")
-        self.engine.finalize()
-        if self.backend == "nccl":
-            module = importlib.import_module("verl.checkpoint_engine.nccl_checkpoint_engine")
-            module.collective.destroy_collective_group(self.config["group_name"])
-        self.engine = None
-        if self.control is not None:
+        endpoints = publication_endpoints(self.harness)
+        # ncclCommDestroy may wait for peers to release their communicators.
+        # Start every receiver close in the independent control process before
+        # destroying the source group; sequential HTTP closes can deadlock.
+        future = self.control.submit(_request_endpoints, endpoints, "publication_close",
+                                     {engine: {} for engine, _, _ in endpoints},
+                                     min(self.timeout_seconds, 60))
+        try:
+            self.engine.finalize()
+            if self.backend == "nccl":
+                module = importlib.import_module("verl.checkpoint_engine.nccl_checkpoint_engine")
+                module.collective.destroy_collective_group(self.config["group_name"])
+            future.result()
+        finally:
+            self.engine = None
             self.control.shutdown(wait=True, cancel_futures=True)
             self.control = None
 

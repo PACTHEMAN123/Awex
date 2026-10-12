@@ -233,6 +233,10 @@ def main():
         address=args.ray_address,
         runtime_env={"env_vars": {"PYTHONPATH": args.stage}},
     )
+    # Ray installs its own SIGTERM handler during init. Restore ours so the
+    # finally block can stop the exact remote process groups this run owns.
+    signal.signal(signal.SIGTERM, terminate)
+    signal.signal(signal.SIGINT, terminate)
     nodes = {node["NodeManagerAddress"]: node for node in ray.nodes() if node["Alive"]}
     for host in args.training_hosts + args.rollout_hosts:
         if host not in nodes:

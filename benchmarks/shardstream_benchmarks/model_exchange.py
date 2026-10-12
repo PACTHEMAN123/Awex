@@ -253,19 +253,32 @@ class MultiVLLMWeightsExchangeIT:
         return vllm_devices, megatron_device
 
     def initialize(self):
+        self.initialization_phases = []
+
+        def phase(name, operation):
+            start_ns = time.time_ns()
+            started = time.perf_counter()
+            operation()
+            row = {"phase": name, "rank": int(self.rank), "start_ns": start_ns,
+                   "end_ns": time.time_ns(),
+                   "duration_ms": (time.perf_counter() - started) * 1000}
+            self.initialization_phases.append(row)
+            emit_profile(logger, event="initialization_phase",
+                         backend=self.publication_mechanism_name, **row)
+
         if self.publication.uses_shardstream_meta_server:
-            self._start_meta_server()
-        self._init_distributed()
+            phase("metadata_server", self._start_meta_server)
+        phase("training_distributed", self._init_distributed)
         if self.publication.uses_shardstream_meta_server:
-            self._share_meta_server_address()
-        self._init_megatron_engine()
-        self.publication.initialize_training()
+            phase("metadata_address", self._share_meta_server_address)
+        phase("megatron_load_and_engine", self._init_megatron_engine)
+        phase("publication_training_prepare", self.publication.initialize_training)
         if self.is_driver:
             if not self.remote_inference:
-                self._start_vllm_server()
-            self._wait_for_all_health()
-            self.publication.initialize_driver()
-        self._training_barrier()
+                phase("rollout_start", self._start_vllm_server)
+            phase("rollout_health", self._wait_for_all_health)
+            phase("publication_driver_prepare", self.publication.initialize_driver)
+        phase("publication_ready_barrier", self._training_barrier)
 
     def destroy(self):
         self._training_barrier()
@@ -885,6 +898,9 @@ def main(args):
                         "real_model_weights": True,
                         "train_world_size": weights_exchange_it.world_size,
                         "inference_tp_size": args.vllm_tp_size,
+                        "initialization_phases": weights_exchange_it.initialization_phases,
+                        "backend_preparation": getattr(weights_exchange_it.publication,
+                                                       "preparation", {}),
                         "records": weights_exchange_it.elastic_records,
                     },
                     indent=2,
