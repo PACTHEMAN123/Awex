@@ -198,12 +198,6 @@ def test_moonlight_uncompressed_query_and_shared_experts_match_inference_storage
     )
     assert name == "model.layers.1.self_attn.q_proj.weight"
     assert dict(converter.convert_param(name, value))[name].data_ptr() == query.data_ptr()
-    norm = torch.arange(8).float()
-    [(name, value)] = train.convert_param(
-        "decoder.layers.1.self_attention.linear_q_proj.layer_norm_weight", norm
-    )
-    assert name == "model.layers.1.input_layernorm.weight"
-    assert value.data_ptr() == norm.data_ptr()
     fused = torch.arange(64).reshape(8, 8).float()
     outputs = dict(train.convert_param(
         "decoder.layers.1.mlp.shared_experts.linear_fc1.weight", fused

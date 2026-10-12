@@ -24,13 +24,6 @@ def _build_mcore_converter_moonlight():
         # expert, routed expert and correction-bias mappings are identical.
         _mla_names = {**base._mla_names, "linear_q_proj.weight": "q_proj.weight"}
 
-        def convert_param(self, name, parameter, vp_stage=None):
-            name = name.replace(
-                "self_attention.linear_q_proj.layer_norm_weight",
-                "input_layernorm.weight",
-            )
-            return super().convert_param(name, parameter, vp_stage)
-
     return MoonlightMcoreWeightConverter
 
 
