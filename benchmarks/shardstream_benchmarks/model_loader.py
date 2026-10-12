@@ -91,6 +91,43 @@ def _preserve_fp32_parameters(models, suffixes):
                 tensor.data = tensor.data.float()
 
 
+def _provider_auto_bridge_class(hf_config):
+    from megatron.bridge import AutoBridge
+
+    if not (
+        hf_config.model_type == "deepseek_v3"
+        and getattr(hf_config, "q_lora_rank", None) is None
+    ):
+        return AutoBridge
+
+    from types import MethodType
+    from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
+    from megatron.bridge.models.conversion.param_mapping import ReplicatedMapping
+
+    class UncompressedQueryAutoBridge(AutoBridge):
+        @property
+        def _model_bridge(self):
+            bridge = super()._model_bridge
+            original_registry = bridge.mapping_registry
+
+            def mapping_registry(instance):
+                registry = original_registry()
+                name = "decoder.layers.*.self_attention.linear_q_proj.layer_norm_weight"
+                if registry.megatron_to_hf_lookup(name.replace("*", "0")) is not None:
+                    return registry
+                # TE fuses Moonlight's input RMSNorm into the uncompressed
+                # query projection. It remains replicated across TP ranks.
+                return MegatronMappingRegistry(
+                    *registry.mappings,
+                    ReplicatedMapping(name, "model.layers.*.input_layernorm.weight"),
+                )
+
+            bridge.mapping_registry = MethodType(mapping_registry, bridge)
+            return bridge
+
+    return UncompressedQueryAutoBridge
+
+
 def initialize_megatron_and_load_hf_with_mbridge(
     hf_config,
     hf_model_dir,
@@ -148,8 +185,7 @@ def initialize_megatron_and_load_hf_with_mbridge(
                 raise
             use_provider_api = True
     if use_provider_api:
-        from megatron.bridge import AutoBridge
-
+        AutoBridge = _provider_auto_bridge_class(hf_config)
         bridge = AutoBridge.from_hf_pretrained(hf_model_dir)
         provider = bridge.to_megatron_provider(load_weights=False)
         parallel_overrides = {

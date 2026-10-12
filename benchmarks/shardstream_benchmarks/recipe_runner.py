@@ -221,12 +221,24 @@ def main():
     parser.add_argument("--model-weight-profile", action="store_true")
     parser.add_argument("--extra-python-path", default="")
     parser.add_argument("--extra-library-path", default="")
+    parser.add_argument("--transport-gin-connections", type=int, choices=(1, 2, 4))
+    parser.add_argument("--transport-max-channels", type=int, choices=(16, 32, 64))
+    parser.add_argument("--transport-gin-fifo-depth", type=int, choices=(4, 8, 16))
     parser.add_argument(
         "--nccl-lib", default="/tmp/shardstream-prepare-nccl2312/nccl/lib"
     )
     args = parser.parse_args()
     if not 0 <= args.warmup_updates < args.num_updates:
         parser.error("Require 0 <= warmup updates < total updates")
+    transport_environment = {
+        name: str(value) for name, value in (
+            ("SHARDSTREAM_GIN_CONNECTIONS", args.transport_gin_connections),
+            ("SHARDSTREAM_MAX_CHANNELS", args.transport_max_channels),
+            ("SHARDSTREAM_GIN_FIFO_DEPTH", args.transport_gin_fifo_depth),
+        ) if value is not None
+    }
+    if transport_environment and args.publication_mechanism != "shardstream":
+        parser.error("Transport preparation tuning applies only to ShardStream")
 
     # Ensure task-owned children are cleaned up when the driver is interrupted.
     def terminate(signum, frame):
@@ -280,10 +292,12 @@ def main():
         "publication_mechanism": args.publication_mechanism,
         "publication_bucket_mb": args.publication_bucket_mb,
         "model_weight_profile": args.model_weight_profile,
+        "transport_environment": transport_environment,
         "node_placements": {},
     }
     try:
         environment = {
+            **transport_environment,
             "SHARDSTREAM_BENCH_ENABLE_AWEX": "1" if args.publication_mechanism == "awex_native_nccl" else "0",
             "SHARDSTREAM_BENCH_NATIVE_MULTIRAIL": "1" if args.publication_mechanism in (
                 "awex_native_nccl", "verl_native_nccl", "verl_native_nixl", "verl_native_mooncake"

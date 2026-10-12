@@ -165,3 +165,26 @@ def test_fp32_state_survives_checkpoint_loading_into_bf16_model():
         model.self_attention.A_log.copy_(checkpoint)
     assert torch.equal(model.self_attention.A_log, checkpoint)
     assert model.weight.dtype == torch.bfloat16
+
+
+def test_moonlight_bridge_maps_fused_input_norm_without_changing_other_models():
+    pytest.importorskip("megatron.bridge")
+    from megatron.bridge import AutoBridge
+    from megatron.bridge.models.conversion.param_mapping import ReplicatedMapping
+    from transformers import DeepseekV3Config, Qwen3Config
+    from shardstream_benchmarks.model_loader import _provider_auto_bridge_class
+
+    config = DeepseekV3Config(q_lora_rank=None)
+    config.architectures = ["DeepseekV3ForCausalLM"]
+    bridge = _provider_auto_bridge_class(config).from_hf_config(config)
+    registry = bridge._model_bridge.mapping_registry()
+    mapping = registry.megatron_to_hf_lookup(
+        "decoder.layers.3.self_attention.linear_q_proj.layer_norm_weight"
+    )
+    assert isinstance(mapping, ReplicatedMapping)
+    assert mapping.hf_param == "model.layers.3.input_layernorm.weight"
+    assert registry.megatron_to_hf_lookup(
+        "decoder.layers.3.self_attention.linear_q_proj.weight"
+    ).hf_param == "model.layers.3.self_attn.q_proj.weight"
+    assert _provider_auto_bridge_class(Qwen3Config()) is AutoBridge
+    assert _provider_auto_bridge_class(DeepseekV3Config(q_lora_rank=128)) is AutoBridge
