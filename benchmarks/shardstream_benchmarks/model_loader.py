@@ -91,41 +91,27 @@ def _preserve_fp32_parameters(models, suffixes):
                 tensor.data = tensor.data.float()
 
 
-def _provider_auto_bridge_class(hf_config):
-    from megatron.bridge import AutoBridge
+def _uncompressed_query_layer_spec(original, config, *args, **kwargs):
+    """Keep KV normalization while avoiding an extra norm on Moonlight's query."""
+    from copy import deepcopy
+    from megatron.core.transformer.mla_qk_norm_config import get_backend
 
-    if not (
-        hf_config.model_type == "deepseek_v3"
-        and getattr(hf_config, "q_lora_rank", None) is None
-    ):
-        return AutoBridge
+    block = deepcopy(original(config, *args, **kwargs))
+    for layer in block.layer_specs:
+        attention = layer.submodules.self_attention
+        base = attention.module
 
-    from types import MethodType
-    from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
-    from megatron.bridge.models.conversion.param_mapping import ReplicatedMapping
+        class UncompressedQueryAttention(base):
+            def _resolve_qk_norm_config(self, submodules):
+                resolved = super()._resolve_qk_norm_config(submodules)
+                if self.config.q_lora_rank is None:
+                    resolved["linear_q_proj"] = get_backend(
+                        self.config.transformer_impl
+                    ).column_parallel_linear()
+                return resolved
 
-    class UncompressedQueryAutoBridge(AutoBridge):
-        @property
-        def _model_bridge(self):
-            bridge = super()._model_bridge
-            original_registry = bridge.mapping_registry
-
-            def mapping_registry(instance):
-                registry = original_registry()
-                name = "decoder.layers.*.self_attention.linear_q_proj.layer_norm_weight"
-                if registry.megatron_to_hf_lookup(name.replace("*", "0")) is not None:
-                    return registry
-                # TE fuses Moonlight's input RMSNorm into the uncompressed
-                # query projection. It remains replicated across TP ranks.
-                return MegatronMappingRegistry(
-                    *registry.mappings,
-                    ReplicatedMapping(name, "model.layers.*.input_layernorm.weight"),
-                )
-
-            bridge.mapping_registry = MethodType(mapping_registry, bridge)
-            return bridge
-
-    return UncompressedQueryAutoBridge
+        attention.module = UncompressedQueryAttention
+    return block
 
 
 def initialize_megatron_and_load_hf_with_mbridge(
@@ -185,7 +171,7 @@ def initialize_megatron_and_load_hf_with_mbridge(
                 raise
             use_provider_api = True
     if use_provider_api:
-        AutoBridge = _provider_auto_bridge_class(hf_config)
+        from megatron.bridge import AutoBridge
         bridge = AutoBridge.from_hf_pretrained(hf_model_dir)
         provider = bridge.to_megatron_provider(load_weights=False)
         parallel_overrides = {
@@ -203,6 +189,12 @@ def initialize_megatron_and_load_hf_with_mbridge(
             if not hasattr(provider, name):
                 raise ValueError(f"Megatron provider does not support {name}")
             setattr(provider, name, value)
+        if hf_config.model_type == "deepseek_v3" and hf_config.q_lora_rank is None:
+            from functools import partial
+
+            provider.transformer_layer_spec = partial(
+                _uncompressed_query_layer_spec, provider.transformer_layer_spec
+            )
         provider.finalize()
         model = provider.provide_distributed_model(
             wrap_with_ddp=False, fp16=provider.fp16, bf16=provider.bf16

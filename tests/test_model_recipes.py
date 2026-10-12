@@ -167,24 +167,26 @@ def test_fp32_state_survives_checkpoint_loading_into_bf16_model():
     assert model.weight.dtype == torch.bfloat16
 
 
-def test_moonlight_bridge_maps_fused_input_norm_without_changing_other_models():
-    pytest.importorskip("megatron.bridge")
-    from megatron.bridge import AutoBridge
-    from megatron.bridge.models.conversion.param_mapping import ReplicatedMapping
-    from transformers import DeepseekV3Config, Qwen3Config
-    from shardstream_benchmarks.model_loader import _provider_auto_bridge_class
+def test_moonlight_query_spec_keeps_kv_norm_and_original_layer_spec():
+    pytest.importorskip("megatron.core")
+    from types import SimpleNamespace as NS
+    from megatron.core.transformer.mla_qk_norm_config import get_backend
+    from shardstream_benchmarks.model_loader import _uncompressed_query_layer_spec
 
-    config = DeepseekV3Config(q_lora_rank=None)
-    config.architectures = ["DeepseekV3ForCausalLM"]
-    bridge = _provider_auto_bridge_class(config).from_hf_config(config)
-    registry = bridge._model_bridge.mapping_registry()
-    mapping = registry.megatron_to_hf_lookup(
-        "decoder.layers.3.self_attention.linear_q_proj.layer_norm_weight"
-    )
-    assert isinstance(mapping, ReplicatedMapping)
-    assert mapping.hf_param == "model.layers.3.input_layernorm.weight"
-    assert registry.megatron_to_hf_lookup(
-        "decoder.layers.3.self_attention.linear_q_proj.weight"
-    ).hf_param == "model.layers.3.self_attn.q_proj.weight"
-    assert _provider_auto_bridge_class(Qwen3Config()) is AutoBridge
-    assert _provider_auto_bridge_class(DeepseekV3Config(q_lora_rank=128)) is AutoBridge
+    class Attention:
+        def _resolve_qk_norm_config(self, submodules):
+            return {"linear_q_proj": "fused-query", "linear_kv_up_proj": "fused-kv"}
+
+    original = NS(layer_specs=[NS(submodules=NS(
+        self_attention=NS(module=Attention), input_layernorm="input-norm"))])
+    config = NS(q_lora_rank=None, transformer_impl="transformer_engine")
+    result = _uncompressed_query_layer_spec(lambda config: original, config)
+    attention = result.layer_specs[0].submodules.self_attention.module()
+    attention.config = config
+    resolved = attention._resolve_qk_norm_config(None)
+    assert resolved["linear_q_proj"] is get_backend(config.transformer_impl).column_parallel_linear()
+    assert resolved["linear_kv_up_proj"] == "fused-kv"
+    assert result.layer_specs[0].submodules.input_layernorm == "input-norm"
+    assert original.layer_specs[0].submodules.self_attention.module is Attention
+    attention.config = NS(q_lora_rank=128)
+    assert attention._resolve_qk_norm_config(None)["linear_q_proj"] == "fused-query"
