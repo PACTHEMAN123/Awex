@@ -138,7 +138,8 @@ def _new_engine(backend, config, master):
     elif backend == 'nixl':
         os.environ.update(UCX_NET_DEVICES=','.join(ports), UCX_MAX_RMA_RAILS='4',
                           UCX_MAX_RNDV_RAILS='4', UCX_MAX_EAGER_RAILS='4',
-                          UCX_RNDV_SCHEME='get_zcopy', UCX_IB_GID_INDEX='3')
+                          UCX_RNDV_SCHEME='get_zcopy', UCX_IB_GID_INDEX='3',
+                          UCX_MAX_HCA_PER_GPU='inf', UCX_SINGLE_NET_DEVICE='n')
     elif backend == 'mooncake' and master:
         names = [port.split(':')[0] for port in ports]
         topology = {f'cuda:{i}': [names, []] for i in range(8)}

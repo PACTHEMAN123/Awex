@@ -118,7 +118,8 @@ class NodeProcesses:
             env.update(NCCL_IB_HCA="=" + ",".join(ports),
                        UCX_NET_DEVICES=",".join(ports), UCX_MAX_RMA_RAILS="4",
                        UCX_MAX_RNDV_RAILS="4", UCX_MAX_EAGER_RAILS="4",
-                       UCX_RNDV_SCHEME="get_zcopy", UCX_IB_GID_INDEX="3")
+                       UCX_RNDV_SCHEME="get_zcopy", UCX_IB_GID_INDEX="3",
+                       UCX_MAX_HCA_PER_GPU="inf", UCX_SINGLE_NET_DEVICE="n")
         command = [str(self.runtime / "bin/python"), *arguments]
         (self.run_dir / f"{name}-command.json").write_text(
             json.dumps(command, indent=2)
