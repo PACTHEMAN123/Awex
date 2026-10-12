@@ -206,6 +206,15 @@ class NativeReceiver:
                 "prepare_ms": (time.perf_counter() - started) * 1000}
 
     def configure(self, config):
+        if config.get("reset_completion"):
+            if self.backend != "mooncake":
+                raise ValueError("Completion reset only applies to Mooncake")
+            # The original double-buffer ring leaves the final downstream
+            # acknowledgements in these slots. The driver invokes this only
+            # after every receiver has returned, before the next publication.
+            self.engine.magic_recv.zero_()
+            torch.cuda.synchronize()
+            return {"worker_rank": self.worker_rank, "completion_reset": True}
         started = time.perf_counter()
         offset = int(self.config["rank_offset"]) + self.worker_rank
         self.engine.init_process_group(**_decode(config["rank_kwargs"])[offset])
@@ -385,8 +394,25 @@ class NativePublication(PublicationMechanism):
             for row in receivers
         ):
             raise RuntimeError("Native checkpoint receiver coverage or byte count mismatch")
+        completion_reset_ms = 0
+        if self.backend == "mooncake":
+            reset_started = time.perf_counter()
+            # All receive RPCs have finished, so every RDMA completion write
+            # is complete. Clear leftover acknowledgements before reusing the
+            # upstream engine; a stale signal otherwise permits early reuse
+            # of a bucket during the next version.
+            self.engine.magic_recv.zero_()
+            torch.cuda.synchronize()
+            reset = self._requests("publication_configure", {
+                engine: {"config": {"reset_completion": True}}
+                for engine, _, _ in publication_endpoints(harness)
+            })
+            if len(reset) != expected or not all(row["completion_reset"] for row in reset):
+                raise RuntimeError("Incomplete Mooncake completion reset")
+            completion_reset_ms = (time.perf_counter() - reset_started) * 1000
         self.last_metrics = {"payload_bytes": total, "tensor_count": count,
-                             "receivers": receivers, "backend": self.backend}
+                             "receivers": receivers, "backend": self.backend,
+                             "completion_reset_ms": completion_reset_ms}
         logger.info("Native veRL publication metrics: %s", self.last_metrics)
 
     def close(self):
