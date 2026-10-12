@@ -123,6 +123,37 @@
       "mtp": true,
       "separate_nodes": true,
       "max_total_gpus": 32
+    },
+    {
+      "id": "qwen3-8b",
+      "model": "Qwen/Qwen3-8B",
+      "source": {
+        "repo": "verl-project/verl",
+        "revision": "165ef13bd9b212d5206c454d6153bdb2ac0acdc6",
+        "path": "examples/grpo_trainer/run_qwen3_8b_megatron.sh",
+        "sha256": "6fdbebc9cb196597705a0aeb99b1b4eda365b382405243a9375f88aee8edc487",
+        "snapshot": "benchmarks/recipes/upstream/qwen3-8b/run_qwen3_8b_megatron.sh"
+      },
+      "training": {
+        "tp": 4,
+        "pp": 1,
+        "cp": 1,
+        "ep": 1,
+        "etp": 1,
+        "world_size": 8
+      },
+      "rollout": {
+        "engine": "vllm",
+        "tp": 4,
+        "attention_dp": 1,
+        "ep": 1,
+        "instances": 6,
+        "world_size": 24,
+        "dp": 1
+      },
+      "mtp": false,
+      "separate_nodes": true,
+      "max_total_gpus": 32
     }
   ]
 }

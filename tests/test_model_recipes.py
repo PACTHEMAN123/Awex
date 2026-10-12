@@ -9,7 +9,10 @@ def test_recipe_gpu_counts_and_cross_node_placement():
         hosts = (
             ["train0", "train1"] if recipe.training["world_size"] > 8 else ["train0"]
         )
-        recipe.validate_placement(hosts, ["infer0"])
+        rollout_hosts = [
+            f"infer{i}" for i in range((recipe.rollout["world_size"] + 7) // 8)
+        ]
+        recipe.validate_placement(hosts, rollout_hosts)
 
 
 def test_glm_vllm_dp_expert_group_uses_eight_rollout_gpus():

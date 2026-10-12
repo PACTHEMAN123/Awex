@@ -26,6 +26,7 @@ class NodeProcesses:
         placement="packed",
         replica_tp=1,
         hca_span=1,
+        nccl_lib="/tmp/shardstream-prepare-nccl2312/nccl/lib",
     ):
         self.source = Path(source)
         self.runtime = Path(runtime)
@@ -35,6 +36,7 @@ class NodeProcesses:
         self.processes = {}
         self.gpus = None
         self.affinity = None
+        self.nccl_lib = str(nccl_lib)
         if placement == "nic-spread":
             from shardstream_benchmarks.placement import plan_nic_spread
 
@@ -69,6 +71,7 @@ class NodeProcesses:
         env["SHARDSTREAM_RECIPE_REPOSITORY"] = str(self.source)
         env["PATH"] = f"{self.runtime}/bin:/usr/local/cuda/bin:" + env.get("PATH", "")
         libs = [
+            self.nccl_lib,
             "/usr/local/cuda/lib64",
             str(self.stage / "lib64"),
             str(self.runtime / "lib"),
@@ -79,8 +82,8 @@ class NodeProcesses:
         env.update(
             {
                 "VLLM_PLUGINS": "shardstream_adapter",
-                "SHARDSTREAM_NCCL_LIB": "/usr/local/cuda/lib64",
-                "LD_PRELOAD": "/usr/local/cuda/lib64/libnccl.so.2",
+                "SHARDSTREAM_NCCL_LIB": self.nccl_lib,
+                "LD_PRELOAD": self.nccl_lib + "/libnccl.so.2",
                 "NCCL_SOCKET_IFNAME": "eth0",
                 "GLOO_SOCKET_IFNAME": "eth0",
                 "NCCL_IB_DISABLE": "0",
@@ -190,7 +193,14 @@ def main():
     )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--timeout", type=int, default=3600)
+    parser.add_argument("--num-updates", type=int, default=3)
+    parser.add_argument("--warmup-updates", type=int, default=1)
+    parser.add_argument(
+        "--nccl-lib", default="/tmp/shardstream-prepare-nccl2312/nccl/lib"
+    )
     args = parser.parse_args()
+    if not 0 <= args.warmup_updates < args.num_updates:
+        parser.error("Require 0 <= warmup updates < total updates")
 
     # Ensure task-owned children are cleaned up when the driver is interrupted.
     def terminate(signum, frame):
@@ -227,6 +237,9 @@ def main():
         "passed": False,
         "generation_dp_rank": 0,
         "gpu_placement": args.gpu_placement,
+        "num_updates": args.num_updates,
+        "warmup_updates": args.warmup_updates,
+        "nccl_lib": args.nccl_lib,
         "node_placements": {},
     }
     try:
@@ -259,6 +272,7 @@ def main():
                         and recipe.id == "qwen3.5-9b"
                         and world == 4
                         else 1,
+                        args.nccl_lib,
                     )
                 )
                 actors.append(actor)
@@ -333,9 +347,9 @@ def main():
             "--vllm-dp-size",
             str(recipe.rollout["dp"]),
             "--num-updates",
-            "3",
+            str(args.num_updates),
             "--warmup-updates",
-            "1",
+            str(args.warmup_updates),
             "--profile",
             "--sync-transfer-start",
             "--meta-server-host",

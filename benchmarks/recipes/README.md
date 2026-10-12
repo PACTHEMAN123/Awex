@@ -11,6 +11,12 @@ evidence, not launch commands for this repository.
 | Qwen2.5-VL-7B | 2/1/1/1/2 | 4 | 4 instances, TP1 | 4 | 8 |
 | GPT-OSS-20B | 4/1/1/8/1 | 8 | 1 instance, TP4 | 4 | 12 |
 | GLM-4.7-Flash | 2/2/2/8/1 | 16 | 1 instance, TP1/DP8/EP8 | 8 | 24 |
+| Qwen3-8B | 4/1/1/1/1 | 8 | 6 instances, TP4 | 24 | 32 |
+
+Qwen3-8B preserves the veRL Megatron source recipe as provenance. The
+disaggregated transfer benchmark selects TP4/PP1 on eight training GPUs and
+six TP4 rollout replicas across three separate nodes; it does not run the
+source recipe's colocated GRPO loop.
 
 GLM's upstream script requests eight actor GPUs, but its EP8/PP2 expert layout
 requires at least sixteen. Its training topology is retained with sixteen GPUs.
