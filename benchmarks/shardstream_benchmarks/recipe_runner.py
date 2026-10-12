@@ -110,7 +110,8 @@ class NodeProcesses:
             # NCCL caches environment options at its first initialization,
             # including the vLLM/Megatron groups created before publication.
             env.update(NCCL_NET_GDR_LEVEL="SYS", NCCL_MIN_NCHANNELS="32",
-                       NCCL_MAX_NCHANNELS="64", NCCL_CROSS_NIC="1")
+                       NCCL_MAX_NCHANNELS="64", NCCL_CROSS_NIC="1",
+                       NCCL_PXN_DISABLE="1", NCCL_P2P_PXN_LEVEL="0")
             ports = sorted({row["hca"].lstrip("=") for row in self.affinity.values()})
             if len(ports) != 4:
                 raise RuntimeError(f"Native baseline requires four actual HCA ports: {ports}")
@@ -283,7 +284,9 @@ def main():
     try:
         environment = {
             "SHARDSTREAM_BENCH_ENABLE_AWEX": "1" if args.publication_mechanism == "awex_native_nccl" else "0",
-            "SHARDSTREAM_BENCH_NATIVE_MULTIRAIL": "1" if args.publication_mechanism.startswith("verl_native_") else "0",
+            "SHARDSTREAM_BENCH_NATIVE_MULTIRAIL": "1" if args.publication_mechanism in (
+                "awex_native_nccl", "verl_native_nccl", "verl_native_nixl", "verl_native_mooncake"
+            ) else "0",
             "SHARDSTREAM_BENCH_EXTRA_PYTHONPATH": args.extra_python_path,
             "SHARDSTREAM_BENCH_EXTRA_LIBRARY_PATH": args.extra_library_path,
             "SHARDSTREAM_BENCH_WARMUP": str(args.warmup_updates),
