@@ -615,7 +615,10 @@ class MultiVLLMWeightsExchangeIT:
     def publication_telemetry(self):
         from shardstream.profiling.telemetry import node_rdma_counters
 
-        local = node_rdma_counters() if self.local_rank == 0 else {"rdma": {}}
+        try:
+            local = node_rdma_counters() if self.local_rank == 0 else {"rdma": {}}
+        except Exception as error:
+            local = {"rdma": {}, "telemetry_error": f"{type(error).__name__}: {error}"}
         local.update(rank=self.rank, cuda_device=device_util.current_device(),
                      allocated_bytes=torch.cuda.memory_allocated(),
                      peak_allocated_bytes=torch.cuda.max_memory_allocated())
@@ -624,21 +627,35 @@ class MultiVLLMWeightsExchangeIT:
             dist.gather_object(local, gathered, dst=0)
         elif self.is_driver:
             gathered = [local]
-        if not self.is_driver:
-            return {}
-        endpoints = {}
-        for _, host, port in self.publication_endpoints():
-            endpoints.setdefault(host, port)
-        rollout = {}
-        with ThreadPoolExecutor(max_workers=len(endpoints)) as executor:
-            futures = {host: executor.submit(requests.get,
-                       f"http://{host}:{port}/publication_telemetry", timeout=30)
-                       for host, port in endpoints.items()}
-            for host, future in futures.items():
-                response = future.result()
-                response.raise_for_status()
-                rollout[host] = response.json()
-        return {"training_ranks": gathered, "rollout_nodes": rollout}
+        result = {}
+        status = [None]
+        if self.is_driver:
+            try:
+                errors = [row["telemetry_error"] for row in gathered
+                          if "telemetry_error" in row]
+                if errors:
+                    raise RuntimeError("; ".join(errors))
+                endpoints = {}
+                for _, host, port in self.publication_endpoints():
+                    endpoints.setdefault(host, port)
+                rollout = {}
+                with ThreadPoolExecutor(max_workers=len(endpoints)) as executor:
+                    futures = {host: executor.submit(requests.get,
+                               f"http://{host}:{port}/publication_telemetry", timeout=30)
+                               for host, port in endpoints.items()}
+                    for host, future in futures.items():
+                        response = future.result()
+                        response.raise_for_status()
+                        rollout[host] = response.json()
+                result = {"training_ranks": gathered, "rollout_nodes": rollout}
+            except Exception as error:
+                status[0] = f"{type(error).__name__}: {error}"
+        # All ranks must agree before another collective or teardown begins.
+        if self.world_size > 1:
+            dist.broadcast_object_list(status, src=0)
+        if status[0] is not None:
+            raise RuntimeError("Publication telemetry failed: " + status[0])
+        return result
 
     def endpoint_command(self, route, payload, endpoints=None):
         endpoints = self.publication_endpoints() if endpoints is None else endpoints

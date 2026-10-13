@@ -1,11 +1,26 @@
 """Read cumulative RDMA port counters without entering CUDA or transport code."""
 
 import os
+import logging
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import socket
 import subprocess
 import time
+
+
+def _rdma_stats(netdev):
+    for attempt in range(2):
+        try:
+            return subprocess.check_output(
+                ["ethtool", "-S", netdev], text=True, timeout=15
+            ), attempt + 1
+        except subprocess.TimeoutExpired:
+            if attempt:
+                raise
+            logging.getLogger(__name__).warning(
+                "RDMA counter read timed out on %s; retrying once", netdev
+            )
 
 
 def node_rdma_counters(root="/sys/class/infiniband"):
@@ -19,7 +34,7 @@ def node_rdma_counters(root="/sys/class/infiniband"):
             raise ValueError(f"Ambiguous HCA/netdev mapping: {endpoint.name}")
         netdev = interfaces[0].name
         before = time.time_ns()
-        text = subprocess.check_output(["ethtool", "-S", netdev], text=True, timeout=15)
+        text, attempts = _rdma_stats(netdev)
         raw = {}
         for line in text.splitlines():
             if ":" not in line:
@@ -33,6 +48,7 @@ def node_rdma_counters(root="/sys/class/infiniband"):
             "tx_bytes": raw["tx_vport_rdma_unicast_bytes"],
             "rx_bytes": raw["rx_vport_rdma_unicast_bytes"],
             "netdev": netdev, "source": "ethtool RDMA unicast bytes",
+            "read_attempts": attempts,
             "started_ns": before, "ended_ns": time.time_ns(),
         }
     with ThreadPoolExecutor(max_workers=4) as executor:
