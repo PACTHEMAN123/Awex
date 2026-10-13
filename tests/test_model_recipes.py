@@ -43,6 +43,20 @@ def test_layout_cannot_be_applied_to_another_model_or_overbooked():
         recipe.with_rollout_replicas(3)
 
 
+def test_qwen8_tp2_supplement_uses_two_trainers_and_one_full_rollout_node():
+    recipe = load_recipes()["qwen3-8b"].with_layout("qwen8-tp2-pp2-r4tp2")
+    assert recipe.training["world_size"] == 16
+    assert (recipe.training["tp"], recipe.training["pp"]) == (2, 2)
+    assert recipe.rollout["tp"] == 2
+    assert recipe.rollout["instances"] == 4
+    assert recipe.rollout["world_size"] == 8
+    recipe.validate_placement(["train0", "train1"], ["infer0"])
+    command = recipe.rollout_arguments("/models/qwen8", "infer0", 8000)
+    assert command[command.index("--tensor-parallel-size") + 1] == "2"
+    with pytest.raises(ValueError):
+        recipe.validate_placement(["train0"], ["infer0"])
+
+
 def test_glm_vllm_dp_expert_group_uses_eight_rollout_gpus():
     recipe = load_recipes()["glm-4.7-flash"]
     assert recipe.rollout["attention_dp"] == 8

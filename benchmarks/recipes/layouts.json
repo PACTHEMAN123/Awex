@@ -1,6 +1,26 @@
 {
   "layouts": [
     {
+      "id": "qwen8-tp2-pp2-r4tp2",
+      "model": "qwen3-8b",
+      "training": {
+        "world_size": 16,
+        "tp": 2,
+        "pp": 2,
+        "cp": 1,
+        "ep": 1,
+        "etp": 1
+      },
+      "rollout": {
+        "tp": 2,
+        "dp": 1,
+        "attention_dp": 1,
+        "ep": 1,
+        "instances": 4,
+        "world_size": 8
+      }
+    },
+    {
       "id": "qwen8-tp2-pp2-r4tp4",
       "model": "qwen3-8b",
       "training": {
