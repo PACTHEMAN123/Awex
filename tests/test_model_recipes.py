@@ -57,6 +57,22 @@ def test_qwen8_tp2_supplement_uses_two_trainers_and_one_full_rollout_node():
         recipe.validate_placement(["train0"], ["infer0"])
 
 
+@pytest.mark.parametrize("suffix,tp,ep,instances", [("r2tp8ep8", 8, 8, 2), ("r4tp4", 4, 1, 4)])
+def test_qwen30_replicated_training_dp2_layouts(suffix, tp, ep, instances):
+    recipe = load_recipes()["qwen3-30b-a3b"].with_layout(
+        "qwen30-tp4-cp2-ep8-" + suffix
+    )
+    train = recipe.training
+    assert (train["tp"], train["cp"], train["ep"], train["etp"]) == (4, 2, 8, 1)
+    assert train["world_size"] // (train["tp"] * train["pp"] * train["cp"]) == 2
+    assert train["world_size"] // (train["etp"] * train["pp"] * train["ep"]) == 2
+    assert train["world_size"] // 2 == train["tp"] * train["cp"] == 8
+    rollout = recipe.rollout
+    assert (rollout["tp"], rollout["ep"], rollout["instances"]) == (tp, ep, instances)
+    assert rollout["world_size"] == 16 and instances // 2 == 8 // tp
+    recipe.validate_placement(["train0", "train1"], ["infer0", "infer1"])
+
+
 def test_glm_vllm_dp_expert_group_uses_eight_rollout_gpus():
     recipe = load_recipes()["glm-4.7-flash"]
     assert recipe.rollout["attention_dp"] == 8
