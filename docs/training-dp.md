@@ -45,6 +45,33 @@ once per membership, and sender and receiver routes use the same seed. Enable it
 in the standalone runner with `--dp-source-ring-order source-node`; `rank` remains
 the default. This option uses the existing ring swizzle mode and kernels.
 
+## Partitioning corresponding shard streams
+
+`--dp-source-policy stream` groups parameter shards by their equivalent source
+ranks. Each group traverses parameters in name/geometry order and partitions
+the cumulative canonical-shard bytes equally among DP replicas. Within a DP
+range, equivalent CP copies divide the range equally. Only a partition boundary
+inside a parameter creates an extra row-aligned slice; a boundary on a parameter
+edge leaves both parameters intact. No contiguous staging buffer is required,
+and the block-size setting does not control stream partitioning.
+
+Partitioning happens independently for every corresponding TP/EP source group,
+before pruning a local plan. DP replicas may each span multiple physical nodes;
+the algorithm uses rank membership, rather than treating a DP replica as a node.
+Different replica geometries, DP1, and incomplete DP identities retain the
+existing replica planner. `SHARDSTREAM_DP_STREAM_PLAN` reports canonical source
+bytes, group counts and boundary splits. Actual injected bytes can additionally
+include replicated inference parameter views and are reported by transport.
+
+`--dp-source-ring-order dp` (environment `SHARDSTREAM_RING_DP_ENTRY=1`) binds
+DP replica i to rollout node i in first-engine order. It uses each operation's
+source DP identity on both endpoints, so all nodes of one DP replica select the
+same rollout entry node. Colocated rollout engines can still rotate within that
+node. This explicit pairing requires ring broadcast/swizzle and at least one
+rollout node per active DP identity; the standalone recipes enable both ring
+features. Source identity conflicts are rejected. The default policy and entry
+order remain `replica` and `rank`.
+
 ## Qwen3-30B-A3B experiments
 
 The existing layouts `qwen30-tp4-cp2-ep8-r2tp8ep8` and
