@@ -53,6 +53,36 @@ def _replica_operation(root: int, receiver: int) -> CommunicationOperation:
     )
 
 
+def test_dp_entry_pairs_replicas_when_each_spans_multiple_nodes(monkeypatch):
+    monkeypatch.setenv("SHARDSTREAM_RING_DP_ENTRY", "1")
+    monkeypatch.setattr(transport, "_ensure_cuda_tensor", lambda *_: None)
+    # DP0 spans training nodes A/B, DP1 spans C/D; global rank order is
+    # deliberately interleaved. Physical node order cannot identify DP.
+    for root, dp in [(16, 0), (24, 0), (20, 1), (28, 1)]:
+        operations = [_replica_operation(root, peer) for peer in (0, 4, 8, 12)]
+        for op in operations:
+            op.send_shard_meta.dp_rank = dp
+        options = dict(infer_instance_world_size=4, num_infer_engines=4,
+                       ring_broadcast=True, ring_swizzle=True,
+                       rollout_node_ids=("rollout0", "rollout1", "rollout0", "rollout1"))
+        send = _build_send_batch({"weight":torch.arange(8).float()},
+                                 TransferPlan(operations={o.recv_rank:[o] for o in operations}),
+                                 root, 32, 0, **options)
+        assert len(send.peers) == 1
+        assert (send.peers[0] // 4) % 2 == dp
+        for op in operations:
+            recv = _build_recv_batch({"weight":torch.empty(8)},
+                                     TransferPlan(operations={root:[op]}),
+                                     op.recv_rank, 32, 0, **options)
+            assert (recv.peers[0] == root) == (op.recv_rank == send.peers[0])
+            if recv.forward_peers[0] >= 0:
+                next_op = next(o for o in operations if o.recv_rank == recv.forward_peers[0])
+                next_batch = _build_recv_batch({"weight":torch.empty(8)},
+                                              TransferPlan(operations={root:[next_op]}),
+                                              next_op.recv_rank, 32, 0, **options)
+                assert next_batch.peers == [op.recv_rank]
+
+
 def test_node_major_communicator_ranks_join_split_physical_nodes():
     node_ids = [10] * 4 + [20] * 4 + [10] * 4 + [20] * 4 + [30] * 8 + [40] * 8
 

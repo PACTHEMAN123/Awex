@@ -254,6 +254,31 @@ def _source_node_ring_seeds(node_ids, inference_world_size, rollout_node_count):
     return tuple(seeds)
 
 
+def _dp_entry_ring_seeds(plan, world_size, rollout_node_ids, ring_root_seeds):
+    """Bind DP i to rollout node i, even when that DP spans many nodes.
+
+    Source metadata is present on both endpoints, so this requires no runtime
+    scheduling or extra collective. CP/rank identity only rotates the member
+    within the selected rollout node.
+    """
+    if not _resolve_bool("SHARDSTREAM_RING_DP_ENTRY"):
+        return ring_root_seeds
+    if rollout_node_ids is None:
+        raise TransportUnavailableError("DP ring entry requires resolved rollout nodes")
+    node_count = len(set(rollout_node_ids))
+    seeds = list(range(world_size)) if ring_root_seeds is None else list(ring_root_seeds)
+    owners = {}
+    for operations in plan.operations.values():
+        for op in operations:
+            dp = int(op.send_shard_meta.dp_rank)
+            if not 0 <= dp < node_count:
+                raise TransportUnavailableError("DP ring entry needs a rollout node for each DP replica")
+            if owners.setdefault(op.send_rank, dp) != dp:
+                raise TransportUnavailableError("Conflicting DP identities for a source rank")
+            seeds[op.send_rank] = dp + node_count * (seeds[op.send_rank] // node_count)
+    return tuple(seeds)
+
+
 def _ring_order(
     root: int,
     peers: list[int],
@@ -607,6 +632,8 @@ def _build_send_batch(
     ring_root_seeds: tuple[int, ...] | None = None,
 ) -> _Batch:
     _resolve_chunk_bytes(chunk_bytes)
+    if ring_broadcast:
+        ring_root_seeds = _dp_entry_ring_seeds(plan, world_size, rollout_node_ids, ring_root_seeds)
     tensors: list[torch.Tensor] = []
     offsets: list[int] = []
     lengths: list[int] = []
@@ -744,6 +771,8 @@ def _build_recv_batch(
     ring_root_seeds: tuple[int, ...] | None = None,
 ) -> _Batch:
     _resolve_chunk_bytes(chunk_bytes)
+    if ring_broadcast:
+        ring_root_seeds = _dp_entry_ring_seeds(plan, world_size, rollout_node_ids, ring_root_seeds)
     tensors: list[torch.Tensor] = []
     offsets: list[int] = []
     lengths: list[int] = []
@@ -1026,6 +1055,8 @@ class Transport:
             "SHARDSTREAM_RING_BROADCAST", ring_broadcast
         )
         self.ring_swizzle = _resolve_bool("SHARDSTREAM_RING_SWIZZLE", ring_swizzle)
+        if _resolve_bool("SHARDSTREAM_RING_DP_ENTRY") and not (self.ring_broadcast and self.ring_swizzle):
+            raise TransportUnavailableError("DP ring entry requires ring broadcast and swizzle")
         self.fp8_block_shape = None
         if _resolve_bool("SHARDSTREAM_FP8_BLOCKWISE", None):
             br = _env_int("SHARDSTREAM_FP8_BLOCK_ROWS", 128, 1)
@@ -1323,6 +1354,7 @@ class Transport:
             else "disabled"
         )
         extension_metrics["ring_source_node_swizzle"] = self.ring_source_node_swizzle
+        extension_metrics["ring_dp_entry"] = _resolve_bool("SHARDSTREAM_RING_DP_ENTRY")
         selected_hca_bandwidth = os.environ.get(
             "SHARDSTREAM_SELECTED_HCA_BANDWIDTH_GBPS"
         )

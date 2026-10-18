@@ -150,8 +150,8 @@ class TransferPlanBuilder:
         self.dp_source_policy = dp_source_policy or os.environ.get(
             "SHARDSTREAM_DP_SOURCE_POLICY", "replica"
         )
-        if self.dp_source_policy not in {"replica", "block"}:
-            raise ValueError("DP source policy must be replica or block")
+        if self.dp_source_policy not in {"replica", "block", "stream"}:
+            raise ValueError("DP source policy must be replica, block or stream")
         self.dp_source_block_bytes = int(
             os.environ.get("SHARDSTREAM_DP_SOURCE_BLOCK_BYTES", str(16 * 1024 * 1024))
             if dp_source_block_bytes is None else dp_source_block_bytes
@@ -245,10 +245,24 @@ class TransferPlanBuilder:
         communication_plan = []
         grouped_replica_loads: Dict[Tuple[int, ...], int] = {}
         source_loads: Dict[int, int] = {}
+        stream_assignments = (
+            self._partition_dp_streams(training_meta_dict, inference_meta_dict, common_params)
+            if self.dp_source_policy == "stream" else {}
+        )
 
         for param_name in sorted(common_params):
             inference_meta = inference_meta_dict[param_name]
             training_meta = training_meta_dict[param_name]
+            if param_name in stream_assignments:
+                param_plan = self._build_dp_stream_operations(
+                    inference_meta, training_meta, stream_assignments[param_name]
+                )
+                communication_plan.extend(
+                    op for op in param_plan
+                    if global_transfer_rank is None
+                    or global_transfer_rank in (op.send_rank, op.recv_rank)
+                )
+                continue
             if self.dp_source_policy == "block" and any(
                 getattr(shard, "dp_size", 1) > 1 for shard in training_meta.shards
             ):
@@ -309,6 +323,113 @@ class TransferPlanBuilder:
             f"for {len(common_params)} common parameters"
         )
         return communication_plan
+
+    @staticmethod
+    def _shard_geometry(shard):
+        return (tuple(shard.global_offset), tuple(shard.shape), shard.dtype)
+
+    def _partition_dp_streams(self, training_meta_dict, inference_meta_dict, common_params):
+        """Partition each corresponding rank group, independent of node count.
+
+        Parameters with the same physical source candidates share a logical
+        stream in name/geometry order. DP replicas receive equal byte ranges;
+        equivalent CP copies divide each DP range equally. Only partition
+        boundaries split tensors. No packed buffer is materialized.
+        """
+        groups, assignments = {}, {}
+        for name in sorted(common_params):
+            meta = training_meta_dict[name]
+            if not any(s.dp_size > 1 for s in meta.shards) or len(meta.replicas) < 2:
+                continue
+            canonical = meta.replicas[0]
+            keys = {self._shard_geometry(s) for s in canonical.shards}
+            if len(keys) != len(canonical.shards) or any(
+                len(replica.shards) != len(keys)
+                or {self._shard_geometry(s) for s in replica.shards} != keys
+                for replica in meta.replicas
+            ):
+                continue
+            candidates = {key: {} for key in keys}
+            for shard in meta.shards:
+                candidates[self._shard_geometry(shard)][shard.global_rank] = shard
+            # Incomplete/ambiguous DP metadata keeps the original replica plan.
+            if any(
+                {s.dp_rank for s in sources.values()} != set(range(next(iter(sources.values())).dp_size))
+                for sources in candidates.values()
+            ):
+                continue
+            assignments[name] = {}
+            for shard in sorted(canonical.shards, key=lambda s: (s.global_offset, s.shape)):
+                geometry = self._shard_geometry(shard)
+                sources = sorted(candidates[geometry].values(),
+                                 key=lambda s: (s.dp_rank, s.cp_rank, s.global_rank))
+                group_key = tuple((s.dp_rank, s.global_rank) for s in sources)
+                row_bytes = math.prod(shard.shape[1:]) * _dtype_element_size(meta.dtype)
+                groups.setdefault(group_key, []).append((name, geometry, sources, row_bytes))
+                assignments[name][geometry] = []
+
+        loads, dp_loads = {}, {}
+        fragments = split_regions = 0
+        for group_key, entries in groups.items():
+            total = sum(geometry[1][0] * row_bytes for _, geometry, _, row_bytes in entries)
+            dp_ids = sorted({dp for dp, _ in group_key})
+            counts = {dp: sum(d == dp for d, _ in group_key) for dp in dp_ids}
+            # Inner CP partitions preserve the outer equal-DP allocation even
+            # if different DP replicas have different numbers of CP copies.
+            boundaries = [0]
+            for dp_index, dp in enumerate(dp_ids):
+                for index in range(1, counts[dp] + 1):
+                    boundaries.append(total * (dp_index * counts[dp] + index)
+                                      // (len(dp_ids) * counts[dp]))
+            cursor = 0
+            for name, geometry, sources, row_bytes in entries:
+                offset, shape, _ = geometry
+                alignment = 128 if str(inference_meta_dict[name].dtype).startswith("torch.float8") and len(shape) > 1 else 1
+                # Floor a boundary to a source row (or FP8 row block). Clamp
+                # to this parameter so a boundary on an edge creates no split.
+                cuts = [max(0, min(shape[0], (boundary - cursor) // (row_bytes * alignment) * alignment))
+                        for boundary in boundaries]
+                cuts[0], cuts[-1] = 0, shape[0]
+                pieces = assignments[name][geometry]
+                for source, start, end in zip(sources, cuts, cuts[1:]):
+                    if start == end:
+                        continue
+                    pieces.append((source, offset[0] + start, offset[0] + end))
+                    nbytes = (end - start) * row_bytes
+                    loads[source.global_rank] = loads.get(source.global_rank, 0) + nbytes
+                    dp_loads[source.dp_rank] = dp_loads.get(source.dp_rank, 0) + nbytes
+                fragments += len(pieces)
+                split_regions += len(pieces) > 1
+                cursor += shape[0] * row_bytes
+        self.dp_stream_stats = dict(groups=len(groups), shard_regions=sum(map(len, groups.values())),
+                                    fragments=fragments, split_regions=split_regions,
+                                    bytes_by_rank=loads, bytes_by_dp=dp_loads)
+        logger.info("SHARDSTREAM_DP_STREAM_PLAN " + json.dumps(self.dp_stream_stats, sort_keys=True))
+        return assignments
+
+    def _build_dp_stream_operations(self, inference_meta, training_meta, assignments):
+        training_map = self._create_shard_offset_for_replica(training_meta.replicas[0], 0, False)
+        plan = []
+        for engine in range(self.num_infer_engines):
+            for replica in inference_meta.replicas:
+                inference_map = self._create_shard_offset_for_replica(replica, engine, True)
+                for region in self._find_overlapping_regions(inference_map, training_map):
+                    for source, start, end in assignments[self._shard_geometry(region.training_shard.shard)]:
+                        start = max(start, region.overlap_start[0])
+                        end = min(end, region.overlap_end[0])
+                        if start >= end:
+                            continue
+                        source_offset = ShardOffset(
+                            shard=source, start_offset=source.global_offset,
+                            end_offset=region.training_shard.end_offset, shape=source.shape,
+                            rank=self._compute_shard_transfer_rank(source, 0, False),
+                        )
+                        plan.extend(self._build_region_communication_plan(OverlapRegion(
+                            inference_shard=region.inference_shard, training_shard=source_offset,
+                            overlap_start=(start, *region.overlap_start[1:]),
+                            overlap_end=(end, *region.overlap_end[1:]),
+                        )))
+        return plan
 
     def _build_dp_block_operations(self, inference_meta, training_meta, source_loads):
         """Stripe disjoint destination regions over equivalent training shards.

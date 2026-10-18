@@ -42,14 +42,15 @@ def signature(op):
 @pytest.mark.parametrize("infer_tp,engines", [(8, 2), (4, 4)])
 @pytest.mark.parametrize("axis", [0, 1])
 @pytest.mark.parametrize("ring", [False, True])
-def test_tp4_cp2_dp2_exact_coverage_and_local_agreement(infer_tp, engines, axis, ring):
+@pytest.mark.parametrize("policy", ["block", "stream"])
+def test_tp4_cp2_dp2_exact_coverage_and_local_agreement(infer_tp, engines, axis, ring, policy):
     shape = (128, 64)
     training = parameter("weight", shape, tp=4, copies=4, dp=2, cp=2, axis=axis)
     inference = parameter("weight", shape, tp=infer_tp, copies=1, dp=1, axis=axis)
     builder = TransferPlanBuilder(infer_world_size=infer_tp * engines,
                                  train_world_size=16, num_infer_engines=engines,
                                  group_replicated_inference=ring,
-                                 dp_source_policy="block", dp_source_block_bytes=256)
+                                 dp_source_policy=policy, dp_source_block_bytes=256)
     ops = builder.build_weights_mapping_operations([inference], [training])
     assert [signature(o) for o in ops] == [signature(o) for o in builder.build_weights_mapping_operations([inference], [training])]
     truth = torch.arange(1, 1 + shape[0] * shape[1], dtype=torch.float32).reshape(shape)
@@ -96,13 +97,14 @@ def test_expert_dp2_and_cross_parameter_load_balance():
     assert loads[2] == loads[3]
 
 
-def test_dp1_retains_existing_plan_and_metadata_copy_preserves_axes():
+@pytest.mark.parametrize("policy", ["block", "stream"])
+def test_dp1_retains_existing_plan_and_metadata_copy_preserves_axes(policy):
     training = parameter("weight", (32, 16), 4, 2, dp=1, cp=2)
     inference = parameter("weight", (32, 16), 8, 1, dp=1)
     options = dict(infer_world_size=16, train_world_size=8, num_infer_engines=2,
                    group_replicated_inference=True)
     old = TransferPlanBuilder(**options, dp_source_policy="replica")
-    new = TransferPlanBuilder(**options, dp_source_policy="block")
+    new = TransferPlanBuilder(**options, dp_source_policy=policy)
     assert [signature(o) for o in old.build_weights_mapping_operations([inference], [training])] == [signature(o) for o in new.build_weights_mapping_operations([inference], [training])]
     copied = training.fast_copy_with_engine_rank(3)
     assert [(s.dp_rank, s.dp_size, s.cp_rank, s.cp_size) for s in copied.shards] == [(s.dp_rank, s.dp_size, s.cp_rank, s.cp_size) for s in training.shards]
@@ -114,7 +116,8 @@ def test_invalid_configuration(policy, size):
         TransferPlanBuilder(1, 2, dp_source_policy=policy, dp_source_block_bytes=size)
 
 
-def test_different_replica_geometry_retains_replica_policy():
+@pytest.mark.parametrize("policy", ["block", "stream"])
+def test_different_replica_geometry_retains_replica_policy(policy):
     training = parameter("weight", (128, 64), 2, 2)
     for index, shard in enumerate(training.replicas[1].shards):
         shard.shape = (128, 32)
@@ -123,7 +126,7 @@ def test_different_replica_geometry_retains_replica_policy():
     inference = parameter("weight", (128, 64), 2, 1, dp=1)
     options = dict(infer_world_size=4, train_world_size=4, num_infer_engines=2)
     original = TransferPlanBuilder(**options, dp_source_policy="replica")
-    block = TransferPlanBuilder(**options, dp_source_policy="block")
+    block = TransferPlanBuilder(**options, dp_source_policy=policy)
     assert [signature(o) for o in original.build_weights_mapping_operations([inference], [training])] == [signature(o) for o in block.build_weights_mapping_operations([inference], [training])]
 
 
@@ -134,3 +137,45 @@ def test_partial_final_block_preserves_every_row():
     ops = builder.build_weights_mapping_operations([inference], [training])
     assert [op.overlap_shape for op in ops] == [(3, 64), (3, 64), (3, 64), (1, 64)]
     assert [op.recv_offset for op in ops] == [(0, 0), (3, 0), (6, 0), (9, 0)]
+
+
+def test_stream_only_splits_parameter_containing_cumulative_midpoint():
+    training = [parameter(name, (rows, 8), 1, 2)
+                for name, rows in [("a", 2), ("b", 6), ("c", 2)]]
+    inference = [parameter(p.name, p.global_shape, 1, 1, dp=1) for p in training]
+    builder = TransferPlanBuilder(2, 2, 2, group_replicated_inference=True,
+                                 dp_source_policy="stream", dp_source_block_bytes=1)
+    ops = builder.build_weights_mapping_operations(inference, training)
+    assert [(o.send_shard_meta.name, o.send_shard_meta.dp_rank, o.send_offset[0], o.overlap_shape[0])
+            for o in ops if o.recv_rank == 0] == [
+                ("a", 0, 0, 2), ("b", 0, 0, 3), ("b", 1, 3, 3), ("c", 1, 0, 2)]
+    assert builder.dp_stream_stats == dict(groups=1, shard_regions=3, fragments=4,
+                                         split_regions=1, bytes_by_rank={0:160, 1:160},
+                                         bytes_by_dp={0:160, 1:160})
+    shuffled = builder.build_weights_mapping_operations(inference[::-1], training[::-1])
+    assert list(map(signature, ops)) == list(map(signature, shuffled))
+
+
+def test_stream_partitions_each_tp_rank_and_preserves_parameter_edges():
+    # Each DP spans two hypothetical nodes (TP0/1 and TP2/3). Corresponding
+    # ranks split their own stream, rather than assigning whole model halves.
+    training = [parameter(name, (16, 16), 4, 2) for name in ("a", "b")]
+    inference = [parameter(p.name, p.global_shape, 4, 1, dp=1) for p in training]
+    builder = TransferPlanBuilder(4, 8, dp_source_policy="stream")
+    ops = builder.build_weights_mapping_operations(inference, training)
+    assert len(ops) == 8
+    assert builder.dp_stream_stats['groups'] == 4
+    assert builder.dp_stream_stats['split_regions'] == 0
+    assert set(builder.dp_stream_stats['bytes_by_rank'].values()) == {4 * 16 * 4}
+    assert {o.send_rank for o in ops if o.send_shard_meta.name == "a"} == set(range(4, 8))
+    assert {o.send_rank for o in ops if o.send_shard_meta.name == "b"} == set(range(8, 12))
+
+
+def test_stream_odd_rows_and_tiny_parameters_have_no_gaps():
+    training = [parameter("a", (1, 8), 1, 2), parameter("b", (4, 8), 1, 2)]
+    inference = [parameter(p.name, p.global_shape, 1, 1, dp=1) for p in training]
+    builder = TransferPlanBuilder(1, 2, dp_source_policy="stream")
+    ops = builder.build_weights_mapping_operations(inference, training)
+    assert [(o.send_shard_meta.name, o.send_shard_meta.dp_rank, o.send_offset[0], o.overlap_shape[0]) for o in ops] == [
+        ("a", 0, 0, 1), ("b", 0, 0, 1), ("b", 1, 1, 3)]
+    assert builder.dp_stream_stats['bytes_by_dp'] == {0:64, 1:96}
