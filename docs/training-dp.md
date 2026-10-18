@@ -66,3 +66,57 @@ separately.
 Experiment artifacts are collected under
 `results/training-dp-20261018` in the workspace and
 `/mnt/fuse/verl-e2e/runs/training-dp-20261018` on the experiment head.
+
+## Measured results (2026-10-18)
+
+These are real BF16 Qwen3-30B-A3B publications on four eight-GPU H20-3e nodes.
+Each configuration has three independent launches, five warmup publications
+and thirty measured publications per launch. Values below are the median of
+the three launch p50s and the median of their p95s, in milliseconds.
+The matched replica controls use the original rank-based ring order.
+
+| Rollout | Replica p50 / p95 | Candidate p50 / p95 | p50 change | Candidate |
+|---|---:|---:|---:|---|
+| 2 × TP8/EP8, one per node | 606.90 / 650.03 | 429.81 / 451.36 | -29.2% | 1 MiB blocks, source-node entry |
+| 4 × TP4, two per node | 389.81 / 395.37 | 374.76 / 388.49 | -3.9% | 1 MiB blocks, rank entry |
+
+The [launch data](data/qwen30-training-dp2-20261018-launches.csv) includes
+every independent result, cold publication latency, dense/expert DP sizes,
+source revision and screening configurations, including regressions.
+The [formal aggregates](data/qwen30-training-dp2-20261018-formal.json) retain
+each launch p50 and p95. Screening uses only seven measured publications and
+is separate from the formal comparison. The TP8 combined candidate changes
+both source granularity and ring entry; its complete benefit must not be
+attributed to block load balancing alone.
+A single-launch TP8 route-only screening measured replica/source-node at
+451.10 ms and block/source-node at 449.30 ms. This points to entry-node
+distribution as the main TP8 gain; extra benefit from block selection alone
+is not established. The small TP4 change overlaps launch-to-launch variation.
+
+All 510 successful publications passed full loaded-parameter equality after
+clearing destinations, version-marker checks and parameter-address stability.
+Every rollout engine passed deterministic generation before/after publication.
+Every measured rank reused its device plan with no batch rebuilding, metadata
+upload or transport initialization. Actual placement confirms one member of
+each dense/expert DP2 group per training node; all sixteen training ranks send.
+All four HCAs on each participating node carried traffic.
+
+One additional TP4 attempt failed before measurement when accumulated NCCL
+temporary segments filled `/dev/shm`. Its four-node logs were retained; only
+closed NCCL segments created during this task were reclaimed. That attempt
+was retried with identical code and transport settings and contributes no
+performance samples. Previous successful launches were reused.
+
+Formal benchmark revision: `aa5869911044d80a1102d23f344bb163a23740ca`.
+The final code validation at `48adb09` additionally covers partial blocks,
+geometry fallback, the DP2 recipes and source-node routing after membership
+changes; each node passed 93 tests (9.86–10.31 seconds).
+The unchanged native extension SHA-256 is
+`d134ab2c2ac9471fb2c55c563565e55dd9954d95e6ef7c847c422e041ec49c6c`.
+
+Full raw artifacts, per-publication CSV, manifests, route-only screening and
+the historical r23 comparison are in the workspace supplement
+`results/training-dp-20261018/REPORT.md`. The raw bundle was downloaded and
+verified against the head SHA-256:
+`4a1c7237bef75fbcbe9b303b91b85ede62199298fca82d94fc1e62d08625311f`.
+OSS FUSE writes returned zero-byte files and EIO on readback; the complete local evidence bundle is the verified persistent copy.
