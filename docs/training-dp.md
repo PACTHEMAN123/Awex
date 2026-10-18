@@ -50,9 +50,10 @@ the default. This option uses the existing ring swizzle mode and kernels.
 `--dp-source-policy stream` groups parameter shards by their equivalent source
 ranks. Each group traverses parameters in name/geometry order and partitions
 the cumulative canonical-shard bytes equally among DP replicas. Within a DP
-range, equivalent CP copies divide the range equally. Only a partition boundary
-inside a parameter creates an extra row-aligned slice; a boundary on a parameter
-edge leaves both parameters intact. No contiguous staging buffer is required,
+range, other equivalent copies (including CP copies) divide the range equally.
+Only a partition boundary inside a parameter creates an extra row-aligned slice;
+a boundary on a parameter edge leaves both parameters intact.
+No contiguous staging buffer is required,
 and the block-size setting does not control stream partitioning.
 
 Partitioning happens independently for every corresponding TP/EP source group,
@@ -147,3 +148,52 @@ the historical r23 comparison are in the workspace supplement
 verified against the head SHA-256:
 `4a1c7237bef75fbcbe9b303b91b85ede62199298fca82d94fc1e62d08625311f`.
 OSS FUSE writes returned zero-byte files and EIO on readback; the complete local evidence bundle is the verified persistent copy.
+
+## Stream partition measurements (2026-10-18)
+
+The selected configuration uses cumulative Stream partitioning and explicit
+DP-to-rollout-node entry pairing. Each topology has three independent
+launches, five warmup publications and thirty measured publications per
+launch. Values are medians of launch p50/p95 values, in milliseconds.
+This section records Stream performance only. Historical experiments above
+remain unchanged.
+
+| Rollout | Stream p50 | Stream p95 |
+|---|---:|---:|
+| 2 × TP8/EP8 | 418.04 | 449.93 |
+| 4 × TP4 | 419.32 | 448.12 |
+
+| Rollout | Three launch p50 values | Three launch p95 values |
+|---|---|---|
+| 2 × TP8/EP8 | 418.04, 413.36, 435.43 | 450.80, 429.95, 449.93 |
+| 4 × TP4 | 439.02, 363.72, 419.32 | 448.12, 386.57, 458.56 |
+
+TP4 has substantial launch variation; all three points are retained.
+
+| Rollout | Groups / source shard regions / boundary splits | Writer spans | Max/min writer bytes |
+|---|---:|---:|---:|
+| 2 × TP8/EP8 | 13 / 19449 / 27 | 22044 | 1.005616 |
+| 4 × TP4 | 13 / 19449 / 27 | 75540 | 1.000000 |
+
+Canonical source regions are counted once; replicated inference parameter
+views can add injections. Writer bytes/spans above are observed transport
+values, so storage-layout fragments and destination resharding are included.
+All 210 Stream publications passed full loaded-weight equality, version
+and address checks; deterministic generation agreed before/after publication.
+The audit also verified every DP entry node and complete forwarding chain,
+steady plan reuse, and four-HCA traffic on every node. Each node passed
+107 CPU tests.
+
+Runtime/test revision: `e8bd224`. Native binary remains unchanged. The actual
+GPU layout has one training DP per node; CPU tests additionally exercise a DP
+spanning multiple nodes. Unused NCCL shared-memory segments were reclaimed
+under the global benchmark lock with user authorization; each launch then
+reclaimed only its own new closed segments. All 32 GPUs were released.
+
+Use `--dp-source-policy stream --dp-source-ring-order dp`.
+
+Independent points: [Stream launch CSV](data/qwen30-training-dp2-stream-20261018-launches.csv)
+and [Stream aggregates](data/qwen30-training-dp2-stream-20261018-formal.json).
+Raw evidence and reproduction scripts are in the workspace supplement
+`results/training-dp-stream-20261018/REPORT.md`.
+Verified evidence SHA-256: `1a1fa3393b0155317f82cb4394e0194620ed5b1b271a71a56ddd6b3039675a23`.
