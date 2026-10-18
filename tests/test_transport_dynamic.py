@@ -75,6 +75,26 @@ def test_expansion_releases_old_fifo_rebuilds_ring_and_preserves_weights(prepare
         transport.send(params, old_plan, 4)
 
 
+def test_expansion_refreshes_source_node_ring_seeds(prepared, monkeypatch):
+    transport, params, _, _, members, group = prepared
+    transport.ring_source_node_swizzle = True
+    transport.ring_root_seeds = (0, 0)
+    calls = []
+
+    def gather(result, node, *, group):
+        calls.append(node)
+        result[:] = [10, 20, 30]
+
+    monkeypatch.setattr(module.dist, "all_gather_object", gather)
+    transport.reconfigure(
+        group, members, ("training", "", 0), params, make_plan(2, members),
+        rollout_node_ids=(10, 20),
+    )
+    assert transport.ring_root_seeds == (0, 1, 0)
+    assert transport._prepared_send[2].peers == [0]
+    assert len(calls) == 1
+
+
 def test_shrink_rebuilds_rank_routes_and_rejoin_keeps_model_storage(prepared):
     transport, params, _, destroyed, expanded, expanded_group = prepared
     pointer = params["weight"].data_ptr()

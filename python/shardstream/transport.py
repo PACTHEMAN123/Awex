@@ -1641,6 +1641,8 @@ class Transport:
             self.ring_root_seeds = None
             self._logical_to_communicator = list(range(self.world_size))
             self._logged_batch_shape = False
+            if self.ring_source_node_swizzle:
+                self.resolve_rollout_topology()
             if sender:
                 self.prepare_send(parameters, plan, allow_staging=False)
             else:

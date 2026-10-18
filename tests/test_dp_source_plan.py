@@ -112,3 +112,25 @@ def test_dp1_retains_existing_plan_and_metadata_copy_preserves_axes():
 def test_invalid_configuration(policy, size):
     with pytest.raises(ValueError):
         TransferPlanBuilder(1, 2, dp_source_policy=policy, dp_source_block_bytes=size)
+
+
+def test_different_replica_geometry_retains_replica_policy():
+    training = parameter("weight", (128, 64), 2, 2)
+    for index, shard in enumerate(training.replicas[1].shards):
+        shard.shape = (128, 32)
+        shard.global_offset = (0, index * 32)
+        shard.sharding_dim = 1
+    inference = parameter("weight", (128, 64), 2, 1, dp=1)
+    options = dict(infer_world_size=4, train_world_size=4, num_infer_engines=2)
+    original = TransferPlanBuilder(**options, dp_source_policy="replica")
+    block = TransferPlanBuilder(**options, dp_source_policy="block")
+    assert [signature(o) for o in original.build_weights_mapping_operations([inference], [training])] == [signature(o) for o in block.build_weights_mapping_operations([inference], [training])]
+
+
+def test_partial_final_block_preserves_every_row():
+    training = parameter("weight", (10, 64), 1, 2)
+    inference = parameter("weight", (10, 64), 1, 1, dp=1)
+    builder = TransferPlanBuilder(1, 2, dp_source_policy="block", dp_source_block_bytes=3 * 64 * 4)
+    ops = builder.build_weights_mapping_operations([inference], [training])
+    assert [op.overlap_shape for op in ops] == [(3, 64), (3, 64), (3, 64), (1, 64)]
+    assert [op.recv_offset for op in ops] == [(0, 0), (3, 0), (6, 0), (9, 0)]
