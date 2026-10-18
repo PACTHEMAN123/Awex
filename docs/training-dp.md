@@ -197,3 +197,61 @@ and [Stream aggregates](data/qwen30-training-dp2-stream-20261018-formal.json).
 Raw evidence and reproduction scripts are in the workspace supplement
 `results/training-dp-stream-20261018/REPORT.md`.
 Verified evidence SHA-256: `1a1fa3393b0155317f82cb4394e0194620ed5b1b271a71a56ddd6b3039675a23`.
+
+## Additional TP4 Stream launches (2026-10-18)
+
+Five additional independent launches use exactly the Stream + DP entry
+configuration of the original 363.72 ms p50 / 386.57 ms p95 run. Each launch
+has five warmup and thirty measured publications. No algorithm or transport
+configuration changed; runtime remains `e8bd224`. All points are retained.
+
+| Additional launch | p50 (ms) | p95 (ms) |
+|---|---:|---:|
+| 1 | 446.39 | 492.62 |
+| 2 | 410.16 | 412.93 |
+| 3 | 413.95 | 434.02 |
+| 4 | 368.35 | 430.98 |
+| 5 | 372.54 | 402.17 |
+
+The five-launch medians are 410.16 ms p50 and 430.98 ms p95.
+Including the original three launches, eight-launch medians are 412.05 ms
+p50 and 432.50 ms p95. New runs verified 175 full publications
+(150 measured); all eight verified 280 publications (240 measured). Routes,
+plan reuse and four-HCA traffic passed audit. All 32 GPUs were released.
+
+[All eight launches](data/qwen30-training-dp2-stream-tp4-repeat-20261018-launches.csv)
+and [batch summaries](data/qwen30-training-dp2-stream-tp4-repeat-20261018-summary.json).
+Raw supplement: `results/training-dp-stream-tp4-repeat-20261018/REPORT.md`.
+
+### Interpretation
+
+The historical per-tensor/rank-entry TP4 median was 389.81 ms; the current
+Stream/DP-entry eight-launch median is 412.05 ms, about 5.7% higher
+latency. TP8 improved from 606.90 ms to 418.04 ms across the combined changes,
+but this comparison changes both source partition and ring entry. An earlier
+single-launch TP8 screening kept per-tensor selection and changed rank entry
+to source-node entry: 535.38 ms to 451.10 ms. This supports entry spreading,
+with the limits of a single screening and a different entry implementation.
+There is no formal repeated per-tensor control using the same DP entry, so
+the evidence does not establish a standalone Stream partition advantage.
+No additional control experiments were run in this supplement.
+
+### Previously measured Qwen30B training DP
+
+Dense DP = world / (TP × PP × CP); expert DP = world / (ETP × PP × EP).
+All configurations below use expert TP1. These are training replica sizes.
+
+| Training GPUs | TP / PP / CP / EP | Rollout | Dense DP | Expert DP |
+|---:|---|---|---:|---:|
+| 16 | 2 / 1 / 2 / 8 | 2 × TP4/EP1 | 4 | 2 |
+| 16 | 2 / 1 / 2 / 8 | 4 × TP4/EP1 | 4 | 2 |
+| 8 | 2 / 1 / 1 / 8 | 6 × TP4/EP1 | 4 | 1 |
+| 16 | 2 / 4 / 2 / 4 | 4 × TP4/EP1 | 1 | 1 |
+| 16 | 4 / 1 / 2 / 8 | 2 × TP8/EP8 | 2 | 2 |
+| 16 | 4 / 1 / 2 / 8 | 4 × TP4/EP1 | 2 | 2 |
+
+The 16-training-GPU / 2×TP4 rollout row is an Awex-only historical point.
+The fully-async GRPO rollout experiments separately use fixed 16-GPU
+TP2/PP1/CP2/EP8 training, hence dense DP4 and expert DP2 for all four rollout
+layouts. Stream GPU validation currently covers the TP4/CP2/EP8 DP2 rows.
+[Successful outcome sources](data/qwen30-training-dp-topologies.json).

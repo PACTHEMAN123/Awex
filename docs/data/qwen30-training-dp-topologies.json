@@ -1,0 +1,152 @@
+[
+  {
+    "training": {
+      "tp": 2,
+      "pp": 1,
+      "cp": 2,
+      "ep": 8,
+      "etp": 1,
+      "world_size": 16
+    },
+    "rollout": {
+      "engine": "vllm",
+      "tp": 4,
+      "attention_dp": 1,
+      "ep": 1,
+      "instances": 2,
+      "world_size": 8,
+      "dp": 1
+    },
+    "examples": [
+      "results/five-model-baselines-20261012/awex-trainer2-rollout12-evidence/matrix/r23-awex-trainer2/qwen3-30b-a3b-trainer2-rollout1-tp4--awex_native_nccl/formal-0/attempt-001/outcome.json",
+      "results/five-model-baselines-20261012/awex-trainer2-rollout12-evidence/matrix/r23-awex-trainer2/qwen3-30b-a3b-trainer2-rollout1-tp4--awex_native_nccl/formal-1/attempt-001/outcome.json"
+    ],
+    "dense_dp": 4,
+    "expert_dp": 2
+  },
+  {
+    "training": {
+      "tp": 2,
+      "pp": 1,
+      "cp": 2,
+      "ep": 8,
+      "etp": 1,
+      "world_size": 16
+    },
+    "rollout": {
+      "engine": "vllm",
+      "tp": 4,
+      "attention_dp": 1,
+      "ep": 1,
+      "instances": 4,
+      "world_size": 16,
+      "dp": 1
+    },
+    "examples": [
+      "results/five-model-baselines-20261012/awex-trainer2-rollout12-evidence/matrix/r23-awex-trainer2/qwen3-30b-a3b-trainer2-rollout2-tp4--awex_native_nccl/formal-0/attempt-001/outcome.json",
+      "results/five-model-baselines-20261012/awex-trainer2-rollout12-evidence/matrix/r23-awex-trainer2/qwen3-30b-a3b-trainer2-rollout2-tp4--awex_native_nccl/formal-1/attempt-001/outcome.json"
+    ],
+    "dense_dp": 4,
+    "expert_dp": 2
+  },
+  {
+    "training": {
+      "tp": 2,
+      "pp": 1,
+      "cp": 1,
+      "ep": 8,
+      "etp": 1,
+      "world_size": 8
+    },
+    "rollout": {
+      "engine": "vllm",
+      "tp": 4,
+      "attention_dp": 1,
+      "ep": 1,
+      "instances": 6,
+      "world_size": 24,
+      "dp": 1
+    },
+    "examples": [
+      "results/five-model-baselines-20261012/formal-r17/qwen3-30b-a3b-main--shardstream/repeat-0/outcome.json",
+      "results/five-model-baselines-20261012/formal-r17/qwen3-30b-a3b-main--shardstream/repeat-1/outcome.json"
+    ],
+    "dense_dp": 4,
+    "expert_dp": 1
+  },
+  {
+    "training": {
+      "tp": 2,
+      "pp": 4,
+      "cp": 2,
+      "ep": 4,
+      "etp": 1,
+      "world_size": 16
+    },
+    "rollout": {
+      "engine": "vllm",
+      "tp": 4,
+      "attention_dp": 1,
+      "ep": 1,
+      "instances": 4,
+      "world_size": 16,
+      "dp": 1
+    },
+    "examples": [
+      "results/five-model-baselines-20261012/formal-r23/qwen30-tp2-pp4-cp2-ep4-r4tp4--shardstream/repeat-0/outcome.json",
+      "results/five-model-baselines-20261012/formal-r23/qwen30-tp2-pp4-cp2-ep4-r4tp4--shardstream/repeat-1/outcome.json"
+    ],
+    "dense_dp": 1,
+    "expert_dp": 1
+  },
+  {
+    "training": {
+      "tp": 4,
+      "pp": 1,
+      "cp": 2,
+      "ep": 8,
+      "etp": 1,
+      "world_size": 16
+    },
+    "rollout": {
+      "engine": "vllm",
+      "tp": 8,
+      "attention_dp": 1,
+      "ep": 8,
+      "instances": 2,
+      "world_size": 16,
+      "dp": 1
+    },
+    "examples": [
+      "results/five-model-baselines-20261012/formal-r23/qwen30-tp4-cp2-ep8-r2tp8ep8--shardstream/repeat-0/outcome.json",
+      "results/five-model-baselines-20261012/formal-r23/qwen30-tp4-cp2-ep8-r2tp8ep8--shardstream/repeat-1/outcome.json"
+    ],
+    "dense_dp": 2,
+    "expert_dp": 2
+  },
+  {
+    "training": {
+      "tp": 4,
+      "pp": 1,
+      "cp": 2,
+      "ep": 8,
+      "etp": 1,
+      "world_size": 16
+    },
+    "rollout": {
+      "engine": "vllm",
+      "tp": 4,
+      "attention_dp": 1,
+      "ep": 1,
+      "instances": 4,
+      "world_size": 16,
+      "dp": 1
+    },
+    "examples": [
+      "results/five-model-baselines-20261012/formal-r23/qwen30-tp4-cp2-ep8-r4tp4--shardstream/repeat-0/outcome.json",
+      "results/five-model-baselines-20261012/formal-r23/qwen30-tp4-cp2-ep8-r4tp4--shardstream/repeat-1/outcome.json"
+    ],
+    "dense_dp": 2,
+    "expert_dp": 2
+  }
+]
