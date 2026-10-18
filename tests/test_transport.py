@@ -274,6 +274,7 @@ def test_resolve_rollout_topology_uses_group_placement_once(monkeypatch):
     instance = transport.Transport.__new__(transport.Transport)
     instance._operation_lock = threading.RLock()
     instance.ring_broadcast = True
+    instance.ring_source_node_swizzle = False
     instance.rollout_node_ids = None
     instance.world_size = 24
     instance.infer_instance_world_size = 2
@@ -290,6 +291,69 @@ def test_resolve_rollout_topology_uses_group_placement_once(monkeypatch):
     instance.resolve_rollout_topology()
     instance.resolve_rollout_topology()
     assert instance.rollout_node_ids == (20, 10, 20, 10)
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("tp,topology", [(8, (10, 20)), (4, (10, 10, 20, 20))])
+def test_source_nodes_spread_ring_entries_and_match_every_relay(monkeypatch, tp, topology):
+    monkeypatch.setattr(transport, "_ensure_cuda_tensor", lambda *_: None)
+    nodes = [10] * 8 + [20] * 8 + [30] * 8 + [40] * 8
+    seeds = transport._source_node_ring_seeds(nodes, 16, 2)
+    tensor = torch.arange(8, dtype=torch.int32)
+    targets = list(range(0, 16, tp))
+    common = dict(world_size=32, chunk_bytes=16, infer_instance_world_size=tp,
+                  num_infer_engines=len(topology), ring_broadcast=True,
+                  ring_swizzle=True, rollout_node_ids=topology, ring_root_seeds=seeds)
+    for root in range(16, 32):
+        ordered = transport._ring_order(
+            root, targets, transport._RingOrderStrategy.ROOT_SWIZZLE,
+            infer_instance_world_size=tp, num_infer_engines=len(topology),
+            rollout_node_ids=topology, ring_root_seeds=seeds,
+        )
+        assert topology[ordered[0] // tp] == (10 if root < 24 else 20)
+        send = _build_send_batch(
+            {"weight": tensor},
+            TransferPlan(operations={p: [_replica_operation(root, p)] for p in targets}),
+            rank=root, **common,
+        )
+        assert send.peers == ordered[:1]
+        for index, rank in enumerate(ordered):
+            recv = _build_recv_batch(
+                {"weight": torch.empty_like(tensor)},
+                TransferPlan(operations={root: [_replica_operation(root, rank)]}),
+                rank=rank, **common,
+            )
+            assert recv.peers == [root if index == 0 else ordered[index - 1]]
+            assert recv.forward_peers == [ordered[index + 1] if index + 1 < len(ordered) else -1]
+            assert recv.ring_ids == send.ring_ids
+
+
+def test_source_node_seeds_use_actual_uneven_placement():
+    seeds = transport._source_node_ring_seeds([10, 20, 40, 30, 40, 40, 30], 2, 2)
+    assert seeds[2:] == (0, 1, 2, 4, 3)
+
+
+def test_source_node_topology_collects_once_with_explicit_rollout_nodes(monkeypatch):
+    instance = transport.Transport.__new__(transport.Transport)
+    instance._operation_lock = threading.RLock()
+    instance.ring_broadcast = True
+    instance.ring_source_node_swizzle = True
+    instance.ring_root_seeds = None
+    instance.rollout_node_ids = (10, 20)
+    instance.world_size = 7
+    instance.infer_instance_world_size = 1
+    instance.num_infer_engines = 2
+    instance.group = object()
+    calls = []
+
+    def gather(result, node, *, group):
+        calls.append(node)
+        result[:] = [10, 20, 40, 30, 40, 40, 30]
+
+    monkeypatch.setattr(transport.dist, "all_gather_object", gather)
+    instance.resolve_rollout_topology()
+    instance.resolve_rollout_topology()
+    assert instance.ring_root_seeds[2:] == (0, 1, 2, 4, 3)
     assert len(calls) == 1
 
 

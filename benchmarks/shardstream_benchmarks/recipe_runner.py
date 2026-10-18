@@ -226,6 +226,7 @@ def main():
     parser.add_argument("--transport-gin-fifo-depth", type=int, choices=(4, 8, 16))
     parser.add_argument("--dp-source-policy", choices=("replica", "block"), default="replica")
     parser.add_argument("--dp-source-block-mb", type=int, default=16)
+    parser.add_argument("--dp-source-ring-order", choices=("rank", "source-node"), default="rank")
     parser.add_argument(
         "--nccl-lib", default="/tmp/shardstream-prepare-nccl2312/nccl/lib"
     )
@@ -247,6 +248,7 @@ def main():
     transport_environment.update(
         SHARDSTREAM_DP_SOURCE_POLICY=args.dp_source_policy,
         SHARDSTREAM_DP_SOURCE_BLOCK_BYTES=str(args.dp_source_block_mb * 1024 * 1024),
+        SHARDSTREAM_RING_SOURCE_NODE_SWIZZLE="1" if args.dp_source_ring_order == "source-node" else "0",
     )
 
     # Ensure task-owned children are cleaned up when the driver is interrupted.

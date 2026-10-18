@@ -241,6 +241,19 @@ def _resolve_bool(name: str, value: bool | None = None) -> bool:
     )
 
 
+def _source_node_ring_seeds(node_ids, inference_world_size, rollout_node_count):
+    """Spread corresponding sources on different training nodes over entries."""
+    source_nodes = list(dict.fromkeys(node_ids[inference_world_size:]))
+    local_indices = {}
+    seeds = list(range(len(node_ids)))
+    for rank in range(inference_world_size, len(node_ids)):
+        node = node_ids[rank]
+        local_index = local_indices.get(node, 0)
+        seeds[rank] = source_nodes.index(node) + rollout_node_count * local_index
+        local_indices[node] = local_index + 1
+    return tuple(seeds)
+
+
 def _ring_order(
     root: int,
     peers: list[int],
@@ -249,10 +262,12 @@ def _ring_order(
     infer_instance_world_size: int = 0,
     num_infer_engines: int = 1,
     rollout_node_ids: tuple[Any, ...] | None = None,
+    ring_root_seeds: tuple[int, ...] | None = None,
 ) -> list[int]:
     ordered = sorted(peers)
     if len(ordered) < 2:
         return ordered
+    swizzle_root = int(root) if ring_root_seeds is None else ring_root_seeds[root]
 
     if rollout_node_ids is not None:
         if len(rollout_node_ids) != num_infer_engines or infer_instance_world_size <= 0:
@@ -265,8 +280,8 @@ def _ring_order(
         node_groups = list(groups.values())
         if strategy is _RingOrderStrategy.FIXED:
             return [peer for group in node_groups for peer in group]
-        node_offset = int(root) % len(node_groups)
-        member_offset = int(root) // len(node_groups)
+        node_offset = swizzle_root % len(node_groups)
+        member_offset = swizzle_root // len(node_groups)
         swizzled = []
         for i in range(len(node_groups)):
             group = node_groups[(node_offset + i) % len(node_groups)]
@@ -300,8 +315,8 @@ def _ring_order(
         if all(node_groups):
             if strategy is _RingOrderStrategy.FIXED:
                 return [peer for group in node_groups for peer in group]
-            node_offset = int(root) % node_count
-            member_offset = (int(root) // node_count) % max(
+            node_offset = swizzle_root % node_count
+            member_offset = (swizzle_root // node_count) % max(
                 len(group) for group in node_groups
             )
             swizzled: list[int] = []
@@ -313,7 +328,7 @@ def _ring_order(
 
     if strategy is _RingOrderStrategy.FIXED:
         return ordered
-    offset = int(root) % len(ordered)
+    offset = swizzle_root % len(ordered)
     return ordered[offset:] + ordered[:offset]
 
 
@@ -337,6 +352,7 @@ def _apply_send_ring_routes(
     num_infer_engines: int,
     swizzle: bool,
     rollout_node_ids: tuple[Any, ...] | None = None,
+    ring_root_seeds: tuple[int, ...] | None = None,
 ) -> None:
     instance_world_size = int(infer_instance_world_size)
     engine_count = int(num_infer_engines)
@@ -392,6 +408,7 @@ def _apply_send_ring_routes(
             infer_instance_world_size=instance_world_size,
             num_infer_engines=engine_count,
             rollout_node_ids=rollout_node_ids,
+            ring_root_seeds=ring_root_seeds,
         )
         canonical = [signature(index) for index in indices_by_peer[order[0]]]
         if not canonical or any(
@@ -439,6 +456,7 @@ def _apply_recv_ring_routes(
     num_infer_engines: int,
     swizzle: bool,
     rollout_node_ids: tuple[Any, ...] | None = None,
+    ring_root_seeds: tuple[int, ...] | None = None,
 ) -> None:
     instance_world_size = int(infer_instance_world_size)
     engine_count = int(num_infer_engines)
@@ -461,6 +479,7 @@ def _apply_recv_ring_routes(
             infer_instance_world_size=instance_world_size,
             num_infer_engines=engine_count,
             rollout_node_ids=rollout_node_ids,
+            ring_root_seeds=ring_root_seeds,
         )
         position = order.index(rank)
         batch.peers[index] = root if position == 0 else order[position - 1]
@@ -585,6 +604,7 @@ def _build_send_batch(
     ring_swizzle: bool = False,
     fp8_block_shape: tuple[int, int] | None = None,
     rollout_node_ids: tuple[Any, ...] | None = None,
+    ring_root_seeds: tuple[int, ...] | None = None,
 ) -> _Batch:
     _resolve_chunk_bytes(chunk_bytes)
     tensors: list[torch.Tensor] = []
@@ -703,6 +723,7 @@ def _build_send_batch(
             num_infer_engines=num_infer_engines,
             swizzle=ring_swizzle,
             rollout_node_ids=rollout_node_ids,
+            ring_root_seeds=ring_root_seeds,
         )
     return batch
 
@@ -720,6 +741,7 @@ def _build_recv_batch(
     ring_swizzle: bool = False,
     fp8_block_shape: tuple[int, int] | None = None,
     rollout_node_ids: tuple[Any, ...] | None = None,
+    ring_root_seeds: tuple[int, ...] | None = None,
 ) -> _Batch:
     _resolve_chunk_bytes(chunk_bytes)
     tensors: list[torch.Tensor] = []
@@ -872,6 +894,7 @@ def _build_recv_batch(
             num_infer_engines=num_infer_engines,
             swizzle=ring_swizzle,
             rollout_node_ids=rollout_node_ids,
+            ring_root_seeds=ring_root_seeds,
         )
     return batch
 
@@ -947,6 +970,10 @@ class Transport:
             )
         self.rollout_node_ids = (
             tuple(rollout_node_ids) if rollout_node_ids is not None else None
+        )
+        self.ring_root_seeds = None
+        self.ring_source_node_swizzle = _resolve_bool(
+            "SHARDSTREAM_RING_SOURCE_NODE_SWIZZLE"
         )
         self._membership_binding = None
         self._device_prepared_binding = None
@@ -1047,7 +1074,10 @@ class Transport:
         membership topology already supplies this information. Node groups use
         their first engine's order; node identity values never determine order.
         """
-        if not self.ring_broadcast or self.rollout_node_ids is not None:
+        if not self.ring_broadcast or (
+            self.rollout_node_ids is not None
+            and (not self.ring_source_node_swizzle or self.ring_root_seeds is not None)
+        ):
             return
         nodes = [None] * self.world_size
         dist.all_gather_object(nodes, _local_node_id(), group=self.group)
@@ -1063,6 +1093,11 @@ class Transport:
                 )
             engine_nodes.append(members[0])
         self.rollout_node_ids = tuple(engine_nodes)
+        if self.ring_source_node_swizzle:
+            self.ring_root_seeds = _source_node_ring_seeds(
+                nodes, self.num_infer_engines * self.infer_instance_world_size,
+                len(set(engine_nodes)),
+            )
 
     def _ensure_initialized(self) -> float:
         if self._reconfiguration_failed:
@@ -1221,6 +1256,7 @@ class Transport:
                             "rank": self.rank,
                             "sender": sender,
                             "rollout_node_ids": self.rollout_node_ids,
+                            "ring_root_seeds": self.ring_root_seeds,
                             "routes": routes,
                         }
                     ),
@@ -1286,6 +1322,7 @@ class Transport:
             if self.ring_broadcast
             else "disabled"
         )
+        extension_metrics["ring_source_node_swizzle"] = self.ring_source_node_swizzle
         selected_hca_bandwidth = os.environ.get(
             "SHARDSTREAM_SELECTED_HCA_BANDWIDTH_GBPS"
         )
@@ -1337,6 +1374,7 @@ class Transport:
                 ring_swizzle=self.ring_swizzle,
                 fp8_block_shape=self.fp8_block_shape,
                 rollout_node_ids=self.rollout_node_ids,
+                ring_root_seeds=self.ring_root_seeds,
             )
             build_batch_time_ms = (time.perf_counter() - build_start) * 1000.0
         metrics = self._run(batch, sender=True, sequence=_sequence_from_step(step_id))
@@ -1367,6 +1405,7 @@ class Transport:
                 ring_swizzle=self.ring_swizzle,
                 fp8_block_shape=self.fp8_block_shape,
                 rollout_node_ids=self.rollout_node_ids,
+                ring_root_seeds=self.ring_root_seeds,
             )
             build_batch_time_ms = (time.perf_counter() - build_start) * 1000.0
         metrics = self._run(batch, sender=False, sequence=_sequence_from_step(step_id))
@@ -1394,6 +1433,7 @@ class Transport:
             ring_swizzle=self.ring_swizzle,
             fp8_block_shape=self.fp8_block_shape,
             rollout_node_ids=self.rollout_node_ids,
+            ring_root_seeds=self.ring_root_seeds,
         )
         self._prepared_send = (parameters, plan, batch)
         self._device_prepared_binding = None
@@ -1418,6 +1458,7 @@ class Transport:
             ring_swizzle=self.ring_swizzle,
             fp8_block_shape=self.fp8_block_shape,
             rollout_node_ids=self.rollout_node_ids,
+            ring_root_seeds=self.ring_root_seeds,
         )
         self._prepared_recv = (parameters, plan, batch)
         self._device_prepared_binding = None
@@ -1597,6 +1638,7 @@ class Transport:
             self.rollout_node_ids = (
                 tuple(rollout_node_ids) if rollout_node_ids is not None else None
             )
+            self.ring_root_seeds = None
             self._logical_to_communicator = list(range(self.world_size))
             self._logged_batch_shape = False
             if sender:
