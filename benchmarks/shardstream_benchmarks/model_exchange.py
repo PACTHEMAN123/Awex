@@ -19,6 +19,7 @@ import argparse
 import copy
 import json
 import os
+import socket
 import subprocess
 import sys
 import threading
@@ -513,6 +514,17 @@ class MultiVLLMWeightsExchangeIT:
             expert_model_parallel_size=self.train_ep_size,
             expert_tensor_parallel_size=self.train_expert_tp_size,
         )
+        logger.info("SHARDSTREAM_TRAIN_LAYOUT %s", json.dumps({
+            "rank": self.rank, "hostname": socket.gethostname(),
+            "local_rank": self.local_rank,
+            "tp_rank": mpu.get_tensor_model_parallel_rank(),
+            "cp_rank": mpu.get_context_parallel_rank(),
+            "dp_rank": mpu.get_data_parallel_rank(),
+            "dp_size": mpu.get_data_parallel_world_size(),
+            "ep_rank": mpu.get_expert_model_parallel_rank(),
+            "expert_dp_rank": mpu.get_expert_data_parallel_rank(),
+            "expert_dp_size": mpu.get_expert_data_parallel_world_size(),
+        }, sort_keys=True))
 
         model_parallel_cuda_manual_seed(0)
 

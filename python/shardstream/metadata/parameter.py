@@ -67,6 +67,8 @@ class ParameterShardMeta:
     cp_rank: int = 0
     cp_size: int = 1
     cp_mode: str = "none"
+    dp_rank: int = 0
+    dp_size: int = 1
 
 
 @dataclass(slots=True)
@@ -120,6 +122,8 @@ class ParameterMeta:
                     cp_rank=shard.cp_rank,
                     cp_size=shard.cp_size,
                     cp_mode=shard.cp_mode,
+                    dp_rank=shard.dp_rank,
+                    dp_size=shard.dp_size,
                     name=shard.name,
                     shape=shard.shape,
                     numel=shard.numel,

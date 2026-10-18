@@ -224,12 +224,16 @@ def main():
     parser.add_argument("--transport-gin-connections", type=int, choices=(1, 2, 4))
     parser.add_argument("--transport-max-channels", type=int, choices=(16, 32, 64))
     parser.add_argument("--transport-gin-fifo-depth", type=int, choices=(4, 8, 16))
+    parser.add_argument("--dp-source-policy", choices=("replica", "block"), default="replica")
+    parser.add_argument("--dp-source-block-mb", type=int, default=16)
     parser.add_argument(
         "--nccl-lib", default="/tmp/shardstream-prepare-nccl2312/nccl/lib"
     )
     args = parser.parse_args()
     if not 0 <= args.warmup_updates < args.num_updates:
         parser.error("Require 0 <= warmup updates < total updates")
+    if args.dp_source_block_mb <= 0:
+        parser.error("DP source block size must be positive")
     transport_environment = {
         name: str(value) for name, value in (
             ("SHARDSTREAM_GIN_CONNECTIONS", args.transport_gin_connections),
@@ -240,6 +244,10 @@ def main():
     }
     if transport_environment and args.publication_mechanism != "shardstream":
         parser.error("Transport preparation tuning applies only to ShardStream")
+    transport_environment.update(
+        SHARDSTREAM_DP_SOURCE_POLICY=args.dp_source_policy,
+        SHARDSTREAM_DP_SOURCE_BLOCK_BYTES=str(args.dp_source_block_mb * 1024 * 1024),
+    )
 
     # Ensure task-owned children are cleaned up when the driver is interrupted.
     def terminate(signum, frame):

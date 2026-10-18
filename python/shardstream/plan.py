@@ -16,6 +16,7 @@
 # under the License.
 
 import json
+import math
 import os
 import time
 from dataclasses import dataclass, field
@@ -134,6 +135,8 @@ class TransferPlanBuilder:
         enable_debug_mode: bool = False,
         strict_param_key_match: bool = False,
         group_replicated_inference: bool = None,
+        dp_source_policy: str = None,
+        dp_source_block_bytes: int = None,
     ):
         if num_infer_engines <= 0:
             raise ValueError("num_infer_engines must be positive")
@@ -144,6 +147,17 @@ class TransferPlanBuilder:
         self.infer_instance_world_size = infer_world_size // num_infer_engines
         self.num_infer_engines = num_infer_engines
         self.enable_debug_mode = enable_debug_mode
+        self.dp_source_policy = dp_source_policy or os.environ.get(
+            "SHARDSTREAM_DP_SOURCE_POLICY", "replica"
+        )
+        if self.dp_source_policy not in {"replica", "block"}:
+            raise ValueError("DP source policy must be replica or block")
+        self.dp_source_block_bytes = int(
+            os.environ.get("SHARDSTREAM_DP_SOURCE_BLOCK_BYTES", str(16 * 1024 * 1024))
+            if dp_source_block_bytes is None else dp_source_block_bytes
+        )
+        if self.dp_source_block_bytes <= 0:
+            raise ValueError("DP source block bytes must be positive")
         self.strict_param_key_match = strict_param_key_match
         self.group_replicated_inference = (
             os.environ.get("SHARDSTREAM_RING_BROADCAST", "0").lower()
@@ -230,10 +244,26 @@ class TransferPlanBuilder:
 
         communication_plan = []
         grouped_replica_loads: Dict[Tuple[int, ...], int] = {}
+        source_loads: Dict[int, int] = {}
 
         for param_name in sorted(common_params):
             inference_meta = inference_meta_dict[param_name]
             training_meta = training_meta_dict[param_name]
+            if self.dp_source_policy == "block" and any(
+                getattr(shard, "dp_size", 1) > 1 for shard in training_meta.shards
+            ):
+                param_plan = self._build_dp_block_operations(
+                    inference_meta, training_meta, source_loads
+                )
+                if param_plan is not None:
+                    # Assignment is global and deterministic, including when callers
+                    # request a pruned local plan for large models.
+                    communication_plan.extend(
+                        op for op in param_plan
+                        if global_transfer_rank is None
+                        or global_transfer_rank in (op.send_rank, op.recv_rank)
+                    )
+                    continue
             grouped_train_replica_indices = None
             if (
                 self.group_replicated_inference
@@ -279,6 +309,72 @@ class TransferPlanBuilder:
             f"for {len(common_params)} common parameters"
         )
         return communication_plan
+
+    def _build_dp_block_operations(self, inference_meta, training_meta, source_loads):
+        """Stripe disjoint destination regions over equivalent training shards.
+
+        A canonical replica supplies geometry only. Each physical source must
+        cover exactly the same shard region; different replica geometries retain
+        the existing replica planner. CP copies may also serve a DP-replicated
+        shard. Ring engines share one assignment and are charged only once.
+        """
+        def geometry(shard):
+            return (tuple(shard.global_offset), tuple(shard.shape), shard.dtype)
+
+        replicas = training_meta.replicas
+        if len(replicas) < 2:
+            return None
+        canonical = replicas[0]
+        keys = {geometry(shard) for shard in canonical.shards}
+        if len(keys) != len(canonical.shards) or any(
+            {geometry(shard) for shard in replica.shards} != keys
+            or len(replica.shards) != len(keys) for replica in replicas
+        ):
+            return None
+        candidates = {key: {} for key in keys}
+        for shard in training_meta.shards:
+            candidates[geometry(shard)][int(shard.global_rank)] = shard
+        training_map = self._create_shard_offset_for_replica(canonical, 0, False)
+        plan = []
+        assignments = {}
+        for engine_rank in range(self.num_infer_engines):
+            for replica_idx, replica in enumerate(inference_meta.replicas):
+                inference_map = self._create_shard_offset_for_replica(
+                    replica, engine_rank, True
+                )
+                for region in self._find_overlapping_regions(inference_map, training_map):
+                    shape = tuple(b - a for a, b in zip(region.overlap_start, region.overlap_end))
+                    # Keep the innermost dimension intact for contiguous rows and
+                    # the existing strided-copy/device-layout lowering. FP8 uses
+                    # 128-row blocks, so conservatively retain that alignment.
+                    axis = 0
+                    alignment = 128 if str(inference_meta.dtype).startswith("torch.float8") and len(shape) > 1 else 1
+                    row_bytes = math.prod(shape[1:]) * _dtype_element_size(training_meta.dtype)
+                    rows = max(alignment, self.dp_source_block_bytes // row_bytes // alignment * alignment)
+                    sources = candidates[geometry(region.training_shard.shard)]
+                    for start in range(region.overlap_start[axis], region.overlap_end[axis], rows):
+                        block_start = (start, *region.overlap_start[1:])
+                        block_end = (min(start + rows, region.overlap_end[0]), *region.overlap_end[1:])
+                        key = (replica_idx, region.inference_shard.shard.global_rank,
+                               block_start, block_end)
+                        if not self.group_replicated_inference or key not in assignments:
+                            rank = min(sources, key=lambda rank: (source_loads.get(rank, 0), rank))
+                            block_bytes = math.prod(b - a for a, b in zip(block_start, block_end)) * _dtype_element_size(training_meta.dtype)
+                            source_loads[rank] = source_loads.get(rank, 0) + block_bytes
+                            assignments[key] = rank
+                        source = sources[assignments[key]]
+                        source_offset = ShardOffset(
+                            shard=source, start_offset=source.global_offset,
+                            end_offset=region.training_shard.end_offset,
+                            shape=source.shape,
+                            rank=self._compute_shard_transfer_rank(source, 0, False),
+                        )
+                        plan.extend(self._build_region_communication_plan(OverlapRegion(
+                            inference_shard=region.inference_shard,
+                            training_shard=source_offset,
+                            overlap_start=block_start, overlap_end=block_end,
+                        )))
+        return plan
 
     def _build_parameter_communication_plan(
         self,

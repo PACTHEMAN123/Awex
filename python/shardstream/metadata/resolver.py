@@ -138,6 +138,11 @@ class ParamMetaResolver(ABC):
                     sharding_type=sharding_type,
                     num_shards=num_shards,
                     sharding_dim=sharding_dim,
+                    dp_rank=rank_info.dp_rank,
+                    dp_size=rank_info.dp_size,
+                    cp_rank=rank_info.cp_rank,
+                    cp_size=rank_info.cp_size,
+                    cp_mode=rank_info.cp_mode,
                 )
                 param_shards[name].append(shard_info)
                 param_sharding_info[name] = (sharding_type, sharding_dim, num_shards)
