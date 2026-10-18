@@ -84,3 +84,14 @@ For one full 8-GPU rollout node, use four replicas for Qwen3.5-9B (TP2 each)
 or eight replicas for Qwen2.5-VL-7B (TP1 each), with four training GPUs on a
 different node in either case. All replicas receive full weight validation and
 text generation checks.
+
+The Qwen3-30B-A3B training-DP supplement uses layouts
+`qwen30-tp4-cp2-ep8-r2tp8ep8` and `qwen30-tp4-cp2-ep8-r4tp4`.
+Both place TP4/CP2/EP8/expert-TP1 on sixteen training GPUs, giving dense DP2
+and expert DP2, with one complete training DP group per eight-GPU node.
+The two rollout nodes hold one TP8/EP8 engine each or two TP4 engines each.
+Use `--dp-source-policy block --dp-source-block-mb 1` to allow different blocks
+of one parameter to come from different training copies. The optional
+`--dp-source-ring-order source-node` spreads entry nodes across training nodes.
+Configuration, correctness guarantees and results are in
+[the training-DP supplement](../../docs/training-dp.md).
