@@ -927,7 +927,8 @@ def main(args):
             status = [None]
             if weights_exchange_it.is_driver:
                 try:
-                    from shardstream_benchmarks.recipe_runner import generation
+                    from shardstream_benchmarks.fp8_config import set_publication_pause
+                    from shardstream_benchmarks.recipe_runner import generation, request
 
                     bootstrap = weights_exchange_it.elastic_records.pop()
                     urls = [f"http://{host}:{port}" for _, host, port
@@ -936,8 +937,11 @@ def main(args):
                     repeated = [generation(url, args.model_path) for url in urls]
                     if [r['message'] for r in before] != [r['message'] for r in repeated]:
                         raise RuntimeError("FP8 checkpoint generation baseline is not repeatable")
+                    paused = set_publication_pause(urls, paused=True, request=request)
                     Path(args.elastic_output).with_name("bootstrap-generation.json").write_text(
                         json.dumps(dict(generation_before=before, generation_before_repeat=repeated,
+                                        generation_paused_for_publications=True,
+                                        generation_pause_mode="wait", generation_pause_results=paused,
                                         generation_baseline_after_checkpoint_bootstrap=True), indent=2) + "\n")
                 except Exception as exc:
                     status[0] = f"{type(exc).__name__}: {exc}"

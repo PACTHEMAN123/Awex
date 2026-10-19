@@ -21,6 +21,21 @@ import json
 import os
 
 
+def set_publication_pause(urls, *, paused, request):
+    """Drain vLLM DP dummy batches before standalone weight-update RPCs."""
+    action = "pause?mode=wait" if paused else "resume"
+    expected = "paused" if paused else "resumed"
+    results = []
+    for url in urls:
+        result = request(f"{url}/{action}", {})
+        if result.get("status") != expected:
+            raise RuntimeError(f"vLLM did not acknowledge {expected}: {result}")
+        results.append(result)
+    if not results:
+        raise ValueError("Publication pause requires inference endpoints")
+    return results
+
+
 def fp8_server_args(*, enabled=None, block_shape=None) -> list[str]:
     if enabled is None:
         enabled = os.environ.get("SHARDSTREAM_FP8_BLOCKWISE", "0") == "1"

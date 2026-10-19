@@ -86,6 +86,8 @@ class NodeProcesses:
         env.update(
             {
                 "VLLM_PLUGINS": "shardstream_adapter",
+                "VLLM_SERVER_DEV_MODE": "1" if environment.get("SHARDSTREAM_FP8_BLOCKWISE", "0") == "1"
+                else env.get("VLLM_SERVER_DEV_MODE", "0"),
                 "SHARDSTREAM_NCCL_LIB": self.nccl_lib,
                 "LD_PRELOAD": self.nccl_lib + "/libnccl.so.2",
                 "NCCL_SOCKET_IFNAME": "eth0",
@@ -512,6 +514,10 @@ def main():
         if args.weight_format == "fp8":
             bootstrap = ray.get(training[0].read_json.remote("bootstrap-generation.json"))
             record.update(bootstrap)
+            from shardstream_benchmarks.fp8_config import set_publication_pause
+
+            record["generation_resume_results"] = set_publication_pause(
+                urls, paused=False, request=request)
         record["generation_after"] = [generation(url, args.model_path,
                                                  recipe.id == 'moonlight-16b-a3b') for url in urls]
         if [result["message"] for result in record["generation_before"]] != [

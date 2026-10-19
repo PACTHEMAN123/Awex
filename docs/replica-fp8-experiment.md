@@ -24,6 +24,15 @@ the regular 0..34 schedule uses distinct norm factors and restores the norm on i
 publication. Thus six formal launches contain 210 regular verified updates,
 180 measured updates, and six additional verified checkpoint bootstraps.
 
+After the repeated generation baseline, drain and pause each instance using
+vLLM's `POST /pause?mode=wait` and require its acknowledgement before regular
+publications. This prevents DP/EP dummy-batch coordination from interleaving with
+weight-update worker RPCs. The benchmark enables vLLM's development endpoints
+for this supported weight-update lifecycle. DP, EP and all transport features
+remain enabled. Resume each instance before the final generation check. Pause
+and resume are outside publication timing. Pre-pause failed attempts and their
+debugger evidence are retained separately from the frozen formal matrix.
+
 Outside each timed publication, clear every destination and scale, then check
 all canonical parameter views against the real BF16 safetensors checkpoint:
 FP8 encoded bytes exactly, scales against an independent block amax reference
