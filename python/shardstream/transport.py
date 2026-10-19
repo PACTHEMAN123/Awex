@@ -524,6 +524,35 @@ def _sequence_from_step(step_id: int) -> int:
     return sequence
 
 
+def _logical_replica_order(op, rank_node_ids, rollout_node_ids, instance_size, swizzle):
+    targets = op.replica_targets
+    if (op.replica_route_id < 0 or not targets or len(set(targets)) != len(targets)
+            or op.recv_rank not in targets):
+        raise TransportUnavailableError("Invalid explicit logical replica route")
+    if rank_node_ids is None:
+        if rollout_node_ids is None or instance_size <= 0:
+            raise TransportUnavailableError("Logical replica routes require resolved physical nodes")
+        nodes = {rank: rollout_node_ids[rank // instance_size] for rank in targets}
+        seed = op.send_rank
+        member_seed = op.send_rank
+    else:
+        nodes = {rank: rank_node_ids[rank] for rank in targets}
+        inference_size = len(rollout_node_ids) * instance_size if rollout_node_ids is not None else op.send_rank
+        source_nodes = list(dict.fromkeys(rank_node_ids[inference_size:]))
+        source_node = rank_node_ids[op.send_rank]
+        seed = source_nodes.index(source_node)
+        member_seed = sum(node == source_node for node in rank_node_ids[inference_size:op.send_rank])
+    groups = {}
+    for target in sorted(targets):
+        groups.setdefault(nodes[target], []).append(target)
+    groups = list(groups.values())
+    if swizzle:
+        offset = seed % len(groups)
+        groups = groups[offset:] + groups[:offset]
+        groups = [g[member_seed % len(g):] + g[:member_seed % len(g)] for g in groups]
+    return tuple(rank for group in groups for rank in group)
+
+
 def _ensure_cuda_tensor(tensor: torch.Tensor, description: str) -> None:
     if not isinstance(tensor, torch.Tensor) or not tensor.is_cuda:
         raise TransportUnavailableError(
@@ -630,9 +659,13 @@ def _build_send_batch(
     fp8_block_shape: tuple[int, int] | None = None,
     rollout_node_ids: tuple[Any, ...] | None = None,
     ring_root_seeds: tuple[int, ...] | None = None,
+    rank_node_ids: tuple[Any, ...] | None = None,
 ) -> _Batch:
     _resolve_chunk_bytes(chunk_bytes)
-    if ring_broadcast:
+    logical_routes = any(op.replica_targets for ops in plan.operations.values() for op in ops)
+    if logical_routes and not ring_broadcast:
+        raise TransportUnavailableError("Logical replica routes require ring broadcast")
+    if ring_broadcast and not logical_routes:
         ring_root_seeds = _dp_entry_ring_seeds(plan, world_size, rollout_node_ids, ring_root_seeds)
     tensors: list[torch.Tensor] = []
     offsets: list[int] = []
@@ -647,10 +680,26 @@ def _build_send_batch(
     expected_counts = [0] * world_size
     context = {}
     quantization = []
+    explicit_routes = []
+    route_orders = {}
     for peer, operations in _operation_groups(plan, rank, world_size):
         peer_offset = 0
         ordinal = 0
         for op in operations:
+            order = None
+            if logical_routes:
+                if not op.replica_targets:
+                    raise TransportUnavailableError("Cannot mix explicit and engine replica routes")
+                route_key = (op.send_rank, op.replica_route_id, op.replica_targets)
+                if route_key not in route_orders:
+                    route_orders[route_key] = _logical_replica_order(
+                        op, rank_node_ids, rollout_node_ids,
+                        infer_instance_world_size, ring_swizzle,
+                    )
+                order = route_orders[route_key]
+                if peer != order[0]:
+                    continue
+            first_fragment = len(tensors)
             if (
                 str(getattr(op.recv_shard_meta, "dtype", None)).removeprefix("torch.")
                 == "float8_e4m3fn"
@@ -723,6 +772,8 @@ def _build_send_batch(
                     region_index=rank,
                 )
                 peer_offset += length
+            if order is not None:
+                explicit_routes.append((first_fragment, len(tensors), order[0], _NO_PEER, op.replica_route_id))
         expected_counts[peer] = ordinal
         region_bytes[rank] = max(region_bytes[rank], peer_offset)
     batch = _Batch(
@@ -742,7 +793,14 @@ def _build_send_batch(
         ring_ids=[_NO_RING] * len(tensors),
         quantization=quantization if fp8_block_shape else [],
     )
-    if ring_broadcast:
+    if logical_routes:
+        for first, last, previous, following, route_id in explicit_routes:
+            for index in range(first, last):
+                batch.peers[index] = previous
+                batch.forward_peers[index] = following
+                batch.ring_ids[index] = route_id
+        _reindex_batch_streams(batch)
+    elif ring_broadcast:
         _apply_send_ring_routes(
             batch,
             root=rank,
@@ -769,9 +827,13 @@ def _build_recv_batch(
     fp8_block_shape: tuple[int, int] | None = None,
     rollout_node_ids: tuple[Any, ...] | None = None,
     ring_root_seeds: tuple[int, ...] | None = None,
+    rank_node_ids: tuple[Any, ...] | None = None,
 ) -> _Batch:
     _resolve_chunk_bytes(chunk_bytes)
-    if ring_broadcast:
+    logical_routes = any(op.replica_targets for ops in plan.operations.values() for op in ops)
+    if logical_routes and not ring_broadcast:
+        raise TransportUnavailableError("Logical replica routes require ring broadcast")
+    if ring_broadcast and not logical_routes:
         ring_root_seeds = _dp_entry_ring_seeds(plan, world_size, rollout_node_ids, ring_root_seeds)
     tensors: list[torch.Tensor] = []
     offsets: list[int] = []
@@ -786,11 +848,25 @@ def _build_recv_batch(
     expected_counts = [0] * world_size
     copybacks: list[tuple[torch.Tensor, torch.Tensor]] = []
     quantization = []
+    explicit_routes = []
+    route_orders = {}
     scale_tensors = []
     for peer, operations in _operation_groups(plan, rank, world_size):
         peer_offset = 0
         ordinal = 0
         for op in operations:
+            order = None
+            if logical_routes:
+                if not op.replica_targets:
+                    raise TransportUnavailableError("Cannot mix explicit and engine replica routes")
+                route_key = (op.send_rank, op.replica_route_id, op.replica_targets)
+                if route_key not in route_orders:
+                    route_orders[route_key] = _logical_replica_order(
+                        op, rank_node_ids, rollout_node_ids,
+                        infer_instance_world_size, ring_swizzle,
+                    )
+                order = route_orders[route_key]
+            first_fragment = len(tensors)
             parameter = parameters[op.recv_shard_meta.name]
             if parameter.dtype == torch.float8_e4m3fn and not fp8_block_shape:
                 raise TransportUnavailableError(
@@ -895,6 +971,11 @@ def _build_recv_batch(
                 )
                 target_offset += int(fragment_numel) * element_size
                 peer_offset += length
+            if order is not None:
+                position = order.index(rank)
+                previous = op.send_rank if position == 0 else order[position - 1]
+                following = order[position + 1] if position + 1 < len(order) else _NO_PEER
+                explicit_routes.append((first_fragment, len(tensors), previous, following, op.replica_route_id))
         expected_counts[peer] = ordinal
         region_bytes[peer] = max(region_bytes[peer], peer_offset)
     batch = _Batch(
@@ -915,7 +996,14 @@ def _build_recv_batch(
         quantization=quantization if fp8_block_shape else [],
         scale_tensors=scale_tensors,
     )
-    if ring_broadcast:
+    if logical_routes:
+        for first, last, previous, following, route_id in explicit_routes:
+            for index in range(first, last):
+                batch.peers[index] = previous
+                batch.forward_peers[index] = following
+                batch.ring_ids[index] = route_id
+        _reindex_batch_streams(batch)
+    elif ring_broadcast:
         _apply_recv_ring_routes(
             batch,
             rank=rank,
@@ -988,6 +1076,7 @@ class Transport:
         ring_swizzle: bool | None = None,
         membership_epoch: int = 0,
         rollout_node_ids: tuple[Any, ...] | None = None,
+        rank_node_ids: tuple[Any, ...] | None = None,
     ):
         self._operation_lock = threading.RLock()
         if membership_epoch < 0:
@@ -1001,6 +1090,10 @@ class Transport:
             tuple(rollout_node_ids) if rollout_node_ids is not None else None
         )
         self.ring_root_seeds = None
+        if rank_node_ids is not None and len(rank_node_ids) != world_size:
+            raise TransportUnavailableError("Physical node map must cover every transfer rank")
+        self.rank_node_ids = tuple(rank_node_ids) if rank_node_ids is not None else None
+        self.logical_replica_routing = os.environ.get("SHARDSTREAM_REPLICA_ROUTING", "engine") == "logical"
         self.ring_source_node_swizzle = _resolve_bool(
             "SHARDSTREAM_RING_SOURCE_NODE_SWIZZLE"
         )
@@ -1108,17 +1201,19 @@ class Transport:
         if not self.ring_broadcast or (
             self.rollout_node_ids is not None
             and (not self.ring_source_node_swizzle or self.ring_root_seeds is not None)
+            and (not self.logical_replica_routing or self.rank_node_ids is not None)
         ):
             return
         nodes = [None] * self.world_size
         dist.all_gather_object(nodes, _local_node_id(), group=self.group)
+        self.rank_node_ids = tuple(nodes)
         engine_nodes = []
         for engine in range(self.num_infer_engines):
             members = nodes[
                 engine * self.infer_instance_world_size : (engine + 1)
                 * self.infer_instance_world_size
             ]
-            if not members or len(set(members)) != 1:
+            if not members or (not self.logical_replica_routing and len(set(members)) != 1):
                 raise TransportUnavailableError(
                     "Each rollout TP instance must reside on one node"
                 )
@@ -1153,6 +1248,7 @@ class Transport:
                 int(self.ring_broadcast),
                 int(self.ring_swizzle),
                 int(self.fp8_block_shape is not None),
+                int(self.logical_replica_routing),
             ],
             dtype=torch.int32,
             device=device,
@@ -1206,6 +1302,9 @@ class Transport:
                 "Membership epoch and inference geometry must match on every rank"
             )
         node_ids = [int(value[0]) for value in identities]
+        if self.rank_node_ids is not None and tuple(node_ids) != self.rank_node_ids:
+            raise TransportUnavailableError("Physical node placement changed after route preparation")
+        self.rank_node_ids = tuple(node_ids)
         self._logical_to_communicator = _node_major_communicator_ranks(
             node_ids,
             inference_tp_size=self.infer_instance_world_size,
@@ -1407,6 +1506,7 @@ class Transport:
                 fp8_block_shape=self.fp8_block_shape,
                 rollout_node_ids=self.rollout_node_ids,
                 ring_root_seeds=self.ring_root_seeds,
+                rank_node_ids=self.rank_node_ids,
             )
             build_batch_time_ms = (time.perf_counter() - build_start) * 1000.0
         metrics = self._run(batch, sender=True, sequence=_sequence_from_step(step_id))
@@ -1438,6 +1538,7 @@ class Transport:
                 fp8_block_shape=self.fp8_block_shape,
                 rollout_node_ids=self.rollout_node_ids,
                 ring_root_seeds=self.ring_root_seeds,
+                rank_node_ids=self.rank_node_ids,
             )
             build_batch_time_ms = (time.perf_counter() - build_start) * 1000.0
         metrics = self._run(batch, sender=False, sequence=_sequence_from_step(step_id))
@@ -1466,6 +1567,7 @@ class Transport:
             fp8_block_shape=self.fp8_block_shape,
             rollout_node_ids=self.rollout_node_ids,
             ring_root_seeds=self.ring_root_seeds,
+                rank_node_ids=self.rank_node_ids,
         )
         self._prepared_send = (parameters, plan, batch)
         self._device_prepared_binding = None
@@ -1491,6 +1593,7 @@ class Transport:
             fp8_block_shape=self.fp8_block_shape,
             rollout_node_ids=self.rollout_node_ids,
             ring_root_seeds=self.ring_root_seeds,
+                rank_node_ids=self.rank_node_ids,
         )
         self._prepared_recv = (parameters, plan, batch)
         self._device_prepared_binding = None
@@ -1671,9 +1774,10 @@ class Transport:
                 tuple(rollout_node_ids) if rollout_node_ids is not None else None
             )
             self.ring_root_seeds = None
+            self.rank_node_ids = None
             self._logical_to_communicator = list(range(self.world_size))
             self._logged_batch_shape = False
-            if self.ring_source_node_swizzle:
+            if self.ring_source_node_swizzle or self.logical_replica_routing:
                 self.resolve_rollout_topology()
             if sender:
                 self.prepare_send(parameters, plan, allow_staging=False)

@@ -227,6 +227,7 @@ def main():
     parser.add_argument("--dp-source-policy", choices=("replica", "block", "stream"), default="replica")
     parser.add_argument("--dp-source-block-mb", type=int, default=16)
     parser.add_argument("--dp-source-ring-order", choices=("rank", "source-node", "dp"), default="rank")
+    parser.add_argument("--replica-routing", choices=("engine", "logical"), default="engine")
     parser.add_argument(
         "--nccl-lib", default="/tmp/shardstream-prepare-nccl2312/nccl/lib"
     )
@@ -247,6 +248,7 @@ def main():
         parser.error("Transport preparation tuning applies only to ShardStream")
     transport_environment.update(
         SHARDSTREAM_DP_SOURCE_POLICY=args.dp_source_policy,
+        SHARDSTREAM_REPLICA_ROUTING=args.replica_routing,
         SHARDSTREAM_DP_SOURCE_BLOCK_BYTES=str(args.dp_source_block_mb * 1024 * 1024),
         SHARDSTREAM_RING_SOURCE_NODE_SWIZZLE="1" if args.dp_source_ring_order == "source-node" else "0",
         SHARDSTREAM_RING_DP_ENTRY="1" if args.dp_source_ring_order == "dp" else "0",

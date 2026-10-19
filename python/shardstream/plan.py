@@ -58,6 +58,9 @@ class CommunicationOperation:
     # Logical source span sizes for a copy-only, materialization-free layout.
     # Empty means the canonical source tensor is one contiguous span.
     send_tensor_span_numels: Tuple[int, ...] = ()
+    # Explicit logical replica chain, independent of inference engine boundaries.
+    replica_targets: Tuple[int, ...] = ()
+    replica_route_id: int = -1
 
 
 @dataclass(slots=True)
@@ -137,6 +140,7 @@ class TransferPlanBuilder:
         group_replicated_inference: bool = None,
         dp_source_policy: str = None,
         dp_source_block_bytes: int = None,
+        replica_routing: str = None,
     ):
         if num_infer_engines <= 0:
             raise ValueError("num_infer_engines must be positive")
@@ -165,6 +169,15 @@ class TransferPlanBuilder:
             if group_replicated_inference is None
             else bool(group_replicated_inference)
         )
+        self.replica_routing = replica_routing or os.environ.get(
+            "SHARDSTREAM_REPLICA_ROUTING", "engine"
+        )
+        if self.replica_routing not in {"engine", "logical"}:
+            raise ValueError("Replica routing must be engine or logical")
+        if self.replica_routing == "logical" and (
+            not self.group_replicated_inference or self.dp_source_policy == "block"
+        ):
+            raise ValueError("Logical replica routing requires ring broadcast and replica/stream source policy")
         logger.info(
             f"TransferPlanBuilder: infer_world_size: {infer_world_size}, train_world_size: {train_world_size}, world_size: {self.world_size}, "
             f"infer_instance_world_size: {self.infer_instance_world_size}, num_infer_engines: {num_infer_engines}, "
@@ -240,6 +253,14 @@ class TransferPlanBuilder:
                 "count=%s sample=%s",
                 len(extra_on_infer),
                 sorted(extra_on_infer)[:8],
+            )
+
+        if self.replica_routing == "logical":
+            from shardstream.replicas import build_logical_replica_operations
+
+            return build_logical_replica_operations(
+                self, inference_meta_dict, training_meta_dict,
+                sorted(common_params), global_transfer_rank,
             )
 
         communication_plan = []
