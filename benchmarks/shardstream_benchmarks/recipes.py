@@ -90,7 +90,7 @@ class ModelRecipe:
             "--max-num-seqs",
             "4",
             "--gpu-memory-utilization",
-            "0.7",
+            str(rollout.get("gpu_memory_utilization", 0.7)),
             "--enforce-eager",
         ]
         if rollout["ep"] > 1:
