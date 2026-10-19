@@ -2,6 +2,7 @@
 
 from collections import defaultdict
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -201,3 +202,20 @@ def test_fp8_ownership_boundary_cannot_split_a_tile():
                                   dp_source_policy="stream", replica_routing="logical")
     with pytest.raises(ValueError, match="quantization tile"):
         builder.build_weights_mapping_operations([infer], [train])
+
+
+def test_native_channel_ids_preserve_engine_routes_and_do_not_alias_expanded_sets():
+    ids = set()
+    for root in range(16, 32):
+        for peer in range(4):
+            op = SimpleNamespace(send_rank=root, replica_targets=tuple(range(peer, 16, 4)),
+                                 replica_route_id=len(ids))
+            ring_id = transport._logical_native_ring_id(op, 32, 4, 4)
+            assert ring_id == transport._ring_id(root, peer, 4)
+            assert ring_id not in ids
+            ids.add(ring_id)
+    for catalog_id, targets in enumerate([(0, 1, 4, 5, 8, 9, 12, 13), tuple(range(16))]):
+        op = SimpleNamespace(send_rank=16, replica_targets=targets, replica_route_id=catalog_id)
+        ring_id = transport._logical_native_ring_id(op, 32, 4, 4)
+        assert ring_id not in ids
+        ids.add(ring_id)

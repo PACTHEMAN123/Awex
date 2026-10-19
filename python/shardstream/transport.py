@@ -525,6 +525,20 @@ def _sequence_from_step(step_id: int) -> int:
     return sequence
 
 
+def _logical_native_ring_id(op, world_size, instance_size, engine_count):
+    """Preserve native channel placement for unchanged engine replica sets.
+
+    Catalog indices describe ownership, but change with tensor boundaries.
+    Native IDs also choose channels. Keep the source/TP encoding for legacy
+    shaped routes; expanded receiver sets use a disjoint ID range.
+    """
+    if instance_size > 0:
+        peer = op.replica_targets[0] % instance_size
+        if op.replica_targets == tuple(e * instance_size + peer for e in range(engine_count)):
+            return _ring_id(op.send_rank, peer, instance_size)
+    return world_size * max(1, instance_size) + op.replica_route_id
+
+
 def _logical_replica_order(op, rank_node_ids, rollout_node_ids, instance_size, swizzle):
     targets = op.replica_targets
     if (op.replica_route_id < 0 or not targets or len(set(targets)) != len(targets)
@@ -807,7 +821,8 @@ def _build_send_batch(
                 )
                 peer_offset += length
             if order is not None:
-                explicit_routes.append((first_fragment, len(tensors), order[0], _NO_PEER, op.replica_route_id))
+                explicit_routes.append((first_fragment, len(tensors), order[0], _NO_PEER,
+                    _logical_native_ring_id(op, world_size, infer_instance_world_size, num_infer_engines)))
         expected_counts[peer] = ordinal
         region_bytes[rank] = max(region_bytes[rank], peer_offset)
     batch = _Batch(
@@ -1010,7 +1025,8 @@ def _build_recv_batch(
                 position = order.index(rank)
                 previous = op.send_rank if position == 0 else order[position - 1]
                 following = order[position + 1] if position + 1 < len(order) else _NO_PEER
-                explicit_routes.append((first_fragment, len(tensors), previous, following, op.replica_route_id))
+                explicit_routes.append((first_fragment, len(tensors), previous, following,
+                    _logical_native_ring_id(op, world_size, infer_instance_world_size, num_infer_engines)))
         expected_counts[peer] = ordinal
         region_bytes[peer] = max(region_bytes[peer], peer_offset)
     batch = _Batch(
