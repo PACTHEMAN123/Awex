@@ -112,6 +112,7 @@ def build_logical_replica_operations(builder, inference, training, names, local_
                          for s in region.sources)].append(region)
 
     operations, route_ids, loads = [], {}, defaultdict(int)
+    route_bytes = defaultdict(int)
     region_count = splits = unique_bytes = destination_bytes = 0
     for key, regions in sorted(groups.items()):
         total = sum((r.end[0] - r.start[0]) * r.row_bytes for r in regions)
@@ -157,6 +158,7 @@ def build_logical_replica_operations(builder, inference, training, names, local_
                     raise ValueError(f"Duplicate physical receiver for {region.name}")
                 route_key = (source_rank, targets)
                 route_id = route_ids.setdefault(route_key, len(route_ids))
+                route_bytes[route_id] += nbytes
                 source_offset = ShardOffset(source, source.global_offset,
                     tuple(a + b for a, b in zip(source.global_offset, source.shape)),
                     source.shape, source_rank)
@@ -173,6 +175,10 @@ def build_logical_replica_operations(builder, inference, training, names, local_
                     op.replica_targets = targets
                     op.replica_route_id = route_id
                     operations.append(op)
+    builder.logical_replica_routes = tuple(
+        (root, targets, route_bytes[route_id])
+        for (root, targets), route_id in route_ids.items()
+    )
     builder.logical_replica_stats = dict(
         source_groups=len(groups), ownership_regions=region_count, boundary_splits=splits,
         routes=len(route_ids), unique_source_bytes=unique_bytes,

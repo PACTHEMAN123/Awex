@@ -79,6 +79,9 @@ class TransferPlan:
     inter_operations: Dict[int, List[CommunicationOperation]] = field(
         default_factory=dict
     )
+    # Global, small routing catalog retained even in a rank-pruned plan:
+    # (source rank, destination ranks, canonical payload bytes), indexed by ID.
+    replica_route_specs: Tuple = ()
 
     def __post_init__(self):
         # Compatibility bridge: accept old `operations` or new `inter_operations`.
@@ -956,7 +959,8 @@ class TransferPlanBuilder:
             logger.info(
                 f"Rank[{global_transfer_rank}] Saved communication plan to {os.path.abspath(file_name)}"
             )
-        return TransferPlan(inter_operations=grouped_operations)
+        return TransferPlan(inter_operations=grouped_operations,
+                            replica_route_specs=getattr(self, "logical_replica_routes", ()))
 
 
 @torch.no_grad()
@@ -1008,7 +1012,7 @@ def compute_transfer_plan_hash(
     def _slice_tuple(slices: Iterable[slice]) -> Tuple[Tuple[int, int, int], ...]:
         return tuple((s.start, s.stop, s.step or 1) for s in slices)
 
-    payload = {"inter": []}
+    payload = {"inter": [], "replica_routes": transfer_plan.replica_route_specs}
     for peer_rank in sorted(transfer_plan.inter_operations.keys()):
         for op in transfer_plan.inter_operations[peer_rank]:
             payload["inter"].append(

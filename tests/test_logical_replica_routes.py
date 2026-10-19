@@ -12,12 +12,12 @@ from shardstream.plan import TransferPlan, TransferPlanBuilder
 from test_dp_source_plan import parameter
 
 
-def _local(operations, rank, sender):
+def _local(operations, rank, sender, specs=()):
     result = defaultdict(list)
     for op in operations:
         if (op.send_rank if sender else op.recv_rank) == rank:
             result[op.recv_rank if sender else op.send_rank].append(op)
-    return TransferPlan(operations=dict(result))
+    return TransferPlan(operations=dict(result), replica_route_specs=specs)
 
 
 def _signature(op):
@@ -64,13 +64,32 @@ def test_complete_updates_follow_the_prepared_replica_chains(
                    infer_instance_world_size=infer_tp * infer_copies,
                    num_infer_engines=engines, ring_broadcast=True, ring_swizzle=True,
                    rollout_node_ids=engine_nodes, rank_node_ids=node_ids)
-    sends = {r: transport._build_send_batch(values[r], _local(ops, r, True), r, **options)
+    specs = builder.logical_replica_routes
+    sends = {r: transport._build_send_batch(values[r], _local(ops, r, True, specs), r, **options)
              for r in range(iw, iw + tw)}
-    recvs = {r: transport._build_recv_batch(values[r], _local(ops, r, False), r, **options)
+    recvs = {r: transport._build_recv_batch(values[r], _local(ops, r, False, specs), r, **options)
              for r in range(iw)}
     expected_bytes = len(trains) * shape[0] * shape[1] * 4
     assert sum(sum(b.lengths) for b in sends.values()) == expected_bytes
     assert builder.logical_replica_stats["unique_source_bytes"] == expected_bytes
+    for rank in range(iw):
+        masks = {name: torch.zeros_like(tensor) for name, tensor in values[rank].items()}
+        for op in ops:
+            if op.recv_rank == rank:
+                masks[op.recv_shard_meta.name][op.inf_slices] += 1
+        assert all(torch.all(mask == 1) for mask in masks.values())
+    orders = transport._logical_route_orders(
+        TransferPlan(replica_route_specs=specs), node_ids, engine_nodes,
+        infer_tp * infer_copies, True,
+    )
+    entries = defaultdict(int)
+    for (root, route_id, targets), order in orders.items():
+        assert set(order) == set(targets) and len(order) == len(targets)
+        node_path = [node_ids[r] for r in order]
+        assert sum(a != b for a, b in zip(node_path, node_path[1:])) == len(set(node_path)) - 1
+        entries[node_path[0]] += specs[route_id][2]
+    if len(entries) > 1:
+        assert max(entries.values()) - min(entries.values()) <= max(s[2] for s in specs)
 
     for version in (1, 2):
         truths = {p.name: (torch.arange(shape[0] * shape[1]).reshape(shape).float()
@@ -156,4 +175,29 @@ def test_missing_training_coverage_is_rejected():
     builder = TransferPlanBuilder(1, 2, group_replicated_inference=True,
                                   dp_source_policy="stream", replica_routing="logical")
     with pytest.raises(ValueError, match="Uncovered training region"):
+        builder.build_weights_mapping_operations([infer], [train])
+
+
+def test_stream_partitions_preserve_each_parameters_geometry_and_only_split_boundaries():
+    trains = [parameter(name, (rows, 16), 1, 2, dp=2)
+              for name, rows in [("a", 16), ("b", 96), ("c", 16)]]
+    infers = [parameter(p.name, p.global_shape, 1, 2, dp=2) for p in trains]
+    builder = TransferPlanBuilder(2, 2, group_replicated_inference=True,
+                                  dp_source_policy="stream", replica_routing="logical")
+    ops = builder.build_weights_mapping_operations(infers, trains)
+    assert builder.logical_replica_stats["boundary_splits"] == 1
+    assert builder.logical_replica_stats["bytes_by_source"] == {0: 4096, 1: 4096}
+    assert all(op.send_shard_meta.name == op.recv_shard_meta.name for op in ops)
+    assert all(op.send_shard_meta.shape == trains["abc".index(op.send_shard_meta.name)].global_shape
+               for op in ops)
+
+
+def test_fp8_ownership_boundary_cannot_split_a_tile():
+    train = parameter("w", (384, 256), 2, 1, dp=1)
+    infer = parameter("w", (384, 256), 1, 1, dp=1)
+    infer = replace(infer, dtype=torch.float8_e4m3fn,
+                    shards=[replace(s, dtype=torch.float8_e4m3fn) for s in infer.shards])
+    builder = TransferPlanBuilder(1, 2, group_replicated_inference=True,
+                                  dp_source_policy="stream", replica_routing="logical")
+    with pytest.raises(ValueError, match="quantization tile"):
         builder.build_weights_mapping_operations([infer], [train])

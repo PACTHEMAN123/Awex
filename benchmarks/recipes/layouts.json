@@ -259,6 +259,126 @@
         "instances": 1,
         "world_size": 8
       }
+    },
+    {
+      "id": "qwen30-tp2-cp2-ep8-r2tp4dp2ep8",
+      "model": "qwen3-30b-a3b",
+      "training": {
+        "world_size": 16,
+        "tp": 2,
+        "pp": 1,
+        "cp": 2,
+        "ep": 8,
+        "etp": 1
+      },
+      "rollout": {
+        "tp": 4,
+        "dp": 2,
+        "attention_dp": 2,
+        "ep": 8,
+        "instances": 2,
+        "world_size": 16
+      }
+    },
+    {
+      "id": "qwen30-tp2-cp2-ep8-r2tp2dp4ep8",
+      "model": "qwen3-30b-a3b",
+      "training": {
+        "world_size": 16,
+        "tp": 2,
+        "pp": 1,
+        "cp": 2,
+        "ep": 8,
+        "etp": 1
+      },
+      "rollout": {
+        "tp": 2,
+        "dp": 4,
+        "attention_dp": 4,
+        "ep": 8,
+        "instances": 2,
+        "world_size": 16
+      }
+    },
+    {
+      "id": "qwen30-tp2-cp2-ep8-r2tp1dp8ep8",
+      "model": "qwen3-30b-a3b",
+      "training": {
+        "world_size": 16,
+        "tp": 2,
+        "pp": 1,
+        "cp": 2,
+        "ep": 8,
+        "etp": 1
+      },
+      "rollout": {
+        "tp": 1,
+        "dp": 8,
+        "attention_dp": 8,
+        "ep": 8,
+        "instances": 2,
+        "world_size": 16
+      }
+    },
+    {
+      "id": "qwen30-tp2-ep8-r2tp2dp4ep8",
+      "model": "qwen3-30b-a3b",
+      "training": {
+        "world_size": 8,
+        "tp": 2,
+        "pp": 1,
+        "cp": 1,
+        "ep": 8,
+        "etp": 1
+      },
+      "rollout": {
+        "tp": 2,
+        "dp": 4,
+        "attention_dp": 4,
+        "ep": 8,
+        "instances": 2,
+        "world_size": 16
+      }
+    },
+    {
+      "id": "qwen30-tp2-pp4-cp2-ep4-r2tp4dp2ep8",
+      "model": "qwen3-30b-a3b",
+      "training": {
+        "world_size": 16,
+        "tp": 2,
+        "pp": 4,
+        "cp": 2,
+        "ep": 4,
+        "etp": 1
+      },
+      "rollout": {
+        "tp": 4,
+        "dp": 2,
+        "attention_dp": 2,
+        "ep": 8,
+        "instances": 2,
+        "world_size": 16
+      }
+    },
+    {
+      "id": "qwen30-tp2-cp2-ep8-r1tp2dp4ep8",
+      "model": "qwen3-30b-a3b",
+      "training": {
+        "world_size": 16,
+        "tp": 2,
+        "pp": 1,
+        "cp": 2,
+        "ep": 8,
+        "etp": 1
+      },
+      "rollout": {
+        "tp": 2,
+        "dp": 4,
+        "attention_dp": 4,
+        "ep": 8,
+        "instances": 1,
+        "world_size": 8
+      }
     }
   ]
 }

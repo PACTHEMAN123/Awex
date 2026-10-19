@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from enum import Enum
 from functools import wraps
+from types import SimpleNamespace
 from typing import Any
 
 from shardstream.topology import (
@@ -553,6 +554,38 @@ def _logical_replica_order(op, rank_node_ids, rollout_node_ids, instance_size, s
     return tuple(rank for group in groups for rank in group)
 
 
+def _logical_route_orders(plan, rank_node_ids, rollout_node_ids, instance_size, swizzle):
+    """Balance entry bytes globally using the same catalog on every endpoint.
+
+    The catalog survives local pruning. This is preparation-only scheduling;
+    publications reuse the resulting immutable native descriptors.
+    """
+    if not plan.replica_route_specs:
+        return {}
+    if rank_node_ids is None:
+        raise TransportUnavailableError("Global logical routes require a physical rank map")
+    loads = {}
+    orders = {}
+    for route_id in sorted(range(len(plan.replica_route_specs)),
+                           key=lambda i: (-plan.replica_route_specs[i][2], i)):
+        root, targets, nbytes = plan.replica_route_specs[route_id]
+        op = SimpleNamespace(send_rank=root, recv_rank=targets[0],
+                             replica_targets=targets, replica_route_id=route_id)
+        base = _logical_replica_order(op, rank_node_ids, rollout_node_ids, instance_size, swizzle)
+        groups = {}
+        for target in base:
+            groups.setdefault(rank_node_ids[target], []).append(target)
+        nodes = list(groups)
+        entry = min(nodes, key=lambda node: (loads.get(node, 0), nodes.index(node))) if swizzle else nodes[0]
+        loads[entry] = loads.get(entry, 0) + nbytes
+        position = nodes.index(entry)
+        order = tuple(rank for node in nodes[position:] + nodes[:position] for rank in groups[node])
+        orders[(root, route_id, targets)] = order
+    logger.info("SHARDSTREAM_LOGICAL_REPLICA_ENTRIES " + json.dumps(
+        dict(entry_bytes_by_node=loads, routes=len(orders)), sort_keys=True))
+    return orders
+
+
 def _ensure_cuda_tensor(tensor: torch.Tensor, description: str) -> None:
     if not isinstance(tensor, torch.Tensor) or not tensor.is_cuda:
         raise TransportUnavailableError(
@@ -681,7 +714,8 @@ def _build_send_batch(
     context = {}
     quantization = []
     explicit_routes = []
-    route_orders = {}
+    route_orders = (_logical_route_orders(plan, rank_node_ids, rollout_node_ids,
+                     infer_instance_world_size, ring_swizzle) if logical_routes else {})
     for peer, operations in _operation_groups(plan, rank, world_size):
         peer_offset = 0
         ordinal = 0
@@ -849,7 +883,8 @@ def _build_recv_batch(
     copybacks: list[tuple[torch.Tensor, torch.Tensor]] = []
     quantization = []
     explicit_routes = []
-    route_orders = {}
+    route_orders = (_logical_route_orders(plan, rank_node_ids, rollout_node_ids,
+                     infer_instance_world_size, ring_swizzle) if logical_routes else {})
     scale_tensors = []
     for peer, operations in _operation_groups(plan, rank, world_size):
         peer_offset = 0
@@ -1567,7 +1602,7 @@ class Transport:
             fp8_block_shape=self.fp8_block_shape,
             rollout_node_ids=self.rollout_node_ids,
             ring_root_seeds=self.ring_root_seeds,
-                rank_node_ids=self.rank_node_ids,
+            rank_node_ids=self.rank_node_ids,
         )
         self._prepared_send = (parameters, plan, batch)
         self._device_prepared_binding = None
@@ -1593,7 +1628,7 @@ class Transport:
             fp8_block_shape=self.fp8_block_shape,
             rollout_node_ids=self.rollout_node_ids,
             ring_root_seeds=self.ring_root_seeds,
-                rank_node_ids=self.rank_node_ids,
+            rank_node_ids=self.rank_node_ids,
         )
         self._prepared_recv = (parameters, plan, batch)
         self._device_prepared_binding = None
