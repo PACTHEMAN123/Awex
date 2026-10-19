@@ -42,9 +42,11 @@ ID, allowing native lowering to concatenate parameter spans into one stream.
 The small global route catalog survives local-plan pruning. Each participant
 therefore makes the same routing decision from the physical rank-to-node map.
 
-During preparation, visit routes from largest to smallest and choose the
-eligible entry node with the fewest assigned entry bytes. Source placement
-breaks ties. All receivers on a node are consecutive before the chain crosses
+During preparation, compare source-placement routing with a greedy schedule
+that visits routes from largest to smallest and chooses the eligible node with
+the fewest assigned entry bytes. Source placement breaks ties. Keep the existing
+entry mapping unless the greedy schedule reduces the difference between the
+largest and smallest node loads. All receivers on a node are consecutive before the chain crosses
 to another node. The source retains only its head operation; every receiver
 records its predecessor and successor and binds its own destination tensor.
 With uniform supported destination types, each logical interval is injected
@@ -57,6 +59,12 @@ Physical placement is gathered once per membership, including individual ranks
 of engines spanning nodes. Prepared batches and native device plans are reused
 for subsequent publications. There is no publication-time scheduling collective.
 The existing CUDA kernels and native binary are unchanged.
+
+The catalog ID is independent of the native ring ID used to select channels.
+Routes with one corresponding worker in each engine keep the established
+source/TP ring encoding. Expanded destination sets use a disjoint ID range.
+This preserves channel placement for unchanged streams while allowing new
+within-engine replica chains.
 
 `SHARDSTREAM_LOGICAL_REPLICA_PLAN` reports unique source bytes, total destination
 bytes, source groups, ownership regions and boundary splits.
@@ -74,3 +82,11 @@ It covers training DP1/2/4, CP, model-internal copies without complete DP
 identities, inference DP, multiple engines and differing replica geometries.
 CPU checks establish plan/descriptor correctness; GPU publication measurements
 are reported separately with their exact source revision and topology.
+
+The standalone vLLM entrypoint explicitly loads a worker extension so fresh DP
+processes register the same ShardStream RPCs as forked TP workers. The recipe
+runner's `--disable-prefix-caching` option makes before/repeat/after generation
+checks use the same uncached prefill shape. It still checks exact outputs and
+pins requests to DP rank zero. Model-weight profiling additionally clears and
+exactly compares every parameter on every inference worker outside the timed
+publication, checks version markers, and verifies stable parameter addresses.

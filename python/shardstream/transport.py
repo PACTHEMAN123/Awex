@@ -580,21 +580,36 @@ def _logical_route_orders(plan, rank_node_ids, rollout_node_ids, instance_size, 
         raise TransportUnavailableError("Global logical routes require a physical rank map")
     loads = {}
     orders = {}
+    original_orders = {}
+    original_loads = {}
+    eligible_nodes = set()
     for route_id in sorted(range(len(plan.replica_route_specs)),
                            key=lambda i: (-plan.replica_route_specs[i][2], i)):
         root, targets, nbytes = plan.replica_route_specs[route_id]
         op = SimpleNamespace(send_rank=root, recv_rank=targets[0],
                              replica_targets=targets, replica_route_id=route_id)
         base = _logical_replica_order(op, rank_node_ids, rollout_node_ids, instance_size, swizzle)
+        key = (root, route_id, targets)
+        original_orders[key] = base
+        original_entry = rank_node_ids[base[0]]
+        original_loads[original_entry] = original_loads.get(original_entry, 0) + nbytes
         groups = {}
         for target in base:
             groups.setdefault(rank_node_ids[target], []).append(target)
         nodes = list(groups)
+        eligible_nodes.update(nodes)
         entry = min(nodes, key=lambda node: (loads.get(node, 0), nodes.index(node))) if swizzle else nodes[0]
         loads[entry] = loads.get(entry, 0) + nbytes
         position = nodes.index(entry)
         order = tuple(rank for node in nodes[position:] + nodes[:position] for rank in groups[node])
-        orders[(root, route_id, targets)] = order
+        orders[key] = order
+    def spread(assigned):
+        values = [assigned.get(node, 0) for node in eligible_nodes]
+        return max(values) - min(values)
+    # Source placement already balances many homogeneous deployments. Avoid
+    # changing their established NIC/peer mapping without a byte-balance gain.
+    if spread(original_loads) <= spread(loads):
+        orders, loads = original_orders, original_loads
     logger.info("SHARDSTREAM_LOGICAL_REPLICA_ENTRIES " + json.dumps(
         dict(entry_bytes_by_node=loads, routes=len(orders)), sort_keys=True))
     return orders

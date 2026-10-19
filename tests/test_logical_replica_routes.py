@@ -6,7 +6,6 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-
 from shardstream import transport
 from shardstream.metadata.parameter import ParameterReplicaMeta
 from shardstream.plan import TransferPlan, TransferPlanBuilder
@@ -219,3 +218,18 @@ def test_native_channel_ids_preserve_engine_routes_and_do_not_alias_expanded_set
         ring_id = transport._logical_native_ring_id(op, 32, 4, 4)
         assert ring_id not in ids
         ids.add(ring_id)
+
+
+def test_balanced_source_placement_keeps_its_existing_entry_mapping():
+    specs = ((4, (0, 2), 100), (5, (1, 3), 100),
+             (6, (0, 2), 100), (7, (1, 3), 100))
+    nodes = (0, 0, 1, 1, 10, 10, 11, 11)
+    orders = transport._logical_route_orders(
+        TransferPlan(replica_route_specs=specs), nodes, (0, 1), 2, True,
+    )
+    for route_id, (root, targets, _) in enumerate(specs):
+        op = SimpleNamespace(send_rank=root, recv_rank=targets[0],
+                             replica_targets=targets, replica_route_id=route_id)
+        assert orders[(root, route_id, targets)] == transport._logical_replica_order(
+            op, nodes, (0, 1), 2, True,
+        )
