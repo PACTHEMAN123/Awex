@@ -10,7 +10,7 @@ import urllib.request
 import uuid
 from pathlib import Path
 
-from shardstream_benchmarks.recipes import load_recipes
+from shardstream_benchmarks.recipes import load_recipes, rollout_host_counts
 
 
 class NodeProcesses:
@@ -324,18 +324,22 @@ def main():
             "SHARDSTREAM_BENCH_WARMUP": str(args.warmup_updates),
             "SHARDSTREAM_BENCH_RAY_ADDRESS": args.ray_address,
         }
+        rollout_counts = rollout_host_counts(recipe.rollout["instances"], len(args.rollout_hosts))
+        engine_gpus = recipe.rollout["tp"] * recipe.rollout["dp"]
         for role, hosts, world in [
             ("training", args.training_hosts, recipe.training["world_size"]),
             ("rollout", args.rollout_hosts, recipe.rollout["world_size"]),
         ]:
-            for host in hosts:
+            for host_index, host in enumerate(hosts):
+                gpu_count = (rollout_counts[host_index] * engine_gpus
+                             if role == "rollout" else world // len(hosts))
                 actor = (
                     ray.remote(NodeProcesses)
                     .options(
                         num_cpus=1,
                         num_gpus=int(nodes[host]["Resources"]["GPU"])
                         if args.gpu_placement == "nic-spread"
-                        else world // len(hosts),
+                        else gpu_count,
                         scheduling_strategy=NodeAffinitySchedulingStrategy(
                             nodes[host]["NodeID"], soft=False
                         ),
@@ -345,7 +349,7 @@ def main():
                         args.runtime,
                         args.stage,
                         run_dir,
-                        world // len(hosts),
+                        gpu_count,
                         args.gpu_placement,
                         recipe.rollout["tp"] if role == "rollout" else 1,
                         2
@@ -360,13 +364,9 @@ def main():
                 (training if role == "training" else rollout).append(actor)
                 record["node_placements"][host] = ray.get(actor.placement.remote())
         endpoints = []
-        instances_per_host = recipe.rollout["instances"] // len(rollout)
-        if instances_per_host < 1 or recipe.rollout["instances"] % len(rollout):
-            raise ValueError("Each vLLM instance must fit entirely on one rollout host")
-        engine_gpus = recipe.rollout["tp"] * recipe.rollout["dp"]
+        engine_rank = 0
         for host_rank, actor in enumerate(rollout):
-            for local_engine in range(instances_per_host):
-                engine_rank = host_rank * instances_per_host + local_engine
+            for local_engine in range(rollout_counts[host_rank]):
                 host, port = args.rollout_hosts[host_rank], 18800 + local_engine
                 devices = ",".join(
                     str(i)
@@ -386,6 +386,7 @@ def main():
                     )
                 )
                 endpoints.append((engine_rank, host, port))
+                engine_rank += 1
         deadline = time.monotonic() + args.timeout
         for _, host, port in endpoints:
             while True:

@@ -62,6 +62,17 @@ def test_two_ingress_ranks_cover_four_numa_local_hcas(monkeypatch):
     assert all(affinity[g]["distance"] == 0 for g in selected)
 
 
+@pytest.mark.parametrize("count", [4, 8])
+def test_every_tp4_instance_covers_four_distinct_hcas(count, monkeypatch):
+    monkeypatch.setattr(os, "sched_getaffinity", lambda _: set(range(8)), raising=False)
+    endpoints = [_RdmaEndpoint(f"mlx5_{h}", 1, 400, str(h)) for h in range(4)]
+    selected, affinity = plan_nic_spread(
+        list(map(str, range(8))), count, 4, topology=topology(), endpoints=endpoints
+    )
+    for offset in range(0, count, 4):
+        assert len({affinity[g]["hca"] for g in selected[offset:offset + 4]}) == 4
+
+
 def test_rank_affinity_uses_physical_gpu_and_existing_threads(monkeypatch):
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "1,3,4,6")
     monkeypatch.setenv(

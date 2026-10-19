@@ -12,6 +12,14 @@ from pathlib import Path
 from shardstream_benchmarks.parallel import resolve_megatron_parallelism
 
 
+def rollout_host_counts(instances: int, host_count: int) -> list[int]:
+    """Keep complete inference instances local, balancing their count by host."""
+    if host_count < 1 or instances < host_count:
+        raise ValueError("Each rollout host needs at least one complete instance")
+    count, extra = divmod(instances, host_count)
+    return [count + (index < extra) for index in range(host_count)]
+
+
 @dataclass(frozen=True)
 class ModelRecipe:
     id: str
@@ -151,14 +159,13 @@ class ModelRecipe:
             raise ValueError("Duplicate rollout host")
         if set(training_hosts) & set(rollout_hosts):
             raise ValueError("Training and rollout must use different physical hosts")
-        for role, hosts, count in (
-            ("training", training_hosts, self.training["world_size"]),
-            ("rollout", rollout_hosts, self.rollout["world_size"]),
-        ):
-            if count % len(hosts) or count // len(hosts) > 8:
-                raise ValueError(
-                    f"{self.id}: {role} placement does not fit 8-GPU nodes"
-                )
+        count = self.training["world_size"]
+        if count % len(training_hosts) or count // len(training_hosts) > 8:
+            raise ValueError(f"{self.id}: training placement does not fit 8-GPU nodes")
+        counts = rollout_host_counts(self.rollout["instances"], len(rollout_hosts))
+        engine_gpus = self.rollout["tp"] * self.rollout["dp"]
+        if max(counts) * engine_gpus > 8:
+            raise ValueError(f"{self.id}: rollout placement does not fit 8-GPU nodes")
 
 
 def recipe_repository() -> Path:

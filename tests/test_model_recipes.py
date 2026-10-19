@@ -1,7 +1,29 @@
 from dataclasses import replace
 
 import pytest
-from shardstream_benchmarks.recipes import load_recipes
+from shardstream_benchmarks.recipes import load_recipes, rollout_host_counts
+
+
+@pytest.mark.parametrize("instances,expected", [(3, [1, 1, 1]), (4, [2, 1, 1]),
+                                                (5, [2, 2, 1]), (6, [2, 2, 2])])
+def test_complete_tp4_instances_balance_across_three_hosts(instances, expected):
+    base = load_recipes()["qwen3-30b-a3b"]
+    recipe = replace(base, training={**base.training, "world_size": 8},
+                     rollout={**base.rollout, "tp": 4, "dp": 1, "ep": 1,
+                              "instances": instances, "world_size": instances * 4})
+    assert rollout_host_counts(instances, 3) == expected
+    recipe.validate_placement(["train0"], ["infer0", "infer1", "infer2"])
+    assert sum(expected) * 4 == recipe.rollout["world_size"]
+
+
+def test_rollout_host_assignment_rejects_empty_hosts_and_overbooking():
+    with pytest.raises(ValueError, match="complete instance"):
+        rollout_host_counts(2, 3)
+    base = load_recipes()["qwen3-30b-a3b"]
+    recipe = replace(base, rollout={**base.rollout, "tp": 4, "dp": 1,
+                                   "instances": 7, "world_size": 28})
+    with pytest.raises(ValueError, match="rollout placement"):
+        recipe.validate_placement(["train0", "train1"], ["infer0", "infer1", "infer2"])
 
 
 def test_recipe_gpu_counts_and_cross_node_placement():
@@ -210,6 +232,7 @@ def test_moonlight_checkpoint_gate_is_not_promoted_by_glm_recipe():
 def test_moonlight_query_spec_keeps_kv_norm_and_original_layer_spec():
     pytest.importorskip("megatron.core")
     from types import SimpleNamespace as NS
+
     from megatron.core.transformer.mla_qk_norm_config import get_backend
     from shardstream_benchmarks.model_loader import _uncompressed_query_layer_spec
 
