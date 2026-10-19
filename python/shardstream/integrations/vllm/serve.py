@@ -50,6 +50,10 @@ def main():
     )
     parser = make_arg_parser(parser)
     args = parser.parse_args()
+    if not args.worker_extension_cls:
+        args.worker_extension_cls = (
+            "shardstream.integrations.vllm.worker_extension.ShardStreamWorkerExtension"
+        )
     validate_parsed_serve_args(args)
 
     logger.info("Starting vLLM server with ShardStream routes enabled")
