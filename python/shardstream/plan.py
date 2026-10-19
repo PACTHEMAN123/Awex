@@ -1027,6 +1027,8 @@ def compute_transfer_plan_hash(
                     op.placement_version,
                     op.param_class,
                     tuple(op.send_tensor_span_numels),
+                    tuple(op.replica_targets),
+                    op.replica_route_id,
                 )
             )
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))

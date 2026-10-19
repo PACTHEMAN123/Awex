@@ -1201,7 +1201,7 @@ class Transport:
         if not self.ring_broadcast or (
             self.rollout_node_ids is not None
             and (not self.ring_source_node_swizzle or self.ring_root_seeds is not None)
-            and (not self.logical_replica_routing or self.rank_node_ids is not None)
+            and (not getattr(self, "logical_replica_routing", False) or self.rank_node_ids is not None)
         ):
             return
         nodes = [None] * self.world_size
@@ -1213,7 +1213,7 @@ class Transport:
                 engine * self.infer_instance_world_size : (engine + 1)
                 * self.infer_instance_world_size
             ]
-            if not members or (not self.logical_replica_routing and len(set(members)) != 1):
+            if not members or (not getattr(self, "logical_replica_routing", False) and len(set(members)) != 1):
                 raise TransportUnavailableError(
                     "Each rollout TP instance must reside on one node"
                 )

@@ -108,7 +108,8 @@ def build_logical_replica_operations(builder, inference, training, names, local_
     groups = defaultdict(list)
     for name in names:
         for region in _regions(name, training[name], inference[name]):
-            groups[tuple(s.global_rank for s in region.sources)].append(region)
+            groups[tuple((s.global_rank, s.dp_rank, s.dp_size, s.cp_rank)
+                         for s in region.sources)].append(region)
 
     operations, route_ids, loads = [], {}, defaultdict(int)
     region_count = splits = unique_bytes = destination_bytes = 0
@@ -137,6 +138,9 @@ def build_logical_replica_operations(builder, inference, training, names, local_
             region_count += 1
             splits += len(pieces) > 1
             for source, begin, finish in pieces:
+                # A stream shares rank identities, not parameter metadata or
+                # physical tensor geometry. Bind this region's actual owner.
+                source = next(s for s in region.sources if s.global_rank == source.global_rank)
                 start = (region.start[0] + begin, *region.start[1:])
                 end = (region.start[0] + finish, *region.end[1:])
                 nbytes = (finish - begin) * region.row_bytes
