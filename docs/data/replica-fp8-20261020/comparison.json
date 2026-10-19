@@ -1,0 +1,19 @@
+{
+  "training_topology_changed": true,
+  "generation_pause_added": true,
+  "precision_only_ablation": false,
+  "rows": [
+    {
+      "case_id": "fp8-intra-dp4",
+      "fp8_p50_ms": 252.8745485469699,
+      "prior_bf16_p50_ms": 442.44135171175003,
+      "whole_configuration_change_percent": -42.845634213748326
+    },
+    {
+      "case_id": "fp8-intra-dp8",
+      "fp8_p50_ms": 245.4265058040619,
+      "prior_bf16_p50_ms": 425.3557943738997,
+      "whole_configuration_change_percent": -42.30089044271368
+    }
+  ]
+}

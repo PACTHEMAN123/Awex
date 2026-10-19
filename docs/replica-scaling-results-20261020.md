@@ -2,6 +2,8 @@
 
 Measured revision: `7507911d1f7ca382555f36ddff3c16dc4ea9d651`, branch `codex/unified-replica-routing`. Four 8-GPU H20-3e nodes.
 
+The subsequent [native FP8 supplement](replica-fp8-results-20261020.md) covers TP2/DP4/EP8 and TP1/DP8/EP8 with training TP2/CP4. Its changed training topology and explicit generation pause make it a complete-configuration comparison rather than a precision-only ablation.
+
 The complete logical routing, stream source selection, source-node ring order, and NIC spread scheme was enabled throughout. No feature-disable controls were run. See the [protocol](replica-scaling-experiment.md) for all layouts and placement rules.
 
 **33 independent launches across 11 unique configurations; 5 warmups and 30 measured publications per launch. All 1,155 publications passed full-parameter checks on every inference worker; 990 steady samples.** Training DP2 uses the identical intra-DP2 launches. No prior experiment measurements were reused.
