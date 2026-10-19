@@ -219,6 +219,8 @@ def main():
     parser.add_argument("--layout")
     parser.add_argument("--publication-bucket-mb", type=int, default=256)
     parser.add_argument("--model-weight-profile", action="store_true")
+    parser.add_argument("--disable-prefix-caching", action="store_true",
+                        help="Use the same uncached prefill for before/repeat/after generation checks")
     parser.add_argument("--extra-python-path", default="")
     parser.add_argument("--extra-library-path", default="")
     parser.add_argument("--transport-gin-connections", type=int, choices=(1, 2, 4))
@@ -299,6 +301,7 @@ def main():
         "run_dir": run_dir,
         "passed": False,
         "generation_dp_rank": 0,
+        "prefix_caching_disabled": args.disable_prefix_caching,
         "gpu_placement": args.gpu_placement,
         "num_updates": args.num_updates,
         "warmup_updates": args.warmup_updates,
@@ -372,10 +375,13 @@ def main():
                     )
                 )
                 # Indices address the GPUs reserved for this actor, not arbitrary GPUs.
+                rollout_arguments = recipe.rollout_arguments(args.model_path, host, port)
+                if args.disable_prefix_caching:
+                    rollout_arguments.append("--no-enable-prefix-caching")
                 ray.get(
                     actor.launch.remote(
                         f"rollout-{engine_rank}",
-                        recipe.rollout_arguments(args.model_path, host, port),
+                        rollout_arguments,
                         {**environment, "SHARDSTREAM_RECIPE_GPU_INDICES": devices},
                     )
                 )
