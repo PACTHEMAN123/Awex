@@ -565,7 +565,8 @@ class MultiVLLMWeightsExchangeIT:
                     )
                 if markers:
                     from shardstream.profiling.model import version_marker_factor
-                    factor = version_marker_factor(version, getattr(self, "marker_period", None))
+                    marker_version = version - int(os.environ.get("SHARDSTREAM_FP8_BLOCKWISE", "0") == "1")
+                    factor = version_marker_factor(marker_version, getattr(self, "marker_period", None))
                     if getattr(self, "marker_mode", "constant") == "scale":
                         if not hasattr(self, "_original_final_norm"):
                             self._original_final_norm = markers[0].detach().clone()
@@ -857,7 +858,8 @@ def main(args):
         )
     if args.profile:
         os.environ["SHARDSTREAM_PROFILE"] = "1"
-        os.environ["SHARDSTREAM_PROFILE_WARMUP_UPDATES"] = str(args.warmup_updates)
+        os.environ["SHARDSTREAM_PROFILE_WARMUP_UPDATES"] = str(
+            args.warmup_updates + int(os.environ.get("SHARDSTREAM_FP8_BLOCKWISE", "0") == "1"))
     if args.sync_transfer_start:
         os.environ["SHARDSTREAM_PROFILE_SYNC_START"] = "1"
     comm_backend = args.comm_backend
@@ -911,11 +913,40 @@ def main(args):
     weights_exchange_it.elastic_records = []
     joins = dict(zip(args.join_after, args.target_engines))
     epoch = 0
+    fp8_model_profile = os.environ.get("SHARDSTREAM_FP8_BLOCKWISE", "0") == "1" and args.model_weight_profile
 
     try:
         weights_exchange_it.initialize()
+        bootstrap = None
+        if fp8_model_profile:
+            # Dummy FP8 storage must receive real checkpoint data before any
+            # generation baseline. Version -1 has FP8 marker factor 1 and remains
+            # separate from the requested warmup/measurement publications.
+            weights_exchange_it.megatron_engine.set_global_step(-1)
+            weights_exchange_it.exchange_weights()
+            status = [None]
+            if weights_exchange_it.is_driver:
+                try:
+                    from shardstream_benchmarks.recipe_runner import generation
+
+                    bootstrap = weights_exchange_it.elastic_records.pop()
+                    urls = [f"http://{host}:{port}" for _, host, port
+                            in weights_exchange_it.publication_endpoints()]
+                    before = [generation(url, args.model_path) for url in urls]
+                    repeated = [generation(url, args.model_path) for url in urls]
+                    if [r['message'] for r in before] != [r['message'] for r in repeated]:
+                        raise RuntimeError("FP8 checkpoint generation baseline is not repeatable")
+                    Path(args.elastic_output).with_name("bootstrap-generation.json").write_text(
+                        json.dumps(dict(generation_before=before, generation_before_repeat=repeated,
+                                        generation_baseline_after_checkpoint_bootstrap=True), indent=2) + "\n")
+                except Exception as exc:
+                    status[0] = f"{type(exc).__name__}: {exc}"
+            if weights_exchange_it.world_size > 1:
+                dist.broadcast_object_list(status, src=0)
+            if status[0] is not None:
+                raise RuntimeError("FP8 checkpoint bootstrap failed: " + status[0])
         for update_index in range(args.num_updates):
-            step_id = update_index - 1
+            step_id = update_index if fp8_model_profile else update_index - 1
             weights_exchange_it.megatron_engine.set_global_step(step_id)
             logger.info(
                 "========== Test weights exchange step %s (%s/%s) ==========",
@@ -936,6 +967,8 @@ def main(args):
                         "passed": True,
                         "model_path": args.model_path,
                         "dtype": "bfloat16",
+                        "rollout_weight_format": "fp8" if bootstrap is not None else "bf16",
+                        "checkpoint_bootstrap": bootstrap,
                         "real_model_weights": True,
                         "marker_period": weights_exchange_it.marker_period,
                         "train_world_size": weights_exchange_it.world_size,

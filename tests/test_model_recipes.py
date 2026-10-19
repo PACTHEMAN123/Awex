@@ -104,6 +104,18 @@ def test_glm_vllm_dp_expert_group_uses_eight_rollout_gpus():
     assert recipe.training["world_size"] + recipe.rollout["world_size"] == 24
 
 
+@pytest.mark.parametrize("tp,dp", [(2, 4), (1, 8)])
+def test_qwen30_fp8_supplement_preserves_source_and_receiver_dp(tp, dp):
+    recipe = load_recipes()["qwen3-30b-a3b"].with_layout(
+        f"qwen30-tp2-cp4-ep8-r2tp{tp}dp{dp}ep8")
+    train = recipe.training
+    assert (train['tp'], train['cp'], train['ep'], train['etp']) == (2, 4, 8, 1)
+    assert train['world_size'] // (train['tp'] * train['cp']) == 2
+    assert train['world_size'] // (train['ep'] * train['etp']) == 2
+    assert (recipe.rollout['tp'], recipe.rollout['dp'], recipe.rollout['ep']) == (tp, dp, 8)
+    recipe.validate_placement(['train0', 'train1'], ['infer0', 'infer1'])
+
+
 def test_glm_upstream_eight_gpu_actor_cannot_satisfy_expert_pipeline_topology():
     recipe = load_recipes()["glm-4.7-flash"]
     bad = replace(recipe, training={**recipe.training, "world_size": 8})

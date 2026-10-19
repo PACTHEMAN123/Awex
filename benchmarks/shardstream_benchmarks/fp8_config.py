@@ -21,10 +21,12 @@ import json
 import os
 
 
-def fp8_server_args() -> list[str]:
-    if os.environ.get("SHARDSTREAM_FP8_BLOCKWISE", "0") != "1":
+def fp8_server_args(*, enabled=None, block_shape=None) -> list[str]:
+    if enabled is None:
+        enabled = os.environ.get("SHARDSTREAM_FP8_BLOCKWISE", "0") == "1"
+    if not enabled:
         return []
-    block = [
+    block = list(block_shape) if block_shape is not None else [
         int(os.environ.get("SHARDSTREAM_FP8_BLOCK_ROWS", "128")),
         int(os.environ.get("SHARDSTREAM_FP8_BLOCK_COLS", "128")),
     ]

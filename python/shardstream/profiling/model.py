@@ -71,27 +71,16 @@ class ModelWeightProfile:
         if operation == "clear":
             with torch.no_grad():
                 for parameter in self.parameters.values():
-                    parameter.zero_()
+                    if parameter.dtype == torch.float8_e4m3fn:
+                        parameter.view(torch.uint8).zero_()
+                    else:
+                        parameter.zero_()
             torch.cuda.synchronize()
             if torch.cuda.is_available():
                 torch.cuda.reset_peak_memory_stats()
             result = {"cleared": True}
         elif operation == "verify":
-            bad = []
-            for name, parameter in self.parameters.items():
-                expected = self.references[name]
-                if name == self.norm_name:
-                    factor = version_marker_factor(version, self.marker_period)
-                    expected = (
-                        expected * factor if self.marker_mode == "scale"
-                        else torch.full_like(expected, factor)
-                    )
-                if not torch.equal(parameter, expected):
-                    bad.append(name)
-            if bad:
-                raise AssertionError(
-                    f"Real model mismatch at version {version}: {bad[:20]} (total={len(bad)})"
-                )
+            validation = self._verify_parameters(version)
             result = {
                 "verified": True,
                 "version": version,
@@ -103,6 +92,7 @@ class ModelWeightProfile:
                 "model_bytes": sum(
                     p.numel() * p.element_size() for p in self.parameters.values()
                 ),
+                **validation,
             }
         elif operation == "compute_start":
             if self.compute is not None:
@@ -126,12 +116,60 @@ class ModelWeightProfile:
             "end_ns": time.time_ns(),
         }
 
+    def _verify_parameters(self, version):
+        bad = []
+        for name, parameter in self.parameters.items():
+            expected = self.references[name]
+            if name == self.norm_name:
+                factor = version_marker_factor(version, self.marker_period)
+                expected = (expected * factor if self.marker_mode == "scale"
+                            else torch.full_like(expected, factor))
+            if not torch.equal(parameter, expected):
+                bad.append(name)
+        if bad:
+            raise AssertionError(
+                f"Real model mismatch at version {version}: {bad[:20]} (total={len(bad)})"
+            )
+        return {}
+
 
 def model_profile_task(operation: str, version: int, marker_mode="constant", marker_period=None, **kwargs):
     scheduler = kwargs["model_context"]["scheduler"]
     profile = getattr(scheduler, "_shardstream_model_weight_profile", None)
     if profile is None:
-        profile = ModelWeightProfile(kwargs["model"], marker_mode, marker_period)
+        if os.environ.get("SHARDSTREAM_FP8_BLOCKWISE", "0") == "1":
+            from shardstream.profiling.fp8_model import FP8ModelWeightProfile
+
+            reader = getattr(scheduler, "shardstream_weights_reader", None)
+            if operation == "clear" and (reader is None or not reader.parameters):
+                # The cold bootstrap initializes canonical reader metadata
+                # inside publish(). Clear its actual native model storage now;
+                # build the checkpoint oracle after that first publication.
+                started = time.time_ns()
+                parameters = dict(kwargs["model"].named_parameters())
+                scheduler._shardstream_fp8_initial_pointers = {
+                    name: p.data_ptr() for name, p in parameters.items()}
+                with torch.no_grad():
+                    for p in parameters.values():
+                        (p.view(torch.uint8) if p.dtype == torch.float8_e4m3fn else p).zero_()
+                torch.cuda.synchronize()
+                if torch.cuda.is_available():
+                    torch.cuda.reset_peak_memory_stats()
+                return dict(cleared=True, cold_native_fp8_storage=True,
+                            parameter_count=len(parameters), pid=os.getpid(),
+                            start_ns=started, end_ns=time.time_ns())
+            initial = getattr(scheduler, "_shardstream_fp8_initial_pointers", None)
+            if initial is not None and initial != {
+                name: p.data_ptr() for name, p in kwargs["model"].named_parameters()
+            }:
+                raise AssertionError("A native FP8 model parameter was replaced during bootstrap")
+            profile = FP8ModelWeightProfile.from_checkpoint(
+                reader,
+                os.environ["SHARDSTREAM_BENCH_MODEL_PATH"],
+                marker_mode, marker_period,
+            )
+        else:
+            profile = ModelWeightProfile(kwargs["model"], marker_mode, marker_period)
         scheduler._shardstream_model_weight_profile = profile
     elif profile.marker_mode != marker_mode or profile.marker_period != marker_period:
         raise ValueError("Cannot change marker mode after taking model references")

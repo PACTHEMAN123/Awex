@@ -98,9 +98,13 @@ class NodeProcesses:
                 "CUDA_DEVICE_MAX_CONNECTIONS": "1",
                 "SHARDSTREAM_RING_BROADCAST": "1",
                 "SHARDSTREAM_RING_SWIZZLE": "1",
-                "SHARDSTREAM_FP8_BLOCKWISE": "0",
+                "SHARDSTREAM_FP8_BLOCKWISE": environment.get("SHARDSTREAM_FP8_BLOCKWISE", "0"),
+                "SHARDSTREAM_FP8_BLOCK_ROWS": "128",
+                "SHARDSTREAM_FP8_BLOCK_COLS": "128",
                 "SHARDSTREAM_PROFILE": "1",
-                "SHARDSTREAM_PROFILE_WARMUP_UPDATES": str(environment.get("SHARDSTREAM_BENCH_WARMUP", 1)),
+                "SHARDSTREAM_PROFILE_WARMUP_UPDATES": str(
+                    int(environment.get("SHARDSTREAM_BENCH_WARMUP", 1))
+                    + int(environment.get("SHARDSTREAM_FP8_BLOCKWISE", "0") == "1")),
                 "SHARDSTREAM_PROFILE_SYNC_START": "1",
                 "HF_HUB_OFFLINE": "1",
                 "TRANSFORMERS_OFFLINE": "1",
@@ -137,6 +141,11 @@ class NodeProcesses:
 
     def status(self):
         return {name: process.poll() for name, process in self.processes.items()}
+
+    def read_json(self, name):
+        if Path(name).name != name:
+            raise ValueError("Expected a run-local artifact name")
+        return json.loads((self.run_dir / name).read_text())
 
     def stop(self):
         for process in self.processes.values():
@@ -219,6 +228,8 @@ def main():
     parser.add_argument("--layout")
     parser.add_argument("--publication-bucket-mb", type=int, default=256)
     parser.add_argument("--model-weight-profile", action="store_true")
+    parser.add_argument("--weight-format", choices=("bf16", "fp8"), default="bf16",
+                        help="FP8 uses fused BF16-to-FP8 transport and a full checkpoint oracle")
     parser.add_argument("--disable-prefix-caching", action="store_true",
                         help="Use the same uncached prefill for before/repeat/after generation checks")
     parser.add_argument("--extra-python-path", default="")
@@ -238,6 +249,10 @@ def main():
         parser.error("Require 0 <= warmup updates < total updates")
     if args.dp_source_block_mb <= 0:
         parser.error("DP source block size must be positive")
+    if args.weight_format == "fp8" and (
+        not args.model_weight_profile or args.publication_mechanism != "shardstream"
+    ):
+        parser.error("FP8 recipe runs require ShardStream and --model-weight-profile")
     transport_environment = {
         name: str(value) for name, value in (
             ("SHARDSTREAM_GIN_CONNECTIONS", args.transport_gin_connections),
@@ -249,6 +264,8 @@ def main():
     if transport_environment and args.publication_mechanism != "shardstream":
         parser.error("Transport preparation tuning applies only to ShardStream")
     transport_environment.update(
+        SHARDSTREAM_FP8_BLOCKWISE="1" if args.weight_format == "fp8" else "0",
+        SHARDSTREAM_BENCH_MODEL_PATH=args.model_path,
         SHARDSTREAM_DP_SOURCE_POLICY=args.dp_source_policy,
         SHARDSTREAM_REPLICA_ROUTING=args.replica_routing,
         SHARDSTREAM_DP_SOURCE_BLOCK_BYTES=str(args.dp_source_block_mb * 1024 * 1024),
@@ -309,6 +326,7 @@ def main():
         "publication_mechanism": args.publication_mechanism,
         "publication_bucket_mb": args.publication_bucket_mb,
         "model_weight_profile": args.model_weight_profile,
+        "weight_format": args.weight_format,
         "transport_environment": transport_environment,
         "node_placements": {},
     }
@@ -376,6 +394,10 @@ def main():
                 )
                 # Indices address the GPUs reserved for this actor, not arbitrary GPUs.
                 rollout_arguments = recipe.rollout_arguments(args.model_path, host, port)
+                if args.weight_format == "fp8":
+                    from shardstream_benchmarks.fp8_config import fp8_server_args
+
+                    rollout_arguments.extend(fp8_server_args(enabled=True, block_shape=(128, 128)))
                 if args.disable_prefix_caching:
                     rollout_arguments.append("--no-enable-prefix-caching")
                 ray.get(
@@ -405,9 +427,12 @@ def main():
                         raise TimeoutError("vLLM health timeout")
                     time.sleep(3)
         urls = [f"http://{host}:{port}" for _, host, port in endpoints]
-        record["generation_before"] = [generation(url, args.model_path,
-                                                  recipe.id == 'moonlight-16b-a3b') for url in urls]
-        if recipe.rollout["dp"] > 1:
+        # Native FP8 starts with dummy storage. Its checkpoint bootstrap and
+        # generation baseline run in the training driver before measured updates.
+        if args.weight_format == "bf16":
+            record["generation_before"] = [generation(url, args.model_path,
+                                                      recipe.id == 'moonlight-16b-a3b') for url in urls]
+        if recipe.rollout["dp"] > 1 and args.weight_format == "bf16":
             record["generation_before_repeat"] = [
                 generation(url, args.model_path, recipe.id == 'moonlight-16b-a3b') for url in urls
             ]
@@ -484,6 +509,9 @@ def main():
             if time.monotonic() >= deadline:
                 raise TimeoutError("Transfer timeout")
             time.sleep(3)
+        if args.weight_format == "fp8":
+            bootstrap = ray.get(training[0].read_json.remote("bootstrap-generation.json"))
+            record.update(bootstrap)
         record["generation_after"] = [generation(url, args.model_path,
                                                  recipe.id == 'moonlight-16b-a3b') for url in urls]
         if [result["message"] for result in record["generation_before"]] != [
