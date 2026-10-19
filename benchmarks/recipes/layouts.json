@@ -379,48 +379,6 @@
         "instances": 1,
         "world_size": 8
       }
-    },
-    {
-      "id": "qwen30-tp2-cp2-ep8-r2tp4dp2",
-      "model": "qwen3-30b-a3b",
-      "training": {
-        "world_size": 16,
-        "tp": 2,
-        "pp": 1,
-        "cp": 2,
-        "ep": 8,
-        "etp": 1
-      },
-      "rollout": {
-        "tp": 4,
-        "dp": 2,
-        "attention_dp": 2,
-        "ep": 1,
-        "instances": 2,
-        "world_size": 16,
-        "gpu_memory_utilization": 0.55
-      }
-    },
-    {
-      "id": "qwen30-tp2-cp2-ep8-r2tp2dp4",
-      "model": "qwen3-30b-a3b",
-      "training": {
-        "world_size": 16,
-        "tp": 2,
-        "pp": 1,
-        "cp": 2,
-        "ep": 8,
-        "etp": 1
-      },
-      "rollout": {
-        "tp": 2,
-        "dp": 4,
-        "attention_dp": 4,
-        "ep": 1,
-        "instances": 2,
-        "world_size": 16,
-        "gpu_memory_utilization": 0.55
-      }
     }
   ]
 }
