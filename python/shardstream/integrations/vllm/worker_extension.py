@@ -18,6 +18,12 @@ from shardstream.integrations.vllm.plugin import _patch_shardstream_worker
 
 _patch_shardstream_worker()
 
+if os.environ.get("SHARDSTREAM_BENCH_ENABLE_AWEX") == "1":
+    # Spawned workers do not inherit the API server's Awex registration.
+    from awex.vllm_plugin import _patch_awex_worker
+
+    _patch_awex_worker()
+
 
 class ShardStreamWorkerExtension:
     """Import hook for vLLM's worker-extension loader."""
