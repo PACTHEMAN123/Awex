@@ -231,6 +231,7 @@ def main():
     parser.add_argument("--publication-bucket-mb", type=int, default=256)
     parser.add_argument("--model-weight-profile", action="store_true")
     parser.add_argument("--communication-memory-profile", action="store_true")
+    parser.add_argument("--awex-nonbatch", action="store_true")
     parser.add_argument("--weight-format", choices=("bf16", "fp8"), default="bf16",
                         help="FP8 uses fused BF16-to-FP8 transport and a full checkpoint oracle")
     parser.add_argument("--disable-prefix-caching", action="store_true",
@@ -248,6 +249,8 @@ def main():
         "--nccl-lib", default="/tmp/shardstream-prepare-nccl2312/nccl/lib"
     )
     args = parser.parse_args()
+    if args.awex_nonbatch and args.publication_mechanism != "awex_native_nccl":
+        parser.error("--awex-nonbatch requires awex_native_nccl")
     if not 0 <= args.warmup_updates < args.num_updates:
         parser.error("Require 0 <= warmup updates < total updates")
     if args.dp_source_block_mb <= 0:
@@ -350,6 +353,8 @@ def main():
             "SHARDSTREAM_BENCH_WARMUP": str(args.warmup_updates),
             "SHARDSTREAM_BENCH_RAY_ADDRESS": args.ray_address,
         }
+        if args.awex_nonbatch:
+            environment["AWEX_USE_BATCH_SEND_RECV"] = "0"
         rollout_counts = rollout_host_counts(recipe.rollout["instances"], len(args.rollout_hosts))
         engine_gpus = recipe.rollout["tp"] * recipe.rollout["dp"]
         for role, hosts, world in [

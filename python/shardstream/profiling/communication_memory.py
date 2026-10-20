@@ -12,11 +12,21 @@ def enabled():
 
 
 def snapshot(empty_cache=False):
+    import pynvml
+
     torch.cuda.synchronize()
     if empty_cache:
         torch.cuda.empty_cache()
     free, total = torch.cuda.mem_get_info()
+    pynvml.nvmlInit()
+    try:
+        uuid = torch.cuda.get_device_properties(torch.cuda.current_device()).uuid
+        handle = pynvml.nvmlDeviceGetHandleByUUID(str(uuid))
+        nvml_used = pynvml.nvmlDeviceGetMemoryInfo(handle).used
+    finally:
+        pynvml.nvmlShutdown()
     return dict(pid=os.getpid(), time_ns=time.time_ns(),
+                nvml_used_bytes=nvml_used,
                 device_used_bytes=total - free,
                 allocated_bytes=torch.cuda.memory_allocated(),
                 reserved_bytes=torch.cuda.memory_reserved(),
@@ -70,6 +80,8 @@ class MemorySampler:
         if self.error:
             raise RuntimeError(self.error)
         return dict(before=self.before, after=after,
+                    sampled_device_before_bytes=self.samples[0][1],
+                    sampled_device_after_bytes=self.samples[-1][1],
                     sampled_device_peak_bytes=max(value for _, value in self.samples),
                     sample_count=len(self.samples), sample_interval_ms=self.interval * 1000,
                     sample_first_ns=self.samples[0][0], sample_last_ns=self.samples[-1][0])
