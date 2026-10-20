@@ -91,9 +91,52 @@ def test_native_fp8_oracle_uses_dense_tp_slice_and_complete_ep_expert(tmp_path, 
                    attn_tp_rank=1, attn_tp_size=2, attn_dp_rank=3,
                    world_size=8, global_rank=7, local_rank=7, infer_engine_config=config)
     oracle = FP8ModelWeightProfile.from_vllm_checkpoint(model, context, tmp_path, 'scale', 35)
+    assert oracle.quantization_rounding == 'fp32_interval'
     assert torch.equal(oracle.references[dense_name], dense[:, 128:])
     assert torch.equal(oracle.references[expert_name], expert)
     # Replacing the live model tensor must fail even if old canonical views survive.
     native[dense_name] = native[dense_name].clone()
     with pytest.raises(AssertionError, match='native FP8 model parameter was replaced'):
         oracle.command('clear', 0)
+
+
+def test_native_fp8_oracle_accepts_only_adjacent_midpoint_roundings(monkeypatch):
+    import pytest
+    from shardstream.profiling.fp8_model import FP8ModelWeightProfile
+    from shardstream.profiling.model import version_marker_factor
+
+    monkeypatch.setattr(torch.cuda, 'synchronize', lambda: None)
+    # Amax 448 gives scale 1. 1.0625 is exactly halfway between FP8 1 and
+    # 1.125, while 1 is unambiguous. Both sources are exactly BF16 values.
+    source = torch.full((128, 128), 1.0625, dtype=torch.bfloat16)
+    source[0, 0], source[0, 1] = 448, 1
+    parameters = {
+        'layer.weight': source.to(torch.float8_e4m3fn),
+        'layer.weight_scale_inv': torch.ones(1, 1),
+        'model.norm.weight': torch.ones(8, dtype=torch.bfloat16),
+    }
+    oracle = FP8ModelWeightProfile(parameters, {
+        'layer.weight': source, 'model.norm.weight': torch.ones(8, dtype=torch.bfloat16),
+    }, 'scale', 35)
+    parameters['model.norm.weight'].mul_(version_marker_factor(-1, 35))
+    oracle.quantization_rounding = 'fp32_interval'
+    parameters['layer.weight'][1, 1] = 1.125
+    result = oracle.command('verify', 0)
+    assert not result['fp8_bytes_exact']
+    assert result['fp8_rounding_mode'] == 'fp32_interval'
+    assert result['fp8_relative_bound'] == 4 * torch.finfo(torch.float32).eps
+    assert result['fp8_ambiguous_elements'] == source.numel() - 2
+    assert result['fp8_alternative_elements'] == 1
+    # The next FP8 value is outside the interval, even at a midpoint.
+    parameters['layer.weight'][1, 1] = 1.25
+    with pytest.raises(AssertionError, match='FP8 byte mismatch'):
+        oracle.command('verify', 0)
+    parameters['layer.weight'][1, 1] = 1.125
+    # A one-step corruption at an unambiguous source must also fail.
+    parameters['layer.weight'][0, 1] = 1.125
+    with pytest.raises(AssertionError, match='FP8 byte mismatch'):
+        oracle.command('verify', 0)
+    parameters['layer.weight'][0, 1] = 1
+    parameters['layer.weight_scale_inv'].mul_(1.01)
+    with pytest.raises(AssertionError, match='scale_inv'):
+        oracle.command('verify', 0)

@@ -31,6 +31,8 @@ class FP8ModelWeightProfile(ModelWeightProfile):
         self.norm_name = "model.norm.weight"
         self.encoded = {}
         self.encoding_scales = {}
+        self.quantization_rounding = "exact"
+        self.rounding_alternatives = {}
         self.quantized = {}
         expected_names = set(self.references)
         for name, actual in self.parameters.items():
@@ -126,6 +128,9 @@ class FP8ModelWeightProfile(ModelWeightProfile):
             parameters=parameters, current_worker_parameters_meta=metadata,
         ), checkpoint, marker_mode, marker_period)
         profile.native_model = model
+        # veRL's Triton FP32 reciprocal can land on the other side of an FP8
+        # midpoint from the independently rounded reciprocal used by GIN.
+        profile.quantization_rounding = "fp32_interval"
         profile.native_pointers = {name: p.data_ptr() for name, p in model.named_parameters()}
         return profile
 
@@ -181,6 +186,10 @@ class FP8ModelWeightProfile(ModelWeightProfile):
 
     def _verify_parameters(self, version):
         br, bc = self.block_shape
+        ambiguous_elements = 0
+        alternative_elements = 0
+        native_rounding = self.quantization_rounding == "fp32_interval"
+        relative_bound = 4 * torch.finfo(torch.float32).eps
         for name, scale_name in self.quantized.items():
             actual_scale = self.parameters[scale_name]
             torch.testing.assert_close(actual_scale, self.references[scale_name],
@@ -189,13 +198,36 @@ class FP8ModelWeightProfile(ModelWeightProfile):
                 source = self.references[name]
                 blocks = source.float().reshape(source.shape[0] // br, br,
                                                source.shape[1] // bc, bc)
-                # Scalar CUDA division can round differently from torch's FP32
-                # reciprocal. Round the reciprocal via FP64 independently.
-                inverse = (1.0 / actual_scale.double()).float()
-                self.encoded[name] = (blocks * inverse[:, None, :, None]).reshape(
-                    source.shape).to(torch.float8_e4m3fn).view(torch.uint8)
+                if native_rounding:
+                    # Use independent FP64 arithmetic with a tight FP32 error
+                    # envelope, rather than rerunning the upstream kernel.
+                    # The scales have already passed the independent amax check.
+                    ideal = blocks.double() / actual_scale.double()[:, None, :, None]
+                    lower = (ideal * (1 - relative_bound)).clamp(-448, 448).float().reshape(
+                        source.shape).to(torch.float8_e4m3fn).view(torch.uint8)
+                    upper = (ideal * (1 + relative_bound)).clamp(-448, 448).float().reshape(
+                        source.shape).to(torch.float8_e4m3fn).view(torch.uint8)
+                    indices = (lower.flatten() != upper.flatten()).nonzero().flatten()
+                    self.encoded[name] = lower
+                    self.rounding_alternatives[name] = (indices, upper.flatten()[indices])
+                else:
+                    # Preserve the GIN exact-byte checkpoint oracle.
+                    inverse = (1.0 / actual_scale.double()).float()
+                    self.encoded[name] = (blocks * inverse[:, None, :, None]).reshape(
+                        source.shape).to(torch.float8_e4m3fn).view(torch.uint8)
                 self.encoding_scales[name] = actual_scale.detach().clone()
-            if not torch.equal(self.parameters[name].view(torch.uint8), self.encoded[name]):
+            actual_bytes = self.parameters[name].view(torch.uint8)
+            if native_rounding:
+                indices, alternatives = self.rounding_alternatives[name]
+                invalid = actual_bytes.flatten() != self.encoded[name].flatten()
+                alternate = invalid[indices] & (actual_bytes.flatten()[indices] == alternatives)
+                invalid[indices] &= ~alternate
+                ambiguous_elements += indices.numel()
+                alternative_elements += int(alternate.sum())
+                mismatch = bool(invalid.any())
+            else:
+                mismatch = not torch.equal(actual_bytes, self.encoded[name])
+            if mismatch:
                 raise AssertionError(f"FP8 byte mismatch at version {version}: {name}")
         for name, actual in self.parameters.items():
             if name in self.quantized or name in self.quantized.values():
@@ -207,7 +239,12 @@ class FP8ModelWeightProfile(ModelWeightProfile):
                             else torch.full_like(expected, factor))
             if not torch.equal(actual, expected):
                 raise AssertionError(f"Mixed parameter mismatch at version {version}: {name}")
-        return dict(full_checkpoint_reference=True, fp8_bytes_exact=True,
+        rounding = (dict(fp8_rounding_mode="fp32_interval", fp8_relative_bound=relative_bound,
+                         fp8_ambiguous_elements=ambiguous_elements,
+                         fp8_alternative_elements=alternative_elements)
+                    if native_rounding else {})
+        return dict(full_checkpoint_reference=True, fp8_bytes_exact=not native_rounding,
+                    **rounding,
                     scale_rtol=5e-7, scale_atol=0,
                     fp8_elements=sum(self.parameters[n].numel() for n in self.quantized),
                     scale_elements=sum(self.parameters[n].numel() for n in self.quantized.values()),
