@@ -539,7 +539,7 @@ class MultiVLLMWeightsExchangeIT:
             fp32_parameter_suffixes=self.fp32_parameter_suffixes,
             return_bridge=(
                 self.publication_mechanism_name
-                in ("verl_native_nccl", "verl_native_nixl", "verl_native_mooncake")
+                in ("verl_native_nccl", "verl_native_nixl", "verl_native_mooncake", "weightbridge_native")
             ),
         )
         if len(loaded) == 3:

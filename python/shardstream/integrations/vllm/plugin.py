@@ -422,7 +422,7 @@ def _patch_shardstream_worker() -> None:
         receiver = create_vllm_publication_receiver(
             mechanism, config, worker_rank=int(rank_info["global_rank"])
         )
-        if mechanism == "verl_native_nccl":
+        if mechanism in ("verl_native_nccl", "weightbridge_native"):
             receiver.model_runner = self.model_runner
         self._publication_receiver = receiver
         return _sanitize_for_ipc(receiver.initialize())

@@ -71,6 +71,7 @@ def _load_builtin_mechanisms() -> None:
     importlib.import_module("shardstream.integrations.publication.transport")
     importlib.import_module("shardstream.integrations.publication.verl_native")
     importlib.import_module("shardstream.integrations.publication.awex_native")
+    importlib.import_module("shardstream.integrations.publication.weightbridge_native")
     _BUILTINS_LOADED = True
 
 
