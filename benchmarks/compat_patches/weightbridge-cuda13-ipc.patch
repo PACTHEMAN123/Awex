@@ -1,0 +1,16 @@
+diff --git a/wbridge/backend/router.py b/wbridge/backend/router.py
+--- a/wbridge/backend/router.py
++++ b/wbridge/backend/router.py
+@@ -181,7 +181,11 @@ def _open_cuda_ipc_mapping(dst_device: int, metadata: dict) -> tuple[int, int]:
+     if len(raw) != 64:
+         raise RuntimeError(f"invalid CUDA IPC memory handle size {len(raw)}")
+     handle = cudart.cudaIpcMemHandle_t()
+-    handle.reserved = raw
++    if hasattr(handle, "reserved"):
++        handle.reserved = raw
++    else:
++        # CUDA Python 13 exposes the opaque struct through getPtr only.
++        ctypes.memmove(handle.getPtr(), raw, len(raw))
+     with torch.cuda.device(dst_device):
+         error, device_ptr = cudart.cudaIpcOpenMemHandle(
+             handle,
