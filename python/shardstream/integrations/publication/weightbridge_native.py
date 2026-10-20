@@ -6,7 +6,7 @@ transport, routing, or manually supplied LoadSpec participates in this path.
 
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 import os
 import time
 
@@ -62,6 +62,20 @@ def _configure(round_bytes):
 
 def _parameter_views(model):
     return {name: param.detach() for name, param in model.named_parameters()}
+
+
+@contextmanager
+def _independent_rendezvous():
+    key = "TORCHELASTIC_USE_AGENT_STORE"
+    previous = os.environ.get(key)
+    os.environ[key] = "False"
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = previous
 
 
 def _context(model_path, model, rank, loader):
@@ -192,7 +206,9 @@ class WeightBridgePublication(PublicationMechanism):
                 }, self.timeout_seconds)
             harness._training_barrier()
             if not self.connected:
-                self.adapter.connect()
+                # This is a new TCPStore, not torchrun's existing agent store.
+                with _independent_rendezvous():
+                    self.adapter.connect()
                 self.connected = True
             event = self.adapter.send_weights()
             if event is not None:

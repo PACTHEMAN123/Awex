@@ -19,6 +19,20 @@ def test_close_before_receiver_initialization_does_not_mask_failure():
     wb.WeightBridgePublication(SimpleNamespace(is_driver=True)).close()
 
 
+@pytest.mark.parametrize("previous", [None, "True"])
+def test_independent_rendezvous_restores_environment_on_error(monkeypatch, previous):
+    key = "TORCHELASTIC_USE_AGENT_STORE"
+    if previous is None:
+        monkeypatch.delenv(key, raising=False)
+    else:
+        monkeypatch.setenv(key, previous)
+    with pytest.raises(RuntimeError):
+        with wb._independent_rendezvous():
+            assert wb.os.environ[key] == "False"
+            raise RuntimeError("probe")
+    assert wb.os.environ.get(key) == previous
+
+
 def test_factory_state_is_lazy_and_recallable():
     calls = []
     def factory():
