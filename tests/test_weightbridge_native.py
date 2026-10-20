@@ -12,6 +12,8 @@ def test_factory_state_is_lazy_and_recallable():
         return object()
     source = wb.ProbeSource(SimpleNamespace(config="original"), {"weight": factory})
     assert list(source.state) == ["weight"] and len(source.state) == 1
+    assert source.state.source.get_all_keys() == ("weight",)
+    assert "weight" in source.state and "missing" not in source.state
     assert not calls
     assert source.state["weight"] is not source.state["weight"]
     assert len(calls) == 2

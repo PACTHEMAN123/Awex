@@ -25,6 +25,13 @@ class FactoryState(Mapping):
 
     def __init__(self, factories):
         self.factories = factories
+        self.source = self
+
+    def get_all_keys(self):
+        return tuple(self.factories)
+
+    def __contains__(self, name):
+        return name in self.factories
 
     def __getitem__(self, name):
         return self.factories[name]()
