@@ -5,6 +5,20 @@ import pytest
 from shardstream.integrations.publication import weightbridge_native as wb
 
 
+def test_parameter_views_allow_probe_mutation_without_copy():
+    model = wb.torch.nn.Linear(3, 2, bias=False)
+    view = wb._parameter_views(model)["weight"]
+    assert not view.requires_grad
+    assert view.data_ptr() == model.weight.data_ptr()
+    view.zero_()
+    assert wb.torch.count_nonzero(model.weight).item() == 0
+    assert model.weight.requires_grad
+
+
+def test_close_before_receiver_initialization_does_not_mask_failure():
+    wb.WeightBridgePublication(SimpleNamespace(is_driver=True)).close()
+
+
 def test_factory_state_is_lazy_and_recallable():
     calls = []
     def factory():

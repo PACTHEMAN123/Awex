@@ -60,12 +60,16 @@ def _configure(round_bytes):
     os.environ.setdefault("WBRIDGE_SPECGEN_PROBE_DEVICE", "auto")
 
 
+def _parameter_views(model):
+    return {name: param.detach() for name, param in model.named_parameters()}
+
+
 def _context(model_path, model, rank, loader):
     from wbridge.frontend.adapters import AdapterContext
     from wbridge.utils.specgen import hf_weights_from_checkpoint
 
     factories, shapes = hf_weights_from_checkpoint(model_path)
-    return AdapterContext(factories, shapes, lambda: dict(model.named_parameters()), loader, rank)
+    return AdapterContext(factories, shapes, lambda: _parameter_views(model), loader, rank)
 
 
 @register_vllm_publication_receiver("weightbridge_native")
@@ -130,6 +134,7 @@ class WeightBridgePublication(PublicationMechanism):
         self.round_bytes = bucket_size
         self.timeout_seconds = timeout_seconds
         self.connected = False
+        self.receivers_initialized = False
 
     def initialize_training(self):
         _configure(self.round_bytes)
@@ -172,6 +177,7 @@ class WeightBridgePublication(PublicationMechanism):
                 "model_path": harness.inference_config["model_path"],
             }} for engine, _, port in endpoints
         }, self.timeout_seconds)
+        self.receivers_initialized = True
 
     def publish(self):
         harness = self.harness
@@ -198,6 +204,6 @@ class WeightBridgePublication(PublicationMechanism):
             self.adapter.flush_profile_outputs()
 
     def close(self):
-        if self.harness.is_driver:
+        if self.harness.is_driver and self.receivers_initialized:
             endpoints = publication_endpoints(self.harness)
             _request_endpoints(endpoints, "publication_close", {engine: {} for engine, _, _ in endpoints}, 60)
