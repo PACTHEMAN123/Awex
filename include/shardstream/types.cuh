@@ -158,6 +158,7 @@ struct WindowLayout {
   std::uint32_t channel_count;
   std::uint32_t world_size;
   std::uint32_t payload_peer_count;
+  std::uint32_t payload_connection_count;
   std::size_t window_bytes;
 };
 

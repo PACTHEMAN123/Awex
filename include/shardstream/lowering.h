@@ -83,7 +83,8 @@ struct Schedule {
 
 inline WindowLayout makeWindowLayout(std::uint32_t world_size, std::uint32_t channel_count,
                                          std::uint32_t fifo_depth, std::size_t slot_bytes,
-                                         std::uint32_t payload_peer_count) {
+                                         std::uint32_t payload_peer_count,
+                                         std::uint32_t payload_connections = UINT32_MAX) {
   if (world_size == 0 || channel_count == 0 || fifo_depth == 0 || slot_bytes == 0) {
     throw std::invalid_argument("invalid transport window dimensions");
   }
@@ -92,7 +93,11 @@ inline WindowLayout makeWindowLayout(std::uint32_t world_size, std::uint32_t cha
   }
   const std::size_t state_connection_count = static_cast<std::size_t>(world_size) * channel_count;
   const std::size_t state_slot_count = state_connection_count * fifo_depth;
-  const std::size_t payload_connection_count = static_cast<std::size_t>(payload_peer_count) * channel_count;
+  const std::size_t payload_connection_count = payload_connections == UINT32_MAX
+    ? static_cast<std::size_t>(payload_peer_count) * channel_count : payload_connections;
+  if (payload_connection_count > static_cast<std::size_t>(payload_peer_count) * channel_count) {
+    throw std::invalid_argument("payload connections exceed peer capacity");
+  }
   const std::size_t payload_slot_count = payload_connection_count * fifo_depth;
   const std::size_t state_offset = ((sizeof(WindowHeader) + kFifoAlignment - 1) / kFifoAlignment) * kFifoAlignment;
   const std::size_t payload_offset =
@@ -101,8 +106,33 @@ inline WindowLayout makeWindowLayout(std::uint32_t world_size, std::uint32_t cha
     ((payload_offset + payload_slot_count * slot_bytes + kWindowAlignment - 1) / kWindowAlignment) *
     kWindowAlignment;
   return WindowLayout{
-    state_offset, payload_offset, slot_bytes, fifo_depth, channel_count, world_size, payload_peer_count, window_bytes,
+    state_offset, payload_offset, slot_bytes, fifo_depth, channel_count, world_size, payload_peer_count,
+    static_cast<std::uint32_t>(payload_connection_count), window_bytes,
   };
+}
+
+inline std::vector<std::uint32_t> payloadChannelMask(const Schedule& schedule,
+                                                    const LoweringConfig& config, Direction direction) {
+  std::vector<std::uint32_t> mask(static_cast<std::size_t>(config.world_size) * config.total_channels, 0);
+  for (std::size_t index = 0; index < schedule.channels.size(); ++index) {
+    const auto channel = schedule.channel_ids.at(index);
+    const auto& queue = schedule.channels[index];
+    const auto mark = [&](std::uint32_t peer) {
+      mask.at(static_cast<std::size_t>(peer) * config.total_channels + channel) = 1;
+    };
+    for (std::uint32_t b = 0; b < queue.batch_count; ++b) {
+      const auto& batch = schedule.batches.at(queue.first_batch + b);
+      for (std::uint32_t w = 0; w < batch.work_count; ++w) {
+        const auto& work = schedule.works.at(batch.work_begin + w);
+        // GIN needs local send staging and receive landing storage. LSA reads
+        // directly from its sender's FIFO, including intra-node relay edges.
+        if (direction == Direction::kSend ||
+            config.peer_transports.at(work.peer) == static_cast<std::uint8_t>(Transport::kGin)) mark(work.peer);
+        if (work.forward_peer != kNoPeer) mark(work.forward_peer);
+      }
+    }
+  }
+  return mask;
 }
 
 inline std::uint64_t divUp(std::uint64_t value, std::uint64_t divisor) {

@@ -161,9 +161,8 @@ __device__ __forceinline__ std::uint8_t* fifoPayload(const KernelArgs& args, std
                                                        unsigned long long step, std::uint32_t fifo_depth,
                                                        bool local_window) {
   auto* window = local_window ? args.local_window : reinterpret_cast<std::uint8_t*>(args.peer_windows[window_rank]);
-  const std::uint32_t payload_peer =
-    args.payload_peer_slots[static_cast<std::size_t>(window_rank) * args.world_size + connection_rank];
-  const std::size_t connection = (static_cast<std::size_t>(payload_peer) * args.layout.channel_count) + channel;
+  const std::size_t connection = args.payload_peer_slots[
+    (static_cast<std::size_t>(window_rank) * args.world_size + connection_rank) * args.layout.channel_count + channel];
   const std::size_t slot =
     connection * args.layout.fifo_depth + static_cast<std::size_t>(step % fifo_depth);
   return window + args.layout.payload_offset + slot * args.layout.slot_bytes;

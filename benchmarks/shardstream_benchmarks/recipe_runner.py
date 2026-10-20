@@ -241,6 +241,7 @@ def main():
     parser.add_argument("--transport-gin-connections", type=int, choices=(1, 2, 4))
     parser.add_argument("--transport-max-channels", type=int, choices=(16, 32, 64))
     parser.add_argument("--transport-gin-fifo-depth", type=int, choices=(4, 8, 16))
+    parser.add_argument("--transport-compact-fifo", action="store_true")
     parser.add_argument("--dp-source-policy", choices=("replica", "block", "stream"), default="replica")
     parser.add_argument("--dp-source-block-mb", type=int, default=16)
     parser.add_argument("--dp-source-ring-order", choices=("rank", "source-node", "dp"), default="rank")
@@ -270,6 +271,10 @@ def main():
     }
     if transport_environment and args.publication_mechanism != "shardstream":
         parser.error("Transport preparation tuning applies only to ShardStream")
+    if args.transport_compact_fifo:
+        if args.publication_mechanism != "shardstream":
+            parser.error("Compact FIFO applies only to ShardStream")
+        transport_environment["SHARDSTREAM_COMPACT_FIFO"] = "1"
     transport_environment.update(
         SHARDSTREAM_COMM_MEMORY_PROFILE="1" if args.communication_memory_profile else "0",
         SHARDSTREAM_FP8_BLOCKWISE="1" if args.weight_format == "fp8" else "0",

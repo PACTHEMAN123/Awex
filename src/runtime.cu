@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <stdexcept>
@@ -384,6 +385,23 @@ bool same_tasks(const std::vector<impl::LoweringTask>& left, const std::vector<i
   return true;
 }
 
+impl::LoweringConfig lowering_config(const DeviceState* state) {
+  impl::LoweringConfig config;
+  config.local_rank = static_cast<std::uint32_t>(state->rank);
+  config.world_size = static_cast<std::uint32_t>(state->world_size);
+  config.total_channels = state->total_channels;
+  config.fifo_depth = state->fifo_depth;
+  config.chunk_bytes = state->chunk_bytes;
+  config.step_bytes = state->step_bytes;
+  config.gin_fifo_depth = state->gin_fifo_depth;
+  config.gin_chunk_bytes = state->gin_chunk_bytes;
+  config.network_step_bytes = state->network_step_bytes;
+  config.ring_channels = state->gin.context_count == 0 ? 0 : impl::powerOfTwoUp(state->gin.context_count);
+  config.peer_channels = state->peer_channels;
+  config.peer_transports = state->peer_transports;
+  return config;
+}
+
 void initialize_sparse_window(DeviceState* state, const std::vector<std::uint32_t>& active_peers,
                               const std::vector<impl::LoweringTask>& tasks, impl::Direction direction,
                               cudaStream_t stream) {
@@ -514,62 +532,12 @@ void initialize_sparse_window(DeviceState* state, const std::vector<std::uint32_
   const std::size_t slot_bytes = (ring_only || packed_fp8_gin) ? state->network_step_bytes :
     state->gin.enabled ? std::max(state->step_bytes, state->network_step_bytes) : state->step_bytes;
   state->payload_peer_count = payload_peer_count;
-  state->layout = impl::makeWindowLayout(state->world_size, state->total_channels, layout_fifo_depth, slot_bytes,
-                                         payload_peer_capacity);
-  state->window_bytes = state->layout.window_bytes;
   state->dense_window_bytes = impl::makeWindowLayout(state->world_size, state->total_channels, layout_fifo_depth,
                                                       slot_bytes, state->world_size)
                                 .window_bytes;
   try {
-    time_preparation(state, "fifo_allocation", [&] {
-      SHARDSTREAM_NCCL_CHECK(ncclMemAlloc(&state->local_base, state->window_bytes));
-      return 0;
-    });
-    time_preparation(state, "fifo_registration", [&] {
-      // This window is used by our Device API kernels, never by NCCL host
-      // collectives. COLL_SYMMETRIC would additionally initialize NCCL's
-      // internal symmetric collective kernels and their unused GIN resources.
-      // DEFAULT still registers the collective LSA/GIN window and peer maps.
-      SHARDSTREAM_NCCL_CHECK(ncclCommWindowRegister(state->comm, state->local_base, state->window_bytes, &state->window,
-                                                NCCL_WIN_DEFAULT));
-      return 0;
-    });
-
-    state->remote_bases.resize(state->world_size, nullptr);
-    state->remote_bases[state->rank] = state->local_base;
-    for (int peer = 0; peer < state->world_size; ++peer) {
-      if (peer == state->rank ||
-          state->peer_transports[peer] == static_cast<std::uint8_t>(impl::Transport::kGin)) {
-        continue;
-      }
-      const int lsa_rank = ncclTeamRankToTeam(state->lsa_team, state->world_team, peer);
-      if (lsa_rank < 0) throw std::runtime_error("transport failed to map an LSA peer rank");
-      SHARDSTREAM_NCCL_CHECK(ncclGetLsaDevicePointer(state->window, 0, lsa_rank, &state->remote_bases[peer]));
-    }
-
-    SHARDSTREAM_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state->device_peer_windows),
-                                  checked_multiply(static_cast<std::size_t>(state->world_size), sizeof(uintptr_t),
-                                                   "transport peer window table")));
-    std::vector<uintptr_t> peer_windows(state->world_size, 0);
-    for (int peer = 0; peer < state->world_size; ++peer) {
-      peer_windows[peer] = reinterpret_cast<uintptr_t>(state->remote_bases[peer]);
-    }
-    SHARDSTREAM_CUDA_CHECK(cudaMemcpyAsync(state->device_peer_windows, peer_windows.data(),
-                                       peer_windows.size() * sizeof(uintptr_t), cudaMemcpyHostToDevice, stream));
-
-    SHARDSTREAM_CUDA_CHECK(cudaMalloc(
-      reinterpret_cast<void**>(&state->device_payload_peer_slots),
-      checked_multiply(payload_peer_slots.size(), sizeof(std::uint32_t), "transport payload peer table")));
-    SHARDSTREAM_CUDA_CHECK(cudaMemcpyAsync(state->device_payload_peer_slots, payload_peer_slots.data(),
-                                       payload_peer_slots.size() * sizeof(std::uint32_t), cudaMemcpyHostToDevice,
-                                       stream));
-
-    SHARDSTREAM_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state->device_peer_transports),
-                                  state->peer_transports.size() * sizeof(std::uint8_t)));
-    SHARDSTREAM_CUDA_CHECK(cudaMemcpyAsync(state->device_peer_transports, state->peer_transports.data(),
-                                       state->peer_transports.size() * sizeof(std::uint8_t), cudaMemcpyHostToDevice,
-                                       stream));
-
+    // Negotiate the actual execution lanes before allocating their payload
+    // storage. Control signals retain their original dense addressing.
     if (state->gin.enabled) {
       std::vector<std::uint64_t> peer_payload_bytes(state->world_size, 0);
       for (const auto& task : tasks) {
@@ -612,6 +580,111 @@ void initialize_sparse_window(DeviceState* state, const std::vector<std::uint32_
         state->gin.channels_per_peer = std::max(state->gin.channels_per_peer, pair_channels);
       }
     }
+    const char* compact_env = std::getenv("SHARDSTREAM_COMPACT_FIFO");
+    const std::uint32_t compact = compact_env && std::strcmp(compact_env, "1") == 0 ? 1U : 0U;
+    const auto modes = impl::topology_detail::allGather(state->comm, &compact, 1, state->world_size, stream);
+    if (std::any_of(modes.begin(), modes.end(), [&](auto mode) { return mode != compact; })) {
+      throw std::runtime_error("compact FIFO mode must match on every rank");
+    }
+    const auto config = lowering_config(state);
+    const auto preview = impl::lowerFixedTasks(tasks, active_peers, direction, config);
+    auto local_channels = impl::payloadChannelMask(preview, config, direction);
+    if (!compact) {
+      for (int peer = 0; peer < state->world_size; ++peer) {
+        for (std::uint32_t channel = 0; channel < state->total_channels; ++channel) {
+          local_channels[peer * state->total_channels + channel] = local_payload_slots[peer] != inactive ? 1U : 0U;
+        }
+      }
+    }
+    auto payload_channel_slots = time_preparation(state, "payload_channel_exchange", [&] {
+      return impl::topology_detail::allGather(
+        state->comm, local_channels.data(), local_channels.size(), state->world_size, stream);
+    });
+    std::uint32_t payload_connection_capacity = 0;
+    for (int rank = 0; rank < state->world_size; ++rank) {
+      std::uint32_t count = 0;
+      for (std::size_t index = 0; index < local_channels.size(); ++index) {
+        auto& slot = payload_channel_slots[rank * local_channels.size() + index];
+        slot = slot ? count++ : inactive;
+      }
+      payload_connection_capacity = std::max(payload_connection_capacity, count);
+    }
+    const auto require_slot = [&](std::uint32_t rank, std::uint32_t peer, std::uint32_t channel) {
+      const auto slot = payload_channel_slots.at(
+        (static_cast<std::size_t>(rank) * state->world_size + peer) * state->total_channels + channel);
+      if (slot == inactive) throw std::runtime_error("schedule references an unallocated payload channel");
+    };
+    for (std::size_t index = 0; index < preview.channels.size(); ++index) {
+      const auto channel = preview.channel_ids[index];
+      const auto& queue = preview.channels[index];
+      for (std::uint32_t b = 0; b < queue.batch_count; ++b) {
+        const auto& batch = preview.batches[queue.first_batch + b];
+        for (std::uint32_t w = 0; w < batch.work_count; ++w) {
+          const auto& work = preview.works[batch.work_begin + w];
+          const bool gin = state->peer_transports[work.peer] == static_cast<std::uint8_t>(impl::Transport::kGin);
+          if (gin || direction == impl::Direction::kSend) require_slot(state->rank, work.peer, channel);
+          if (gin || direction == impl::Direction::kRecv) require_slot(work.peer, state->rank, channel);
+          if (work.forward_peer != impl::kNoPeer) {
+            require_slot(state->rank, work.forward_peer, channel);
+            if (state->peer_transports[work.forward_peer] == static_cast<std::uint8_t>(impl::Transport::kGin)) {
+              require_slot(work.forward_peer, state->rank, channel);
+            }
+          }
+        }
+      }
+    }
+    state->layout = impl::makeWindowLayout(state->world_size, state->total_channels, layout_fifo_depth, slot_bytes,
+                                           payload_peer_capacity, payload_connection_capacity);
+    state->window_bytes = state->layout.window_bytes;
+    time_preparation(state, "fifo_allocation", [&] {
+      SHARDSTREAM_NCCL_CHECK(ncclMemAlloc(&state->local_base, state->window_bytes));
+      return 0;
+    });
+    time_preparation(state, "fifo_registration", [&] {
+      // This window is used by our Device API kernels, never by NCCL host
+      // collectives. COLL_SYMMETRIC would additionally initialize NCCL's
+      // internal symmetric collective kernels and their unused GIN resources.
+      // DEFAULT still registers the collective LSA/GIN window and peer maps.
+      SHARDSTREAM_NCCL_CHECK(ncclCommWindowRegister(state->comm, state->local_base, state->window_bytes, &state->window,
+                                                NCCL_WIN_DEFAULT));
+      return 0;
+    });
+
+    state->remote_bases.resize(state->world_size, nullptr);
+    state->remote_bases[state->rank] = state->local_base;
+    for (int peer = 0; peer < state->world_size; ++peer) {
+      if (peer == state->rank ||
+          state->peer_transports[peer] == static_cast<std::uint8_t>(impl::Transport::kGin)) {
+        continue;
+      }
+      const int lsa_rank = ncclTeamRankToTeam(state->lsa_team, state->world_team, peer);
+      if (lsa_rank < 0) throw std::runtime_error("transport failed to map an LSA peer rank");
+      SHARDSTREAM_NCCL_CHECK(ncclGetLsaDevicePointer(state->window, 0, lsa_rank, &state->remote_bases[peer]));
+    }
+
+    SHARDSTREAM_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state->device_peer_windows),
+                                  checked_multiply(static_cast<std::size_t>(state->world_size), sizeof(uintptr_t),
+                                                   "transport peer window table")));
+    std::vector<uintptr_t> peer_windows(state->world_size, 0);
+    for (int peer = 0; peer < state->world_size; ++peer) {
+      peer_windows[peer] = reinterpret_cast<uintptr_t>(state->remote_bases[peer]);
+    }
+    SHARDSTREAM_CUDA_CHECK(cudaMemcpyAsync(state->device_peer_windows, peer_windows.data(),
+                                       peer_windows.size() * sizeof(uintptr_t), cudaMemcpyHostToDevice, stream));
+
+    SHARDSTREAM_CUDA_CHECK(cudaMalloc(
+      reinterpret_cast<void**>(&state->device_payload_peer_slots),
+      checked_multiply(payload_channel_slots.size(), sizeof(std::uint32_t), "transport payload channel table")));
+    SHARDSTREAM_CUDA_CHECK(cudaMemcpyAsync(state->device_payload_peer_slots, payload_channel_slots.data(),
+                                       payload_channel_slots.size() * sizeof(std::uint32_t), cudaMemcpyHostToDevice,
+                                       stream));
+
+    SHARDSTREAM_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&state->device_peer_transports),
+                                  state->peer_transports.size() * sizeof(std::uint8_t)));
+    SHARDSTREAM_CUDA_CHECK(cudaMemcpyAsync(state->device_peer_transports, state->peer_transports.data(),
+                                       state->peer_transports.size() * sizeof(std::uint8_t), cudaMemcpyHostToDevice,
+                                       stream));
+
     state->window_active_peers = active_peers;
     state->window_initialized = true;
   } catch (...) {
@@ -790,21 +863,7 @@ Metrics launch(int64_t handle, const std::vector<TensorView>& tensors, const std
     // lowering and uploads must allow an application's compute thread to run.
     const auto initialization_start = Clock::now();
     initialize_sparse_window(state, active_peers, tasks, direction, stream);
-    impl::LoweringConfig config;
-    config.local_rank = static_cast<std::uint32_t>(state->rank);
-    config.world_size = static_cast<std::uint32_t>(state->world_size);
-    config.total_channels = state->total_channels;
-    config.fifo_depth = state->fifo_depth;
-    config.chunk_bytes = state->chunk_bytes;
-    config.step_bytes = state->step_bytes;
-    config.gin_fifo_depth = state->gin_fifo_depth;
-    config.gin_chunk_bytes = state->gin_chunk_bytes;
-    config.network_step_bytes = state->network_step_bytes;
-    config.ring_channels = state->gin.context_count == 0
-      ? 0
-      : impl::powerOfTwoUp(state->gin.context_count);
-    config.peer_channels = state->peer_channels;
-    config.peer_transports = state->peer_transports;
+    const auto config = lowering_config(state);
     const auto lowering_start = Clock::now();
     auto schedule = impl::lowerFixedTasks(tasks, active_peers, direction, config);
     for (const auto& work : schedule.works) {
@@ -926,9 +985,10 @@ Metrics launch(int64_t handle, const std::vector<TensorView>& tensors, const std
   metrics["slot_bytes"] = std::int64_t(state->layout.slot_bytes);
   metrics["payload_peer_count"] = std::int64_t(state->payload_peer_count);
   metrics["payload_peer_capacity"] = std::int64_t(state->layout.payload_peer_count);
+  metrics["payload_connection_capacity"] = std::int64_t(state->layout.payload_connection_count);
   metrics["control_window_bytes"] = std::int64_t(state->layout.payload_offset);
   metrics["payload_buffer_bytes"] = std::int64_t(
-    static_cast<std::size_t>(state->layout.payload_peer_count) * state->total_channels * state->layout.fifo_depth *
+    static_cast<std::size_t>(state->layout.payload_connection_count) * state->layout.fifo_depth *
     state->layout.slot_bytes);
   metrics["registered_window_bytes"] = std::int64_t(state->window_bytes);
   metrics["dense_window_bytes"] = std::int64_t(state->dense_window_bytes);

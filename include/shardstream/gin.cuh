@@ -56,9 +56,8 @@ __device__ __forceinline__ ncclGinSignal_t ginCreditSignal(const KernelArgs& arg
 __device__ __forceinline__ std::size_t ginPayloadOffset(const KernelArgs& args, std::uint32_t window_rank,
                                                           std::uint32_t peer, std::uint32_t channel,
                                                           unsigned long long step, std::uint32_t fifo_depth) {
-  const std::uint32_t payload_slot =
-    args.payload_peer_slots[static_cast<std::size_t>(window_rank) * args.world_size + peer];
-  const std::size_t connection = static_cast<std::size_t>(payload_slot) * args.layout.channel_count + channel;
+  const std::size_t connection = args.payload_peer_slots[
+    (static_cast<std::size_t>(window_rank) * args.world_size + peer) * args.layout.channel_count + channel];
   const std::size_t slot =
     connection * args.layout.fifo_depth + static_cast<std::size_t>(step % fifo_depth);
   return args.layout.payload_offset + slot * args.layout.slot_bytes;
