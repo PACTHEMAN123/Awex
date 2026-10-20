@@ -9,6 +9,7 @@ reference before using their FP32 rounding to define the byte oracle.
 import json
 from contextlib import ExitStack
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 
@@ -65,6 +66,75 @@ class FP8ModelWeightProfile(ModelWeightProfile):
             if actual.shape != self.references[name].shape:
                 raise ValueError(f"Checkpoint reference shape mismatch: {name}")
         self.pointers = {name: p.data_ptr() for name, p in self.parameters.items()}
+
+    @classmethod
+    def from_vllm_checkpoint(cls, model, context, checkpoint, marker_mode, marker_period):
+        """Build a checkpoint oracle without a ShardStream reader or transport.
+
+        The native baseline is currently qualified for Qwen3-MoE TP1/2 with
+        EP8. Expanded expert names already identify complete HF tensors; dense
+        parameters use the same vLLM shard coordinates as the model catalog.
+        """
+        from safetensors import safe_open
+        from shardstream.integrations.models.registry import get_infer_weights_converter
+        from shardstream.integrations.sharding.vllm import (
+            get_vllm_rank_info, get_vllm_sharding_strategy,
+        )
+        from shardstream.metadata.sharding import ShardingType
+
+        config = context["infer_engine_config"]
+        rank = get_vllm_rank_info(context, 0)
+        architecture = model.config.architectures[0]
+        if architecture != "Qwen3MoeForCausalLM" or rank.tp_size not in (1, 2) or rank.ep_size != 8:
+            raise ValueError("Native FP8 checkpoint oracle requires Qwen3-MoE TP1/2 EP8")
+        converter = get_infer_weights_converter(
+            "vllm", architecture, hf_config=model.config,
+            infer_engine_config=config, rank_info=rank,
+        )
+        strategy = get_vllm_sharding_strategy(
+            architecture, config, rank, hf_config=model.config)
+        parameters = {key: value for name, parameter in model.named_parameters()
+                      for key, value in converter.convert_param(name, parameter)}
+        checkpoint = Path(checkpoint)
+        index = json.loads((checkpoint / "model.safetensors.index.json").read_text())["weight_map"]
+        metadata = []
+        with ExitStack() as stack:
+            files = {}
+            for key, actual in parameters.items():
+                name, is_scale = normalize_scale_inv_name(key)
+                offsets = [0] * actual.ndim
+                if not is_scale:
+                    filename = index[name]
+                    if filename not in files:
+                        files[filename] = stack.enter_context(safe_open(
+                            checkpoint / filename, framework="pt", device="cpu"))
+                    shape = tuple(files[filename].get_slice(name).get_shape())
+                    if tuple(actual.shape) != shape:
+                        kind, dim, count = strategy.get_sharding_strategy(name, rank_info=rank)
+                        if kind == ShardingType.TP_SHARDING:
+                            physical, world = rank.tp_rank, rank.tp_size
+                        elif kind == ShardingType.DP_TP_SHARDING:
+                            physical, world = rank.attn_tp_rank, rank.attn_tp_size
+                        else:
+                            raise ValueError(f"Unsupported native FP8 checkpoint shard: {key}")
+                        offsets[dim] = (physical // (world // count)) * actual.shape[dim]
+                        if any(actual.shape[d] != shape[d] for d in range(actual.ndim) if d != dim):
+                            raise ValueError(f"Native FP8 checkpoint shard shape mismatch: {key}")
+                metadata.append(SimpleNamespace(name=key, shards=[SimpleNamespace(
+                    shape=tuple(actual.shape), global_offset=tuple(offsets))]))
+        profile = cls.from_checkpoint(SimpleNamespace(
+            parameters=parameters, current_worker_parameters_meta=metadata,
+        ), checkpoint, marker_mode, marker_period)
+        profile.native_model = model
+        profile.native_pointers = {name: p.data_ptr() for name, p in model.named_parameters()}
+        return profile
+
+    def command(self, operation, version):
+        if hasattr(self, "native_model") and self.native_pointers != {
+            name: p.data_ptr() for name, p in self.native_model.named_parameters()
+        }:
+            raise AssertionError("A native FP8 model parameter was replaced")
+        return super().command(operation, version)
 
     @classmethod
     def from_checkpoint(cls, reader, checkpoint, marker_mode, marker_period):

@@ -17,6 +17,7 @@ import pickle
 import threading
 import time
 import uuid
+from contextlib import nullcontext
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
 import requests
@@ -183,6 +184,45 @@ def _load_one(model, name, weight):
         model.load_weights([(name, weight)])
 
 
+def _load_fp8_weights(model_runner, weights):
+    """Use veRL's quantizer and refit lifecycle with recyclable NCCL views.
+
+    The upstream convenience loader materializes its input list. The NCCL
+    engine yields views into two reused buckets, so consume its iterator in
+    the original vLLM loader without retaining views across bucket reuse.
+    Parameter subclass handling follows veRL's load_quanted_weights helper.
+    """
+    from verl.utils.vllm.vllm_quant_utils import (
+        prepare_quanted_weights_for_loading,
+        process_quanted_weights_after_loading,
+        quant_weights,
+    )
+
+    model = model_runner.model
+    state = prepare_quanted_weights_for_loading(model)
+    for name, parameter in model.named_parameters():
+        parameter._verl_qualname = name
+        if hasattr(parameter, "subclass_type"):
+            parameter.orig_type = parameter.__class__
+            parameter.__class__ = parameter.subclass_type
+    try:
+        from vllm.model_executor.model_loader.mtp_validation import disable_mtp_completeness_check
+    except ImportError:
+        disable_mtp_completeness_check = nullcontext
+    try:
+        with disable_mtp_completeness_check():
+            model.load_weights(quant_weights(
+                weights, model, model_runner.vllm_config.quant_config,
+                dtype=model_runner.vllm_config.model_config.dtype,
+            ))
+    finally:
+        for parameter in model.parameters():
+            if hasattr(parameter, "orig_type"):
+                parameter.__class__ = parameter.orig_type
+                del parameter.orig_type
+    process_quanted_weights_after_loading(model, state)
+
+
 class NativeReceiver:
     backend = None
 
@@ -261,7 +301,12 @@ class NativeReceiver:
         # Consume each bucket view before advancing the native async iterator;
         # keep vLLM's original loader initialized once for the full update.
         target = getattr(model, "target", model)
-        target.load_weights(weights())
+        if os.environ.get("VERL_VLLM_FP8_QUANT_ENABLED") == "1":
+            if self.backend != "nccl" or target is not model:
+                raise ValueError("Native FP8 benchmark requires NCCL and one target model")
+            _load_fp8_weights(self.model_runner, weights())
+        else:
+            target.load_weights(weights())
         torch.cuda.synchronize()
         receive_apply_ms = (time.perf_counter() - started) * 1000
         post_started = time.perf_counter()

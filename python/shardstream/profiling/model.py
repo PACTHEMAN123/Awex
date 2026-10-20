@@ -163,11 +163,17 @@ def model_profile_task(operation: str, version: int, marker_mode="constant", mar
                 name: p.data_ptr() for name, p in kwargs["model"].named_parameters()
             }:
                 raise AssertionError("A native FP8 model parameter was replaced during bootstrap")
-            profile = FP8ModelWeightProfile.from_checkpoint(
-                reader,
-                os.environ["SHARDSTREAM_BENCH_MODEL_PATH"],
-                marker_mode, marker_period,
-            )
+            if os.environ.get("VERL_VLLM_FP8_QUANT_ENABLED") == "1":
+                profile = FP8ModelWeightProfile.from_vllm_checkpoint(
+                    kwargs["model"], kwargs["model_context"],
+                    os.environ["SHARDSTREAM_BENCH_MODEL_PATH"], marker_mode, marker_period,
+                )
+            else:
+                profile = FP8ModelWeightProfile.from_checkpoint(
+                    reader,
+                    os.environ["SHARDSTREAM_BENCH_MODEL_PATH"],
+                    marker_mode, marker_period,
+                )
         else:
             profile = ModelWeightProfile(kwargs["model"], marker_mode, marker_period)
         scheduler._shardstream_model_weight_profile = profile

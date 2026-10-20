@@ -252,9 +252,10 @@ def main():
     if args.dp_source_block_mb <= 0:
         parser.error("DP source block size must be positive")
     if args.weight_format == "fp8" and (
-        not args.model_weight_profile or args.publication_mechanism != "shardstream"
+        not args.model_weight_profile or args.publication_mechanism not in (
+            "shardstream", "verl_native_nccl")
     ):
-        parser.error("FP8 recipe runs require ShardStream and --model-weight-profile")
+        parser.error("FP8 requires ShardStream or veRL NCCL and --model-weight-profile")
     transport_environment = {
         name: str(value) for name, value in (
             ("SHARDSTREAM_GIN_CONNECTIONS", args.transport_gin_connections),
@@ -335,6 +336,9 @@ def main():
     try:
         environment = {
             **transport_environment,
+            "VERL_VLLM_FP8_QUANT_ENABLED": "1" if (
+                args.weight_format == "fp8" and args.publication_mechanism == "verl_native_nccl"
+            ) else "0",
             "SHARDSTREAM_BENCH_ENABLE_AWEX": "1" if args.publication_mechanism == "awex_native_nccl" else "0",
             "SHARDSTREAM_BENCH_NATIVE_MULTIRAIL": "1" if args.publication_mechanism in (
                 "awex_native_nccl", "verl_native_nccl", "verl_native_nixl", "verl_native_mooncake"
