@@ -230,6 +230,7 @@ def main():
     parser.add_argument("--layout")
     parser.add_argument("--publication-bucket-mb", type=int, default=256)
     parser.add_argument("--model-weight-profile", action="store_true")
+    parser.add_argument("--communication-memory-profile", action="store_true")
     parser.add_argument("--weight-format", choices=("bf16", "fp8"), default="bf16",
                         help="FP8 uses fused BF16-to-FP8 transport and a full checkpoint oracle")
     parser.add_argument("--disable-prefix-caching", action="store_true",
@@ -267,6 +268,7 @@ def main():
     if transport_environment and args.publication_mechanism != "shardstream":
         parser.error("Transport preparation tuning applies only to ShardStream")
     transport_environment.update(
+        SHARDSTREAM_COMM_MEMORY_PROFILE="1" if args.communication_memory_profile else "0",
         SHARDSTREAM_FP8_BLOCKWISE="1" if args.weight_format == "fp8" else "0",
         SHARDSTREAM_BENCH_MODEL_PATH=args.model_path,
         SHARDSTREAM_DP_SOURCE_POLICY=args.dp_source_policy,
@@ -448,6 +450,10 @@ def main():
                 raise RuntimeError(
                     "Generation baseline is not repeatable before weight transfer"
                 )
+        if args.communication_memory_profile:
+            record["communication_memory_baseline"] = {
+                url: request(url + "/communication_memory_baseline", {}) for url in urls
+            }
         train_args = [
             "-m",
             "shardstream_benchmarks.model_exchange",

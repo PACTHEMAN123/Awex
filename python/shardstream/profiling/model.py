@@ -63,6 +63,12 @@ class ModelWeightProfile:
         torch.cuda.synchronize()
 
     def command(self, operation, version):
+        from shardstream.profiling.communication_memory import enabled, MemorySampler
+
+        memory = None
+        if operation == "verify" and getattr(self, "memory_sampler", None) is not None:
+            memory = self.memory_sampler.stop()
+            self.memory_sampler = None
         if any(
             p.data_ptr() != self.pointers[name] for name, p in self.parameters.items()
         ):
@@ -79,6 +85,8 @@ class ModelWeightProfile:
             if torch.cuda.is_available():
                 torch.cuda.reset_peak_memory_stats()
             result = {"cleared": True}
+            if enabled():
+                self.memory_sampler = MemorySampler().start()
         elif operation == "verify":
             validation = self._verify_parameters(version)
             result = {
@@ -110,6 +118,7 @@ class ModelWeightProfile:
             raise ValueError("Unsupported model profile command")
         return {
             **result,
+            **({"communication_memory": memory} if memory is not None else {}),
             "pid": os.getpid(),
             "pointers": self.pointers,
             "start_ns": started_ns,
@@ -175,11 +184,18 @@ def model_profile_task(operation: str, version: int, marker_mode="constant", mar
                     marker_mode, marker_period,
                 )
         else:
+            from shardstream.profiling.communication_memory import enabled, snapshot
+            before_references = snapshot() if enabled() else None
             profile = ModelWeightProfile(kwargs["model"], marker_mode, marker_period)
+            if enabled():
+                profile.reference_memory = dict(before=before_references, after=snapshot(),
+                    reference_bytes=sum(p.numel() * p.element_size() for p in profile.references.values()))
         scheduler._shardstream_model_weight_profile = profile
     elif profile.marker_mode != marker_mode or profile.marker_period != marker_period:
         raise ValueError("Cannot change marker mode after taking model references")
     result = profile.command(operation, version)
+    if hasattr(profile, "reference_memory"):
+        result["reference_memory"] = profile.reference_memory
     reader = getattr(scheduler, "shardstream_weights_reader", None)
     if reader is not None and operation == "verify":
         result["transfer_metrics"] = getattr(reader, "last_transfer_metrics", {})

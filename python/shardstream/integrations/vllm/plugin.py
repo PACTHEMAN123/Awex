@@ -565,6 +565,17 @@ def register_shardstream_plugin() -> None:
         from awex.vllm_plugin import register_awex_plugin
         register_awex_plugin()
 
+    @router.post("/communication_memory_baseline")
+    async def communication_memory_baseline(raw_request: Request):
+        from shardstream.profiling.communication_memory import memory_task
+        from shardstream.integrations.publication.vllm import PublicationVLLMServerAdapter
+
+        adapter = PublicationVLLMServerAdapter(
+            raw_request.app.state.engine_client, asyncio.get_running_loop(), 120)
+        results = await asyncio.to_thread(
+            adapter.execute_task_in_model_worker, memory_task, empty_cache=True)
+        return JSONResponse(content={"ranks": results})
+
     @router.post("/areal_shardstream_init")
     async def shardstream_init(request: ShardStreamInitRequest, raw_request: Request):
         try:

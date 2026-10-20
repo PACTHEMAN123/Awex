@@ -490,6 +490,10 @@ class MultiVLLMWeightsExchangeIT:
             pass
 
         self.mcore_model, self.mcore_hf_config = self.setup_megatron()
+        from shardstream.profiling.communication_memory import enabled, snapshot
+        if enabled():
+            logger.info("COMM_MEMORY_BASELINE %s", json.dumps({
+                "rank": self.rank, "role": "training", **snapshot(empty_cache=True)}))
         from shardstream.integrations.engine.megatron import MegatronEngine
 
         self.megatron_engine = MegatronEngine(
@@ -582,10 +586,16 @@ class MultiVLLMWeightsExchangeIT:
             else None
         )
 
+        from shardstream.profiling.communication_memory import enabled, MemorySampler
+        memory_sampler = MemorySampler().start() if enabled() else None
         end_to_end_start = time.perf_counter()
         self.publication.publish()
         device_util.synchronize()
         publication_ms = (time.perf_counter() - end_to_end_start) * 1000
+        if memory_sampler is not None:
+            logger.info("COMM_MEMORY_UPDATE %s", json.dumps({
+                "rank": self.rank, "role": "training", "version": version,
+                **memory_sampler.stop()}))
         if (getattr(self, "marker_mode", "constant") == "scale"
                 and version == -1 and self.publication_mechanism_name == "shardstream"):
             from shardstream.profiling.model import preparation_snapshot
