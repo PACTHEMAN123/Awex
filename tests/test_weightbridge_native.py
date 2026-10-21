@@ -192,3 +192,37 @@ def test_matrix_checkpoint_keeps_existing_probe_contract():
         factories, shapes, model, loader)
     assert actual is factories and actual_shapes is shapes and actual_loader is loader
     assert views()["bias"].shape == model.bias.shape
+
+
+def test_storage_probe_uses_full_owner_for_strided_mla_aliases():
+    model = wb.torch.nn.Module()
+    model.weight = wb.torch.nn.Parameter(wb.torch.arange(24.).reshape(6, 4))
+    latent = model.weight.T.view(4, 2, 3)
+    uk, uv = latent.split([1, 2], dim=-1)
+    model.W_UV = wb.torch.nn.Parameter(uv.transpose(0, 1))
+    model.W_UK_T = wb.torch.nn.Parameter(uk.permute(1, 2, 0))
+    assert not model.W_UV.is_contiguous()
+    actual = wb._storage_parameter_views(model)
+    assert set(actual) == {"weight"}
+    assert actual["weight"].data_ptr() == model.weight.data_ptr()
+    actual["weight"].add_(100)
+    assert wb.torch.equal(model.W_UV, (model.weight.T.view(4, 2, 3)[..., 1:]).transpose(0, 1))
+    assert wb.torch.equal(model.W_UK_T, model.weight.T.view(4, 2, 3)[..., :1].permute(1, 2, 0))
+
+
+def test_dense_transposed_storage_view_shares_native_values():
+    model = wb.torch.nn.Module()
+    model.weight = wb.torch.nn.Parameter(wb.torch.arange(12.).reshape(3, 4).T)
+    actual = wb._storage_parameter_views(model)["weight"]
+    assert actual.is_contiguous() and actual.data_ptr() == model.weight.data_ptr()
+    actual.fill_(9)
+    assert wb.torch.equal(model.weight, wb.torch.full_like(model.weight, 9))
+
+
+def test_strided_uncovered_storage_is_rejected_before_probe_mutation():
+    model = wb.torch.nn.Module()
+    model.weight = wb.torch.nn.Parameter(wb.torch.arange(20.).reshape(4, 5)[:, 1:4])
+    original = model.weight.detach().clone()
+    with pytest.raises(ValueError, match="without a full owner"):
+        wb._storage_parameter_views(model)
+    assert wb.torch.equal(model.weight, original)

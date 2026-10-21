@@ -112,6 +112,37 @@ def _independent_rendezvous():
             os.environ[key] = previous
 
 
+def _storage_parameter_views(model):
+    """Bind native storage once when strided parameters alias a full owner.
+
+    A reshape of a strided view can allocate a detached copy. Prefer an
+    existing contiguous parameter covering its complete storage. Black-box
+    probing still discovers every correspondence; no mapping is supplied.
+    """
+    values = _parameter_views(model)
+    def key(value):
+        storage = value.untyped_storage()
+        return storage.data_ptr(), storage.nbytes(), value.dtype, value.device
+    owners = {key(value): name for name, value in values.items()
+              if value.is_contiguous() and value.storage_offset() == 0
+              and value.numel() * value.element_size() == value.untyped_storage().nbytes()}
+    views = {}
+    for name, value in values.items():
+        if value.is_contiguous():
+            views[name] = value
+            continue
+        if key(value) in owners:
+            continue
+        # A dense transpose with no registered owner can expose its physical
+        # axis order as a shared-storage matrix, without changing the model.
+        order = sorted(range(value.ndim), key=lambda axis: -value.stride(axis))
+        physical = value.permute(order)
+        if not physical.is_contiguous():
+            raise ValueError(f"Cannot expose non-dense parameter storage without a full owner: {name}")
+        views[name] = physical.view(physical.shape[0], -1)
+    return views
+
+
 def _normalize_probe_views(factories, shapes, model, loader):
     """Expose fused HF tensors as matrix views to the native black-box probe.
 
@@ -122,7 +153,7 @@ def _normalize_probe_views(factories, shapes, model, loader):
     import math
     fused = {name: shape for name, shape in shapes.items() if len(shape) > 2}
     if not fused:
-        return factories, shapes, lambda: _parameter_views(model), loader
+        return factories, shapes, lambda: _storage_parameter_views(model), loader
     normalized = dict(factories)
     normalized_shapes = dict(shapes)
     for name, shape in fused.items():
@@ -144,7 +175,7 @@ def _normalize_probe_views(factories, shapes, model, loader):
 
     def worker_views():
         return {name: value.unsqueeze(0) if value.ndim == 1 else value
-                for name, value in _parameter_views(model).items()}
+                for name, value in _storage_parameter_views(model).items()}
     print("WB_PROBE_MATRIX_VIEWS " + json.dumps({
         "pid": os.getpid(), "fused_sources": len(fused),
         "checkpoint_values_unchanged": True,
@@ -171,6 +202,10 @@ def _context(model_path, model, rank, loader):
                                                "preserves_upstream_merge_order": True}), flush=True)
 
     factories, shapes = hf_weights_from_checkpoint(model_path)
+    storage_views = _storage_parameter_views(model)
+    print("WB_STORAGE_VIEWS " + json.dumps({"pid": os.getpid(), "rank": rank,
+        "model_parameters": len(_parameter_views(model)), "storage_views": len(storage_views),
+        "strided_aliases_covered_by_owner": len(_parameter_views(model)) - len(storage_views)}), flush=True)
     factories, shapes, worker_views, loader = _normalize_probe_views(
         factories, shapes, model, loader)
     return AdapterContext(factories, shapes, worker_views, loader, rank)
