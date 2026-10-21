@@ -201,6 +201,18 @@ def _context(model_path, model, rank, loader):
         print("WB_SPECGEN_INDEX " + json.dumps({"pid": os.getpid(), "rank": rank,
                                                "preserves_upstream_merge_order": True}), flush=True)
 
+    from wbridge.utils import data as weightbridge_data
+    from shardstream.integrations.publication.weightbridge_specgen import indexed_source_union
+    if not getattr(weightbridge_data._merge_shards_for_src_shard_spec, "_indexed_candidates", False):
+        contained = weightbridge_data._shard_contained_in
+        adjacent_union = weightbridge_data._try_merge_two_shards
+        def source_union(shards):
+            return indexed_source_union(shards, contained, adjacent_union)
+        source_union._indexed_candidates = True
+        weightbridge_data._merge_shards_for_src_shard_spec = source_union
+        print("WB_SOURCE_UNION_INDEX " + json.dumps({"pid": os.getpid(), "rank": rank,
+            "preserves_upstream_merge_order": True}), flush=True)
+
     factories, shapes = hf_weights_from_checkpoint(model_path)
     storage_views = _storage_parameter_views(model)
     print("WB_STORAGE_VIEWS " + json.dumps({"pid": os.getpid(), "rank": rank,

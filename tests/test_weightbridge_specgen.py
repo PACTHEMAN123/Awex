@@ -61,3 +61,36 @@ print(json.dumps(report))
 
 def test_indexed_matches_pinned_upstream():
     assert checked == 3003
+
+
+def test_source_union_matches_upstream_candidates_and_input_mutation():
+    import copy
+    upstream=runpy.run_path(str(root/'tests/fixtures/weightbridge_upstream_union.py'))
+    native=upstream['_merge_shards_for_src_shard_spec']
+    contained=upstream['_shard_contained_in'];merge=upstream['_try_merge_two_shards']
+    randomizer=random.Random(20261023)
+    for trial in range(3000):
+        dimensions=randomizer.randint(1,3)
+        boxes=[]
+        widths=[randomizer.randint(2,8) for _ in range(dimensions)]
+        for _ in range(randomizer.randint(0,35)):
+            box=[]
+            for width in widths:
+                left=randomizer.randint(0,width-1)
+                right=randomizer.randint(left,width)
+                box.append((left,right,randomizer.choice([width,-width])))
+            boxes.append(box)
+        original=copy.deepcopy(boxes);indexed=copy.deepcopy(boxes)
+        expected=native(original)
+        actual=module.indexed_source_union(indexed,contained,merge)
+        assert actual==expected,(boxes,expected,actual)
+        assert indexed==original
+    for n in (16,64,256):
+        boxes=[[(2,3,32),(c,c+1,n)] for c in list(range(0,n,2))+list(range(1,n,2))]
+        original=copy.deepcopy(boxes);indexed=copy.deepcopy(boxes)
+        assert module.indexed_source_union(indexed,contained,merge)==native(original)
+        assert indexed==original
+    n=5760
+    boxes=[[(2,3,32),(c,c+1,n)] for c in list(range(0,n,2))+list(range(1,n,2))]
+    actual=module.indexed_source_union(boxes,contained,merge)
+    assert actual==[[(2,3,32),(0,n,n)]]
