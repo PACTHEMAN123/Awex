@@ -167,13 +167,18 @@ def test_fused_checkpoint_probe_views_preserve_native_shapes_values_and_storage(
     factories, shapes, views, load = wb._normalize_probe_views(
         {"fused": lambda: source, "vector": lambda: vector},
         {"fused": (2, 3, 4), "vector": (4,)}, model, loader)
-    assert shapes == {"fused": (6, 4), "vector": (4,)}
-    assert factories["fused"]().data_ptr() == source.data_ptr()
-    probe = wb.torch.arange(24, dtype=wb.torch.float32).reshape(6, 4) + 100
-    load({"fused": lambda: probe, "vector": lambda: vector})
+    keys = ["fused::wb_matrix[0]", "fused::wb_matrix[1]"]
+    assert shapes == {keys[0]: (3, 4), keys[1]: (3, 4), "vector": (4,)}
+    for i, key in enumerate(keys):
+        assert wb.torch.equal(factories[key](), source[i])
+        assert factories[key]().data_ptr() == source[i].data_ptr()
+    probe = wb.torch.arange(24, dtype=wb.torch.float32).reshape(2, 3, 4) + 100
+    load({keys[i]: (lambda i=i: probe[i]) for i in range(2)} | {"vector": lambda: vector})
     assert received[0]["fused"].shape == source.shape
-    assert received[0]["fused"].data_ptr() == probe.data_ptr()
-    assert wb.torch.equal(received[0]["fused"].flatten(), probe.flatten())
+    assert set(received[0]) == {"fused", "vector"}
+    assert wb.torch.equal(received[0]["fused"], probe)
+    with pytest.raises(ValueError, match="Incomplete checkpoint matrix probes"):
+        load({keys[0]: lambda: probe[0]})
     actual = views()
     assert actual["bias"].shape == (1, 3)
     assert actual["bias"].data_ptr() == model.bias.data_ptr()
@@ -226,3 +231,22 @@ def test_strided_uncovered_storage_is_rejected_before_probe_mutation():
     with pytest.raises(ValueError, match="without a full owner"):
         wb._storage_parameter_views(model)
     assert wb.torch.equal(model.weight, original)
+
+
+def test_expert_matrix_probe_boundaries_survive_independent_transposes():
+    source = wb.torch.arange(60.).reshape(3, 4, 5)
+    model = wb.torch.nn.Module()
+    model.experts = wb.torch.nn.Parameter(source.transpose(1, 2).contiguous())
+    def native_loader(factories):
+        model.experts.data.copy_(factories["experts"]().transpose(1, 2))
+    factories, shapes, views, load = wb._normalize_probe_views(
+        {"experts": lambda: source}, {"experts": source.shape}, model, native_loader)
+    expected = model.experts.detach().clone()
+    probes = {k: (lambda v=f(): v + 1000) for k, f in factories.items()}
+    load(probes)
+    assert wb.torch.equal(model.experts, expected + 1000)
+    # Restore from the native-shaped sources; matrices have their own identities.
+    load(factories)
+    assert wb.torch.equal(model.experts, expected)
+    assert all(tuple(shape) == (4, 5) for shape in shapes.values())
+    assert views()["experts"].data_ptr() == model.experts.data_ptr()

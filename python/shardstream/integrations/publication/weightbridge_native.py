@@ -144,32 +144,47 @@ def _storage_parameter_views(model):
 
 
 def _normalize_probe_views(factories, shapes, model, loader):
-    """Expose fused HF tensors as matrix views to the native black-box probe.
+    """Expose each fused HF matrix separately to the native black-box probe.
 
-    Framework loaders continue receiving the original checkpoint shapes. The
-    probe alone sees row-major views; worker vector parameters get one leading
-    singleton axis. No values, storage pointers or inferred mappings are supplied.
+    Framework loaders receive the original checkpoint shapes and values. The
+    probe sees each last-two-axis matrix independently, preserving per-expert
+    transposes; worker vectors get one leading singleton axis. No LoadSpec is
+    supplied and actual model parameter storage is unchanged.
     """
-    import math
+    import itertools
     fused = {name: shape for name, shape in shapes.items() if len(shape) > 2}
     if not fused:
         return factories, shapes, lambda: _storage_parameter_views(model), loader
     normalized = dict(factories)
     normalized_shapes = dict(shapes)
+    pieces = {}
     for name, shape in fused.items():
-        matrix_shape = (math.prod(shape[:-1]), shape[-1])
-        normalized_shapes[name] = matrix_shape
-        def fetch(factory=factories[name], matrix_shape=matrix_shape):
-            return factory().view(matrix_shape)
-        normalized[name] = fetch
+        del normalized[name], normalized_shapes[name]
+        pieces[name] = []
+        # Keep the two matrix axes together. Flattening the expert axis into
+        # rows loses per-expert transpose boundaries in a native 2D mapping.
+        for index in itertools.product(*(range(n) for n in shape[:-2])):
+            key = name + "::wb_matrix[" + ",".join(map(str, index)) + "]"
+            if key in normalized:
+                raise ValueError(f"Checkpoint matrix-view name collision: {key}")
+            pieces[name].append(key)
+            normalized_shapes[key] = tuple(shape[-2:])
+            def fetch(factory=factories[name], index=index):
+                return factory()[index]
+            normalized[key] = fetch
 
     def load(probes):
         original = dict(probes)
         for name, shape in fused.items():
-            if name not in probes:
+            keys = pieces[name]
+            if not any(key in probes for key in keys):
                 continue
-            def fetch(factory=probes[name], shape=shape):
-                return factory().view(shape)
+            if not all(key in probes for key in keys):
+                raise ValueError(f"Incomplete checkpoint matrix probes for {name}")
+            for key in keys:
+                del original[key]
+            def fetch(keys=tuple(keys), shape=shape):
+                return torch.stack([probes[key]() for key in keys]).view(shape)
             original[name] = fetch
         loader(original)
 
@@ -178,6 +193,8 @@ def _normalize_probe_views(factories, shapes, model, loader):
                 for name, value in _storage_parameter_views(model).items()}
     print("WB_PROBE_MATRIX_VIEWS " + json.dumps({
         "pid": os.getpid(), "fused_sources": len(fused),
+        "matrix_sources": sum(map(len, pieces.values())),
+        "preserves_expert_matrix_boundaries": True,
         "checkpoint_values_unchanged": True,
     }), flush=True)
     return normalized, normalized_shapes, worker_views, load
