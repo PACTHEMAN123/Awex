@@ -13,6 +13,21 @@ from pathlib import Path
 from shardstream_benchmarks.recipes import load_recipes, rollout_host_counts
 
 
+def nccl_buffer_environment(buffer_bytes=None, net_chunk_bytes=None):
+    """Validate sizes against the pinned NCCL 2.31.2 signed fields."""
+    environment = {}
+    if buffer_bytes is not None:
+        if not 0 < buffer_bytes < 2**31:
+            raise ValueError("NCCL buffer size must be positive and below 2 GiB")
+        environment["NCCL_BUFFSIZE"] = str(buffer_bytes)
+    if net_chunk_bytes is not None:
+        # NCCL silently clamps chunks to BUFFSIZE / NCCL_STEPS (8).
+        if not 0 < net_chunk_bytes <= (buffer_bytes or 4 * 2**20) // 8:
+            raise ValueError("NCCL net chunk must be positive and at most BUFFSIZE / 8")
+        environment["NCCL_P2P_NET_CHUNKSIZE"] = str(net_chunk_bytes)
+    return environment
+
+
 class NodeProcesses:
     """Own only the process groups launched by this recipe invocation."""
 
@@ -233,6 +248,7 @@ def main():
     parser.add_argument("--communication-memory-profile", action="store_true")
     parser.add_argument("--awex-nonbatch", action="store_true")
     parser.add_argument("--nccl-buffer-bytes", type=int)
+    parser.add_argument("--nccl-net-chunk-bytes", type=int)
     parser.add_argument("--weight-format", choices=("bf16", "fp8"), default="bf16",
                         help="FP8 uses fused BF16-to-FP8 transport and a full checkpoint oracle")
     parser.add_argument("--disable-prefix-caching", action="store_true",
@@ -253,8 +269,10 @@ def main():
     args = parser.parse_args()
     if args.awex_nonbatch and args.publication_mechanism != "awex_native_nccl":
         parser.error("--awex-nonbatch requires awex_native_nccl")
-    if args.nccl_buffer_bytes is not None and args.nccl_buffer_bytes <= 0:
-        parser.error("NCCL buffer size must be positive")
+    try:
+        nccl_environment = nccl_buffer_environment(args.nccl_buffer_bytes, args.nccl_net_chunk_bytes)
+    except ValueError as error:
+        parser.error(str(error))
     if not 0 <= args.warmup_updates < args.num_updates:
         parser.error("Require 0 <= warmup updates < total updates")
     if args.dp_source_block_mb <= 0:
@@ -278,8 +296,7 @@ def main():
         if args.publication_mechanism != "shardstream":
             parser.error("Compact FIFO applies only to ShardStream")
         transport_environment["SHARDSTREAM_COMPACT_FIFO"] = "1"
-    if args.nccl_buffer_bytes is not None:
-        transport_environment["NCCL_BUFFSIZE"] = str(args.nccl_buffer_bytes)
+    transport_environment.update(nccl_environment)
     transport_environment.update(
         SHARDSTREAM_COMM_MEMORY_PROFILE="1" if args.communication_memory_profile else "0",
         SHARDSTREAM_FP8_BLOCKWISE="1" if args.weight_format == "fp8" else "0",
