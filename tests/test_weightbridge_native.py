@@ -334,3 +334,32 @@ def test_native_glm_probe_includes_mtp_draft_storage_and_native_loader(monkeypat
     assert wb.torch.equal(main.weight, a) and wb.torch.equal(draft.weight, b)
     views = wb._parameter_views(wb._native_vllm_model(runner))
     assert {v.data_ptr() for v in views.values()} == {main.weight.data_ptr(), draft.weight.data_ptr()}
+
+
+def test_glm_shared_checkpoint_aliases_receive_the_same_native_probe():
+    a, b = wb.torch.arange(6.).view(2, 3), wb.torch.arange(6.).view(2, 3) + 10
+    sources = {"model.embed_tokens.weight": a, "lm_head.weight": b,
+        "model.layers.47.embed_tokens.weight": a.clone(),
+        "model.layers.47.shared_head.head.weight": b.clone(),
+        "unrelated_equal_weight": a.clone()}
+    config = dict(architectures=["Glm4MoeLiteForCausalLM"], num_hidden_layers=47,
+                  num_nextn_predict_layers=1)
+    received = []
+    fs, shapes, load = wb._normalize_glm_mtp_aliases(
+        {k: (lambda v=v: v) for k, v in sources.items()},
+        {k: v.shape for k, v in sources.items()}, config, lambda fs: received.append(fs))
+    assert set(fs) == set(shapes) == {"model.embed_tokens.weight", "lm_head.weight", "unrelated_equal_weight"}
+    x, y = a + 100, b + 200
+    load({"model.embed_tokens.weight": lambda: x, "lm_head.weight": lambda: y})
+    assert received[0]["model.layers.47.embed_tokens.weight"]() is x
+    assert received[0]["model.layers.47.shared_head.head.weight"]() is y
+    assert "unrelated_equal_weight" in fs
+
+
+def test_glm_shared_alias_normalization_rejects_distinct_checkpoint_weights():
+    name, alias = "model.embed_tokens.weight", "model.layers.47.embed_tokens.weight"
+    config = dict(architectures=["Glm4MoeLiteForCausalLM"], num_hidden_layers=47,
+                  num_nextn_predict_layers=1)
+    with pytest.raises(ValueError, match="shared checkpoint alias differs"):
+        wb._normalize_glm_mtp_aliases({name: lambda: wb.torch.ones(2, 3),
+            alias: lambda: wb.torch.zeros(2, 3)}, {name: (2, 3), alias: (2, 3)}, config, lambda fs: None)

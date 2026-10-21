@@ -224,6 +224,48 @@ def _normalize_probe_views(factories, shapes, model, loader, *, include_buffers=
     return normalized, normalized_shapes, worker_views, load
 
 
+def _normalize_glm_mtp_aliases(factories, shapes, config, loader):
+    """Give declared MTP shared embeddings/head one checkpoint identity.
+
+    Megatron uses shared parameters; vLLM's MTP loader reads the checkpoint's
+    duplicate names. Check real values before probing, then expose the same
+    canonical probe to both native loaders. Never merge arbitrary equal weights.
+    """
+    if "Glm4MoeLiteForCausalLM" not in config.get("architectures", []):
+        return factories, shapes, loader
+    aliases = {}
+    for offset in range(config.get("num_nextn_predict_layers", 0)):
+        layer = config["num_hidden_layers"] + offset
+        for alias, canonical in [
+            (f"model.layers.{layer}.embed_tokens.weight", "model.embed_tokens.weight"),
+            (f"model.layers.{layer}.shared_head.head.weight", "lm_head.weight"),
+        ]:
+            if alias not in factories:
+                continue
+            if canonical not in factories or tuple(shapes[alias]) != tuple(shapes[canonical]):
+                raise ValueError(f"GLM MTP shared checkpoint alias has incompatible shape: {alias}")
+            a, b = factories[alias](), factories[canonical]()
+            if a.dtype != b.dtype or not torch.equal(a, b):
+                raise ValueError(f"GLM MTP shared checkpoint alias differs from {canonical}: {alias}")
+            aliases[alias] = canonical
+    if not aliases:
+        return factories, shapes, loader
+    canonical_factories = {k: v for k, v in factories.items() if k not in aliases}
+    canonical_shapes = {k: v for k, v in shapes.items() if k not in aliases}
+    def load(probes):
+        expanded = dict(probes)
+        for alias, canonical in aliases.items():
+            if canonical in probes:
+                expanded[alias] = probes[canonical]
+        loader(expanded)
+    print("WB_CHECKPOINT_ALIASES " + json.dumps({
+        "pid": os.getpid(), "aliases": aliases,
+        "checkpoint_copies_exactly_equal": True,
+        "scope": "GLM MTP declared shared embeddings and head",
+    }), flush=True)
+    return canonical_factories, canonical_shapes, load
+
+
 def _context(model_path, model, rank, loader, *, include_buffers=False):
     from wbridge.frontend.adapters import AdapterContext
     from wbridge.utils import specgen
@@ -255,6 +297,10 @@ def _context(model_path, model, rank, loader, *, include_buffers=False):
             "preserves_upstream_merge_order": True}), flush=True)
 
     factories, shapes = hf_weights_from_checkpoint(model_path)
+    from pathlib import Path
+    checkpoint_config = json.loads((Path(model_path) / "config.json").read_text())
+    factories, shapes, loader = _normalize_glm_mtp_aliases(
+        factories, shapes, checkpoint_config, loader)
     storage_views = _storage_parameter_views(model, include_buffers=include_buffers)
     print("WB_STORAGE_VIEWS " + json.dumps({"pid": os.getpid(), "rank": rank,
         "model_parameters": len(_parameter_views(model, include_buffers=include_buffers)), "storage_views": len(storage_views),
