@@ -38,6 +38,31 @@ def test_parameter_views_allow_probe_mutation_without_copy():
     assert model.weight.requires_grad
 
 
+def test_probe_guard_rejects_wrong_restore_even_if_later_checks_use_it():
+    model = wb.torch.nn.Linear(3, 2, bias=False)
+    with pytest.raises(RuntimeError, match="probe changed checkpoint parameters"):
+        with wb._model_probe_guard(model, "rollout", 0):
+            # A self-consistent restore through a wrong map is still wrong.
+            model.weight.data.copy_(model.weight.detach().flip(1))
+
+
+def test_probe_guard_allows_native_loader_storage_replacement(capsys):
+    model = wb.torch.nn.Linear(3, 2, bias=False)
+    original = model.weight
+    with wb._model_probe_guard(model, "rollout", 0):
+        model.weight = wb.torch.nn.Parameter(model.weight.detach().clone())
+    assert model.weight.data_ptr() != original.data_ptr()
+    assert '"verified": true' in capsys.readouterr().out
+
+
+def test_probe_guard_preserves_original_specgen_error():
+    model = wb.torch.nn.Linear(3, 2, bias=False)
+    with pytest.raises(ValueError, match="specgen failed"):
+        with wb._model_probe_guard(model, "training", 0):
+            model.weight.data.zero_()
+            raise ValueError("specgen failed")
+
+
 def test_close_before_receiver_initialization_does_not_mask_failure():
     wb.WeightBridgePublication(SimpleNamespace(is_driver=True)).close()
 

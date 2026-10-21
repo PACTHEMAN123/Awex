@@ -74,6 +74,31 @@ def _parameter_views(model):
 
 
 @contextmanager
+def _model_probe_guard(model, role, rank):
+    """Check specgen restoration against the framework-loaded checkpoint.
+
+    WeightBridge restores and verifies through its inferred LoadSpec. Keep an
+    independent reference from before probing, outside publication timing, so
+    a wrong mapping cannot become the reference for subsequent update checks.
+    """
+    expected = {name: value.clone() for name, value in _parameter_views(model).items()}
+    yield
+    actual = _parameter_views(model)
+    bad = sorted(set(actual) ^ set(expected))
+    for name in expected.keys() & actual.keys():
+        a, b = actual[name], expected[name]
+        if a.shape != b.shape or a.dtype != b.dtype or not torch.equal(a, b):
+            bad.append(name)
+    if bad:
+        raise RuntimeError(f"WeightBridge probe changed checkpoint parameters: {sorted(bad)[:20]} (total={len(bad)})")
+    print("WB_CHECKPOINT_GUARD " + json.dumps({
+        "pid": os.getpid(), "role": role, "rank": rank, "verified": True,
+        "parameter_tensors": len(expected),
+        "parameter_bytes": sum(p.numel() * p.element_size() for p in expected.values()),
+    }), flush=True)
+
+
+@contextmanager
 def _independent_rendezvous():
     key = "TORCHELASTIC_USE_AGENT_STORE"
     previous = os.environ.get(key)
@@ -120,10 +145,11 @@ class WeightBridgeReceiver:
                 model.load_weights((name, factory()) for name, factory in factories.items())
 
         started = time.perf_counter()
-        self.adapter = ReceiverAdapter(
-            _context(self.config["model_path"], model, self.worker_rank, load),
-            ipc, num_workers=self.config["world_per_engine"],
-        )
+        with _model_probe_guard(model, "rollout", self.worker_rank):
+            self.adapter = ReceiverAdapter(
+                _context(self.config["model_path"], model, self.worker_rank, load),
+                ipc, num_workers=self.config["world_per_engine"],
+            )
         torch.cuda.synchronize()
         return {"worker_rank": self.worker_rank, "specgen_ms": (time.perf_counter() - started) * 1000}
 
@@ -185,8 +211,9 @@ class WeightBridgePublication(PublicationMechanism):
             with torch.no_grad():
                 bridge._model_bridge.load_weights_hf_to_megatron(source, [harness.mcore_model])
 
-        self.adapter = SenderAdapter(_context(
-            harness.inference_config["model_path"], harness.mcore_model, harness.rank, load), args)
+        with _model_probe_guard(harness.mcore_model, "training", harness.rank):
+            self.adapter = SenderAdapter(_context(
+                harness.inference_config["model_path"], harness.mcore_model, harness.rank, load), args)
         torch.cuda.synchronize()
 
     def initialize_driver(self):
