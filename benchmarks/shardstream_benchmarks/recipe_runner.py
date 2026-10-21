@@ -49,6 +49,7 @@ class NodeProcesses:
         self.run_dir = Path(run_dir)
         self.run_dir.mkdir(parents=True, exist_ok=False)
         self.processes = {}
+        self.profiled = False
         self.gpus = None
         self.affinity = None
         self.nccl_lib = str(nccl_lib)
@@ -142,6 +143,15 @@ class NodeProcesses:
                        UCX_RNDV_SCHEME="get_zcopy", UCX_IB_GID_INDEX="3",
                        UCX_MAX_HCA_PER_GPU="inf", UCX_SINGLE_NET_DEVICE="n")
         command = [str(self.runtime / "bin/python"), *arguments]
+        if env.get("SHARDSTREAM_TIMELINE") == "1":
+            self.profiled = True
+            trace_dir = self.run_dir / "nsys"
+            trace_dir.mkdir(exist_ok=True)
+            command = ["nsys", "profile", "--trace=cuda,nvtx", "--sample=none",
+                       "--cpuctxsw=none", "--capture-range=cudaProfilerApi",
+                       "--capture-range-end=none", "--trace-fork-before-exec=true",
+                       "--cuda-graph-trace=node", "--output=" + str(trace_dir / name),
+                       *command]
         (self.run_dir / f"{name}-command.json").write_text(
             json.dumps(command, indent=2)
         )
@@ -170,7 +180,7 @@ class NodeProcesses:
                 os.killpg(process.pid, signal.SIGTERM)
         for process in self.processes.values():
             try:
-                process.wait(timeout=15)
+                process.wait(timeout=120 if self.profiled else 15)
             except subprocess.TimeoutExpired:
                 os.killpg(process.pid, signal.SIGKILL)
                 process.wait(timeout=15)
@@ -246,6 +256,7 @@ def main():
     parser.add_argument("--publication-bucket-mb", type=int, default=256)
     parser.add_argument("--model-weight-profile", action="store_true")
     parser.add_argument("--communication-memory-profile", action="store_true")
+    parser.add_argument("--nsys", action="store_true", help="Capture updates 2 through 4; adds no CUDA synchronization")
     parser.add_argument("--awex-nonbatch", action="store_true")
     parser.add_argument("--nccl-buffer-bytes", type=int)
     parser.add_argument("--nccl-net-chunk-bytes", type=int)
@@ -298,6 +309,7 @@ def main():
         transport_environment["SHARDSTREAM_COMPACT_FIFO"] = "1"
     transport_environment.update(nccl_environment)
     transport_environment.update(
+        SHARDSTREAM_TIMELINE="1" if args.nsys else "0",
         SHARDSTREAM_COMM_MEMORY_PROFILE="1" if args.communication_memory_profile else "0",
         SHARDSTREAM_FP8_BLOCKWISE="1" if args.weight_format == "fp8" else "0",
         SHARDSTREAM_BENCH_MODEL_PATH=args.model_path,

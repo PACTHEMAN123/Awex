@@ -53,6 +53,8 @@ class ProbeSource:
 
 
 def _configure(round_bytes):
+    from shardstream.profiling.timeline import instrument_weightbridge
+    instrument_weightbridge()
     if int(round_bytes) <= 0:
         raise ValueError("WeightBridge round cap must be positive")
     os.environ["WBRIDGE_ROUND_CAP_BYTES"] = str(int(round_bytes))

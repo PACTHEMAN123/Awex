@@ -431,7 +431,9 @@ def _patch_shardstream_worker() -> None:
         receiver = getattr(self, "_publication_receiver", None)
         if receiver is None:
             raise RuntimeError("Publication receiver is not initialized")
-        result = receiver.update(_shardstream_transfer_model(self.model_runner), step_id)
+        from shardstream.profiling.timeline import publication
+        with publication("rollout", int(step_id), int(receiver.worker_rank)):
+            result = receiver.update(_shardstream_transfer_model(self.model_runner), step_id)
         return _sanitize_for_ipc(result)
 
     def publication_configure(self, config: dict):

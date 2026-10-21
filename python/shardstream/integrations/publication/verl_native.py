@@ -123,6 +123,8 @@ def _engine_class(backend):
     names = {"nccl": "NCCLCheckpointEngine", "nixl": "NIXLCheckpointEngine",
              "mooncake": "MooncakeCheckpointEngine"}
     module = importlib.import_module(f"verl.checkpoint_engine.{backend}_checkpoint_engine")
+    from shardstream.profiling.timeline import instrument_verl
+    instrument_verl(module, backend)
     if backend == "nccl" and not isinstance(module.collective, _MultiprocessCollective):
         module.collective = _MultiprocessCollective()
     return getattr(module, names[backend])
@@ -263,6 +265,7 @@ class NativeReceiver:
                 "group_ms": (time.perf_counter() - started) * 1000}
 
     def update(self, model, step_id):
+        from shardstream.profiling.timeline import phase
         count = total = 0
         receive_wait_ms = 0
         started = time.perf_counter()
@@ -275,9 +278,10 @@ class NativeReceiver:
             while True:
                 wait_start = time.perf_counter()
                 try:
-                    name, weight = asyncio.run_coroutine_threadsafe(
-                        next_weight(), self.loop
-                    ).result(timeout=self.config["timeout_seconds"])
+                    with phase("receive_next_wait"):
+                        name, weight = asyncio.run_coroutine_threadsafe(
+                            next_weight(), self.loop
+                        ).result(timeout=self.config["timeout_seconds"])
                 except StopAsyncIteration:
                     break
                 receive_wait_ms += (time.perf_counter() - wait_start) * 1000
@@ -306,8 +310,10 @@ class NativeReceiver:
                 raise ValueError("Native FP8 benchmark requires NCCL and one target model")
             _load_fp8_weights(self.model_runner, weights())
         else:
-            target.load_weights(weights())
-        torch.cuda.synchronize()
+            with phase("loader_including_receive"):
+                target.load_weights(weights())
+        with phase("loader_final_sync"):
+            torch.cuda.synchronize()
         receive_apply_ms = (time.perf_counter() - started) * 1000
         post_started = time.perf_counter()
         if architecture in ("Glm4MoeLiteForCausalLM", "DeepseekV3ForCausalLM"):
@@ -414,10 +420,11 @@ class NativePublication(PublicationMechanism):
         return sorted(_rows(response.json()["results"]), key=lambda row: row["worker_rank"])
 
     def _export(self):
+        from shardstream.profiling.timeline import iter_phases
         models = [self.harness.mcore_model]
         signature = inspect.signature(self.bridge.export_hf_weights)
         kwargs = {"show_progress": False} if "show_progress" in signature.parameters else {}
-        for name, tensor in self.bridge.export_hf_weights(models, **kwargs):
+        for name, tensor in iter_phases(self.bridge.export_hf_weights(models, **kwargs), "export_next"):
             yield name, tensor
 
     def publish(self):
@@ -439,8 +446,11 @@ class NativePublication(PublicationMechanism):
                 yield name, weight
         future = self.control.submit(_request_endpoints, publication_endpoints(harness),
                                      "publication_update", payloads, self.timeout_seconds)
-        asyncio.run(self.engine.send_weights(counted(), global_steps=version))
-        receivers = future.result()
+        from shardstream.profiling.timeline import phase
+        with phase("engine_send"):
+            asyncio.run(self.engine.send_weights(counted(), global_steps=version))
+        with phase("receiver_rpc_wait"):
+            receivers = future.result()
         torch.cuda.synchronize()
         expected = int(harness.inference_config["tp_size"]) * int(
             harness.inference_config.get("dp_size", 1)) * len(publication_endpoints(harness))

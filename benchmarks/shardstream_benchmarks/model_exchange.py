@@ -588,10 +588,12 @@ class MultiVLLMWeightsExchangeIT:
 
         from shardstream.profiling.communication_memory import enabled, MemorySampler
         memory_sampler = MemorySampler().start() if enabled() else None
-        end_to_end_start = time.perf_counter()
-        self.publication.publish()
-        device_util.synchronize()
-        publication_ms = (time.perf_counter() - end_to_end_start) * 1000
+        from shardstream.profiling.timeline import publication
+        with publication("training", version, int(self.rank)):
+            end_to_end_start = time.perf_counter()
+            self.publication.publish()
+            device_util.synchronize()
+            publication_ms = (time.perf_counter() - end_to_end_start) * 1000
         if memory_sampler is not None:
             logger.info("COMM_MEMORY_UPDATE %s", json.dumps({
                 "rank": self.rank, "role": "training", "version": version,
