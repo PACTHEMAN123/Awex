@@ -302,3 +302,35 @@ def test_fused_probe_vector_and_scalar_sources_keep_two_native_copy_axes():
         assert received[0][k].shape == expected.shape
         assert wb.torch.equal(received[0][k], expected)
     assert views()["scalar"].data_ptr() == model.scalar.data_ptr()
+
+
+def test_native_glm_probe_includes_mtp_draft_storage_and_native_loader(monkeypatch):
+    class Model(wb.torch.nn.Module):
+        def __init__(self, key):
+            super().__init__()
+            self.key = key
+            self.weight = wb.torch.nn.Parameter(wb.torch.zeros(2, 2))
+        def load_weights(self, weights):
+            self.weight.copy_(dict(weights)[self.key])
+    class Container(wb.torch.nn.Module):
+        def __init__(self, target, draft, layers):
+            super().__init__(); self.target = target; self.draft = draft
+            assert layers == 47
+    monkeypatch.setitem(sys.modules, "shardstream.integrations.models.glm4_moe_lite",
+                        SimpleNamespace(GLM47FlashTransferModel=Container))
+    main, draft = Model("main"), Model("draft")
+    main_config, draft_config = object(), object()
+    runner = SimpleNamespace(model=main, model_config=main_config,
+        drafter=SimpleNamespace(model=draft), vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(hf_config=SimpleNamespace(
+                architectures=["Glm4MoeLiteForCausalLM"], num_hidden_layers=47)),
+            speculative_config=SimpleNamespace(draft_model_config=draft_config)))
+    calls = []
+    monkeypatch.setitem(sys.modules, "vllm.model_executor.model_loader.utils",
+        SimpleNamespace(process_weights_after_loading=lambda m,c,d: calls.append((m,c))))
+    a, b = wb.torch.arange(4.).view(2, 2), wb.torch.arange(4.).view(2, 2) + 100
+    wb._load_vllm_weights(runner, {"main": lambda: a, "draft": lambda: b})
+    assert calls == [(main, main_config), (draft, draft_config)]
+    assert wb.torch.equal(main.weight, a) and wb.torch.equal(draft.weight, b)
+    views = wb._parameter_views(wb._native_vllm_model(runner))
+    assert {v.data_ptr() for v in views.values()} == {main.weight.data_ptr(), draft.weight.data_ptr()}

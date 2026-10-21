@@ -264,15 +264,36 @@ def _context(model_path, model, rank, loader, *, include_buffers=False):
     return AdapterContext(factories, shapes, worker_views, loader, rank)
 
 
+def _native_vllm_model(model_runner):
+    """Include the native GLM MTP draft in the same checkpoint target."""
+    config = getattr(model_runner, "vllm_config", None)
+    if config is None or config.speculative_config is None:
+        return model_runner.model
+    hf = config.model_config.hf_config
+    if "Glm4MoeLiteForCausalLM" not in (getattr(hf, "architectures", None) or []):
+        return model_runner.model
+    draft = getattr(getattr(model_runner, "drafter", None), "model", None)
+    if draft is None:
+        raise RuntimeError("GLM MTP checkpoint target is unavailable")
+    from shardstream.integrations.models.glm4_moe_lite import GLM47FlashTransferModel
+    # This container only exposes existing parameter names and storage. Native
+    # vLLM loaders and the black-box probe discover every weight correspondence.
+    return GLM47FlashTransferModel(model_runner.model, draft, hf.num_hidden_layers)
+
+
 def _load_vllm_weights(model_runner, factories):
-    """Probe the complete native loader, including derived attention weights."""
+    """Probe complete native loaders and post-load state for main and MTP."""
     from vllm.model_executor.model_loader.utils import process_weights_after_loading
 
-    model = model_runner.model
+    model = _native_vllm_model(model_runner)
+    targets = [(model_runner.model, model_runner.model_config)]
+    if hasattr(model, "target") and hasattr(model, "draft"):
+        targets.append((model.draft,
+                        model_runner.vllm_config.speculative_config.draft_model_config))
     with torch.no_grad():
-        model.load_weights((name, factory()) for name, factory in factories.items())
-        process_weights_after_loading(
-            model, model_runner.model_config, next(model.parameters()).device)
+        for target, config in targets:
+            target.load_weights((name, factory()) for name, factory in factories.items())
+            process_weights_after_loading(target, config, next(target.parameters()).device)
 
 
 @register_vllm_publication_receiver("weightbridge_native")
@@ -289,7 +310,7 @@ class WeightBridgeReceiver:
         from wbridge.backend.control_channel import coordinator_ipc, coordinator_tcp_port
         from wbridge.frontend.adapters import ReceiverAdapter
 
-        model = self.model_runner.model
+        model = _native_vllm_model(self.model_runner)
         port = self.config["server_port"]
         ipc = coordinator_ipc(port)
         if self.worker_rank == 0:
