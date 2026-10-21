@@ -69,9 +69,11 @@ def _configure(round_bytes):
                                       "effective_bytes": RECEIVER_ROUND_CAP_BYTES}), flush=True)
 
 
-def _parameter_views(model):
+def _parameter_views(model, *, include_buffers=False):
     """Expose checkpoint parameters and persistent framework buffers."""
     values = {name: param.detach() for name, param in model.named_parameters()}
+    if not include_buffers:
+        return values
     for prefix, module in model.named_modules():
         for name, value in module.named_buffers(recurse=False):
             if name not in module._non_persistent_buffers_set:
@@ -88,9 +90,9 @@ def _model_probe_guard(model, role, rank):
     independent reference from before probing, outside publication timing, so
     a wrong mapping cannot become the reference for subsequent update checks.
     """
-    expected = {name: value.clone() for name, value in _parameter_views(model).items()}
+    expected = {name: value.clone() for name, value in _parameter_views(model, include_buffers=True).items()}
     yield
-    actual = _parameter_views(model)
+    actual = _parameter_views(model, include_buffers=True)
     bad = sorted(set(actual) ^ set(expected))
     for name in expected.keys() & actual.keys():
         a, b = actual[name], expected[name]
@@ -119,14 +121,14 @@ def _independent_rendezvous():
             os.environ[key] = previous
 
 
-def _storage_parameter_views(model):
+def _storage_parameter_views(model, *, include_buffers=False):
     """Bind native storage once when strided parameters alias a full owner.
 
     A reshape of a strided view can allocate a detached copy. Prefer an
     existing contiguous parameter covering its complete storage. Black-box
     probing still discovers every correspondence; no mapping is supplied.
     """
-    values = _parameter_views(model)
+    values = _parameter_views(model, include_buffers=include_buffers)
     def key(value):
         storage = value.untyped_storage()
         return storage.data_ptr(), storage.nbytes(), value.dtype, value.device
@@ -150,7 +152,7 @@ def _storage_parameter_views(model):
     return views
 
 
-def _normalize_probe_views(factories, shapes, model, loader):
+def _normalize_probe_views(factories, shapes, model, loader, *, include_buffers=False):
     """Expose each fused HF matrix separately to the native black-box probe.
 
     Framework loaders receive the original checkpoint shapes and values. The
@@ -161,7 +163,7 @@ def _normalize_probe_views(factories, shapes, model, loader):
     import itertools
     fused = {name: shape for name, shape in shapes.items() if len(shape) > 2}
     if not fused:
-        return factories, shapes, lambda: _storage_parameter_views(model), loader
+        return factories, shapes, lambda: _storage_parameter_views(model, include_buffers=include_buffers), loader
     normalized = dict(factories)
     normalized_shapes = dict(shapes)
     pieces = {}
@@ -197,7 +199,7 @@ def _normalize_probe_views(factories, shapes, model, loader):
 
     def worker_views():
         return {name: value.unsqueeze(0) if value.ndim == 1 else value
-                for name, value in _storage_parameter_views(model).items()}
+                for name, value in _storage_parameter_views(model, include_buffers=include_buffers).items()}
     print("WB_PROBE_MATRIX_VIEWS " + json.dumps({
         "pid": os.getpid(), "fused_sources": len(fused),
         "matrix_sources": sum(map(len, pieces.values())),
@@ -207,7 +209,7 @@ def _normalize_probe_views(factories, shapes, model, loader):
     return normalized, normalized_shapes, worker_views, load
 
 
-def _context(model_path, model, rank, loader):
+def _context(model_path, model, rank, loader, *, include_buffers=False):
     from wbridge.frontend.adapters import AdapterContext
     from wbridge.utils import specgen
     from wbridge.utils.specgen import hf_weights_from_checkpoint
@@ -238,12 +240,12 @@ def _context(model_path, model, rank, loader):
             "preserves_upstream_merge_order": True}), flush=True)
 
     factories, shapes = hf_weights_from_checkpoint(model_path)
-    storage_views = _storage_parameter_views(model)
+    storage_views = _storage_parameter_views(model, include_buffers=include_buffers)
     print("WB_STORAGE_VIEWS " + json.dumps({"pid": os.getpid(), "rank": rank,
-        "model_parameters": len(_parameter_views(model)), "storage_views": len(storage_views),
-        "strided_aliases_covered_by_owner": len(_parameter_views(model)) - len(storage_views)}), flush=True)
+        "model_parameters": len(_parameter_views(model, include_buffers=include_buffers)), "storage_views": len(storage_views),
+        "strided_aliases_covered_by_owner": len(_parameter_views(model, include_buffers=include_buffers)) - len(storage_views)}), flush=True)
     factories, shapes, worker_views, loader = _normalize_probe_views(
-        factories, shapes, model, loader)
+        factories, shapes, model, loader, include_buffers=include_buffers)
     return AdapterContext(factories, shapes, worker_views, loader, rank)
 
 
@@ -350,7 +352,8 @@ class WeightBridgePublication(PublicationMechanism):
 
         with _model_probe_guard(harness.mcore_model, "training", harness.rank):
             self.adapter = SenderAdapter(_context(
-                harness.inference_config["model_path"], harness.mcore_model, harness.rank, load), args)
+                harness.inference_config["model_path"], harness.mcore_model, harness.rank, load,
+                include_buffers=True), args)
         torch.cuda.synchronize()
 
     def initialize_driver(self):

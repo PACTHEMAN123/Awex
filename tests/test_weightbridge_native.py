@@ -257,9 +257,26 @@ def test_checkpoint_views_include_persistent_router_bias_but_not_runtime_counter
     model.router = wb.torch.nn.Module()
     model.router.register_buffer("expert_bias", wb.torch.arange(4.))
     model.router.register_buffer("local_tokens", wb.torch.ones(4), persistent=False)
-    actual = wb._parameter_views(model)
+    actual = wb._parameter_views(model, include_buffers=True)
     assert set(actual) == {"router.expert_bias"}
     assert actual["router.expert_bias"].data_ptr() == model.router.expert_bias.data_ptr()
     with pytest.raises(RuntimeError, match="probe changed checkpoint parameters"):
         with wb._model_probe_guard(model, "training", 0):
             model.router.expert_bias.add_(1)
+
+
+def test_receiver_probe_excludes_fixed_attention_scale_buffers():
+    model = wb.torch.nn.Linear(3, 2, bias=False)
+    model.register_buffer("_k_scale", wb.torch.ones(()))
+    model.register_buffer("_v_scale", wb.torch.ones(()))
+    factories = {"weight": lambda: model.weight.detach().clone()}
+    shapes = {"weight": (2, 3)}
+    _, _, receiver_views, _ = wb._normalize_probe_views(
+        factories, shapes, model, lambda probes: None)
+    _, _, sender_views, _ = wb._normalize_probe_views(
+        factories, shapes, model, lambda probes: None, include_buffers=True)
+    assert set(receiver_views()) == {"weight"}
+    assert set(sender_views()) == {"weight", "_k_scale", "_v_scale"}
+    with pytest.raises(RuntimeError, match="probe changed checkpoint parameters"):
+        with wb._model_probe_guard(model, "rollout", 0):
+            model._k_scale.zero_()
