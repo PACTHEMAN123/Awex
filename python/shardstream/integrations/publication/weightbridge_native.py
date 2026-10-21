@@ -112,6 +112,46 @@ def _independent_rendezvous():
             os.environ[key] = previous
 
 
+def _normalize_probe_views(factories, shapes, model, loader):
+    """Expose fused HF tensors as matrix views to the native black-box probe.
+
+    Framework loaders continue receiving the original checkpoint shapes. The
+    probe alone sees row-major views; worker vector parameters get one leading
+    singleton axis. No values, storage pointers or inferred mappings are supplied.
+    """
+    import math
+    fused = {name: shape for name, shape in shapes.items() if len(shape) > 2}
+    if not fused:
+        return factories, shapes, lambda: _parameter_views(model), loader
+    normalized = dict(factories)
+    normalized_shapes = dict(shapes)
+    for name, shape in fused.items():
+        matrix_shape = (math.prod(shape[:-1]), shape[-1])
+        normalized_shapes[name] = matrix_shape
+        def fetch(factory=factories[name], matrix_shape=matrix_shape):
+            return factory().view(matrix_shape)
+        normalized[name] = fetch
+
+    def load(probes):
+        original = dict(probes)
+        for name, shape in fused.items():
+            if name not in probes:
+                continue
+            def fetch(factory=probes[name], shape=shape):
+                return factory().view(shape)
+            original[name] = fetch
+        loader(original)
+
+    def worker_views():
+        return {name: value.unsqueeze(0) if value.ndim == 1 else value
+                for name, value in _parameter_views(model).items()}
+    print("WB_PROBE_MATRIX_VIEWS " + json.dumps({
+        "pid": os.getpid(), "fused_sources": len(fused),
+        "checkpoint_values_unchanged": True,
+    }), flush=True)
+    return normalized, normalized_shapes, worker_views, load
+
+
 def _context(model_path, model, rank, loader):
     from wbridge.frontend.adapters import AdapterContext
     from wbridge.utils import specgen
@@ -131,7 +171,9 @@ def _context(model_path, model, rank, loader):
                                                "preserves_upstream_merge_order": True}), flush=True)
 
     factories, shapes = hf_weights_from_checkpoint(model_path)
-    return AdapterContext(factories, shapes, lambda: _parameter_views(model), loader, rank)
+    factories, shapes, worker_views, loader = _normalize_probe_views(
+        factories, shapes, model, loader)
+    return AdapterContext(factories, shapes, worker_views, loader, rank)
 
 
 def _load_vllm_weights(model_runner, factories):

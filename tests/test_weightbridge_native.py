@@ -155,3 +155,40 @@ def test_vllm_loader_probe_includes_native_post_load_weights(monkeypatch):
     assert calls == ["post_load"]
     assert wb.torch.equal(model.weight, weights)
     assert wb.torch.equal(model.derived, weights.T)
+
+
+def test_fused_checkpoint_probe_views_preserve_native_shapes_values_and_storage():
+    source = wb.torch.arange(24, dtype=wb.torch.float32).reshape(2, 3, 4)
+    vector = wb.torch.arange(4, dtype=wb.torch.float32)
+    model = wb.torch.nn.Linear(4, 3)
+    received = []
+    def loader(factories):
+        received.append({name: factory() for name, factory in factories.items()})
+    factories, shapes, views, load = wb._normalize_probe_views(
+        {"fused": lambda: source, "vector": lambda: vector},
+        {"fused": (2, 3, 4), "vector": (4,)}, model, loader)
+    assert shapes == {"fused": (6, 4), "vector": (4,)}
+    assert factories["fused"]().data_ptr() == source.data_ptr()
+    probe = wb.torch.arange(24, dtype=wb.torch.float32).reshape(6, 4) + 100
+    load({"fused": lambda: probe, "vector": lambda: vector})
+    assert received[0]["fused"].shape == source.shape
+    assert received[0]["fused"].data_ptr() == probe.data_ptr()
+    assert wb.torch.equal(received[0]["fused"].flatten(), probe.flatten())
+    actual = views()
+    assert actual["bias"].shape == (1, 3)
+    assert actual["bias"].data_ptr() == model.bias.data_ptr()
+    actual["bias"].fill_(7)
+    assert wb.torch.equal(model.bias, wb.torch.full_like(model.bias, 7))
+    assert actual["weight"].data_ptr() == model.weight.data_ptr()
+
+
+def test_matrix_checkpoint_keeps_existing_probe_contract():
+    source = wb.torch.zeros(3, 4)
+    model = wb.torch.nn.Linear(4, 3)
+    factories = {"weight": lambda: source}
+    shapes = {"weight": (3, 4)}
+    loader = lambda factories: None
+    actual, actual_shapes, views, actual_loader = wb._normalize_probe_views(
+        factories, shapes, model, loader)
+    assert actual is factories and actual_shapes is shapes and actual_loader is loader
+    assert views()["bias"].shape == model.bias.shape
