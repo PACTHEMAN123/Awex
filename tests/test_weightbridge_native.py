@@ -1,8 +1,31 @@
 from types import SimpleNamespace
+import sys
 
 import pytest
 
 from shardstream.integrations.publication import weightbridge_native as wb
+
+
+def test_round_cap_is_set_before_instrumentation_import(monkeypatch):
+    from shardstream.profiling import timeline
+    requested = 512 << 20
+    def instrument():
+        assert wb.os.environ["WBRIDGE_ROUND_CAP_BYTES"] == str(requested)
+        monkeypatch.setitem(sys.modules, "wbridge.backend.router",
+                            SimpleNamespace(RECEIVER_ROUND_CAP_BYTES=requested))
+    monkeypatch.setattr(timeline, "instrument_weightbridge", instrument)
+    monkeypatch.delenv("WBRIDGE_ROUND_CAP_BYTES", raising=False)
+    wb._configure(requested)
+
+
+def test_stale_imported_round_cap_fails_instead_of_mislabeling(monkeypatch):
+    from shardstream.profiling import timeline
+    monkeypatch.setattr(timeline, "instrument_weightbridge", lambda: None)
+    monkeypatch.setitem(sys.modules, "wbridge.backend.router",
+                        SimpleNamespace(RECEIVER_ROUND_CAP_BYTES=2 << 30))
+    monkeypatch.delenv("WBRIDGE_ROUND_CAP_BYTES", raising=False)
+    with pytest.raises(RuntimeError, match="imported with round cap"):
+        wb._configure(512 << 20)
 
 
 def test_parameter_views_allow_probe_mutation_without_copy():

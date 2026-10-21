@@ -7,6 +7,7 @@ transport, routing, or manually supplied LoadSpec participates in this path.
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
+import json
 import os
 import time
 
@@ -53,13 +54,19 @@ class ProbeSource:
 
 
 def _configure(round_bytes):
-    from shardstream.profiling.timeline import instrument_weightbridge
-    instrument_weightbridge()
     if int(round_bytes) <= 0:
         raise ValueError("WeightBridge round cap must be positive")
     os.environ["WBRIDGE_ROUND_CAP_BYTES"] = str(int(round_bytes))
     os.environ.setdefault("WBRIDGE_COORDINATOR_REGISTER_TIMEOUT_S", "1200")
     os.environ.setdefault("WBRIDGE_SPECGEN_PROBE_DEVICE", "auto")
+    # Importing even gantt initializes the backend package and its round-cap constant.
+    from shardstream.profiling.timeline import instrument_weightbridge
+    instrument_weightbridge()
+    from wbridge.backend.router import RECEIVER_ROUND_CAP_BYTES
+    if RECEIVER_ROUND_CAP_BYTES != int(round_bytes):
+        raise RuntimeError(f"WeightBridge imported with round cap {RECEIVER_ROUND_CAP_BYTES}; requested {round_bytes}")
+    print("WB_ROUND_CAP " + json.dumps({"pid": os.getpid(), "requested_bytes": int(round_bytes),
+                                      "effective_bytes": RECEIVER_ROUND_CAP_BYTES}), flush=True)
 
 
 def _parameter_views(model):
