@@ -250,3 +250,16 @@ def test_expert_matrix_probe_boundaries_survive_independent_transposes():
     assert wb.torch.equal(model.experts, expected)
     assert all(tuple(shape) == (4, 5) for shape in shapes.values())
     assert views()["experts"].data_ptr() == model.experts.data_ptr()
+
+
+def test_checkpoint_views_include_persistent_router_bias_but_not_runtime_counters():
+    model = wb.torch.nn.Module()
+    model.router = wb.torch.nn.Module()
+    model.router.register_buffer("expert_bias", wb.torch.arange(4.))
+    model.router.register_buffer("local_tokens", wb.torch.ones(4), persistent=False)
+    actual = wb._parameter_views(model)
+    assert set(actual) == {"router.expert_bias"}
+    assert actual["router.expert_bias"].data_ptr() == model.router.expert_bias.data_ptr()
+    with pytest.raises(RuntimeError, match="probe changed checkpoint parameters"):
+        with wb._model_probe_guard(model, "training", 0):
+            model.router.expert_bias.add_(1)

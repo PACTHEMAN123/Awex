@@ -70,7 +70,14 @@ def _configure(round_bytes):
 
 
 def _parameter_views(model):
-    return {name: param.detach() for name, param in model.named_parameters()}
+    """Expose checkpoint parameters and persistent framework buffers."""
+    values = {name: param.detach() for name, param in model.named_parameters()}
+    for prefix, module in model.named_modules():
+        for name, value in module.named_buffers(recurse=False):
+            if name not in module._non_persistent_buffers_set:
+                full_name = f"{prefix}.{name}" if prefix else name
+                values[full_name] = value.detach()
+    return values
 
 
 @contextmanager
