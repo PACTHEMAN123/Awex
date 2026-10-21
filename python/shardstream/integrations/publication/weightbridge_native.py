@@ -114,7 +114,21 @@ def _independent_rendezvous():
 
 def _context(model_path, model, rank, loader):
     from wbridge.frontend.adapters import AdapterContext
+    from wbridge.utils import specgen
     from wbridge.utils.specgen import hf_weights_from_checkpoint
+    from shardstream.integrations.publication.weightbridge_specgen import indexed_merge
+
+    # Preserve upstream geometry and first-pair merge ordering, but avoid its
+    # quadratic scan over non-adjacent expert-bias fragments. Initialization
+    # only: no transfer, routing or buffer configuration is changed.
+    if not getattr(specgen._merge_consecutive_mappings, "_indexed_candidates", False):
+        adjacent = specgen._merge_adjacent_shards
+        def merge(mappings):
+            return indexed_merge(mappings, adjacent)
+        merge._indexed_candidates = True
+        specgen._merge_consecutive_mappings = merge
+        print("WB_SPECGEN_INDEX " + json.dumps({"pid": os.getpid(), "rank": rank,
+                                               "preserves_upstream_merge_order": True}), flush=True)
 
     factories, shapes = hf_weights_from_checkpoint(model_path)
     return AdapterContext(factories, shapes, lambda: _parameter_views(model), loader, rank)
