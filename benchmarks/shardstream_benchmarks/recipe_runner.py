@@ -267,6 +267,7 @@ def main():
     parser.add_argument("--publication-bucket-mb", type=int, default=256)
     parser.add_argument("--model-weight-profile", action="store_true")
     parser.add_argument("--communication-memory-profile", action="store_true")
+    parser.add_argument("--fifo-layout-profile", action="store_true")
     parser.add_argument("--nsys", action="store_true", help="Capture updates 2 through 4; adds no CUDA synchronization")
     parser.add_argument("--awex-nonbatch", action="store_true")
     parser.add_argument("--nccl-buffer-bytes", type=int)
@@ -322,6 +323,7 @@ def main():
     transport_environment.update(
         SHARDSTREAM_TIMELINE="1" if args.nsys else "0",
         SHARDSTREAM_COMM_MEMORY_PROFILE="1" if args.communication_memory_profile else "0",
+        SHARDSTREAM_PROFILE_FIFO_LAYOUT="1" if args.fifo_layout_profile else "0",
         SHARDSTREAM_FP8_BLOCKWISE="1" if args.weight_format == "fp8" else "0",
         SHARDSTREAM_BENCH_MODEL_PATH=args.model_path,
         SHARDSTREAM_DP_SOURCE_POLICY=args.dp_source_policy,

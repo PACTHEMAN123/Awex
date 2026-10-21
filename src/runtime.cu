@@ -58,6 +58,9 @@ struct DeviceState {
   std::size_t window_bytes = 0;
   std::size_t dense_window_bytes = 0;
   std::uint32_t payload_peer_count = 0;
+  // Host-only evidence of the lowered schedule, before dense reservations.
+  std::vector<std::uint32_t> required_payload_channels;
+  std::vector<std::uint32_t> registered_payload_channels;
   std::uint64_t timeout_cycles = 0;
   int clock_rate_khz = 0;
   std::uint64_t last_sequence = 0;
@@ -589,6 +592,7 @@ void initialize_sparse_window(DeviceState* state, const std::vector<std::uint32_
     const auto config = lowering_config(state);
     const auto preview = impl::lowerFixedTasks(tasks, active_peers, direction, config);
     auto local_channels = impl::payloadChannelMask(preview, config, direction);
+    state->required_payload_channels = local_channels;
     if (!compact) {
       for (int peer = 0; peer < state->world_size; ++peer) {
         for (std::uint32_t channel = 0; channel < state->total_channels; ++channel) {
@@ -600,6 +604,7 @@ void initialize_sparse_window(DeviceState* state, const std::vector<std::uint32_
       return impl::topology_detail::allGather(
         state->comm, local_channels.data(), local_channels.size(), state->world_size, stream);
     });
+    state->registered_payload_channels = local_channels;
     std::uint32_t payload_connection_capacity = 0;
     for (int rank = 0; rank < state->world_size; ++rank) {
       std::uint32_t count = 0;
@@ -993,6 +998,27 @@ Metrics launch(int64_t handle, const std::vector<TensorView>& tensors, const std
   metrics["registered_window_bytes"] = std::int64_t(state->window_bytes);
   metrics["dense_window_bytes"] = std::int64_t(state->dense_window_bytes);
   metrics["registered_window_savings_bytes"] = std::int64_t(state->dense_window_bytes - state->window_bytes);
+  if (const char* evidence = std::getenv("SHARDSTREAM_PROFILE_FIFO_LAYOUT");
+      evidence && std::strcmp(evidence, "1") == 0) {
+    metrics["logical_rank"] = std::int64_t(state->logical_rank);
+    metrics["fifo_layout_sender"] = bool(direction == impl::Direction::kSend);
+    metrics["fifo_layout_compact"] = bool(
+      std::getenv("SHARDSTREAM_COMPACT_FIFO") &&
+      std::strcmp(std::getenv("SHARDSTREAM_COMPACT_FIFO"), "1") == 0);
+    metrics["fifo_layout_logical_to_communicator"] = std::vector<int64_t>(
+      state->logical_to_communicator.begin(), state->logical_to_communicator.end());
+    metrics["fifo_layout_required_mask"] = std::vector<int64_t>(
+      state->required_payload_channels.begin(), state->required_payload_channels.end());
+    metrics["fifo_layout_registered_mask"] = std::vector<int64_t>(
+      state->registered_payload_channels.begin(), state->registered_payload_channels.end());
+    std::vector<int64_t> input_bytes(state->world_size, 0), forward_bytes(state->world_size, 0);
+    for (const auto& task : tasks) {
+      input_bytes[task.peer] += task.nbytes;
+      if (task.forward_peer != impl::kNoPeer) forward_bytes[task.forward_peer] += task.nbytes;
+    }
+    metrics["fifo_layout_task_peer_bytes"] = std::move(input_bytes);
+    metrics["fifo_layout_forward_peer_bytes"] = std::move(forward_bytes);
+  }
   metrics["plan_cache_hit"] = bool(plan_cache_hit);
   metrics["host_lowering_time_ms"] = host_lowering_time_ms;
   metrics["metadata_upload_time_ms"] = metadata_upload_time_ms;
