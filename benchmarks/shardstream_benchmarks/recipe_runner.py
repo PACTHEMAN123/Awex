@@ -13,6 +13,17 @@ from pathlib import Path
 from shardstream_benchmarks.recipes import load_recipes, rollout_host_counts
 
 
+def training_launch_arguments(hosts, world_size, node_rank, invocation, train_args):
+    # Metadata binds to hosts[0], so rank zero must stay on that host.
+    return [
+        "-m", "torch.distributed.run", "--nnodes", str(len(hosts)),
+        "--nproc-per-node", str(world_size // len(hosts)),
+        "--node-rank", str(node_rank), "--rdzv-backend", "static",
+        "--rdzv-endpoint", hosts[0] + ":18891", "--rdzv-id", invocation,
+        *train_args,
+    ]
+
+
 def nccl_buffer_environment(buffer_bytes=None, net_chunk_bytes=None):
     """Validate sizes against the pinned NCCL 2.31.2 signed fields."""
     environment = {}
@@ -537,23 +548,10 @@ def main():
         if args.layout is not None:
             train_args.extend(["--layout", args.layout])
         for node_rank, actor in enumerate(training):
-            torchrun = [
-                "-m",
-                "torch.distributed.run",
-                "--nnodes",
-                str(len(training)),
-                "--nproc-per-node",
-                str(recipe.training["world_size"] // len(training)),
-                "--node-rank",
-                str(node_rank),
-                "--rdzv-backend",
-                "c10d",
-                "--rdzv-endpoint",
-                args.training_hosts[0] + ":18891",
-                "--rdzv-id",
-                invocation,
-                *train_args,
-            ]
+            torchrun = training_launch_arguments(
+                args.training_hosts, recipe.training["world_size"], node_rank,
+                invocation, train_args,
+            )
             ray.get(actor.launch.remote("training", torchrun, environment))
         while True:
             states = ray.get([actor.status.remote() for actor in training])
