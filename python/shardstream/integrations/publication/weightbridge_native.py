@@ -134,6 +134,17 @@ def _context(model_path, model, rank, loader):
     return AdapterContext(factories, shapes, lambda: _parameter_views(model), loader, rank)
 
 
+def _load_vllm_weights(model_runner, factories):
+    """Probe the complete native loader, including derived attention weights."""
+    from vllm.model_executor.model_loader.utils import process_weights_after_loading
+
+    model = model_runner.model
+    with torch.no_grad():
+        model.load_weights((name, factory()) for name, factory in factories.items())
+        process_weights_after_loading(
+            model, model_runner.model_config, next(model.parameters()).device)
+
+
 @register_vllm_publication_receiver("weightbridge_native")
 class WeightBridgeReceiver:
     def __init__(self, config, worker_rank):
@@ -155,8 +166,7 @@ class WeightBridgeReceiver:
             self.coordinator = coordinator.spawn(ipc, coordinator_tcp_port(port))
 
         def load(factories):
-            with torch.no_grad():
-                model.load_weights((name, factory()) for name, factory in factories.items())
+            _load_vllm_weights(self.model_runner, factories)
 
         started = time.perf_counter()
         with _model_probe_guard(model, "rollout", self.worker_rank):

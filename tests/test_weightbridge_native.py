@@ -129,3 +129,29 @@ def test_receiver_timeout_is_not_reported_as_consumed():
     receiver = wb.WeightBridgeReceiver({"timeout_seconds": 0}, 0)
     with pytest.raises(TimeoutError):
         receiver.update(None, 0)
+
+
+def test_vllm_loader_probe_includes_native_post_load_weights(monkeypatch):
+    class Model(wb.torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = wb.torch.nn.Parameter(wb.torch.zeros(2, 2))
+            self.derived = wb.torch.nn.Parameter(wb.torch.zeros(2, 2))
+        def load_weights(self, weights):
+            self.weight.copy_(dict(weights)["weight"])
+    model = Model()
+    config = SimpleNamespace(dtype=wb.torch.float32)
+    calls = []
+    def post_load(actual_model, actual_config, device):
+        assert actual_model is model and actual_config is config
+        assert device == model.weight.device
+        calls.append("post_load")
+        model.derived.copy_(model.weight.T)
+    monkeypatch.setitem(sys.modules, "vllm.model_executor.model_loader.utils",
+                        SimpleNamespace(process_weights_after_loading=post_load))
+    weights = wb.torch.arange(4, dtype=wb.torch.float32).reshape(2, 2)
+    wb._load_vllm_weights(SimpleNamespace(model=model, model_config=config),
+                          {"weight": lambda: weights})
+    assert calls == ["post_load"]
+    assert wb.torch.equal(model.weight, weights)
+    assert wb.torch.equal(model.derived, weights.T)
