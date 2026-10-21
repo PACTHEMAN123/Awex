@@ -168,7 +168,7 @@ def test_fused_checkpoint_probe_views_preserve_native_shapes_values_and_storage(
         {"fused": lambda: source, "vector": lambda: vector},
         {"fused": (2, 3, 4), "vector": (4,)}, model, loader)
     keys = ["fused::wb_matrix[0]", "fused::wb_matrix[1]"]
-    assert shapes == {keys[0]: (3, 4), keys[1]: (3, 4), "vector": (4,)}
+    assert shapes == {keys[0]: (3, 4), keys[1]: (3, 4), "vector": (1, 4)}
     for i, key in enumerate(keys):
         assert wb.torch.equal(factories[key](), source[i])
         assert factories[key]().data_ptr() == source[i].data_ptr()
@@ -250,6 +250,7 @@ def test_expert_matrix_probe_boundaries_survive_independent_transposes():
     assert wb.torch.equal(model.experts, expected)
     assert all(tuple(shape) == (4, 5) for shape in shapes.values())
     assert views()["experts"].data_ptr() == model.experts.data_ptr()
+    assert views()["experts"].shape == (15, 4)
 
 
 def test_checkpoint_views_include_persistent_router_bias_but_not_runtime_counters():
@@ -280,3 +281,24 @@ def test_receiver_probe_excludes_fixed_attention_scale_buffers():
     with pytest.raises(RuntimeError, match="probe changed checkpoint parameters"):
         with wb._model_probe_guard(model, "rollout", 0):
             model._k_scale.zero_()
+
+
+def test_fused_probe_vector_and_scalar_sources_keep_two_native_copy_axes():
+    model = wb.torch.nn.Module()
+    model.vector = wb.torch.nn.Parameter(wb.torch.arange(5.))
+    model.scalar = wb.torch.nn.Parameter(wb.torch.ones(()))
+    sources = {"fused": wb.torch.arange(24.).view(2, 3, 4),
+               "vector": model.vector.detach().clone(), "scalar": model.scalar.detach().clone()}
+    received = []
+    factories, shapes, views, load = wb._normalize_probe_views(
+        {k: (lambda v=v: v) for k, v in sources.items()},
+        {k: tuple(v.shape) for k, v in sources.items()}, model,
+        lambda fs: received.append({k: f() for k, f in fs.items()}))
+    assert all(len(shape) == 2 for shape in shapes.values())
+    assert all(f().ndim == 2 for f in factories.values())
+    assert all(v.ndim == 2 for v in views().values())
+    load(factories)
+    for k, expected in sources.items():
+        assert received[0][k].shape == expected.shape
+        assert wb.torch.equal(received[0][k], expected)
+    assert views()["scalar"].data_ptr() == model.scalar.data_ptr()

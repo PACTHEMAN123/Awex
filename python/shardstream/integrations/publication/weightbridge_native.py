@@ -157,10 +157,11 @@ def _normalize_probe_views(factories, shapes, model, loader, *, include_buffers=
 
     Framework loaders receive the original checkpoint shapes and values. The
     probe sees each last-two-axis matrix independently, preserving per-expert
-    transposes; worker vectors get one leading singleton axis. No LoadSpec is
+    transposes. All sources and workers expose two matrix axes. No LoadSpec is
     supplied and actual model parameter storage is unchanged.
     """
     import itertools
+    import math
     fused = {name: shape for name, shape in shapes.items() if len(shape) > 2}
     if not fused:
         return factories, shapes, lambda: _storage_parameter_views(model, include_buffers=include_buffers), loader
@@ -182,8 +183,20 @@ def _normalize_probe_views(factories, shapes, model, loader, *, include_buffers=
                 return factory()[index]
             normalized[key] = fetch
 
+    small = {name: shape for name, shape in shapes.items() if len(shape) < 2}
+    for name, shape in small.items():
+        normalized_shapes[name] = (1, math.prod(shape))
+        def fetch(factory=factories[name], shape=normalized_shapes[name]):
+            return factory().view(shape)
+        normalized[name] = fetch
+
     def load(probes):
         original = dict(probes)
+        for name, shape in small.items():
+            if name in probes:
+                def fetch(factory=probes[name], shape=shape):
+                    return factory().view(shape)
+                original[name] = fetch
         for name, shape in fused.items():
             keys = pieces[name]
             if not any(key in probes for key in keys):
@@ -198,12 +211,14 @@ def _normalize_probe_views(factories, shapes, model, loader, *, include_buffers=
         loader(original)
 
     def worker_views():
-        return {name: value.unsqueeze(0) if value.ndim == 1 else value
+        return {name: value.view(1, -1) if value.ndim < 2
+                else value.view(-1, value.shape[-1])
                 for name, value in _storage_parameter_views(model, include_buffers=include_buffers).items()}
     print("WB_PROBE_MATRIX_VIEWS " + json.dumps({
         "pid": os.getpid(), "fused_sources": len(fused),
         "matrix_sources": sum(map(len, pieces.values())),
         "preserves_expert_matrix_boundaries": True,
+        "all_source_and_worker_views_are_matrices": True,
         "checkpoint_values_unchanged": True,
     }), flush=True)
     return normalized, normalized_shapes, worker_views, load
