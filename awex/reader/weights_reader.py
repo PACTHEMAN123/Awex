@@ -197,6 +197,15 @@ class WeightsReader(WeightExchangeReader):
             # build meta/slices with the same tensor layout assumptions.
             "device_backend": device_util.get_device_type(),
         }
+        if self.model_arch_name == "Glm4MoeLiteForCausalLM":
+            self.infer_conf["mtp_alias_targets"] = [
+                parameter.name
+                for parameter in self.parameters_meta
+                if parameter.name.startswith("model.layers.")
+                and parameter.name.endswith(
+                    ("embed_tokens.weight", "shared_head.head.weight")
+                )
+            ]
         self.meta_server_client.put_object("infer_conf", self.infer_conf)
         logger.info(f"Put inference config {self.infer_conf} to meta server")
         if self.engine_rank == 0:
@@ -767,6 +776,9 @@ class WorkerWeightsReader:
         logger.info(
             f"Start to flush cache for step {step_id} for rank {self.transfer_rank}"
         )
+        post_update = getattr(self.weight_converter, "post_update", None)
+        if callable(post_update):
+            post_update(self.model)
         flash_cache_success = self.scheduler.flush_cache()
         assert flash_cache_success, "Cache flush failed after updating weights"
         logger.info(

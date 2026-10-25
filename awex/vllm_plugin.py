@@ -217,6 +217,10 @@ def _patch_awex_worker() -> None:
         except AssertionError:
             ep_rank, ep_size = 0, 1
 
+        # A physical EP process group does not imply expert parameter ownership.
+        if not bool(getattr(parallel_config, "enable_expert_parallel", False)):
+            ep_rank, ep_size = 0, 1
+
         local_world_size = int(getattr(parallel_config, "world_size", 1) or 1)
         local_rank = int(getattr(parallel_config, "rank", 0) or 0)
         cp_size = int(getattr(parallel_config, "prefill_context_parallel_size", 1) or 1)
@@ -349,7 +353,7 @@ def _patch_awex_worker() -> None:
         if isinstance(infer_engine_config, dict):
             infer_engine_config = InferenceConfig.from_dict(infer_engine_config)
             task_kwargs["infer_engine_config"] = infer_engine_config
-        task_kwargs["model"] = self.model_runner.model
+        task_kwargs["model"] = _awex_transfer_model(self.model_runner)
         task_kwargs["model_context"] = _awex_model_context(self, infer_engine_config)
         result = target(**task_kwargs)
         return _sanitize_for_ipc(result)
@@ -504,3 +508,18 @@ def register_awex_plugin() -> None:
 def register_awex_routes() -> None:
     """Public entrypoint to register Awex routes without relying on vLLM plugin system."""
     register_awex_plugin()
+
+
+def _awex_transfer_model(model_runner):
+    model = model_runner.model
+    config = model_runner.vllm_config.model_config.hf_config
+    if "Glm4MoeLiteForCausalLM" not in (getattr(config, "architectures", None) or []):
+        return model
+    if model_runner.vllm_config.speculative_config is None:
+        return model
+    draft = getattr(getattr(model_runner, "drafter", None), "model", None)
+    if draft is None:
+        raise RuntimeError("GLM MTP is enabled but its draft model is unavailable")
+    from awex.models.glm4_moe_lite import GLM47FlashTransferModel
+
+    return GLM47FlashTransferModel(model, draft, config.num_hidden_layers)

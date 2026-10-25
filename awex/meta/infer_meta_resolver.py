@@ -100,6 +100,7 @@ class InferParamMetaResolver(ParamMetaResolver):
             self._model_arch_name,
             self.infer_engine_config,
             self.rank0_info,
+            hf_config=self.hf_config,
         )
         self._params_meta = self._build_params_meta()
         if self._inference_engine.config.enable_debug_mode:
@@ -179,6 +180,10 @@ class InferParamMetaResolver(ParamMetaResolver):
         )
         return min(params_raw_meta, key=cls._meta_identity_key)
 
+    def _get_logical_shard_rank(self, name, shard):
+        mapper = getattr(self._sharding_strategy, "get_logical_shard_rank", None)
+        return mapper(name, shard) if mapper is not None else None
+
     def _get_sharding_info(
         self, name: str, rank_info: RankInfo, param_meta: dict[str, Any]
     ) -> tuple[ShardingType, int, int]:
@@ -201,7 +206,9 @@ class InferParamMetaResolver(ParamMetaResolver):
         model_context = kwargs["model_context"]
         params_meta = []
         rank_info = get_rank_info_extractor(engine_name)(model_context, engine_rank)
-        model_arch_name = type(model).__name__
+        model_arch_name = (
+            getattr(model.config, "architectures", None) or [type(model).__name__]
+        )[0]
         meta = {
             "rank_info": rank_info,
             "params_meta": params_meta,

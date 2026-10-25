@@ -90,6 +90,10 @@ class ParamMetaResolver(ABC):
         """
         pass
 
+    def _get_logical_shard_rank(self, name, shard):
+        """Model hook for physically replicated KV-head shards."""
+        return None
+
     def _build_params_meta(self) -> list[ParameterMeta]:
         """
         Build and return a list of ParameterMeta objects with global (unsharded) size, shape, and relative offset
@@ -148,7 +152,9 @@ class ParamMetaResolver(ABC):
             if sharding_type == ShardingType.NO_SHARDING:
                 # FIX: For NO_SHARDING, each rank should be its own replica with one shard
                 replicas[name] = [[shard] for shard in shards]
-            elif num_shards == 1:
+            elif num_shards == 1 and all(
+                self._get_logical_shard_rank(name, shard) is None for shard in shards
+            ):
                 # For single shard parameters, put all shards in one replica
                 replicas[name] = [shards]
             else:
@@ -166,7 +172,13 @@ class ParamMetaResolver(ABC):
 
                 rank_to_shards = defaultdict(list)
                 for shard in shards:
-                    rank_to_shards[getattr(shard, rank_key)].append(shard)
+                    logical_rank = self._get_logical_shard_rank(name, shard)
+                    key = (
+                        getattr(shard, rank_key)
+                        if logical_rank is None
+                        else logical_rank
+                    )
+                    rank_to_shards[key].append(shard)
 
                 replica_counts = [
                     len(shard_list) for shard_list in rank_to_shards.values()
