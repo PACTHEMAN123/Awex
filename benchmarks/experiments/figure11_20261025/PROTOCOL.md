@@ -23,7 +23,10 @@ veRL NCCL and NIXL use their native checkpoint engines, 256 MiB buckets and
 native loading. Awex uses official inclusionAI/Awex main commit
 `bae159256a768d54465ed693d90d925025032a17`, with `comm_backend=mooncake` and
 `AWEX_MOONCAKE_PROTOCOL=rdma`. Its native conversion, shard planner, writer and
-reader remain unchanged. Every transport must attest RDMA, source-file hash,
+reader remain unchanged. Benchmark native-layout adapters are ported separately
+in `f7ed45cc9b95fd62b7a78177da2dfaf2ee85cf75`, covering vLLM expert names,
+replicated GQA heads, MLA and MTP. An untouched-upstream full-model attempt
+failed strict metadata-key validation and is archived separately. Every transport must attest RDMA, source-file hash,
 GPU memory registration and successful native reads. TCP fallback is rejected.
 NCCL buffer is explicitly 4 MiB, its default; this is not a Mooncake RDMA knob.
 All new Awex experiments default to this RDMA path; historical Awex NCCL data

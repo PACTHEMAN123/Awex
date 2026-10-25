@@ -14,7 +14,7 @@ STAGE = BASE / 'stage'
 RUNTIME = Path('/tmp/verl-nccl-1020-runtime')
 for target, bundle, branch in [
     (SOURCE, BASE/'shardstream.bundle', 'codex/figure11-four-backends-20261025'),
-    (AWEX, BASE/'awex.bundle', 'codex/awex-rdma-official-20261025'),
+    (AWEX, BASE/'awex.bundle', 'codex/awex-rdma-model-adapters-20261025'),
 ]:
     if not target.exists():
         subprocess.run(['git', 'clone', '-b', branch, str(bundle), str(target)], check=True)
@@ -41,7 +41,13 @@ destination.parent.mkdir(parents=True, exist_ok=True)
 shutil.copy2(native, destination)
 revision = subprocess.check_output(['git','-C',str(SOURCE),'rev-parse','HEAD'],text=True).strip()
 awex_revision = subprocess.check_output(['git','-C',str(AWEX),'rev-parse','HEAD'],text=True).strip()
-assert awex_revision == 'bae159256a768d54465ed693d90d925025032a17'
+assert awex_revision == 'f7ed45cc9b95fd62b7a78177da2dfaf2ee85cf75'
+subprocess.run(['git','-C',str(AWEX),'merge-base','--is-ancestor',
+                'bae159256a768d54465ed693d90d925025032a17','HEAD'],check=True)
+subprocess.run(['git','-C',str(AWEX),'diff','--exit-code',
+                'bae159256a768d54465ed693d90d925025032a17','HEAD','--',
+                'awex/transfer','awex/writer/mooncake_writer.py',
+                'awex/reader/mooncake_reader.py'],check=True)
 env = dict(os.environ,
     PYTHONPATH=f'{STAGE}:/tmp/verl-nccl-1020-deps:/tmp/verl-nccl-1020-verl:{AWEX}:/tmp/comm-memory-1021-mooncake',
     LD_LIBRARY_PATH='/tmp/verl-nccl-1020-nccl/nvidia/nccl/lib:/usr/local/cuda/lib64:/tmp/verl-nccl-1020-deps/nvidia/cuda_runtime/lib:'+str(RUNTIME/'lib/python3.12/site-packages/torch/lib'))
