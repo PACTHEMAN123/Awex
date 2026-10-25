@@ -86,7 +86,7 @@ def main():
         else:
             if send:
                 assert reg_calls == first_regs, "sender registered parameter slices again"
-            if first_mrs > initial_mrs:
+            if first_mrs > 0:
                 assert mr_calls == first_mrs, "new verbs MR registration after initial exchange"
         print(json.dumps(dict(event="ASTATE_PROBE", role=args.role,
                               version=version, verified=True, pid=os.getpid(),
