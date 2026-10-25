@@ -108,3 +108,16 @@ class AwexRDMAPublication(AwexNCCLPublication):
 
         enable_rdma_audit()
         super().initialize_training()
+
+
+@register_publication_mechanism("awex_native_astate")
+class AwexAStatePublication(AwexNCCLPublication):
+    """Official Awex AState writer/reader with persistent host staging."""
+
+    comm_backend = "astate"
+
+    def initialize_training(self):
+        from shardstream.integrations.publication.awex_astate import enable_astate_audit
+
+        enable_astate_audit()
+        super().initialize_training()

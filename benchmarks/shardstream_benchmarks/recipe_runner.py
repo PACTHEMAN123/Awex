@@ -163,6 +163,12 @@ class NodeProcesses:
             # This changes the control-message limit, not a transfer buffer.
             env["MC_HANDSHAKE_MAX_LENGTH"] = "67108864"
             env["AWEX_MOONCAKE_DEVICE"] = ",".join(port.split(":")[0] for port in ports)
+        if environment.get("SHARDSTREAM_BENCH_AWEX_ASTATE") == "1":
+            import socket
+
+            env["POD_IP"] = socket.gethostbyname(socket.gethostname())
+            env["SHARDSTREAM_ASTATE_MANIFEST"] = "/tmp/figure11-1025/astate-artifact.json"
+            env["TRANSFER_ENGINE_SKIP_RDMA_EXCEPTION"] = "false"
         command = [str(self.runtime / "bin/python"), *arguments]
         if env.get("SHARDSTREAM_TIMELINE") == "1":
             self.profiled = True
@@ -406,9 +412,9 @@ def main():
             "VERL_VLLM_FP8_QUANT_ENABLED": "1" if (
                 args.weight_format == "fp8" and args.publication_mechanism == "verl_native_nccl"
             ) else "0",
-            "SHARDSTREAM_BENCH_ENABLE_AWEX": "1" if args.publication_mechanism in ("awex_native_nccl", "awex_native_rdma") else "0",
+            "SHARDSTREAM_BENCH_ENABLE_AWEX": "1" if args.publication_mechanism in ("awex_native_nccl", "awex_native_rdma", "awex_native_astate") else "0",
             "SHARDSTREAM_BENCH_NATIVE_MULTIRAIL": "1" if args.publication_mechanism in (
-                "awex_native_nccl", "awex_native_rdma", "verl_native_nccl", "verl_native_nixl", "verl_native_mooncake"
+                "awex_native_nccl", "awex_native_rdma", "awex_native_astate", "verl_native_nccl", "verl_native_nixl", "verl_native_mooncake"
             ) else "0",
             "SHARDSTREAM_BENCH_EXTRA_PYTHONPATH": args.extra_python_path,
             "SHARDSTREAM_BENCH_EXTRA_LIBRARY_PATH": args.extra_library_path,
@@ -418,6 +424,8 @@ def main():
         if args.publication_mechanism == "awex_native_rdma":
             environment["SHARDSTREAM_BENCH_AWEX_RDMA"] = "1"
             environment["AWEX_MOONCAKE_PROTOCOL"] = "rdma"
+        if args.publication_mechanism == "awex_native_astate":
+            environment["SHARDSTREAM_BENCH_AWEX_ASTATE"] = "1"
         if args.awex_nonbatch:
             environment["AWEX_USE_BATCH_SEND_RECV"] = "0"
         rollout_counts = rollout_host_counts(recipe.rollout["instances"], len(args.rollout_hosts))

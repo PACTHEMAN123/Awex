@@ -564,6 +564,9 @@ def register_shardstream_plugin() -> None:
     _patch_shardstream_worker()
     _ensure_router_attached()
     if os.environ.get("SHARDSTREAM_BENCH_ENABLE_AWEX") == "1":
+        if os.environ.get("SHARDSTREAM_BENCH_AWEX_ASTATE") == "1":
+            from shardstream.integrations.publication.awex_astate import enable_astate_audit
+            enable_astate_audit()
         if os.environ.get("SHARDSTREAM_BENCH_AWEX_RDMA") == "1":
             from shardstream.integrations.publication.awex_rdma import enable_rdma_audit
             enable_rdma_audit()
