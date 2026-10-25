@@ -6,6 +6,23 @@ import os
 from pathlib import Path
 
 
+def configure_astate_devices():
+    """Select two active container HCAs using this process's physical GPU mapping."""
+    import torch
+    from shardstream.topology import _active_rdma_endpoints, _gpu_hca_topology
+
+    endpoints = _active_rdma_endpoints()
+    maximum = int(os.environ.get("TRANSFER_ENGINE_MAX_RDMA_DEVICES", "2"))
+    distances = _gpu_hca_topology(endpoints, torch.cuda.device_count())
+    if distances is None or not 0 < maximum <= len(endpoints):
+        raise RuntimeError("Cannot resolve AState GPU locality and active RDMA devices")
+    local = distances[torch.cuda.current_device()]
+    chosen = sorted(range(len(endpoints)), key=lambda i: (local[i], endpoints[i].pci_path, endpoints[i].name))[:maximum]
+    names = [endpoints[i].name for i in chosen]
+    os.environ["TRANSFER_ENGINE_RDMA_DEVICES"] = ",".join(names)
+    return names
+
+
 def configure_astate_discovery(meta_server_addr):
     if "UTRANS_DISABLE_RDMA" in os.environ:
         raise RuntimeError("AState qualification requires native RDMA enabled")
@@ -30,6 +47,7 @@ def enable_astate_audit():
             @functools.wraps(method)
             def initialize(self, *args, **kwargs):
                 configure_astate_discovery(self.meta_server_addr)
+                devices = configure_astate_devices()
                 result = method(self, *args, **kwargs)
                 manifest_path = Path(os.environ["SHARDSTREAM_ASTATE_MANIFEST"])
                 manifest = json.loads(manifest_path.read_text())
@@ -45,6 +63,7 @@ def enable_astate_audit():
                     pid=os.getpid(), rank=self.transfer_rank, role=role, protocol="rdma",
                     module=str(binary), sha256=binary_hash,
                     source_revision=manifest["source_revision"],
+                    source_patch_sha256=manifest["source_patch_sha256"], rdma_devices=devices,
                     utrans_sha256=manifest["utrans_sha256"], staging="cpu_pinned",
                     max_rdma_devices=os.environ.get("TRANSFER_ENGINE_MAX_RDMA_DEVICES", "2"),
                     discovery="HTTP")), flush=True)

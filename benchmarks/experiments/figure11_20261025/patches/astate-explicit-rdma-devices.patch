@@ -1,0 +1,28 @@
+diff --git a/src/common/option.h b/src/common/option.h
+index 50c0048..b90cf0c 100644
+--- a/src/common/option.h
++++ b/src/common/option.h
+@@ -150,6 +150,7 @@ OPTION(TRANSFER_ENGINE_LOG_TENSOR_META, BOOL, "true")
+ // skip rdma exception for test environment when rdma not working
+ OPTION(TRANSFER_ENGINE_SKIP_RDMA_EXCEPTION, BOOL, "false")
+ OPTION(TRANSFER_ENGINE_MAX_RDMA_DEVICES, INT, "2")
++OPTION(TRANSFER_ENGINE_RDMA_DEVICES, STRING, "") // Optional explicit verbs device names, comma separated
+ OPTION(TRANSFER_ENGINE_RDMA_NUM_POLLERS, INT, "1")
+ OPTION(TRANSPORT_RECEIVE_RETRY_COUNT, INT, "30")
+ OPTION(TRANSPORT_RECEIVE_RETRY_SLEEP_MS, INT, "3000")
+diff --git a/src/transport/rdma_transporter.cpp b/src/transport/rdma_transporter.cpp
+index 21260cd..4f6e85c 100644
+--- a/src/transport/rdma_transporter.cpp
++++ b/src/transport/rdma_transporter.cpp
+@@ -209,6 +209,11 @@ bool RDMATransporter::SetupRpcServerWithRetry(utrans_config_t& /*utrans_config*/
+ }
+ 
+ std::string RDMATransporter::SelectRdmaDevices(const Options& options, int rank_id) {
++    auto configured = options.find(TRANSFER_ENGINE_RDMA_DEVICES);
++    if (configured != options.end() && !configured->second.empty()) {
++        SPDLOG_INFO("Using configured RDMA devices: {}", configured->second);
++        return configured->second;
++    }
+     SPDLOG_INFO("DEBUG: selectRdmaDevices called with rank_id={}", rank_id);
+     int max_devices = GetOptionValue<int>(options, TRANSFER_ENGINE_MAX_RDMA_DEVICES);
+     SPDLOG_INFO("DEBUG: max_devices={}", max_devices);

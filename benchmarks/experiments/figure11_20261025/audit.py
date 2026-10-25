@@ -68,6 +68,7 @@ def analyze(directory):
   assert len({r['extension_sha256'] for r in artifacts})==1
   assert len({r['utrans_sha256'] for r in artifacts})==1
   assert len({r['source_revision'] for r in artifacts})==1
+  assert len({r['source_patch_sha256'] for r in artifacts})==1
   expected_count=case['training_gpus']+case['rollout_gpus']
   assert len(astate_transports)==len(astate_completions)==expected_count
   assert all(r['protocol']=='rdma' for r in astate_transports+astate_completions)
@@ -75,6 +76,8 @@ def analyze(directory):
   assert {r['sha256'] for r in astate_transports}=={artifacts[0]['extension_sha256']}
   assert {r['utrans_sha256'] for r in astate_transports}=={artifacts[0]['utrans_sha256']}
   assert {r['source_revision'] for r in astate_transports}=={artifacts[0]['source_revision']}
+  assert {r['source_patch_sha256'] for r in astate_transports}=={artifacts[0]['source_patch_sha256']}
+  assert all(len(r['rdma_devices'])==len(set(r['rdma_devices']))==2 for r in astate_transports)
   for rows in [astate_transports,astate_completions]:
    assert sum(r['role']=='send' for r in rows)==case['training_gpus']
    assert sum(r['role']=='receive' for r in rows)==case['rollout_gpus']

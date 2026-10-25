@@ -76,5 +76,6 @@ if artifact.exists():
         'import torch,astate,astate._core.astate_cpp as n; print(torch.__version__,astate.__version__,n.__file__)'],
         env=astate_env,text=True)
     row['astate']={key:manifest[key] for key in ['source_revision','transport','extension_sha256','utrans_sha256']}
+    row['astate']['source_patch_sha256']=manifest.get('source_patch_sha256')
 (BASE/'prepared.json').write_text(json.dumps(row,indent=2)+'\n')
 print(json.dumps(row),flush=True)

@@ -59,3 +59,34 @@ def test_astate_rejects_disabled_rdma_or_ignored_errors(monkeypatch, variable, v
     monkeypatch.setenv(variable, value)
     with pytest.raises(RuntimeError):
         configure_astate_discovery("trainer:1234")
+
+
+def test_astate_selects_active_devices_for_the_current_gpu(monkeypatch):
+    import os
+    import torch
+    from shardstream import topology
+    from shardstream.integrations.publication.awex_astate import configure_astate_devices
+
+    monkeypatch.delenv("TRANSFER_ENGINE_MAX_RDMA_DEVICES", raising=False)
+    monkeypatch.setenv("TRANSFER_ENGINE_RDMA_DEVICES", "previous")
+    endpoints = [SimpleNamespace(name=name, pci_path=str(i))
+                 for i, name in enumerate(["mlx5_5", "mlx5_15", "mlx5_20", "mlx5_28"])]
+    monkeypatch.setattr(topology, "_active_rdma_endpoints", lambda: endpoints)
+    monkeypatch.setattr(topology, "_gpu_hca_topology", lambda endpoints, count:
+                        [[0, 3, 4, 4], [4, 4, 2, 0]])
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 1)
+    assert configure_astate_devices() == ["mlx5_28", "mlx5_20"]
+    assert os.environ["TRANSFER_ENGINE_RDMA_DEVICES"] == "mlx5_28,mlx5_20"
+
+
+def test_astate_refuses_unresolved_gpu_topology(monkeypatch):
+    import torch
+    from shardstream import topology
+    from shardstream.integrations.publication.awex_astate import configure_astate_devices
+
+    monkeypatch.setattr(topology, "_active_rdma_endpoints", lambda: [])
+    monkeypatch.setattr(topology, "_gpu_hca_topology", lambda *args: None)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+    with pytest.raises(RuntimeError, match="Cannot resolve"):
+        configure_astate_devices()

@@ -34,8 +34,10 @@ def main():
     import torch
     import astate
     from astate.utils import create_sharded_key
+    from shardstream.integrations.publication.awex_astate import configure_astate_devices
 
     torch.cuda.set_device(0)
+    devices = configure_astate_devices()
     counters = ctypes.CDLL(args.counter_library)
     for name in ("astate_probe_reg_calls", "astate_probe_mr_calls"):
         getattr(counters, name).restype = ctypes.c_ulonglong
@@ -96,6 +98,7 @@ def main():
                               initial_register_calls=baseline,
                               initial_verbs_mr_calls=initial_mrs,
                               source_addresses=[t.data_ptr() for t in sources],
+                              rdma_devices=devices,
                               astate_module=astate.__file__)), flush=True)
 
 

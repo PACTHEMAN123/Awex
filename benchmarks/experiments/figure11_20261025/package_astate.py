@@ -21,7 +21,9 @@ def digest(path):
 
 def main():
     assert subprocess.check_output(["git", "-C", str(SOURCE), "rev-parse", "HEAD"], text=True).strip() == REVISION
-    subprocess.run(["git", "-C", str(SOURCE), "diff", "--exit-code", "HEAD"], check=True)
+    patch = BASE / "source/benchmarks/experiments/figure11_20261025/patches/astate-explicit-rdma-devices.patch"
+    actual = subprocess.check_output(["git", "-C", str(SOURCE), "diff", "--binary", "HEAD"])
+    assert actual == patch.read_bytes(), "AState source must match the reviewed device configuration patch"
     assert not TARGET.exists(), "do not replace an existing pinned artifact"
     TARGET.mkdir()
     shutil.copytree(SOURCE / "python/astate", TARGET / "python/astate",
@@ -53,6 +55,7 @@ def main():
         candidate, = library_dir.glob("libutrans.so*")
         utrans.symlink_to(candidate.name)
     manifest = dict(source_revision=REVISION, transport="default-libutrans-rdma",
+                    source_patch_sha256=digest(patch),
                     extension=str(extension), extension_sha256=digest(extension),
                     utrans_library=str(utrans), utrans_sha256=digest(utrans),
                     ld_library_path=":".join([str(library_dir), *inherited]),
