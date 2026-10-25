@@ -62,7 +62,7 @@ def analyze(directory):
   assert len(qualified)==2 and {q['role'] for q in qualified}=={'send','receive'}
   for q in qualified:
    assert q['code']==0 and not q['timed_out'] and not q['gpu_processes_after']
-   assert [e['version'] for e in q['events']]==list(range(4))
+   assert [e['version'] for e in q['events']]==list(range(-1,3))
    assert all(e['verified'] for e in q['events'])
    assert all(q['artifact']['extension_sha256']==r['extension_sha256'] and q['artifact']['utrans_sha256']==r['utrans_sha256'] for r in artifacts)
   assert len({r['extension_sha256'] for r in artifacts})==1

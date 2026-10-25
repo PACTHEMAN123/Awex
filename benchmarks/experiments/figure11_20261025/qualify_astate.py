@@ -91,7 +91,7 @@ def main():
                 print(json.dumps({key: row[key] for key in ("ip", "role", "code", "timed_out", "events", "output_tail")}), flush=True)
                 assert row["code"] == 0 and not row["timed_out"]
                 assert not row["gpu_processes_after"]
-                assert [event["version"] for event in row["events"]] == list(range(4))
+                assert [event["version"] for event in row["events"]] == list(range(-1, 3))
                 assert all(event["verified"] for event in row["events"])
                 assert any(row["after"][name][key] > row["before"][name][key]
                            for name in row["before"] for key in ("port_xmit_data", "port_rcv_data"))

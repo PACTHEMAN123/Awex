@@ -46,7 +46,8 @@ def main():
     initial_mrs = counters.astate_probe_mr_calls()
     previous = []
     first_regs = first_mrs = None
-    for version in range(4):
+    # Match the full-model harness, including its initial version -1.
+    for index, version in enumerate(range(-1, 3)):
         # Keep previous allocations alive to force different source addresses.
         dense = ((torch.arange(1024 * 1024, device="cuda").reshape(1024, 1024)
                   % 97) + version * 7).to(torch.bfloat16).T
@@ -79,7 +80,7 @@ def main():
         table.complete(version)
         reg_calls = counters.astate_probe_reg_calls()
         mr_calls = counters.astate_probe_mr_calls()
-        if version == 0:
+        if index == 0:
             first_regs, first_mrs = reg_calls, mr_calls
             if send:
                 assert reg_calls > baseline, "registration observer did not see first publication"
