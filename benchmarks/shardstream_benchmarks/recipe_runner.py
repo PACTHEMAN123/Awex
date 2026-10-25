@@ -400,6 +400,7 @@ def main():
         "warmup_updates": args.warmup_updates,
         "nccl_lib": args.nccl_lib,
         "publication_mechanism": args.publication_mechanism,
+        "awex_nonbatch": args.awex_nonbatch,
         "publication_bucket_mb": args.publication_bucket_mb,
         "model_weight_profile": args.model_weight_profile,
         "weight_format": args.weight_format,
