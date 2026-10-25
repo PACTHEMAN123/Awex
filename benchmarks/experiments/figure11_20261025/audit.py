@@ -35,6 +35,11 @@ def analyze(directory):
  assert all(not r['gpu_processes'].strip() for r in before+after)
  assert {r['prepared']['revision'] for r in before}=={case['revision']}
  assert len({r['prepared']['native_sha256'] for r in before})==1
+ if case['backend']=='nixl':
+  assert all(r['prepared']['nixl']['version']=='1.5.0' for r in before)
+  assert {r['prepared']['nixl']['artifact_sha256'] for r in before}=={'de778242fbd632b9f44ca0c8240b393b746068b56e6856b8bdfb1edaa1580653'}
+  assert len({json.dumps(r['prepared']['nixl']['files'],sort_keys=True) for r in before})==1
+  assert '/tmp/figure11-1025/nixl-runtime' in case['command'][case['command'].index('--extra-python-path')+1].split(':')
  records=None;affinity={};training_layout=[];native_metrics=[];archives=[];rdma_transports=[];rdma_completions=[];rdma_reuse=[];astate_transports=[];astate_completions=[]
  for item in load(directory/'manifest.json'):
   path=directory/item['file'];assert path.stat().st_size==item['bytes'] and hashlib.sha256(path.read_bytes()).hexdigest()==item['sha256']

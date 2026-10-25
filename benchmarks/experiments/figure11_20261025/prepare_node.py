@@ -50,22 +50,31 @@ subprocess.run(['git','-C',str(AWEX),'diff','--exit-code',
                 'awex/reader/mooncake_reader.py','awex/writer/astate_writer.py',
                 'awex/reader/astate_reader.py'],check=True)
 env = dict(os.environ,
-    PYTHONPATH=f'{STAGE}:/tmp/verl-nccl-1020-deps:/tmp/verl-nccl-1020-verl:{AWEX}:/tmp/comm-memory-1021-mooncake',
+    PYTHONPATH=f'{BASE}/nixl-runtime:{STAGE}:/tmp/verl-nccl-1020-deps:/tmp/verl-nccl-1020-verl:{AWEX}:/tmp/comm-memory-1021-mooncake',
     LD_LIBRARY_PATH='/tmp/verl-nccl-1020-nccl/nvidia/nccl/lib:/usr/local/cuda/lib64:/tmp/verl-nccl-1020-deps/nvidia/cuda_runtime/lib:'+str(RUNTIME/'lib/python3.12/site-packages/torch/lib'))
 code = '''import json,torch,ray,vllm,mooncake.engine,awex.transfer.mooncake_comm
 from importlib.metadata import version
 from pathlib import Path
 import hashlib
-print(json.dumps(dict(torch=torch.__version__,ray=ray.__version__,vllm=vllm.__version__,mooncake=mooncake.engine.__file__,registration_policy=awex.transfer.mooncake_comm.MooncakeTransport.registration_policy,mooncake_version=version('mooncake-transfer-engine'),mooncake_sha256=hashlib.sha256(Path(mooncake.engine.__file__).read_bytes()).hexdigest(),awex=awex.transfer.mooncake_comm.__file__)))'''
+from verl.checkpoint_engine.nixl_checkpoint_engine import NIXLCheckpointEngine
+import nixl._bindings as nixl_bindings
+nixl_root=Path('/tmp/figure11-1025/nixl-runtime')
+nixl_artifact=Path('/tmp/figure11-1025/nixl-runtime-1.5.0-cu13.tar.gz')
+nixl=dict(version=version('nixl-cu13'), artifact_sha256=hashlib.sha256(nixl_artifact.read_bytes()).hexdigest(),
+          files={str(p.relative_to(nixl_root)):hashlib.sha256(p.read_bytes()).hexdigest()
+                 for p in sorted(nixl_root.rglob('*')) if p.is_file() and p.suffix not in ('.pyc',)})
+print(json.dumps(dict(nixl=nixl,torch=torch.__version__,ray=ray.__version__,vllm=vllm.__version__,mooncake=mooncake.engine.__file__,registration_policy=awex.transfer.mooncake_comm.MooncakeTransport.registration_policy,mooncake_version=version('mooncake-transfer-engine'),mooncake_sha256=hashlib.sha256(Path(mooncake.engine.__file__).read_bytes()).hexdigest(),awex=awex.transfer.mooncake_comm.__file__)))'''
 imports = subprocess.check_output([str(RUNTIME/'bin/python'),'-c',code],env=env,text=True)
 dependency=json.loads(imports);assert dependency['mooncake_version']=='0.3.13.post1'
 assert dependency['registration_policy']=='persistent_snapshots'
+assert dependency['nixl']['version']=='1.5.0'
+assert dependency['nixl']['artifact_sha256']=='de778242fbd632b9f44ca0c8240b393b746068b56e6856b8bdfb1edaa1580653'
 row = dict(hostname=socket.gethostname(), revision=revision, awex_revision=awex_revision,
            native_sha256=hashlib.sha256(destination.read_bytes()).hexdigest(),
            awex_transport_sha256=hashlib.sha256((AWEX/'awex/transfer/mooncake_comm.py').read_bytes()).hexdigest(),
            registration_policy=dependency['registration_policy'],
            mooncake_version=dependency['mooncake_version'],mooncake_sha256=dependency['mooncake_sha256'],
-           imports=imports,
+           nixl=dependency['nixl'], imports=imports,
            gpu_processes=subprocess.check_output(['nvidia-smi','--query-compute-apps=pid,used_memory','--format=csv,noheader'],text=True))
 assert not row['gpu_processes'].strip(), row['gpu_processes']
 artifact = BASE/'astate-artifact.json'

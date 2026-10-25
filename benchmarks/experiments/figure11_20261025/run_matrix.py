@@ -84,6 +84,10 @@ def main():
             deps=DEPS;libraries='/tmp/verl-nccl-1020-deps/nvidia/cuda_runtime/lib'
             qualification_hash=None
             mooncake_qualification_hash=None
+            if row['backend']=='nixl':
+                deps=f'{BASE}/nixl-runtime:'+deps
+                assert all(r['prepared']['nixl']['version']=='1.5.0' for r in before)
+                assert len({r['prepared']['nixl']['artifact_sha256'] for r in before})==1
             if row['mechanism']=='awex_native_rdma':
                 qualification=(BASE/'mooncake-qualification.json').read_bytes()
                 qualified=json.loads(qualification)
