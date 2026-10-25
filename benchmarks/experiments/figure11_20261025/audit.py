@@ -52,6 +52,8 @@ def analyze(directory):
       rows=json_events(text,'SHARDSTREAM_RANK_AFFINITY ')
       if rows:affinity[member.name]=(item['ip'],rows)
  if case['backend']=='awex':
+  assert all(r['prepared']['mooncake_version']=='0.3.13.post1' for r in before)
+  assert len({r['prepared']['mooncake_sha256'] for r in before})==1
   expected_count=case['training_gpus']+case['rollout_gpus']
   assert len(rdma_transports)==len(rdma_completions)==expected_count
   assert all(r['protocol']=='rdma' for r in rdma_transports+rdma_completions)

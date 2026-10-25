@@ -52,11 +52,16 @@ env = dict(os.environ,
     PYTHONPATH=f'{STAGE}:/tmp/verl-nccl-1020-deps:/tmp/verl-nccl-1020-verl:{AWEX}:/tmp/comm-memory-1021-mooncake',
     LD_LIBRARY_PATH='/tmp/verl-nccl-1020-nccl/nvidia/nccl/lib:/usr/local/cuda/lib64:/tmp/verl-nccl-1020-deps/nvidia/cuda_runtime/lib:'+str(RUNTIME/'lib/python3.12/site-packages/torch/lib'))
 code = '''import json,torch,ray,vllm,mooncake.engine,awex.transfer.mooncake_comm
-print(json.dumps(dict(torch=torch.__version__,ray=ray.__version__,vllm=vllm.__version__,mooncake=mooncake.engine.__file__,awex=awex.transfer.mooncake_comm.__file__)))'''
+from importlib.metadata import version
+from pathlib import Path
+import hashlib
+print(json.dumps(dict(torch=torch.__version__,ray=ray.__version__,vllm=vllm.__version__,mooncake=mooncake.engine.__file__,mooncake_version=version('mooncake-transfer-engine'),mooncake_sha256=hashlib.sha256(Path(mooncake.engine.__file__).read_bytes()).hexdigest(),awex=awex.transfer.mooncake_comm.__file__)))'''
 imports = subprocess.check_output([str(RUNTIME/'bin/python'),'-c',code],env=env,text=True)
+dependency=json.loads(imports);assert dependency['mooncake_version']=='0.3.13.post1'
 row = dict(hostname=socket.gethostname(), revision=revision, awex_revision=awex_revision,
            native_sha256=hashlib.sha256(destination.read_bytes()).hexdigest(),
            awex_transport_sha256=hashlib.sha256((AWEX/'awex/transfer/mooncake_comm.py').read_bytes()).hexdigest(),
+           mooncake_version=dependency['mooncake_version'],mooncake_sha256=dependency['mooncake_sha256'],
            imports=imports,
            gpu_processes=subprocess.check_output(['nvidia-smi','--query-compute-apps=pid,used_memory','--format=csv,noheader'],text=True))
 assert not row['gpu_processes'].strip(), row['gpu_processes']
