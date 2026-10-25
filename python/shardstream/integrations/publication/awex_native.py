@@ -1,4 +1,4 @@
-"""Run the workspace Awex NCCL writer/reader under the common model harness."""
+"""Run the upstream Awex writer/reader under the common model harness."""
 
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
@@ -16,6 +16,7 @@ class AwexNCCLPublication(PublicationMechanism):
     # The harness loads the same Megatron model before creating the upstream
     # Awex engine. No ShardStream transport or metadata service is initialized.
     training_engine_backend = None
+    comm_backend = "nccl"
 
     def __init__(self, harness, timeout_seconds=1800, **kwargs):
         super().__init__(harness, **kwargs)
@@ -35,8 +36,8 @@ class AwexNCCLPublication(PublicationMechanism):
         if harness.world_size > 1:
             dist.broadcast_object_list(addresses, src=0)
         harness.meta_server_addr = addresses[0]
-        harness.train_config.update(comm_backend='nccl', meta_server_addr=addresses[0])
-        harness.inference_config.update(comm_backend='nccl', meta_server_addr=addresses[0])
+        harness.train_config.update(comm_backend=self.comm_backend, meta_server_addr=addresses[0])
+        harness.inference_config.update(comm_backend=self.comm_backend, meta_server_addr=addresses[0])
 
         class BenchmarkEngine(MegatronEngine):
             def close(self):
@@ -60,7 +61,7 @@ class AwexNCCLPublication(PublicationMechanism):
         payload = {'meta_server_addr': self.harness.meta_server_addr,
                    'engine_rank': rank,
                    'num_engines': self.harness.inference_config['num_engines'],
-                   'comm_backend': 'nccl', 'enable_debug_mode': False,
+                   'comm_backend': self.comm_backend, 'enable_debug_mode': False,
                    'nnodes': 1, 'node_rank': 0}
         response = requests.post(f'http://{host}:{port}/areal_awex_init', json=payload,
                                  timeout=self.timeout_seconds)
@@ -94,3 +95,16 @@ class AwexNCCLPublication(PublicationMechanism):
             from awex.meta.meta_server import stop_meta_server
             stop_meta_server()
             self.harness.meta_server_addr = None
+
+
+@register_publication_mechanism("awex_native_rdma")
+class AwexRDMAPublication(AwexNCCLPublication):
+    """Official Awex Mooncake planner, writer and reader using GPU RDMA."""
+
+    comm_backend = "mooncake"
+
+    def initialize_training(self):
+        from shardstream.integrations.publication.awex_rdma import enable_rdma_audit
+
+        enable_rdma_audit()
+        super().initialize_training()

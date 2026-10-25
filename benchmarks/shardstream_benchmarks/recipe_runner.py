@@ -153,6 +153,11 @@ class NodeProcesses:
                        UCX_MAX_RNDV_RAILS="4", UCX_MAX_EAGER_RAILS="4",
                        UCX_RNDV_SCHEME="get_zcopy", UCX_IB_GID_INDEX="3",
                        UCX_MAX_HCA_PER_GPU="inf", UCX_SINGLE_NET_DEVICE="n")
+        if environment.get("SHARDSTREAM_BENCH_AWEX_RDMA") == "1":
+            import socket
+
+            env["AWEX_MOONCAKE_HOST"] = socket.gethostbyname(socket.gethostname())
+            env["AWEX_MOONCAKE_DEVICE"] = ",".join(port.split(":")[0] for port in ports)
         command = [str(self.runtime / "bin/python"), *arguments]
         if env.get("SHARDSTREAM_TIMELINE") == "1":
             self.profiled = True
@@ -396,15 +401,18 @@ def main():
             "VERL_VLLM_FP8_QUANT_ENABLED": "1" if (
                 args.weight_format == "fp8" and args.publication_mechanism == "verl_native_nccl"
             ) else "0",
-            "SHARDSTREAM_BENCH_ENABLE_AWEX": "1" if args.publication_mechanism == "awex_native_nccl" else "0",
+            "SHARDSTREAM_BENCH_ENABLE_AWEX": "1" if args.publication_mechanism in ("awex_native_nccl", "awex_native_rdma") else "0",
             "SHARDSTREAM_BENCH_NATIVE_MULTIRAIL": "1" if args.publication_mechanism in (
-                "awex_native_nccl", "verl_native_nccl", "verl_native_nixl", "verl_native_mooncake"
+                "awex_native_nccl", "awex_native_rdma", "verl_native_nccl", "verl_native_nixl", "verl_native_mooncake"
             ) else "0",
             "SHARDSTREAM_BENCH_EXTRA_PYTHONPATH": args.extra_python_path,
             "SHARDSTREAM_BENCH_EXTRA_LIBRARY_PATH": args.extra_library_path,
             "SHARDSTREAM_BENCH_WARMUP": str(args.warmup_updates),
             "SHARDSTREAM_BENCH_RAY_ADDRESS": args.ray_address,
         }
+        if args.publication_mechanism == "awex_native_rdma":
+            environment["SHARDSTREAM_BENCH_AWEX_RDMA"] = "1"
+            environment["AWEX_MOONCAKE_PROTOCOL"] = "rdma"
         if args.awex_nonbatch:
             environment["AWEX_USE_BATCH_SEND_RECV"] = "0"
         rollout_counts = rollout_host_counts(recipe.rollout["instances"], len(args.rollout_hosts))

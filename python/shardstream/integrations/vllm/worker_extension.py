@@ -20,6 +20,9 @@ _patch_shardstream_worker()
 
 if os.environ.get("SHARDSTREAM_BENCH_ENABLE_AWEX") == "1":
     # Spawned workers do not inherit the API server's Awex registration.
+    if os.environ.get("SHARDSTREAM_BENCH_AWEX_RDMA") == "1":
+        from shardstream.integrations.publication.awex_rdma import enable_rdma_audit
+        enable_rdma_audit()
     from awex.vllm_plugin import _patch_awex_worker
 
     _patch_awex_worker()
