@@ -17,6 +17,7 @@ from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from audit import analyze
 from cleanup import cleanup_shm
 from plan import IPS, matrix, matching_completions
+from protocol import NUM_UPDATES, WARMUP_UPDATES
 
 BASE=Path('/tmp/figure11-1025'); ROOT=BASE/'results'; SOURCE=BASE/'source'; STAGE=BASE/'stage'
 DEPS=f'/tmp/verl-nccl-1020-deps:/tmp/verl-nccl-1020-verl:{BASE}/awex:/tmp/comm-memory-1021-mooncake'
@@ -126,7 +127,7 @@ def main():
                 '--publication-bucket-mb','256','--model-weight-profile','--disable-prefix-caching',
                 '--extra-python-path',deps,'--extra-library-path',libraries,
                 '--runtime','/tmp/verl-nccl-1020-runtime','--nccl-lib','/tmp/verl-nccl-1020-nccl/nvidia/nccl/lib',
-                '--num-updates','35','--warmup-updates','5','--timeout',
+                '--num-updates',str(NUM_UPDATES),'--warmup-updates',str(WARMUP_UPDATES),'--timeout',
                 '28800' if row['backend']=='awex' else '3600',
                 '--nccl-buffer-bytes',str(row.get('nccl_buffer_bytes',4194304)),'--dp-source-policy','stream',
                 '--dp-source-ring-order','source-node','--replica-routing','logical']
@@ -137,7 +138,8 @@ def main():
                       '--transport-gin-fifo-depth','16','--transport-compact-fifo']
             if row.get('memory_profile'):cmd+=['--communication-memory-profile']
             case=dict(**row,label=label,attempt=attempt,revision=before[0]['prepared']['revision'],
-                      awex_revision=before[0]['prepared']['awex_revision'],command=cmd)
+                      awex_revision=before[0]['prepared']['awex_revision'],command=cmd,
+                      num_updates=NUM_UPDATES,warmup_updates=WARMUP_UPDATES)
             if row['mechanism']=='awex_native_nccl':case['awex_coordinated_close']=True
             if qualification_hash:case['astate_qualification_sha256']=qualification_hash
             if mooncake_qualification_hash:case['mooncake_qualification_sha256']=mooncake_qualification_hash
@@ -147,7 +149,7 @@ def main():
             env=dict(os.environ,PYTHONPATH=str(STAGE)+':'+deps,SHARDSTREAM_RECIPE_REPOSITORY=str(SOURCE))
             with (directory/'controller.log').open('w') as out:
                 child=subprocess.Popen(cmd,env=env,stdout=out,stderr=subprocess.STDOUT)
-                # Retain the full 35-update experiment for either native Awex
+                # Retain the complete requested experiment for either native Awex
                 # transport, including its initial setup.
                 try:code=child.wait(timeout=29100 if row['backend']=='awex' else 3900)
                 except subprocess.TimeoutExpired:

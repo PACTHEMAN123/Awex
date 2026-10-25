@@ -25,7 +25,7 @@ def main():
    if qualified:
     assert len(qualified)==1
     summary=json.loads(qualified[0].with_name('summary.json').read_text())
-    assert summary['backend']=='awex' and summary['verified_updates']==35 and summary['full_parameters_verified']
+    assert summary['backend']=='awex' and summary['verified_updates'] in (20,35) and summary['full_parameters_verified']
     continue
   save(dict(state='running',stage=stage,pid=os.getpid(),started=time.time()))
   print(json.dumps(dict(event='campaign-stage',stage=stage)),flush=True)

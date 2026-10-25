@@ -1,6 +1,7 @@
 """Reconstruct one accepted launch from raw evidence; standard library only."""
 import ast,hashlib,json,math,re,statistics,tarfile
 from pathlib import Path
+from protocol import launch_protocol
 HF_BYTES=61064245248
 
 def load(p):return json.loads(p.read_text())
@@ -19,7 +20,8 @@ def analyze(directory):
  assert outcome['training']==case.get('training',dict(tp=4,pp=1,cp=2,ep=8,etp=1,world_size=case['training_gpus']))
  for key in ['tp','dp','ep']:assert outcome['rollout'][key]==case[key]
  assert outcome['rollout']['instances']==case['replicas'] and outcome['rollout']['world_size']==case['rollout_gpus']
- assert outcome['num_updates']==35 and outcome['warmup_updates']==5 and outcome['publication_bucket_mb']==256
+ total,warmup=launch_protocol(case,outcome)
+ assert outcome['publication_bucket_mb']==256
  assert len(outcome['generation_before'])==len(outcome['generation_after'])==case['replicas']
  assert [r['message'] for r in outcome['generation_before']]==[r['message'] for r in outcome['generation_after']]
  env=outcome['transport_environment']
@@ -132,18 +134,18 @@ def analyze(directory):
   assert len(rdma_transports)==len(rdma_completions)==expected_count
   assert all(r['protocol']=='rdma' for r in rdma_transports+rdma_completions)
   assert all(r['handshake_max_length']=='67108864' and r['registration_policy']=='persistent_snapshots' for r in rdma_transports)
-  assert len(rdma_reuse)==35*expected_count
+  assert len(rdma_reuse)==total*expected_count
   for rank in range(expected_count):
    rows=sorted([r for r in rdma_reuse if r['rank']==rank],key=lambda r:r['sequence'])
-   assert len(rows)==35 and [r['sequence'] for r in rows]==list(range(1,36))
+   assert len(rows)==total and [r['sequence'] for r in rows]==list(range(1,total+1))
    assert len({(r['pid'],r['role'],r['register_calls'],r['registered_buffers'],r['registered_bytes']) for r in rows})==1
    assert all(r['registration_policy']=='persistent_snapshots' for r in rows)
 
   assert {r['sha256'] for r in rdma_transports}=={before[0]['prepared']['awex_transport_sha256']}
   assert sum(r['role']=='send' for r in rdma_completions)==case['training_gpus']
   assert sum(r['role']=='receive' for r in rdma_completions)==case['rollout_gpus']
- assert records is not None and len(records)==35
- assert [r['version'] for r in records]==list(range(-1,34))
+ assert records is not None and len(records)==total
+ assert [r['version'] for r in records]==list(range(-1,total-1))
  assert len(training_layout)==case['training_gpus']
  assert {r['rank'] for r in training_layout}==set(range(case['training_gpus']))
  pointers={};checks=0;network=[]
@@ -158,7 +160,7 @@ def analyze(directory):
     if case['backend']=='shardstream':
      metric=w['transfer_metrics'];assert metric['channel_limit']==64 and metric['registered_fifo_depth']==16
      assert metric['gin_connection_count']==4
-     if i>=5:assert metric['plan_cache_hit']
+     if i>=warmup:assert metric['plan_cache_hit']
      native_metrics.append(dict(version=r['version'],engine=engine,rank=rank,metrics=metric))
   if case['backend'] in ('nccl','nixl'):
    metric=r['backend_metrics'];assert metric['backend']==case['backend'] and metric['payload_bytes']==HF_BYTES
@@ -193,10 +195,10 @@ def analyze(directory):
     assert all(set(r['hca'].lstrip('=').split(','))==all_hcas for r in rows)
    engines.append(dict(engine=number,host=host,gpus=chosen,hcas=hcas))
  assert len(engines)==case['replicas']
- samples=[r['end_to_end_update_ms'] for r in records[5:]]
- assert len(samples)==30 and all(math.isfinite(v) and v>0 for v in samples)
+ samples=[r['end_to_end_update_ms'] for r in records[warmup:]]
+ assert len(samples)==total-warmup and all(math.isfinite(v) and v>0 for v in samples)
  result=dict(backend=case['backend'],mechanism=case['mechanism'],case_id=case['case_id'],series=case['series'],repeat=case['repeat'],revision=case['revision'],
-  verified_updates=35,measured_updates=30,worker_checks=checks,p50_ms=statistics.median(samples),p95_ms=sorted(samples)[28],
+  verified_updates=total,measured_updates=total-warmup,worker_checks=checks,p50_ms=statistics.median(samples),p95_ms=sorted(samples)[math.ceil(.95*len(samples))-1],
   cold_update_ms=records[0]['end_to_end_update_ms'],samples_ms=samples,training=outcome['training'],rollout=outcome['rollout'],
   training_hosts=case['training_hosts'],rollout_hosts=case['rollout_hosts'],active_rollout_hosts=len(case['rollout_hosts']),
   native_sha256=before[0]['prepared']['native_sha256'],generation_unchanged=True,full_parameters_verified=True,

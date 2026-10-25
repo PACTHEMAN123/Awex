@@ -12,6 +12,8 @@ SOURCE = BASE / 'source'
 AWEX = BASE / 'awex'
 STAGE = BASE / 'stage'
 RUNTIME = Path('/tmp/verl-nccl-1020-runtime')
+assert not subprocess.check_output(['nvidia-smi','--query-compute-apps=pid,used_memory',
+    '--format=csv,noheader'],text=True).strip(), 'Refuse source deployment while GPUs are active'
 for target, bundle, branch in [
     (SOURCE, BASE/'shardstream.bundle', 'codex/figure11-four-backends-20261025'),
     (AWEX, BASE/'awex.bundle', 'codex/awex-rdma-model-adapters-20261025'),

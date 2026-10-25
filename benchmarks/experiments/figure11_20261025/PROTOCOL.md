@@ -6,7 +6,7 @@ veRL NCCL, veRL NIXL, Awex Mooncake RDMA with persistent registration, and
 ShardStream. No optimizer loop.
 
 Each backend has 11 unique configurations and three independent launches per
-configuration. Each launch contains five warmups and 30 measured updates.
+configuration. Following the user’s 2026-10-26 change, each future launch contains 20 total updates: five warmups and 15 measured updates. Completed 35-update launches remain immutable; final Figure 11 comparisons use the same first 20 updates (15 measured) from each launch. All three independent launches per point remain required.
 The trainer-DP2 point reuses the identical intra-DP2 launch within this campaign;
 no historical measurements are substituted. Total: 132 launches, 4,620 verified
 updates, 3,960 measured samples and 68,880 rollout-worker parameter checks.

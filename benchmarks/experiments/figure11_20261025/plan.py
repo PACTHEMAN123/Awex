@@ -28,7 +28,7 @@ def matrix():
  priority={'inter-r1':0,'intra-dp8':1,'inter-r6':2}
  rows.sort(key=lambda r:(0 if r['repeat']==0 and r['case_id'] in priority else 1,priority.get(r['case_id'],9) if r['repeat']==0 else 9))
  assert len(rows)==132 and len({(r['case_id'],r['repeat'],r['backend']) for r in rows})==132
- assert sum(r['rollout_gpus']*35 for r in rows)==68880
+ assert sum(r['rollout_gpus'] for r in rows)==1968
  return rows
 
 
