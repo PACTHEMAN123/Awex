@@ -158,6 +158,10 @@ class NodeProcesses:
 
             env["AWEX_MOONCAKE_HOST"] = socket.gethostbyname(socket.gethostname())
             env["MC_GID_INDEX"] = "3"
+            # Full-model Awex registers thousands of native tensor slices.
+            # Their P2P MR metadata exceeds Mooncake's default 1 MiB limit.
+            # This changes the control-message limit, not a transfer buffer.
+            env["MC_HANDSHAKE_MAX_LENGTH"] = "67108864"
             env["AWEX_MOONCAKE_DEVICE"] = ",".join(port.split(":")[0] for port in ports)
         command = [str(self.runtime / "bin/python"), *arguments]
         if env.get("SHARDSTREAM_TIMELINE") == "1":

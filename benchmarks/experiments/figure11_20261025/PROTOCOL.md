@@ -22,13 +22,17 @@ updates, 3,960 measured samples and 68,880 rollout-worker parameter checks.
 veRL NCCL and NIXL use their native checkpoint engines, 256 MiB buckets and
 native loading. Awex uses official inclusionAI/Awex main commit
 `bae159256a768d54465ed693d90d925025032a17`, with `comm_backend=mooncake` and
-`AWEX_MOONCAKE_PROTOCOL=rdma`. Its native conversion, shard planner, writer and
-reader remain unchanged. Benchmark native-layout adapters are ported separately
+`AWEX_MOONCAKE_PROTOCOL=rdma`. Its native transport, shard planner, Mooncake writer
+and Mooncake reader remain unchanged. Benchmark native-layout adapters are ported separately
 in `f7ed45cc9b95fd62b7a78177da2dfaf2ee85cf75`, covering vLLM expert names,
 replicated GQA heads, MLA and MTP. An untouched-upstream full-model attempt
 failed strict metadata-key validation and is archived separately. Every transport must attest RDMA, source-file hash,
 GPU memory registration and successful native reads. TCP fallback is rejected.
 NCCL buffer is explicitly 4 MiB, its default; this is not a Mooncake RDMA knob.
+Mooncake `MC_HANDSHAKE_MAX_LENGTH=67108864` permits full-model memory-region
+metadata (the first model-scale RDMA attempt exceeded the native 1 MiB default
+with a 1,377,665-byte handshake). This controls metadata acceptance only; native
+Awex tensor staging, registration, transfer and acknowledgment remain unchanged.
 All new Awex experiments default to this RDMA path; historical Awex NCCL data
 retain their original provenance and are not relabelled. ShardStream uses stream source selection, source-node ring
 order, logical replica routing, compact FIFO, 64 channels, depth 16 and four

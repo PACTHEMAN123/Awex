@@ -29,6 +29,7 @@ def enable_rdma_audit():
             "pid": os.getpid(), "rank": self.rank, "protocol": self.protocol,
             "endpoint": self.endpoint, "module": str(source), "sha256": source_hash,
             "device": os.environ.get("AWEX_MOONCAKE_DEVICE", ""),
+            "handshake_max_length": os.environ.get("MC_HANDSHAKE_MAX_LENGTH", ""),
         }), flush=True)
 
     @functools.wraps(register)

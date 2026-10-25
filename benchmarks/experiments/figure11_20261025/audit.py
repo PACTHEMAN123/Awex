@@ -55,6 +55,7 @@ def analyze(directory):
   expected_count=case['training_gpus']+case['rollout_gpus']
   assert len(rdma_transports)==len(rdma_completions)==expected_count
   assert all(r['protocol']=='rdma' for r in rdma_transports+rdma_completions)
+  assert all(r['handshake_max_length']=='67108864' for r in rdma_transports)
   assert {r['sha256'] for r in rdma_transports}=={before[0]['prepared']['awex_transport_sha256']}
   assert sum(r['role']=='send' for r in rdma_completions)==case['training_gpus']
   assert sum(r['role']=='receive' for r in rdma_completions)==case['rollout_gpus']
