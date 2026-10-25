@@ -90,7 +90,8 @@ def main():
                 '--publication-bucket-mb','256','--model-weight-profile','--disable-prefix-caching',
                 '--extra-python-path',DEPS,'--extra-library-path','/tmp/verl-nccl-1020-deps/nvidia/cuda_runtime/lib',
                 '--runtime','/tmp/verl-nccl-1020-runtime','--nccl-lib','/tmp/verl-nccl-1020-nccl/nvidia/nccl/lib',
-                '--num-updates','35','--warmup-updates','5','--timeout','3600',
+                '--num-updates','35','--warmup-updates','5','--timeout',
+                '28800' if row['backend']=='awex' else '3600',
                 '--nccl-buffer-bytes','4194304','--dp-source-policy','stream',
                 '--dp-source-ring-order','source-node','--replica-routing','logical']
             if row['backend']=='shardstream':
@@ -107,7 +108,7 @@ def main():
                 child=subprocess.Popen(cmd,env=env,stdout=out,stderr=subprocess.STDOUT)
                 # Native Awex registers every planned tensor slice each update;
                 # permit the full 35-update experiment without changing samples.
-                try:code=child.wait(timeout=14400 if row['backend']=='awex' else 3900)
+                try:code=child.wait(timeout=29100 if row['backend']=='awex' else 3900)
                 except subprocess.TimeoutExpired:
                     child.terminate()
                     try:code=child.wait(timeout=180)
