@@ -157,6 +157,7 @@ class NodeProcesses:
             import socket
 
             env["AWEX_MOONCAKE_HOST"] = socket.gethostbyname(socket.gethostname())
+            env["MC_GID_INDEX"] = "3"
             env["AWEX_MOONCAKE_DEVICE"] = ",".join(port.split(":")[0] for port in ports)
         command = [str(self.runtime / "bin/python"), *arguments]
         if env.get("SHARDSTREAM_TIMELINE") == "1":
