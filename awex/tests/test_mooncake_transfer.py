@@ -91,9 +91,9 @@ class MemoryEngine:
         return 0
 
     def transfer_sync_read(self, endpoint, local, remote, size):
-        assert self.registered[local] == size
+        assert self.registered[local] >= size
         peer = next(e for e in self.instances if endpoint.endswith(f":{e.port}"))
-        assert peer.registered[remote] == size
+        assert peer.registered[remote] >= size
         if self.read_result:
             return self.read_result
         ctypes.memmove(local, remote, size)
@@ -132,11 +132,22 @@ def test_fanout_strided_views_repeated_step(transport):
     readers = [transport(i) for i in range(2)]
     ops = [_operation(i) for i in range(2)]
     plan = TransferPlan(operations={i: [op] for i, op in enumerate(ops)})
-    for version in range(2):
+    allocations = []
+    registered_addresses = None
+    for version in range(4):
         source = torch.arange(12, dtype=torch.float32).reshape(3, 4) + version * 100
+        allocations.append(source)
+        expected = source.clone()
         targets = [torch.full((4, 3), -1.0).T for _ in readers]
+        addresses = [t.data_ptr() for t in targets]
         with ThreadPoolExecutor(max_workers=3) as pool:
-            send = pool.submit(writer.send, {"weight": source}, plan, 42)
+            send = pool.submit(
+                writer.send,
+                {"weight": source},
+                plan,
+                42,
+                on_ready=lambda source=source: source.fill_(-777),
+            )
             receives = [
                 pool.submit(
                     reader.receive,
@@ -151,14 +162,24 @@ def test_fanout_strided_views_repeated_step(transport):
             for receive in receives:
                 receive.result(timeout=5)
             send.result(timeout=5)
-        for target in targets:
-            torch.testing.assert_close(target[:, 1:3], source[:, 1:3])
+        for target, address in zip(targets, addresses, strict=True):
+            assert target.data_ptr() == address
+            torch.testing.assert_close(target[:, 1:3], expected[:, 1:3])
             assert torch.all(target[:, [0, 3]] == -1)
-        assert not writer.buffers
+        assert writer.buffers
         assert not writer.meta_client.values
-        assert all(not e.registered for e in MemoryEngine.instances)
-    # Identical source slices for multiple inference engines are registered once.
-    assert writer.engine.registration_count == 2
+        current = [dict(e.registered) for e in MemoryEngine.instances]
+        if registered_addresses is None:
+            registered_addresses = current
+        assert current == registered_addresses
+    # New caller addresses and repeated step IDs do not cause registration.
+    assert len({t.data_ptr() for t in allocations}) == 4
+    assert all(e.registration_count == 1 for e in MemoryEngine.instances)
+    for instance in [writer, *readers]:
+        instance.close()
+        instance.close()
+        assert not instance.buffers
+    assert all(not e.registered for e in MemoryEngine.instances)
 
 
 @pytest.mark.parametrize("train_size,infer_size", [(1, 2), (2, 1)])
@@ -405,3 +426,88 @@ def test_native_tcp_loopback(monkeypatch):
         receive.result(timeout=20)
         send.result(timeout=20)
     torch.testing.assert_close(target[:, 1:3], source[:, 1:3])
+
+
+def test_next_send_cannot_overwrite_unacknowledged_snapshot(transport):
+    writer = transport(2)
+    plan = TransferPlan(operations={0: [_operation()]})
+    published = threading.Event()
+    source = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(
+            writer.send, {"weight": source}, plan, 0, on_ready=published.set
+        )
+        assert published.wait(timeout=1)
+        with pytest.raises(RuntimeError, match="already active"):
+            writer.send({"weight": torch.full_like(source, -777)}, plan, 1)
+        with pytest.raises(RuntimeError, match="active or failed"):
+            writer.close()
+        (snapshot,) = writer.buffers.values()
+        torch.testing.assert_close(snapshot, source[:, 1:3])
+        writer.meta_client.get_object("mooncake_0_0_2_0_buffers", timeout=1)
+        writer.meta_client.put_object("mooncake_0_0_2_0_done", "")
+        future.result(timeout=3)
+    writer.close()
+
+
+def test_changed_layout_is_rejected_before_snapshot_overwrite(transport):
+    writer = transport(2)
+    plan = TransferPlan(operations={0: [_operation()]})
+
+    def send_and_ack(source):
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(writer.send, {"weight": source}, plan, 0)
+            writer.meta_client.get_object("mooncake_0_0_2_0_buffers", timeout=1)
+            writer.meta_client.put_object("mooncake_0_0_2_0_done", "")
+            future.result(timeout=3)
+
+    send_and_ack(torch.ones(3, 4))
+    with pytest.raises(ValueError, match="layout changed"):
+        writer.send({"weight": torch.ones(3, 4, dtype=torch.float64)}, plan, 1)
+    assert not writer.buffers  # No descriptors were published for this attempt.
+    with pytest.raises(RuntimeError, match="restart the job"):
+        writer.send({}, TransferPlan(), 2)
+
+
+def test_failed_transport_cannot_free_exported_buffers(transport):
+    writer = transport(2)
+    writer.timeout = 0.01
+    with pytest.raises(TimeoutError):
+        writer.send(
+            {"weight": torch.ones(3, 4)},
+            TransferPlan(operations={0: [_operation()]}),
+            0,
+        )
+    before = dict(writer.engine.registered)
+    with pytest.raises(RuntimeError, match="active or failed"):
+        writer.close()
+    assert writer.engine.registered == before
+
+
+def test_receiver_staging_reuses_larger_registered_capacity(transport):
+    writer, reader = transport(2), transport(0)
+    big = _operation()
+    small = _operation()
+    small.send_shard_meta = SimpleNamespace(name="small")
+    small.recv_shard_meta = SimpleNamespace(name="small")
+    small.train_slices = small.inf_slices = (slice(0, 1), slice(1, 3))
+    small.overlap_shape = (1, 2)
+    writer_plan = TransferPlan(operations={0: [big, small]})
+    reader_plan = TransferPlan(operations={2: [big, small]})
+    for version in range(3):
+        source = {
+            name: torch.full((3, 4), float(version)) for name in ["weight", "small"]
+        }
+        target = {name: torch.full((3, 4), -1.0) for name in source}
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            send = pool.submit(writer.send, source, writer_plan, version)
+            receive = pool.submit(reader.receive, target, reader_plan, version)
+            receive.result(timeout=3)
+            send.result(timeout=3)
+        assert torch.all(target["weight"][:, 1:3] == version)
+        assert torch.all(target["small"][0, 1:3] == version)
+        assert torch.all(target["small"][1:] == -1)
+    assert writer.engine.registration_count == 2
+    assert reader.engine.registration_count == 1
+    writer.close()
+    reader.close()

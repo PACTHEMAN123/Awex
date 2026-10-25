@@ -127,10 +127,13 @@ memory. Protocol and step order must agree on every participating worker.
   <img width="85%" alt="RDMA transport" src="images/rmda_transport.png"><br>
 </div>
 
-The sender owns registered snapshots until every reader has acknowledged them.
-Colocated updates retain these snapshots on CPU while training weights are
-offloaded, so the engine must implement memory release/resume hooks. The receiver
-stages one slice at a time to support strided target views.
+The sender retains registered snapshots across updates and overwrites them only
+after every reader has acknowledged the preceding publication. Caller allocations
+may change without re-registering snapshots. Colocated updates retain snapshots
+on CPU while training weights are offloaded, so the engine must implement memory
+release/resume hooks. The receiver reuses staging per dtype/device, growing to the
+largest slice, to support strided target views. An idle successful transport can
+release its buffers with `close()`; active or failed transports must retain them.
 
 Topology and transfer plans are fixed for an initialized job. Changing inference
 rank counts requires reinitialization; dynamic scaling is not implemented by this

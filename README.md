@@ -132,12 +132,17 @@ TCP stages through CPU memory. With `enable_colocate_mode=True`, training snapsh
 also use CPU memory so training weights can be offloaded before inference resumes.
 The existing engine offload/resume hooks must be implemented for colocated use.
 
-Training keeps a contiguous snapshot of each distinct outgoing slice until all
-its readers acknowledge completion. Allow memory for these snapshots (on CPU for
-TCP or colocated updates, otherwise on the source device), in addition to converted
-weights. Inference stages one slice at a time and copies it into the target view,
-including non-contiguous layouts. All participating ranks must execute updates in
-the same order with matching step IDs.
+Training retains a contiguous, registered snapshot of each distinct outgoing
+slice across updates. It overwrites a snapshot only after every reader has
+acknowledged the preceding publication. Replaced converter/model allocations do
+not require re-registering these snapshots. Allow memory for them (on CPU for TCP
+or colocated updates, otherwise on the source device), in addition to converted
+weights. Inference retains one staging allocation per dtype/device, grows it to
+the largest received slice, and copies into target views, including strided ones.
+The publication layout, dtype and device must stay fixed. All participating ranks
+must execute updates in the same order with matching step IDs. Concurrent calls
+on one transport are rejected. Call `transport.close()` after all exchanges have
+completed to release registrations; active or failed transports cannot close.
 
 A failed exchange aborts further updates. Published buffers remain registered on
 timeouts or transfer errors because remote access may still be in flight; restart

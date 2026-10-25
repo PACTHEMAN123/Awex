@@ -18,6 +18,7 @@
 """Mooncake data transfers, with AWEX metadata used only for rendezvous."""
 
 import os
+import threading
 from collections.abc import Callable
 
 import torch
@@ -47,6 +48,8 @@ class MooncakeTransport:
     not prove that remote DMA has stopped: retain registered buffers on failure
     and reject subsequent exchanges instead of allowing their storage to be reused.
     """
+
+    registration_policy = "persistent_snapshots"
 
     def __init__(self, meta_client: MetaServerClient, rank: int, timeout: float):
         try:
@@ -78,6 +81,12 @@ class MooncakeTransport:
         self.sequence = 0
         self.failed = False
         self.buffers = {}
+        self._snapshots = {}
+        self._staging = {}
+        self._state_lock = threading.Lock()
+        self._active = False
+        self._closed = False
+        self._send_layout = None
 
     @staticmethod
     def _check(result, operation):
@@ -85,13 +94,38 @@ class MooncakeTransport:
             raise RuntimeError(f"Mooncake {operation} failed with code {result}")
 
     def _begin(self, step_id):
-        if self.failed or self.buffers:
-            raise RuntimeError("Previous Mooncake exchange failed; restart the job")
-        # Include an invocation counter so repeated updates at the same training
-        # step cannot consume a previous exchange's descriptors or acknowledgments.
-        key = f"mooncake_{step_id}_{self.sequence}"
-        self.sequence += 1
-        return key
+        with self._state_lock:
+            if self.failed or self._closed:
+                raise RuntimeError(
+                    "Previous Mooncake exchange failed or closed; restart the job"
+                )
+            if self._active:
+                raise RuntimeError("A Mooncake exchange is already active")
+            self._active = True
+            # An invocation counter prevents stale descriptors/acknowledgments
+            # when multiple publications use the same training step.
+            key = f"mooncake_{step_id}_{self.sequence}"
+            self.sequence += 1
+            return key
+
+    def _end(self, *, failed=False):
+        with self._state_lock:
+            self.failed = self.failed or failed
+            self._active = False
+
+    def close(self):
+        """Release idle registrations; a failed publication requires job teardown.
+
+        A timeout cannot establish that peer DMA has stopped. Failed or active
+        transports therefore retain their allocations instead of recycling them.
+        """
+        with self._state_lock:
+            if self.failed or self._active:
+                raise RuntimeError("Cannot close an active or failed Mooncake exchange")
+            self._closed = True
+            self._release()
+            self._snapshots.clear()
+            self._staging.clear()
 
     def _register(self, tensor):
         address = tensor.data_ptr()
@@ -122,6 +156,28 @@ class MooncakeTransport:
         try:
             descriptors = {}
             slices = {}
+            layout = []
+            for peer, operations in sorted(plan.operations.items()):
+                for op in operations:
+                    source = slice_tensor(parameters[op.send_shard_meta.name], op, True)
+                    device = (
+                        torch.device("cpu")
+                        if offload or self.protocol == "tcp"
+                        else source.device
+                    )
+                    layout.append(
+                        (
+                            peer,
+                            _op_signature(op),
+                            tuple(source.shape),
+                            source.dtype,
+                            device,
+                        )
+                    )
+            layout = tuple(layout)
+            if self._send_layout is not None and layout != self._send_layout:
+                raise ValueError("Mooncake publication layout changed; restart the job")
+            self._send_layout = layout
             for peer, operations in sorted(plan.operations.items()):
                 entries = []
                 for op in operations:
@@ -138,15 +194,20 @@ class MooncakeTransport:
                             if offload or self.protocol == "tcp"
                             else source.device
                         )
-                        # Own the exact allocation registered with Mooncake. Views
-                        # can overlap, and colocated model weights are offloaded
-                        # before inference resumes its allocations.
-                        tensor = source.to(device=target_device, copy=True).contiguous()
+                        tensor = self._snapshots.get(cache_key)
+                        if tensor is None:
+                            # Own a stable, compact snapshot independently of
+                            # converter/model allocations, which may be replaced.
+                            tensor = torch.empty(
+                                source.shape, dtype=source.dtype, device=target_device
+                            )
+                            self._register(tensor)
+                            self._snapshots[cache_key] = tensor
+                        tensor.copy_(source)
                         del source
-                        address, size = self._register(tensor)
                         slices[cache_key] = (
-                            address,
-                            size,
+                            tensor.data_ptr(),
+                            tensor.numel() * tensor.element_size(),
                             tuple(tensor.shape),
                             str(tensor.dtype),
                         )
@@ -169,16 +230,20 @@ class MooncakeTransport:
                 error = self.meta_client.get_object(f"{key}_done", timeout=self.timeout)
                 if error:
                     raise RuntimeError(f"Mooncake reader {peer} failed: {error}")
-            self._release()
+            # Every peer has completed its read. Keep registered snapshots for
+            # the next publication; only now is overwriting them safe.
             for peer in descriptors:
                 key = f"{prefix}_{self.rank}_{peer}"
                 self.meta_client.delete_if_exists(f"{key}_buffers")
                 self.meta_client.delete_if_exists(f"{key}_done")
         except Exception:
-            self.failed = True
+            self._end(failed=True)
             if not published:
                 self._release()
+                self._snapshots.clear()
             raise
+        else:
+            self._end()
 
     @torch.no_grad()
     def receive(
@@ -212,12 +277,32 @@ class MooncakeTransport:
                             continue
                         # Staging supports strided slices and transposed converter
                         # views; TCP uses host buffers on both sides.
-                        buffer = torch.empty(
-                            shape,
-                            dtype=target.dtype,
-                            device="cpu" if self.protocol == "tcp" else target.device,
+                        device = (
+                            torch.device("cpu")
+                            if self.protocol == "tcp"
+                            else target.device
                         )
-                        local_address, _ = self._register(buffer)
+                        cache_key = (target.dtype, device)
+                        storage = self._staging.get(cache_key)
+                        count = target.numel()
+                        if storage is None or storage.numel() < count:
+                            # The preceding synchronous read and target copy
+                            # have finished, so an undersized buffer can retire.
+                            if storage is not None:
+                                old_address = storage.data_ptr()
+                                self._check(
+                                    self.engine.unregister_memory(old_address),
+                                    "unregister_memory",
+                                )
+                                del self.buffers[old_address]
+                                del self._staging[cache_key]
+                            storage = torch.empty(
+                                count, dtype=target.dtype, device=device
+                            )
+                            self._register(storage)
+                            self._staging[cache_key] = storage
+                        buffer = storage[:count].view(shape)
+                        local_address = buffer.data_ptr()
                         device_util.synchronize()
                         self._check(
                             self.engine.transfer_sync_read(
@@ -226,14 +311,14 @@ class MooncakeTransport:
                             "transfer_sync_read",
                         )
                         target.copy_(buffer)
-                        # The copy must finish before unregistering or reusing the
-                        # staging allocation, including CUDA's asynchronous copies.
+                        # Finish the copy before reusing persistent staging.
                         device_util.synchronize()
-                        self._release()
                     self.meta_client.put_object(f"{key}_done", "")
                 except Exception as exc:
                     self.meta_client.put_object(f"{key}_done", str(exc))
                     raise
         except Exception:
-            self.failed = True
+            self._end(failed=True)
             raise
+        else:
+            self._end()
