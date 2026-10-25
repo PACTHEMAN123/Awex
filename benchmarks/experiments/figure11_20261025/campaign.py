@@ -19,6 +19,11 @@ def main():
  for stage,args in stages:
   save(dict(state='running',stage=stage,pid=os.getpid(),started=time.time()))
   print(json.dumps(dict(event='campaign-stage',stage=stage)),flush=True)
+  if stage=='other-paper-awex':
+   code=subprocess.call([sys.executable,'-u',str(SCRIPT.with_name('verify_other_assets.py'))])
+   if code:
+    save(dict(state='needs-investigation',stage='other-model-checksums',exit_code=code,finished=time.time()))
+    raise SystemExit(code)
   code=subprocess.call([sys.executable,'-u',str(SCRIPT),*args])
   if code:
    save(dict(state='needs-investigation',stage=stage,exit_code=code,finished=time.time()))
