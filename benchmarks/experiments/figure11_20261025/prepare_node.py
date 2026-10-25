@@ -47,7 +47,8 @@ subprocess.run(['git','-C',str(AWEX),'merge-base','--is-ancestor',
 subprocess.run(['git','-C',str(AWEX),'diff','--exit-code',
                 'bae159256a768d54465ed693d90d925025032a17','HEAD','--',
                 'awex/transfer','awex/writer/mooncake_writer.py',
-                'awex/reader/mooncake_reader.py'],check=True)
+                'awex/reader/mooncake_reader.py','awex/writer/astate_writer.py',
+                'awex/reader/astate_reader.py'],check=True)
 env = dict(os.environ,
     PYTHONPATH=f'{STAGE}:/tmp/verl-nccl-1020-deps:/tmp/verl-nccl-1020-verl:{AWEX}:/tmp/comm-memory-1021-mooncake',
     LD_LIBRARY_PATH='/tmp/verl-nccl-1020-nccl/nvidia/nccl/lib:/usr/local/cuda/lib64:/tmp/verl-nccl-1020-deps/nvidia/cuda_runtime/lib:'+str(RUNTIME/'lib/python3.12/site-packages/torch/lib'))
@@ -65,5 +66,15 @@ row = dict(hostname=socket.gethostname(), revision=revision, awex_revision=awex_
            imports=imports,
            gpu_processes=subprocess.check_output(['nvidia-smi','--query-compute-apps=pid,used_memory','--format=csv,noheader'],text=True))
 assert not row['gpu_processes'].strip(), row['gpu_processes']
+artifact = BASE/'astate-artifact.json'
+if artifact.exists():
+    manifest=json.loads(artifact.read_text())
+    for name, checksum in manifest['files'].items():
+        assert hashlib.sha256((BASE/'astate-runtime'/name).read_bytes()).hexdigest()==checksum
+    astate_env=dict(env, PYTHONPATH=manifest['pythonpath'], LD_LIBRARY_PATH=manifest['ld_library_path'])
+    row['astate_imports']=subprocess.check_output([str(RUNTIME/'bin/python'),'-c',
+        'import torch,astate,astate._core.astate_cpp as n; print(torch.__version__,astate.__version__,n.__file__)'],
+        env=astate_env,text=True)
+    row['astate']={key:manifest[key] for key in ['source_revision','transport','extension_sha256','utrans_sha256']}
 (BASE/'prepared.json').write_text(json.dumps(row,indent=2)+'\n')
 print(json.dumps(row),flush=True)

@@ -35,7 +35,7 @@ def analyze(directory):
  assert all(not r['gpu_processes'].strip() for r in before+after)
  assert {r['prepared']['revision'] for r in before}=={case['revision']}
  assert len({r['prepared']['native_sha256'] for r in before})==1
- records=None;affinity={};training_layout=[];native_metrics=[];archives=[];rdma_transports=[];rdma_completions=[]
+ records=None;affinity={};training_layout=[];native_metrics=[];archives=[];rdma_transports=[];rdma_completions=[];astate_transports=[];astate_completions=[]
  for item in load(directory/'manifest.json'):
   path=directory/item['file'];assert path.stat().st_size==item['bytes'] and hashlib.sha256(path.read_bytes()).hexdigest()==item['sha256']
   archives.append(dict(file=str(path),sha256=item['sha256']))
@@ -48,10 +48,31 @@ def analyze(directory):
      training_layout.extend(json_events(text,'SHARDSTREAM_TRAIN_LAYOUT '))
      rdma_transports.extend(json_events(text,'AWEX_RDMA_TRANSPORT '))
      rdma_completions.extend(json_events(text,'AWEX_RDMA_COMPLETE '))
+     astate_transports.extend(json_events(text,'AWEX_ASTATE_TRANSPORT '))
+     astate_completions.extend(json_events(text,'AWEX_ASTATE_COMPLETE '))
      if member.name.startswith('rollout-'):
       rows=json_events(text,'SHARDSTREAM_RANK_AFFINITY ')
       if rows:affinity[member.name]=(item['ip'],rows)
- if case['backend']=='awex':
+ if case['mechanism']=='awex_native_astate':
+  assert not rdma_transports and not rdma_completions, 'mixed Awex transports'
+  artifacts=[r['prepared']['astate'] for r in before]
+  assert len({r['extension_sha256'] for r in artifacts})==1
+  assert len({r['utrans_sha256'] for r in artifacts})==1
+  assert len({r['source_revision'] for r in artifacts})==1
+  expected_count=case['training_gpus']+case['rollout_gpus']
+  assert len(astate_transports)==len(astate_completions)==expected_count
+  assert all(r['protocol']=='rdma' for r in astate_transports+astate_completions)
+  assert all(r['staging']=='cpu_pinned' and r['discovery']=='HTTP' and r['max_rdma_devices']=='2' for r in astate_transports)
+  assert {r['sha256'] for r in astate_transports}=={artifacts[0]['extension_sha256']}
+  assert {r['utrans_sha256'] for r in astate_transports}=={artifacts[0]['utrans_sha256']}
+  assert {r['source_revision'] for r in astate_transports}=={artifacts[0]['source_revision']}
+  for rows in [astate_transports,astate_completions]:
+   assert sum(r['role']=='send' for r in rows)==case['training_gpus']
+   assert sum(r['role']=='receive' for r in rows)==case['rollout_gpus']
+   assert {r['rank'] for r in rows}==set(range(expected_count))
+ elif case['backend']=='awex':
+  assert case['mechanism']=='awex_native_rdma'
+  assert not astate_transports and not astate_completions, 'mixed Awex transports'
   assert all(r['prepared']['mooncake_version']=='0.3.13.post1' for r in before)
   assert len({r['prepared']['mooncake_sha256'] for r in before})==1
   expected_count=case['training_gpus']+case['rollout_gpus']
@@ -114,12 +135,14 @@ def analyze(directory):
  assert len(engines)==case['replicas']
  samples=[r['end_to_end_update_ms'] for r in records[5:]]
  assert len(samples)==30 and all(math.isfinite(v) and v>0 for v in samples)
- result=dict(backend=case['backend'],case_id=case['case_id'],series=case['series'],repeat=case['repeat'],revision=case['revision'],
+ result=dict(backend=case['backend'],mechanism=case['mechanism'],case_id=case['case_id'],series=case['series'],repeat=case['repeat'],revision=case['revision'],
   verified_updates=35,measured_updates=30,worker_checks=checks,p50_ms=statistics.median(samples),p95_ms=sorted(samples)[28],
   cold_update_ms=records[0]['end_to_end_update_ms'],samples_ms=samples,training=outcome['training'],rollout=outcome['rollout'],
   training_hosts=case['training_hosts'],rollout_hosts=case['rollout_hosts'],active_rollout_hosts=len(case['rollout_hosts']),
   native_sha256=before[0]['prepared']['native_sha256'],generation_unchanged=True,full_parameters_verified=True,
   engine_placement=engines,archive_provenance=archives)
+ if case['mechanism']=='awex_native_astate':
+  result['astate_artifact']=artifacts[0]
  if case.get('memory_profile'):
   assert outcome['communication_memory_baseline']
   memory=[]
@@ -128,6 +151,8 @@ def analyze(directory):
     for rank,w in enumerate(workers):
      m=w['communication_memory'];assert m['sample_count']>0
      assert m['sampled_device_peak_bytes']>=m['sampled_device_before_bytes']
+     if case['mechanism']=='awex_native_astate':
+      assert m['sampled_host_rss_peak_bytes']>=m['sampled_host_rss_before_bytes']
      memory.append(dict(version=r['version'],engine=engine,rank=rank,**m))
   result['communication_memory']=memory
  return result,network,native_metrics,records
