@@ -44,7 +44,8 @@ def collect(run_dir):
     return dict(ip=ray.util.get_node_ip_address(),data=stream.getvalue())
 
 def node_calls(task,ips,*args):
-    ray.init(address=IPS[0]+':6381',logging_level='ERROR')
+    ray.init(address=IPS[0]+':6381',logging_level='ERROR',
+             runtime_env={'env_vars':{'PYTHONPATH':str(STAGE)+':'+DEPS+':'+str(SOURCE/'benchmarks/experiments/figure11_20261025')}})
     try:
         nodes={n['NodeManagerAddress']:n['NodeID'] for n in ray.nodes() if n['Alive']}
         assert all(ip in nodes for ip in ips),nodes
