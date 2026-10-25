@@ -92,6 +92,9 @@ def main():
                     assert q['code']==0 and not q['timed_out'] and not q['gpu_processes_after'] and q['closed']
                     assert [e['version'] for e in q['events']]==list(range(-1,3))
                     assert all(e['verified'] and e['register_calls']==2 for e in q['events'])
+                    assert len(q['before'])==len(q['after'])==4 and set(q['before'])==set(q['after'])
+                    assert any(q['after'][n][k]>q['before'][n][k] for n in q['before'] for k in ['tx_bytes','rx_bytes'])
+                    assert len({tuple(e['registered_addresses']) for e in q['events']})==1
                     assert all(q['artifact']['awex_transport_sha256']==r['prepared']['awex_transport_sha256']
                                and q['artifact']['awex_revision']==r['prepared']['awex_revision'] for r in before)
                 (directory/'mooncake-qualification.json').write_bytes(qualification)
