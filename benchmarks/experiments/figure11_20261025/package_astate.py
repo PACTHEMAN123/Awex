@@ -24,6 +24,7 @@ def main():
     patch = BASE / "source/benchmarks/experiments/figure11_20261025/patches/astate-explicit-rdma-devices.patch"
     actual = subprocess.check_output(["git", "-C", str(SOURCE), "diff", "--binary", "HEAD"])
     assert actual == patch.read_bytes(), "AState source must match the reviewed device configuration patch"
+    native_ucx = "USE_ASTATE_RDMA_IMPL:BOOL=ON" in (SOURCE / "build/CMakeCache.txt").read_text()
     assert not TARGET.exists(), "do not replace an existing pinned artifact"
     TARGET.mkdir()
     shutil.copytree(SOURCE / "python/astate", TARGET / "python/astate",
@@ -51,13 +52,17 @@ def main():
         shutil.copy2(filename, library_dir / name, follow_symlinks=True)
     utrans = library_dir / "libutrans.so"
     # Some linkers record the versioned SONAME instead of the unversioned name.
-    if not utrans.exists():
+    if not native_ucx and not utrans.exists():
         candidate, = library_dir.glob("libutrans.so*")
         utrans.symlink_to(candidate.name)
-    manifest = dict(source_revision=REVISION, transport="default-libutrans-rdma",
+    manifest = dict(source_revision=REVISION,
+                    transport="native-ucx-rdma" if native_ucx else "default-libutrans-rdma",
                     source_patch_sha256=digest(patch),
                     extension=str(extension), extension_sha256=digest(extension),
-                    utrans_library=str(utrans), utrans_sha256=digest(utrans),
+                    utrans_library=None if native_ucx else str(utrans),
+                    utrans_sha256=None if native_ucx else digest(utrans),
+                    ucx_static_sha256={name: digest(SOURCE / "install/lib" / name)
+                                       for name in ["libucp.a", "libuct.a", "libucs.a", "libucm.a"]} if native_ucx else {},
                     ld_library_path=":".join([str(library_dir), *inherited]),
                     pythonpath=str(TARGET / "python"),
                     ldd=dependencies,

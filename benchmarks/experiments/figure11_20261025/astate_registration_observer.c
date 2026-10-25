@@ -20,6 +20,11 @@ static void *resolve(const char *name) {
         if (library) symbol = dlsym(library, name);
     }
     if (!symbol) {
+        const char *extension = getenv("SHARDSTREAM_ASTATE_COUNTER_EXTENSION");
+        void *library = extension ? dlopen(extension, RTLD_LAZY | RTLD_NOLOAD) : NULL;
+        if (library) symbol = dlsym(library, name);
+    }
+    if (!symbol) {
         fprintf(stderr, "AState observer cannot resolve %s: %s\n", name, dlerror());
         abort();
     }

@@ -20,6 +20,10 @@ def configure_astate_devices():
     chosen = sorted(range(len(endpoints)), key=lambda i: (local[i], endpoints[i].pci_path, endpoints[i].name))[:maximum]
     names = [endpoints[i].name for i in chosen]
     os.environ["TRANSFER_ENGINE_RDMA_DEVICES"] = ",".join(names)
+    os.environ.update(UCX_TLS="rc,self", UCX_IB_GID_INDEX="3",
+                      UCX_NET_DEVICES=",".join(f"{endpoints[i].name}:{endpoints[i].port}" for i in chosen),
+                      UCX_MAX_RMA_RAILS=str(maximum), UCX_MAX_RNDV_RAILS=str(maximum),
+                      UCX_MAX_EAGER_RAILS=str(maximum))
     return names
 
 
@@ -56,14 +60,17 @@ def enable_astate_audit():
                 binary_hash = hashlib.sha256(binary.read_bytes()).hexdigest()
                 if binary_hash != manifest["extension_sha256"]:
                     raise RuntimeError("AState extension differs from the qualified artifact")
-                library = Path(manifest["utrans_library"])
-                if hashlib.sha256(library.read_bytes()).hexdigest() != manifest["utrans_sha256"]:
-                    raise RuntimeError("AState libutrans differs from the qualified artifact")
+                if manifest["utrans_library"]:
+                    library = Path(manifest["utrans_library"])
+                    if hashlib.sha256(library.read_bytes()).hexdigest() != manifest["utrans_sha256"]:
+                        raise RuntimeError("AState libutrans differs from the qualified artifact")
                 print("AWEX_ASTATE_TRANSPORT " + json.dumps(dict(
                     pid=os.getpid(), rank=self.transfer_rank, role=role, protocol="rdma",
                     module=str(binary), sha256=binary_hash,
                     source_revision=manifest["source_revision"],
                     source_patch_sha256=manifest["source_patch_sha256"], rdma_devices=devices,
+                    transport_implementation=manifest["transport"],
+                    ucx_tls=os.environ["UCX_TLS"], ucx_gid_index=os.environ["UCX_IB_GID_INDEX"],
                     utrans_sha256=manifest["utrans_sha256"], staging="cpu_pinned",
                     max_rdma_devices=os.environ.get("TRANSFER_ENGINE_MAX_RDMA_DEVICES", "2"),
                     discovery="HTTP")), flush=True)

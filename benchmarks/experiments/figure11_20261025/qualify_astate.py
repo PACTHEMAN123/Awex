@@ -43,7 +43,8 @@ def run_probe(role, peer):
     subprocess.run(["gcc", "-shared", "-fPIC", "-O2", "-std=c11",
                     str(DIRECTORY / "astate_registration_observer.c"), "-ldl", "-o", str(observer)], check=True)
     env = dict(os.environ, PYTHONPATH=str(BASE / "stage") + ":" + manifest["pythonpath"],
-               LD_LIBRARY_PATH=manifest["ld_library_path"], LD_PRELOAD=str(observer))
+               LD_LIBRARY_PATH=manifest["ld_library_path"], LD_PRELOAD=str(observer),
+               SHARDSTREAM_ASTATE_COUNTER_EXTENSION=manifest["extension"])
     env.pop("UTRANS_DISABLE_RDMA", None)
     before = network()
     command = ["/tmp/verl-nccl-1020-runtime/bin/python", "-u", str(DIRECTORY / "astate_probe.py"),

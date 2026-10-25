@@ -69,7 +69,9 @@ def test_astate_selects_active_devices_for_the_current_gpu(monkeypatch):
 
     monkeypatch.delenv("TRANSFER_ENGINE_MAX_RDMA_DEVICES", raising=False)
     monkeypatch.setenv("TRANSFER_ENGINE_RDMA_DEVICES", "previous")
-    endpoints = [SimpleNamespace(name=name, pci_path=str(i))
+    for key in ["UCX_TLS", "UCX_IB_GID_INDEX", "UCX_NET_DEVICES", "UCX_MAX_RMA_RAILS", "UCX_MAX_RNDV_RAILS", "UCX_MAX_EAGER_RAILS"]:
+        monkeypatch.setenv(key, "previous")
+    endpoints = [SimpleNamespace(name=name, pci_path=str(i), port=1)
                  for i, name in enumerate(["mlx5_5", "mlx5_15", "mlx5_20", "mlx5_28"])]
     monkeypatch.setattr(topology, "_active_rdma_endpoints", lambda: endpoints)
     monkeypatch.setattr(topology, "_gpu_hca_topology", lambda endpoints, count:
@@ -78,6 +80,8 @@ def test_astate_selects_active_devices_for_the_current_gpu(monkeypatch):
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 1)
     assert configure_astate_devices() == ["mlx5_28", "mlx5_20"]
     assert os.environ["TRANSFER_ENGINE_RDMA_DEVICES"] == "mlx5_28,mlx5_20"
+    assert os.environ["UCX_NET_DEVICES"] == "mlx5_28:1,mlx5_20:1"
+    assert os.environ["UCX_TLS"] == "rc,self" and os.environ["UCX_IB_GID_INDEX"] == "3"
 
 
 def test_astate_refuses_unresolved_gpu_topology(monkeypatch):
