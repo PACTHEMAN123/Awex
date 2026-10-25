@@ -1,4 +1,4 @@
-"""Run qualified Fig 11 first, then remaining Awex RDMA paper points."""
+"""Run qualified Fig 11 first, then remaining Awex NCCL paper points."""
 import json
 import os
 from pathlib import Path
@@ -8,6 +8,8 @@ import time
 
 BASE=Path('/tmp/figure11-1025')
 SCRIPT=Path(__file__).with_name('run_matrix.py')
+from plan import matrix, matching_completions
+from other_awex_plan import matrix as other_matrix
 
 def save(value):
  p=BASE/'campaign-state.json';tmp=p.with_suffix('.partial')
@@ -18,7 +20,8 @@ def main():
          ('figure11',[]),('other-paper-awex',['--suite','paper-awex'])]
  for stage,args in stages:
   if stage=='full-model-qualification':
-   qualified=list((BASE/'results').glob('inter-r1-awex-r0-attempt*/complete.json'))
+   row=next(r for r in matrix() if r['case_id']=='inter-r1' and r['backend']=='awex' and r['repeat']==0)
+   qualified=matching_completions(BASE/'results',row)
    if qualified:
     assert len(qualified)==1
     summary=json.loads(qualified[0].with_name('summary.json').read_text())
@@ -37,8 +40,8 @@ def main():
    raise SystemExit(code)
   root=BASE/('other-results' if stage=='other-paper-awex' else 'results')
   state=json.loads((root/'active.json').read_text())
-  required=1 if stage=='full-model-qualification' else (132 if stage=='figure11' else 24)
+  required=1 if stage=='full-model-qualification' else (132 if stage=='figure11' else len(other_matrix()))
   assert state['passed']==required,state
- save(dict(state='complete',figure11_launches=132,other_awex_launches=24,finished=time.time()))
+ save(dict(state='complete',figure11_launches=132,other_awex_launches=len(other_matrix()),finished=time.time()))
 
 if __name__=='__main__':main()

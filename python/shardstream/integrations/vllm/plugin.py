@@ -644,11 +644,11 @@ def register_shardstream_plugin() -> None:
                 raise ValueError("Unsupported model profile command")
             from shardstream.profiling.model import model_profile_task
 
-            adapter = getattr(raw_request.app.state, "shardstream_adapter", None)
-            if adapter is None:
-                adapter = getattr(raw_request.app.state, "awex_adapter", None)
-            if adapter is None:
-                adapter = _get_publication_adapter(raw_request)
+            # Profiling must collect every DP core, independently of the
+            # publication backend's update RPC return-value convention.
+            adapter = PublicationVLLMServerAdapter(
+                raw_request.app.state.engine_client, asyncio.get_running_loop(), 120
+            )
             results = await asyncio.to_thread(
                 adapter.execute_task_in_model_worker,
                 model_profile_task,

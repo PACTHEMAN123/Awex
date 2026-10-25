@@ -1,4 +1,4 @@
-"""Fresh native RDMA points in current paper Figures 9, 10 and 13."""
+"""Fresh native NCCL points in current paper Figures 9, 10 and 13."""
 from plan import IPS
 
 # Explicit axes from the frozen paper configurations. B is shared by Figs 9/10.
@@ -15,8 +15,12 @@ CASES=[
 
 def matrix():
  rows=[]
- for config,recipe,model,layout,replicas,hosts,train,infer in CASES:
-  memory=config=='memory-default';train_hosts=IPS[:1] if memory else IPS[:2]
+ expanded=[(c,4194304) for c in CASES if c[0]!='memory-default']
+ memory=next(c for c in CASES if c[0]=='memory-default')
+ for label,size in [('256k',262144),('1m',1048576),('4m',4194304),('16m',16777216),('32m',33554432),('64m',67108864)]:
+  expanded.append(((f'memory-{label}',*memory[1:]),size))
+ for (config,recipe,model,layout,replicas,hosts,train,infer),buffer_bytes in expanded:
+  memory=config.startswith('memory-');train_hosts=IPS[:1] if memory else IPS[:2]
   rollout_hosts=IPS[2:2+hosts]
   training=dict(zip(['tp','pp','cp','ep','etp'],train),world_size=8*len(train_hosts))
   for repeat in range(3):
@@ -25,6 +29,6 @@ def matrix():
     layout=layout,training_hosts=train_hosts,rollout_hosts=rollout_hosts,training=training,
     training_gpus=training['world_size'],rollout_gpus=replicas*infer[0]*infer[1],
     replicas=replicas,tp=infer[0],dp=infer[1],ep=infer[2],repeat=repeat,
-    backend='awex',mechanism='awex_native_rdma',memory_profile=memory))
- assert len(rows)==24 and len({(r['case_id'],r['repeat']) for r in rows})==24
+    backend='awex',mechanism='awex_native_nccl',memory_profile=memory,nccl_buffer_bytes=buffer_bytes))
+ assert len(rows)==39 and len({(r['case_id'],r['repeat']) for r in rows})==39
  return rows

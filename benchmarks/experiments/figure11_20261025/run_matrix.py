@@ -16,7 +16,7 @@ import ray
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from audit import analyze
 from cleanup import cleanup_shm
-from plan import IPS, matrix
+from plan import IPS, matrix, matching_completions
 
 BASE=Path('/tmp/figure11-1025'); ROOT=BASE/'results'; SOURCE=BASE/'source'; STAGE=BASE/'stage'
 DEPS=f'/tmp/verl-nccl-1020-deps:/tmp/verl-nccl-1020-verl:{BASE}/awex:/tmp/comm-memory-1021-mooncake'
@@ -61,7 +61,7 @@ def main():
     rows=matrix();expected=132
     if a.suite=='paper-awex':
         from other_awex_plan import matrix as other_matrix
-        ROOT=BASE/'other-results';rows=other_matrix();expected=24
+        ROOT=BASE/'other-results';rows=other_matrix();expected=len(rows)
     ROOT.mkdir(exist_ok=True)
     with open('/mnt/fuse/verl-e2e/runs/five-model-baselines-20261012/matrix/active.lock','a+') as lock:
         fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
@@ -69,7 +69,7 @@ def main():
         for row in rows:
             if a.backend and row['backend']!=a.backend:continue
             label=f"{row['case_id']}-{row['backend']}-r{row['repeat']}"
-            complete=list(ROOT.glob(label+'-attempt*/complete.json'))
+            complete=matching_completions(ROOT,row)
             if complete:
                 assert len(complete)==1
                 accepted.append(json.loads((complete[0].parent/'summary.json').read_text()));continue
@@ -128,8 +128,10 @@ def main():
                 '--runtime','/tmp/verl-nccl-1020-runtime','--nccl-lib','/tmp/verl-nccl-1020-nccl/nvidia/nccl/lib',
                 '--num-updates','35','--warmup-updates','5','--timeout',
                 '28800' if row['backend']=='awex' else '3600',
-                '--nccl-buffer-bytes','4194304','--dp-source-policy','stream',
+                '--nccl-buffer-bytes',str(row.get('nccl_buffer_bytes',4194304)),'--dp-source-policy','stream',
                 '--dp-source-ring-order','source-node','--replica-routing','logical']
+            if row['mechanism']=='awex_native_nccl':
+                cmd+=['--awex-nonbatch']
             if row['backend']=='shardstream':
                 cmd+=['--transport-gin-connections','4','--transport-max-channels','64',
                       '--transport-gin-fifo-depth','16','--transport-compact-fifo']

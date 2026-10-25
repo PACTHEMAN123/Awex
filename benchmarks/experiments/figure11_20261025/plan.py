@@ -1,6 +1,6 @@
 """Frozen Figure 11 matrix; roles never share GPUs or physical hosts."""
 IPS=['11.18.56.89','11.18.50.148','11.18.50.220','11.17.132.185']
-BACKENDS={'nccl':'verl_native_nccl','nixl':'verl_native_nixl','awex':'awex_native_rdma','shardstream':'shardstream'}
+BACKENDS={'nccl':'verl_native_nccl','nixl':'verl_native_nixl','awex':'awex_native_nccl','shardstream':'shardstream'}
 
 def cases(repeat):
  train=IPS[:2];infer=IPS[2:]
@@ -30,3 +30,11 @@ def matrix():
  assert len(rows)==132 and len({(r['case_id'],r['repeat'],r['backend']) for r in rows})==132
  assert sum(r['rollout_gpus']*35 for r in rows)==68880
  return rows
+
+
+def matching_completions(root, row):
+ """A completed run from another transport never satisfies the active plan."""
+ import json
+ label=f"{row['case_id']}-{row['backend']}-r{row['repeat']}"
+ return [p for p in root.glob(label+'-attempt*/complete.json')
+         if json.loads(p.with_name('case.json').read_text())['mechanism']==row['mechanism']]

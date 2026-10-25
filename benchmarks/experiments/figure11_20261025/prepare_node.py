@@ -48,7 +48,8 @@ subprocess.run(['git','-C',str(AWEX),'diff','--exit-code',
                 'bae159256a768d54465ed693d90d925025032a17','HEAD','--',
                 ':(exclude)awex/transfer/mooncake_comm.py','awex/transfer','awex/writer/mooncake_writer.py',
                 'awex/reader/mooncake_reader.py','awex/writer/astate_writer.py',
-                'awex/reader/astate_reader.py'],check=True)
+                'awex/reader/astate_reader.py','awex/writer/nccl_writer.py',
+                'awex/reader/nccl_reader.py'],check=True)
 env = dict(os.environ,
     PYTHONPATH=f'{BASE}/nixl-runtime:{STAGE}:/tmp/verl-nccl-1020-deps:/tmp/verl-nccl-1020-verl:{AWEX}:/tmp/comm-memory-1021-mooncake',
     LD_LIBRARY_PATH='/tmp/verl-nccl-1020-nccl/nvidia/nccl/lib:/usr/local/cuda/lib64:/tmp/verl-nccl-1020-deps/nvidia/cuda_runtime/lib:'+str(RUNTIME/'lib/python3.12/site-packages/torch/lib'))
@@ -69,7 +70,9 @@ dependency=json.loads(imports);assert dependency['mooncake_version']=='0.3.13.po
 assert dependency['registration_policy']=='persistent_snapshots'
 assert dependency['nixl']['version']=='1.5.0'
 assert dependency['nixl']['artifact_sha256']=='de778242fbd632b9f44ca0c8240b393b746068b56e6856b8bdfb1edaa1580653'
-row = dict(hostname=socket.gethostname(), revision=revision, awex_revision=awex_revision,
+nccl_files=['awex/transfer/nccl_comm.py','awex/writer/nccl_writer.py','awex/reader/nccl_reader.py']
+nccl_hashes={name:hashlib.sha256((AWEX/name).read_bytes()).hexdigest() for name in nccl_files}
+row = dict(awex_nccl_files=nccl_hashes, hostname=socket.gethostname(), revision=revision, awex_revision=awex_revision,
            native_sha256=hashlib.sha256(destination.read_bytes()).hexdigest(),
            awex_transport_sha256=hashlib.sha256((AWEX/'awex/transfer/mooncake_comm.py').read_bytes()).hexdigest(),
            registration_policy=dependency['registration_policy'],

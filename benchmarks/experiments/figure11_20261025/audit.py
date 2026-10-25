@@ -23,7 +23,7 @@ def analyze(directory):
  assert len(outcome['generation_before'])==len(outcome['generation_after'])==case['replicas']
  assert [r['message'] for r in outcome['generation_before']]==[r['message'] for r in outcome['generation_after']]
  env=outcome['transport_environment']
- assert env['NCCL_BUFFSIZE']=='4194304'
+ assert env['NCCL_BUFFSIZE']==str(case.get('nccl_buffer_bytes',4194304))
  if case['backend']=='shardstream':
   expected={'SHARDSTREAM_DP_SOURCE_POLICY':'stream','SHARDSTREAM_RING_SOURCE_NODE_SWIZZLE':'1',
    'SHARDSTREAM_REPLICA_ROUTING':'logical','SHARDSTREAM_COMPACT_FIFO':'1','SHARDSTREAM_MAX_CHANNELS':'64',
@@ -90,8 +90,15 @@ def analyze(directory):
    assert sum(r['role']=='send' for r in rows)==case['training_gpus']
    assert sum(r['role']=='receive' for r in rows)==case['rollout_gpus']
    assert {r['rank'] for r in rows}==set(range(expected_count))
- elif case['backend']=='awex':
-  assert case['mechanism']=='awex_native_rdma'
+ elif case['mechanism']=='awex_native_nccl':
+  assert case['backend']=='awex'
+  assert not rdma_transports and not rdma_completions and not rdma_reuse
+  assert not astate_transports and not astate_completions
+  assert env['AWEX_USE_BATCH_SEND_RECV']=='0'
+  assert '--awex-nonbatch' in case['command']
+  assert all(r['prepared']['awex_nccl_files'] for r in before)
+  assert len({json.dumps(r['prepared']['awex_nccl_files'],sort_keys=True) for r in before})==1
+ elif case['mechanism']=='awex_native_rdma':
   assert not astate_transports and not astate_completions, 'mixed Awex transports'
   qualification=(directory/'mooncake-qualification.json').read_bytes()
   assert hashlib.sha256(qualification).hexdigest()==case['mooncake_qualification_sha256']
@@ -184,6 +191,10 @@ def analyze(directory):
   engine_placement=engines,archive_provenance=archives)
  if case['backend']=='awex':
   result['awex_revision']=case['awex_revision']
+  if case['mechanism']=='awex_native_nccl':
+   result['awex_nonbatch']=True
+   result['awex_nccl_files']=before[0]['prepared']['awex_nccl_files']
+   result['nccl_buffer_bytes']=case.get('nccl_buffer_bytes',4194304)
   if case['mechanism']=='awex_native_rdma':
    result['registration_policy']='persistent_snapshots'
    result['awex_transport_sha256']=before[0]['prepared']['awex_transport_sha256']
