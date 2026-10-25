@@ -12,7 +12,7 @@ def configure_astate_discovery(meta_server_addr):
     if os.environ.get("TRANSFER_ENGINE_SKIP_RDMA_EXCEPTION", "false").lower() != "false":
         raise RuntimeError("AState qualification cannot ignore RDMA failures")
     host, port = meta_server_addr.rsplit(":", 1)
-    os.environ.update(DISCOVERY_CONFIG_CENTER_TYPE="HTTP",
+    os.environ.update(ASTATE_OPTIONS_LOAD_MODE="ENV", DISCOVERY_CONFIG_CENTER_TYPE="HTTP",
                       ASYSTEM_META_SERVER_IP=host, ASYSTEM_META_SERVER_PORT=port,
                       TRANSFER_ENGINE_SKIP_RDMA_EXCEPTION="false")
 

@@ -56,6 +56,15 @@ def analyze(directory):
  if case['mechanism']=='awex_native_astate':
   assert not rdma_transports and not rdma_completions, 'mixed Awex transports'
   artifacts=[r['prepared']['astate'] for r in before]
+  qualification=(directory/'astate-qualification.json').read_bytes()
+  assert hashlib.sha256(qualification).hexdigest()==case['astate_qualification_sha256']
+  qualified=json.loads(qualification)
+  assert len(qualified)==2 and {q['role'] for q in qualified}=={'send','receive'}
+  for q in qualified:
+   assert q['code']==0 and not q['timed_out'] and not q['gpu_processes_after']
+   assert [e['version'] for e in q['events']]==list(range(4))
+   assert all(e['verified'] for e in q['events'])
+   assert all(q['artifact']['extension_sha256']==r['extension_sha256'] and q['artifact']['utrans_sha256']==r['utrans_sha256'] for r in artifacts)
   assert len({r['extension_sha256'] for r in artifacts})==1
   assert len({r['utrans_sha256'] for r in artifacts})==1
   assert len({r['source_revision'] for r in artifacts})==1

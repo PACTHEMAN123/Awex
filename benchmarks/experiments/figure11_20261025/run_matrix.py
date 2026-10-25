@@ -81,6 +81,22 @@ def main():
             assert all(not r['gpu_processes'].strip() for r in before),before
             assert len({r['prepared']['revision'] for r in before})==1
             assert len({r['prepared']['awex_revision'] for r in before})==1
+            deps=DEPS;libraries='/tmp/verl-nccl-1020-deps/nvidia/cuda_runtime/lib'
+            qualification_hash=None
+            if row['mechanism']=='awex_native_astate':
+                qualification=(BASE/'astate-qualification.json').read_bytes()
+                qualified=json.loads(qualification)
+                assert len(qualified)==2 and {q['role'] for q in qualified}=={'send','receive'}
+                for q in qualified:
+                    assert q['code']==0 and not q['timed_out'] and not q['gpu_processes_after']
+                    assert [e['version'] for e in q['events']]==list(range(4))
+                    assert all(e['verified'] for e in q['events'])
+                    assert all(q['artifact']['extension_sha256']==r['prepared']['astate']['extension_sha256']
+                               and q['artifact']['utrans_sha256']==r['prepared']['astate']['utrans_sha256'] for r in before)
+                (directory/'astate-qualification.json').write_bytes(qualification)
+                qualification_hash=hashlib.sha256(qualification).hexdigest()
+                deps=f'{BASE}/astate-runtime/python:'+deps
+                libraries=f'{BASE}/astate-runtime/lib:'+libraries
             cmd=[sys.executable,'-m','shardstream_benchmarks.recipe_runner',row.get('recipe','qwen3-30b-a3b'),
                 '--ray-address',IPS[0]+':6381','--training-hosts',*row['training_hosts'],
                 '--rollout-hosts',*row['rollout_hosts'],'--model-path','/mnt/fuse/verl-e2e/models/'+row.get('model','Qwen3-30B-A3B'),
@@ -88,7 +104,7 @@ def main():
                 '--output',str(directory/'outcome.json'),'--layout',row['layout'],
                 '--rollout-replicas',str(row['replicas']),'--publication-mechanism',row['mechanism'],
                 '--publication-bucket-mb','256','--model-weight-profile','--disable-prefix-caching',
-                '--extra-python-path',DEPS,'--extra-library-path','/tmp/verl-nccl-1020-deps/nvidia/cuda_runtime/lib',
+                '--extra-python-path',deps,'--extra-library-path',libraries,
                 '--runtime','/tmp/verl-nccl-1020-runtime','--nccl-lib','/tmp/verl-nccl-1020-nccl/nvidia/nccl/lib',
                 '--num-updates','35','--warmup-updates','5','--timeout',
                 '28800' if row['backend']=='awex' else '3600',
@@ -100,14 +116,15 @@ def main():
             if row.get('memory_profile'):cmd+=['--communication-memory-profile']
             case=dict(**row,label=label,attempt=attempt,revision=before[0]['prepared']['revision'],
                       awex_revision=before[0]['prepared']['awex_revision'],command=cmd)
+            if qualification_hash:case['astate_qualification_sha256']=qualification_hash
             save(directory/'case.json',case)
             save(ROOT/'active.json',dict(state='running',directory=directory.name,started=time.time(),pid=os.getpid()))
             print(json.dumps(dict(event='start',label=label,directory=directory.name)),flush=True)
-            env=dict(os.environ,PYTHONPATH=str(STAGE)+':'+DEPS,SHARDSTREAM_RECIPE_REPOSITORY=str(SOURCE))
+            env=dict(os.environ,PYTHONPATH=str(STAGE)+':'+deps,SHARDSTREAM_RECIPE_REPOSITORY=str(SOURCE))
             with (directory/'controller.log').open('w') as out:
                 child=subprocess.Popen(cmd,env=env,stdout=out,stderr=subprocess.STDOUT)
-                # Native Awex registers every planned tensor slice each update;
-                # permit the full 35-update experiment without changing samples.
+                # Retain the full 35-update experiment for either native Awex
+                # transport, including its initial setup.
                 try:code=child.wait(timeout=29100 if row['backend']=='awex' else 3900)
                 except subprocess.TimeoutExpired:
                     child.terminate()
