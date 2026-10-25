@@ -41,12 +41,12 @@ destination.parent.mkdir(parents=True, exist_ok=True)
 shutil.copy2(native, destination)
 revision = subprocess.check_output(['git','-C',str(SOURCE),'rev-parse','HEAD'],text=True).strip()
 awex_revision = subprocess.check_output(['git','-C',str(AWEX),'rev-parse','HEAD'],text=True).strip()
-assert awex_revision == 'f7ed45cc9b95fd62b7a78177da2dfaf2ee85cf75'
+assert awex_revision == '49e919b95bcb2851ac2f4f56226f7f6b595cb775'
 subprocess.run(['git','-C',str(AWEX),'merge-base','--is-ancestor',
                 'bae159256a768d54465ed693d90d925025032a17','HEAD'],check=True)
 subprocess.run(['git','-C',str(AWEX),'diff','--exit-code',
                 'bae159256a768d54465ed693d90d925025032a17','HEAD','--',
-                'awex/transfer','awex/writer/mooncake_writer.py',
+                ':(exclude)awex/transfer/mooncake_comm.py','awex/transfer','awex/writer/mooncake_writer.py',
                 'awex/reader/mooncake_reader.py','awex/writer/astate_writer.py',
                 'awex/reader/astate_reader.py'],check=True)
 env = dict(os.environ,
@@ -56,12 +56,14 @@ code = '''import json,torch,ray,vllm,mooncake.engine,awex.transfer.mooncake_comm
 from importlib.metadata import version
 from pathlib import Path
 import hashlib
-print(json.dumps(dict(torch=torch.__version__,ray=ray.__version__,vllm=vllm.__version__,mooncake=mooncake.engine.__file__,mooncake_version=version('mooncake-transfer-engine'),mooncake_sha256=hashlib.sha256(Path(mooncake.engine.__file__).read_bytes()).hexdigest(),awex=awex.transfer.mooncake_comm.__file__)))'''
+print(json.dumps(dict(torch=torch.__version__,ray=ray.__version__,vllm=vllm.__version__,mooncake=mooncake.engine.__file__,registration_policy=awex.transfer.mooncake_comm.MooncakeTransport.registration_policy,mooncake_version=version('mooncake-transfer-engine'),mooncake_sha256=hashlib.sha256(Path(mooncake.engine.__file__).read_bytes()).hexdigest(),awex=awex.transfer.mooncake_comm.__file__)))'''
 imports = subprocess.check_output([str(RUNTIME/'bin/python'),'-c',code],env=env,text=True)
 dependency=json.loads(imports);assert dependency['mooncake_version']=='0.3.13.post1'
+assert dependency['registration_policy']=='persistent_snapshots'
 row = dict(hostname=socket.gethostname(), revision=revision, awex_revision=awex_revision,
            native_sha256=hashlib.sha256(destination.read_bytes()).hexdigest(),
            awex_transport_sha256=hashlib.sha256((AWEX/'awex/transfer/mooncake_comm.py').read_bytes()).hexdigest(),
+           registration_policy=dependency['registration_policy'],
            mooncake_version=dependency['mooncake_version'],mooncake_sha256=dependency['mooncake_sha256'],
            imports=imports,
            gpu_processes=subprocess.check_output(['nvidia-smi','--query-compute-apps=pid,used_memory','--format=csv,noheader'],text=True))

@@ -35,7 +35,7 @@ def analyze(directory):
  assert all(not r['gpu_processes'].strip() for r in before+after)
  assert {r['prepared']['revision'] for r in before}=={case['revision']}
  assert len({r['prepared']['native_sha256'] for r in before})==1
- records=None;affinity={};training_layout=[];native_metrics=[];archives=[];rdma_transports=[];rdma_completions=[];astate_transports=[];astate_completions=[]
+ records=None;affinity={};training_layout=[];native_metrics=[];archives=[];rdma_transports=[];rdma_completions=[];rdma_reuse=[];astate_transports=[];astate_completions=[]
  for item in load(directory/'manifest.json'):
   path=directory/item['file'];assert path.stat().st_size==item['bytes'] and hashlib.sha256(path.read_bytes()).hexdigest()==item['sha256']
   archives.append(dict(file=str(path),sha256=item['sha256']))
@@ -48,6 +48,7 @@ def analyze(directory):
      training_layout.extend(json_events(text,'SHARDSTREAM_TRAIN_LAYOUT '))
      rdma_transports.extend(json_events(text,'AWEX_RDMA_TRANSPORT '))
      rdma_completions.extend(json_events(text,'AWEX_RDMA_COMPLETE '))
+     rdma_reuse.extend(json_events(text,'AWEX_RDMA_REUSE '))
      astate_transports.extend(json_events(text,'AWEX_ASTATE_TRANSPORT '))
      astate_completions.extend(json_events(text,'AWEX_ASTATE_COMPLETE '))
      if member.name.startswith('rollout-'):
@@ -87,12 +88,30 @@ def analyze(directory):
  elif case['backend']=='awex':
   assert case['mechanism']=='awex_native_rdma'
   assert not astate_transports and not astate_completions, 'mixed Awex transports'
+  qualification=(directory/'mooncake-qualification.json').read_bytes()
+  assert hashlib.sha256(qualification).hexdigest()==case['mooncake_qualification_sha256']
+  qualified=json.loads(qualification)
+  assert len(qualified)==3 and sum(q['role']=='send' for q in qualified)==1
+  for q in qualified:
+   assert q['code']==0 and not q['timed_out'] and not q['gpu_processes_after'] and q['closed']
+   assert [e['version'] for e in q['events']]==list(range(-1,3))
+   assert all(e['verified'] and e['register_calls']==2 for e in q['events'])
+   assert all(q['artifact']['awex_transport_sha256']==r['prepared']['awex_transport_sha256']
+              and q['artifact']['awex_revision']==r['prepared']['awex_revision'] for r in before)
+  assert all(r['prepared']['registration_policy']=='persistent_snapshots' for r in before)
   assert all(r['prepared']['mooncake_version']=='0.3.13.post1' for r in before)
   assert len({r['prepared']['mooncake_sha256'] for r in before})==1
   expected_count=case['training_gpus']+case['rollout_gpus']
   assert len(rdma_transports)==len(rdma_completions)==expected_count
   assert all(r['protocol']=='rdma' for r in rdma_transports+rdma_completions)
-  assert all(r['handshake_max_length']=='67108864' for r in rdma_transports)
+  assert all(r['handshake_max_length']=='67108864' and r['registration_policy']=='persistent_snapshots' for r in rdma_transports)
+  assert len(rdma_reuse)==35*expected_count
+  for rank in range(expected_count):
+   rows=sorted([r for r in rdma_reuse if r['rank']==rank],key=lambda r:r['sequence'])
+   assert len(rows)==35 and [r['sequence'] for r in rows]==list(range(1,36))
+   assert len({(r['pid'],r['role'],r['register_calls'],r['registered_buffers'],r['registered_bytes']) for r in rows})==1
+   assert all(r['registration_policy']=='persistent_snapshots' for r in rows)
+
   assert {r['sha256'] for r in rdma_transports}=={before[0]['prepared']['awex_transport_sha256']}
   assert sum(r['role']=='send' for r in rdma_completions)==case['training_gpus']
   assert sum(r['role']=='receive' for r in rdma_completions)==case['rollout_gpus']

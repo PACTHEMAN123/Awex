@@ -83,6 +83,19 @@ def main():
             assert len({r['prepared']['awex_revision'] for r in before})==1
             deps=DEPS;libraries='/tmp/verl-nccl-1020-deps/nvidia/cuda_runtime/lib'
             qualification_hash=None
+            mooncake_qualification_hash=None
+            if row['mechanism']=='awex_native_rdma':
+                qualification=(BASE/'mooncake-qualification.json').read_bytes()
+                qualified=json.loads(qualification)
+                assert len(qualified)==3 and sum(q['role']=='send' for q in qualified)==1
+                for q in qualified:
+                    assert q['code']==0 and not q['timed_out'] and not q['gpu_processes_after'] and q['closed']
+                    assert [e['version'] for e in q['events']]==list(range(-1,3))
+                    assert all(e['verified'] and e['register_calls']==2 for e in q['events'])
+                    assert all(q['artifact']['awex_transport_sha256']==r['prepared']['awex_transport_sha256']
+                               and q['artifact']['awex_revision']==r['prepared']['awex_revision'] for r in before)
+                (directory/'mooncake-qualification.json').write_bytes(qualification)
+                mooncake_qualification_hash=hashlib.sha256(qualification).hexdigest()
             if row['mechanism']=='awex_native_astate':
                 qualification=(BASE/'astate-qualification.json').read_bytes()
                 qualified=json.loads(qualification)
@@ -117,6 +130,7 @@ def main():
             case=dict(**row,label=label,attempt=attempt,revision=before[0]['prepared']['revision'],
                       awex_revision=before[0]['prepared']['awex_revision'],command=cmd)
             if qualification_hash:case['astate_qualification_sha256']=qualification_hash
+            if mooncake_qualification_hash:case['mooncake_qualification_sha256']=mooncake_qualification_hash
             save(directory/'case.json',case)
             save(ROOT/'active.json',dict(state='running',directory=directory.name,started=time.time(),pid=os.getpid()))
             print(json.dumps(dict(event='start',label=label,directory=directory.name)),flush=True)
