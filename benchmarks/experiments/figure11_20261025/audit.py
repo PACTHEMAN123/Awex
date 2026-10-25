@@ -16,7 +16,7 @@ def analyze(directory):
  assert outcome['weight_format']=='bf16' and outcome['model_weight_profile']
  assert outcome['prefix_caching_disabled'] and outcome['gpu_placement']=='nic-spread'
  assert outcome['layout']==case['layout'] and outcome['training_hosts']==case['training_hosts'] and outcome['rollout_hosts']==case['rollout_hosts']
- assert outcome['training']==dict(tp=4,pp=1,cp=2,ep=8,etp=1,world_size=case['training_gpus'])
+ assert outcome['training']==case.get('training',dict(tp=4,pp=1,cp=2,ep=8,etp=1,world_size=case['training_gpus']))
  for key in ['tp','dp','ep']:assert outcome['rollout'][key]==case[key]
  assert outcome['rollout']['instances']==case['replicas'] and outcome['rollout']['world_size']==case['rollout_gpus']
  assert outcome['num_updates']==35 and outcome['warmup_updates']==5 and outcome['publication_bucket_mb']==256
@@ -118,4 +118,14 @@ def analyze(directory):
   training_hosts=case['training_hosts'],rollout_hosts=case['rollout_hosts'],active_rollout_hosts=len(case['rollout_hosts']),
   native_sha256=before[0]['prepared']['native_sha256'],generation_unchanged=True,full_parameters_verified=True,
   engine_placement=engines,archive_provenance=archives)
+ if case.get('memory_profile'):
+  assert outcome['communication_memory_baseline']
+  memory=[]
+  for r in records:
+   for engine,workers in r['ranks'].items():
+    for rank,w in enumerate(workers):
+     m=w['communication_memory'];assert m['sample_count']>0
+     assert m['sampled_device_peak_bytes']>=m['sampled_device_before_bytes']
+     memory.append(dict(version=r['version'],engine=engine,rank=rank,**m))
+  result['communication_memory']=memory
  return result,network,native_metrics,records

@@ -55,12 +55,18 @@ def node_calls(task,ips,*args):
     finally:ray.shutdown()
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--backend');p.add_argument('--limit',type=int);a=p.parse_args()
+    global ROOT
+    p=argparse.ArgumentParser();p.add_argument('--backend');p.add_argument('--limit',type=int)
+    p.add_argument('--suite',choices=['figure11','paper-awex'],default='figure11');a=p.parse_args()
+    rows=matrix();expected=132
+    if a.suite=='paper-awex':
+        from other_awex_plan import matrix as other_matrix
+        ROOT=BASE/'other-results';rows=other_matrix();expected=24
     ROOT.mkdir(exist_ok=True)
     with open('/mnt/fuse/verl-e2e/runs/five-model-baselines-20261012/matrix/active.lock','a+') as lock:
         fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
         accepted=[];started=0
-        for row in matrix():
+        for row in rows:
             if a.backend and row['backend']!=a.backend:continue
             label=f"{row['case_id']}-{row['backend']}-r{row['repeat']}"
             complete=list(ROOT.glob(label+'-attempt*/complete.json'))
@@ -75,9 +81,9 @@ def main():
             assert all(not r['gpu_processes'].strip() for r in before),before
             assert len({r['prepared']['revision'] for r in before})==1
             assert len({r['prepared']['awex_revision'] for r in before})==1
-            cmd=[sys.executable,'-m','shardstream_benchmarks.recipe_runner','qwen3-30b-a3b',
+            cmd=[sys.executable,'-m','shardstream_benchmarks.recipe_runner',row.get('recipe','qwen3-30b-a3b'),
                 '--ray-address',IPS[0]+':6381','--training-hosts',*row['training_hosts'],
-                '--rollout-hosts',*row['rollout_hosts'],'--model-path','/mnt/fuse/verl-e2e/models/Qwen3-30B-A3B',
+                '--rollout-hosts',*row['rollout_hosts'],'--model-path','/mnt/fuse/verl-e2e/models/'+row.get('model','Qwen3-30B-A3B'),
                 '--source',str(SOURCE),'--stage',str(STAGE),'--run-root',str(BASE/'runs'),
                 '--output',str(directory/'outcome.json'),'--layout',row['layout'],
                 '--rollout-replicas',str(row['replicas']),'--publication-mechanism',row['mechanism'],
@@ -90,6 +96,7 @@ def main():
             if row['backend']=='shardstream':
                 cmd+=['--transport-gin-connections','4','--transport-max-channels','64',
                       '--transport-gin-fifo-depth','16','--transport-compact-fifo']
+            if row.get('memory_profile'):cmd+=['--communication-memory-profile']
             case=dict(**row,label=label,attempt=attempt,revision=before[0]['prepared']['revision'],
                       awex_revision=before[0]['prepared']['awex_revision'],command=cmd)
             save(directory/'case.json',case)
@@ -98,7 +105,9 @@ def main():
             env=dict(os.environ,PYTHONPATH=str(STAGE)+':'+DEPS,SHARDSTREAM_RECIPE_REPOSITORY=str(SOURCE))
             with (directory/'controller.log').open('w') as out:
                 child=subprocess.Popen(cmd,env=env,stdout=out,stderr=subprocess.STDOUT)
-                try:code=child.wait(timeout=3900)
+                # Native Awex registers every planned tensor slice each update;
+                # permit the full 35-update experiment without changing samples.
+                try:code=child.wait(timeout=14400 if row['backend']=='awex' else 3900)
                 except subprocess.TimeoutExpired:
                     child.terminate()
                     try:code=child.wait(timeout=180)
@@ -110,10 +119,17 @@ def main():
                     name=item['ip']+'.tar.gz';(directory/name).write_bytes(item['data'])
                     manifest.append(dict(ip=item['ip'],file=name,bytes=len(item['data']),sha256=hashlib.sha256(item['data']).hexdigest()))
                 save(directory/'manifest.json',manifest)
-            after=node_calls(inventory,IPS);save(directory/'final-inventory.json',after)
-            assert all(not r['gpu_processes'].strip() for r in after),'Run did not release GPUs'
-            save(directory/'shm-cleanup.json',node_calls(cleanup_shm,IPS,before))
             try:
+                # A terminated torchrun can exit before CUDA workers finish
+                # releasing their contexts. Require idle GPUs after a bounded
+                # grace period; retain the original observation as evidence.
+                after=node_calls(inventory,IPS);save(directory/'first-final-inventory.json',after)
+                for _ in range(12):
+                    if all(not r['gpu_processes'].strip() for r in after):break
+                    time.sleep(5);after=node_calls(inventory,IPS)
+                save(directory/'final-inventory.json',after)
+                assert all(not r['gpu_processes'].strip() for r in after),'Run did not release GPUs'
+                save(directory/'shm-cleanup.json',node_calls(cleanup_shm,IPS,before))
                 result,network,metrics,records=analyze(directory)
                 save(directory/'summary.json',result);save(directory/'network.json',network)
                 save(directory/'native-metrics.json',metrics);save(directory/'records.json',records)
@@ -125,7 +141,7 @@ def main():
                 raise
             save(ROOT/'progress.json',dict(accepted=accepted,finished=time.time()))
             print(json.dumps(dict(event='passed',label=label,p50_ms=result['p50_ms'])),flush=True)
-        state='complete' if len(accepted)==132 else 'qualification-complete'
+        state='complete' if len(accepted)==expected else 'qualification-complete'
         save(ROOT/'active.json',dict(state=state,passed=len(accepted),finished=time.time()))
 
 if __name__=='__main__':main()

@@ -60,3 +60,12 @@ locally after each launch. A detached controller must survive SSH disconnects.
 
 The performance trend is a measurement outcome, never an acceptance threshold.
 Do not change configuration, validation or sampling to obtain a preferred trend.
+
+After this matrix, `run_matrix.py --suite paper-awex` runs the current paper's
+remaining native Awex RDMA points: three launches each for A/B/C/D/E (Fig 9),
+F/G (Fig 10, sharing fresh B), and the default RDMA memory configuration (Fig 13).
+The explicit axes in `other_awex_plan.py` are checked against pinned recipes.
+Memory runs use a separate suite and opt-in 10 ms NVML sampling, retaining all
+per-worker samples, PyTorch live/cache peaks and device residency. Sampled NVML
+peaks are lower bounds; these runs are not substituted for uninstrumented timing.
+No six-setting RDMA buffer sweep is invented from the old NCCL buffer sweep.
