@@ -17,6 +17,13 @@ def main():
  stages=[('full-model-qualification',['--backend','awex','--limit','1']),
          ('figure11',[]),('other-paper-awex',['--suite','paper-awex'])]
  for stage,args in stages:
+  if stage=='full-model-qualification':
+   qualified=list((BASE/'results').glob('inter-r1-awex-r0-attempt*/complete.json'))
+   if qualified:
+    assert len(qualified)==1
+    summary=json.loads(qualified[0].with_name('summary.json').read_text())
+    assert summary['backend']=='awex' and summary['verified_updates']==35 and summary['full_parameters_verified']
+    continue
   save(dict(state='running',stage=stage,pid=os.getpid(),started=time.time()))
   print(json.dumps(dict(event='campaign-stage',stage=stage)),flush=True)
   if stage=='other-paper-awex':
