@@ -138,6 +138,7 @@ def main():
             if row.get('memory_profile'):cmd+=['--communication-memory-profile']
             case=dict(**row,label=label,attempt=attempt,revision=before[0]['prepared']['revision'],
                       awex_revision=before[0]['prepared']['awex_revision'],command=cmd)
+            if row['mechanism']=='awex_native_nccl':case['awex_coordinated_close']=True
             if qualification_hash:case['astate_qualification_sha256']=qualification_hash
             if mooncake_qualification_hash:case['mooncake_qualification_sha256']=mooncake_qualification_hash
             save(directory/'case.json',case)

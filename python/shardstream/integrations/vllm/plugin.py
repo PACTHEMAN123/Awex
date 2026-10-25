@@ -584,6 +584,18 @@ def register_shardstream_plugin() -> None:
             adapter.execute_task_in_model_worker, memory_task, empty_cache=True)
         return JSONResponse(content={"ranks": results})
 
+    @router.post("/awex_benchmark_close")
+    async def awex_benchmark_close(raw_request: Request):
+        from shardstream.integrations.publication.awex_native import close_awex_nccl_worker
+
+        adapter = PublicationVLLMServerAdapter(
+            raw_request.app.state.engine_client, asyncio.get_running_loop(), 120
+        )
+        results = await asyncio.to_thread(
+            adapter.execute_task_in_model_worker, close_awex_nccl_worker
+        )
+        return JSONResponse(content={"ranks": results})
+
     @router.post("/areal_shardstream_init")
     async def shardstream_init(request: ShardStreamInitRequest, raw_request: Request):
         try:

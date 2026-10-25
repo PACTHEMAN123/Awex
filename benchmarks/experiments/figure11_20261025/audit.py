@@ -40,7 +40,7 @@ def analyze(directory):
   assert {r['prepared']['nixl']['artifact_sha256'] for r in before}=={'de778242fbd632b9f44ca0c8240b393b746068b56e6856b8bdfb1edaa1580653'}
   assert len({json.dumps(r['prepared']['nixl']['files'],sort_keys=True) for r in before})==1
   assert '/tmp/figure11-1025/nixl-runtime' in case['command'][case['command'].index('--extra-python-path')+1].split(':')
- awex_environments=[]
+ awex_environments=[];awex_closed=[]
  records=None;affinity={};training_layout=[];native_metrics=[];archives=[];rdma_transports=[];rdma_completions=[];rdma_reuse=[];astate_transports=[];astate_completions=[]
  for item in load(directory/'manifest.json'):
   path=directory/item['file'];assert path.stat().st_size==item['bytes'] and hashlib.sha256(path.read_bytes()).hexdigest()==item['sha256']
@@ -52,8 +52,9 @@ def analyze(directory):
     elif member.name.endswith('.log'):
      text=a.extractfile(member).read().decode(errors='replace')
      training_layout.extend(json_events(text,'SHARDSTREAM_TRAIN_LAYOUT '))
+     awex_closed.extend(json_events(text,'AWEX_NCCL_CLOSE '))
      for match in re.finditer(r'-- (\d+) -- Env (?:variables|varabbles) for weights (writer|reader): (\{.*?\})',text):
-      awex_environments.append(dict(pid=int(match[1]),role=match[2],env=ast.literal_eval(match[3])))
+      awex_environments.append(dict(ip=item['ip'],pid=int(match[1]),role=match[2],env=ast.literal_eval(match[3])))
      rdma_transports.extend(json_events(text,'AWEX_RDMA_TRANSPORT '))
      rdma_completions.extend(json_events(text,'AWEX_RDMA_COMPLETE '))
      rdma_reuse.extend(json_events(text,'AWEX_RDMA_REUSE '))
@@ -97,10 +98,16 @@ def analyze(directory):
   assert case['backend']=='awex'
   assert not rdma_transports and not rdma_completions and not rdma_reuse
   assert not astate_transports and not astate_completions
-  assert len({r['pid'] for r in awex_environments if r['role']=='writer'})==case['training_gpus']
-  assert len({r['pid'] for r in awex_environments if r['role']=='reader'})==case['rollout_gpus']
+  assert len({(r['ip'],r['pid']) for r in awex_environments if r['role']=='writer'})==case['training_gpus']
+  assert len({(r['ip'],r['pid']) for r in awex_environments if r['role']=='reader'})==case['rollout_gpus']
   assert all(r['env']['AWEX_USE_BATCH_SEND_RECV']=='0' for r in awex_environments)
   assert '--awex-nonbatch' in case['command']
+  if case.get('awex_coordinated_close'):
+   assert len(awex_closed)==case['training_gpus']+case['rollout_gpus']
+   assert all(r['closed'] and not r['already_closed'] for r in awex_closed)
+   assert {r['rank'] for r in awex_closed}==set(range(len(awex_closed)))
+   assert sum(r['role']=='send' for r in awex_closed)==case['training_gpus']
+   assert sum(r['role']=='receive' for r in awex_closed)==case['rollout_gpus']
   assert all(r['prepared']['awex_nccl_files'] for r in before)
   assert len({json.dumps(r['prepared']['awex_nccl_files'],sort_keys=True) for r in before})==1
  elif case['mechanism']=='awex_native_rdma':
