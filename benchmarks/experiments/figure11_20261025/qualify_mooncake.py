@@ -20,14 +20,9 @@ def run_probe(role, rank):
     import time
 
     def network():
-        result = {}
-        for path in Path("/sys/class/infiniband").glob("*/ports/1/counters"):
-            try:
-                result[path.parents[2].name] = {
-                    key: int((path / key).read_text())
-                    for key in ("port_xmit_data", "port_rcv_data")}
-            except OSError:
-                continue
+        from shardstream.profiling.telemetry import node_rdma_counters
+        result = node_rdma_counters()['rdma']
+        assert len(result) == 4, 'require all four real RDMA port counters'
         return result
 
     def gpu_processes():
@@ -78,7 +73,8 @@ def run_probe(role, rank):
 def main():
     with open("/mnt/fuse/verl-e2e/runs/five-model-baselines-20261012/matrix/active.lock", "a+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        ray.init(address="11.18.56.89:6381", logging_level="ERROR")
+        ray.init(address="11.18.56.89:6381", logging_level="ERROR",
+                 runtime_env={"env_vars": {"PYTHONPATH": os.environ["PYTHONPATH"]}})
         try:
             nodes = {row["NodeManagerAddress"]: row["NodeID"] for row in ray.nodes() if row["Alive"]}
             rows = ray.get([run_probe.options(scheduling_strategy=NodeAffinitySchedulingStrategy(
@@ -93,7 +89,7 @@ def main():
                 assert all(event["verified"] and event["register_calls"] == 2 for event in row["events"])
                 assert len({tuple(e["registered_addresses"]) for e in row["events"]}) == 1
                 assert any(row["after"][name][key] > row["before"][name][key]
-                           for name in row["before"] for key in ("port_xmit_data", "port_rcv_data"))
+                           for name in row["before"] for key in ("tx_bytes", "rx_bytes"))
             assert len({row["artifact"]["awex_transport_sha256"] for row in rows}) == 1
             assert len({row["artifact"]["awex_revision"] for row in rows}) == 1
         finally:

@@ -174,6 +174,12 @@ def analyze(directory):
   training_hosts=case['training_hosts'],rollout_hosts=case['rollout_hosts'],active_rollout_hosts=len(case['rollout_hosts']),
   native_sha256=before[0]['prepared']['native_sha256'],generation_unchanged=True,full_parameters_verified=True,
   engine_placement=engines,archive_provenance=archives)
+ if case['backend']=='awex':
+  result['awex_revision']=case['awex_revision']
+  if case['mechanism']=='awex_native_rdma':
+   result['registration_policy']='persistent_snapshots'
+   result['awex_transport_sha256']=before[0]['prepared']['awex_transport_sha256']
+   result['registration_counts']=[r for r in rdma_reuse if r['sequence']==1]
  if case['mechanism']=='awex_native_astate':
   result['astate_artifact']=artifacts[0]
  if case.get('memory_profile'):
