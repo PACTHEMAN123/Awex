@@ -271,7 +271,7 @@ def _normalize_glm_mtp_aliases(factories, shapes, config, loader):
     return canonical_factories, canonical_shapes, load
 
 
-def _context(model_path, model, rank, loader, *, include_buffers=False):
+def _context(model_path, model, rank, loader, *, include_buffers=False, source_transform=None):
     from wbridge.frontend.adapters import AdapterContext
     from wbridge.utils import specgen
     from wbridge.utils.specgen import hf_weights_from_checkpoint
@@ -306,6 +306,8 @@ def _context(model_path, model, rank, loader, *, include_buffers=False):
     checkpoint_config = json.loads((Path(model_path) / "config.json").read_text())
     factories, shapes, loader = _normalize_glm_mtp_aliases(
         factories, shapes, checkpoint_config, loader)
+    if source_transform is not None:
+        factories, shapes = source_transform(factories, shapes)
     storage_views = _storage_parameter_views(model, include_buffers=include_buffers)
     print("WB_STORAGE_VIEWS " + json.dumps({"pid": os.getpid(), "rank": rank,
         "model_parameters": len(_parameter_views(model, include_buffers=include_buffers)), "storage_views": len(storage_views),

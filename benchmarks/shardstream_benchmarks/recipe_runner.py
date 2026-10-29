@@ -341,9 +341,9 @@ def main():
         parser.error("DP source block size must be positive")
     if args.weight_format == "fp8" and (
         not args.model_weight_profile or args.publication_mechanism not in (
-            "shardstream", "verl_native_nccl")
+            "shardstream", "verl_native_nccl", "weightbridge_gather_fp8")
     ):
-        parser.error("FP8 requires ShardStream or veRL NCCL and --model-weight-profile")
+        parser.error("FP8 requires a qualified FP8 publication mechanism and --model-weight-profile")
     transport_environment = {
         name: str(value) for name, value in (
             ("SHARDSTREAM_GIN_CONNECTIONS", args.transport_gin_connections),
@@ -437,7 +437,7 @@ def main():
         environment = {
             **transport_environment,
             "VERL_VLLM_FP8_QUANT_ENABLED": "1" if (
-                args.weight_format == "fp8" and args.publication_mechanism == "verl_native_nccl"
+                args.weight_format == "fp8" and args.publication_mechanism in ("verl_native_nccl", "weightbridge_gather_fp8")
             ) else "0",
             "SHARDSTREAM_BENCH_ENABLE_AWEX": "1" if args.publication_mechanism in ("awex_native_nccl", "awex_native_rdma", "awex_native_astate") else "0",
             "SHARDSTREAM_BENCH_NATIVE_MULTIRAIL": "1" if args.publication_mechanism in (

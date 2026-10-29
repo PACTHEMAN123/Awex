@@ -73,9 +73,8 @@ class FP8ModelWeightProfile(ModelWeightProfile):
     def from_vllm_checkpoint(cls, model, context, checkpoint, marker_mode, marker_period):
         """Build a checkpoint oracle without a ShardStream reader or transport.
 
-        The native baseline is currently qualified for Qwen3-MoE TP1/2 with
-        EP8. Expanded expert names already identify complete HF tensors; dense
-        parameters use the same vLLM shard coordinates as the model catalog.
+        Supports Qwen3-MoE TP1/2 with EP1/8. Expert names identify HF tensors;
+        TP-sharded experts and dense parameters use native vLLM shard offsets.
         """
         from safetensors import safe_open
         from shardstream.integrations.models.registry import get_infer_weights_converter
@@ -87,8 +86,8 @@ class FP8ModelWeightProfile(ModelWeightProfile):
         config = context["infer_engine_config"]
         rank = get_vllm_rank_info(context, 0)
         architecture = model.config.architectures[0]
-        if architecture != "Qwen3MoeForCausalLM" or rank.tp_size not in (1, 2) or rank.ep_size != 8:
-            raise ValueError("Native FP8 checkpoint oracle requires Qwen3-MoE TP1/2 EP8")
+        if architecture != "Qwen3MoeForCausalLM" or rank.tp_size not in (1, 2) or rank.ep_size not in (1, 8):
+            raise ValueError("Native FP8 checkpoint oracle requires Qwen3-MoE TP1/2 EP1/8")
         converter = get_infer_weights_converter(
             "vllm", architecture, hf_config=model.config,
             infer_engine_config=config, rank_info=rank,
