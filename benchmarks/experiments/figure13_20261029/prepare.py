@@ -14,7 +14,7 @@ from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 BASE = Path('/tmp/weightbridge-memory-1029')
 IPS = ['11.18.56.89', '11.18.50.220', '11.18.50.148', '11.17.132.185']
-REV = 'c66e8f5'
+REV = '8020f16'
 WB_REV = '17ea1bc6370424d52152880834a94659db5002ec'
 
 
@@ -38,6 +38,15 @@ def prepare(bundle, stage_archive, wb_archive):
         subprocess.run(['git', '-C', str(source), 'checkout', '--detach', REV], check=True,
                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     revision = output('git', '-C', str(source), 'rev-parse', 'HEAD')
+    if not revision.startswith(REV):
+        assert not output('git', '-C', str(source), 'status', '--porcelain')
+        (BASE / 'source-v2.bundle').write_bytes(bundle)
+        subprocess.run(['git', '-C', str(source), 'fetch', str(BASE / 'source-v2.bundle'),
+                        'codex/weightbridge-small-memory-20261029'], check=True,
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        subprocess.run(['git', '-C', str(source), 'checkout', '--detach', REV], check=True,
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        revision = output('git', '-C', str(source), 'rev-parse', 'HEAD')
     assert revision.startswith(REV)
     assert not output('git', '-C', str(source), 'status', '--porcelain')
     stage = BASE / 'stage'
@@ -87,7 +96,7 @@ if __name__ == '__main__':
     try:
         nodes = {n['NodeManagerAddress']: n['NodeID'] for n in ray.nodes() if n['Alive']}
         assert set(IPS) <= set(nodes), nodes
-        bundle = (BASE / 'source.bundle').read_bytes()
+        bundle = (BASE / 'source-v2.bundle').read_bytes()
         wb_source = '/tmp/weightbridge-fig9-1022/weightbridge'
         assert output('git', '-C', wb_source, 'rev-parse', 'HEAD') == WB_REV
         assert not output('git', '-C', wb_source, 'status', '--porcelain')

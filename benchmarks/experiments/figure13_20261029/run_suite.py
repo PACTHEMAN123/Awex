@@ -19,11 +19,11 @@ from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from legacy_summary import analyze, parse_events
 
 BASE = Path('/tmp/weightbridge-memory-1029')
-ROOT = BASE / 'results'
+ROOT = BASE / 'formal'
 SOURCE, STAGE = BASE / 'source', BASE / 'stage'
 IPS = ['11.18.56.89', '11.18.50.220', '11.18.50.148', '11.17.132.185']
 DEPS = '/tmp/verl-nccl-1020-deps:/tmp/weightbridge-memory-1029/weightbridge:/tmp/comm-memory-1021-mooncake'
-DURABLE = Path('/mnt/fuse/verl-e2e/runs/weightbridge-memory-20261029')
+DURABLE = Path('/mnt/fuse/verl-e2e/runs/weightbridge-memory-20261029/formal')
 PAIRS = {'a': (IPS[:2], [128, 64, 256, 512]), 'b': (IPS[2:], [32, 16, 8, 256])}
 
 
@@ -163,6 +163,9 @@ def run_pair(pair):
     try:
         for repeat in range(3):
             for cap in caps if repeat % 2 == 0 else list(reversed(caps)):
+                if (BASE / 'STOP_AFTER_CASE').exists():
+                    save(ROOT / f'active-{pair}.json', dict(state='stopped', finished=time.time()))
+                    return False
                 rows.append(run_case(pair, ips, cap, repeat))
                 save(ROOT / f'results-{pair}.json', rows)
         save(ROOT / f'active-{pair}.json', dict(state='complete', launches=len(rows), finished=time.time()))
@@ -184,6 +187,7 @@ if __name__ == '__main__':
             assert set(IPS) <= set(NODES)
             before = calls(inventory, IPS)
             assert all(not r['gpu_processes'].strip() for r in before), before
+            assert all(r['revision'].startswith('8020f16') for r in before), before
             save(ROOT / 'initial-inventory.json', before)
             save(ROOT / 'active.json', dict(state='running', pid=os.getpid(), started=time.time(), planned_launches=24))
             with ThreadPoolExecutor(max_workers=2) as pool:
