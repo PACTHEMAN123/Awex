@@ -3,6 +3,7 @@ import hashlib
 import json
 from pathlib import Path
 import subprocess
+import time
 
 import ray
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
@@ -17,6 +18,9 @@ def prepare(bundle, revision):
     assert not subprocess.check_output(['nvidia-smi', '--query-compute-apps=pid', '--format=csv,noheader'], text=True).strip()
     (BASE / 'source.bundle').write_bytes(bundle)
     source = BASE / 'source'
+    if source.exists() and subprocess.run(['git', '-C', str(source), 'rev-parse', 'HEAD'],
+                                          capture_output=True).returncode:
+        source.rename(BASE / f'incomplete-source-{time.time_ns()}')
     if not source.exists():
         subprocess.run(['git', 'clone', '--shared', '/tmp/weightbridge-memory-1029/source', str(source)], check=True)
     assert not subprocess.check_output(['git', '-C', str(source), 'status', '--porcelain'], text=True).strip()
@@ -36,8 +40,16 @@ if __name__ == '__main__':
     try:
         nodes = {n['NodeManagerAddress']: n['NodeID'] for n in ray.nodes() if n['Alive']}
         bundle = (BASE / 'source.bundle').read_bytes()
-        rows = ray.get([prepare.options(scheduling_strategy=NodeAffinitySchedulingStrategy(
-            nodes[ip], soft=False)).remote(bundle, sys.argv[1]) for ip in IPS], timeout=180)
+        pending = [prepare.options(scheduling_strategy=NodeAffinitySchedulingStrategy(
+            nodes[ip], soft=False)).remote(bundle, sys.argv[1]) for ip in IPS]
+        rows, errors = [], []
+        for task in pending:
+            try:
+                rows.append(ray.get(task, timeout=180))
+            except Exception as error:
+                errors.append(str(error))
+        if errors:
+            raise RuntimeError(errors)
         (BASE / 'deployment.json').write_text(json.dumps(rows, indent=2) + '\n')
         print(json.dumps(rows), flush=True)
     finally:
