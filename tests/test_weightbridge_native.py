@@ -85,6 +85,23 @@ def test_independent_rendezvous_restores_environment_on_error(monkeypatch, previ
     assert wb.os.environ.get(key) == previous
 
 
+def test_probe_guard_uses_independent_cpu_storage(monkeypatch):
+    model = wb.torch.nn.Linear(3, 2, bias=False)
+    original_to = wb.torch.Tensor.to
+    observed = []
+
+    def tracked_to(tensor, *args, **kwargs):
+        result = original_to(tensor, *args, **kwargs)
+        if kwargs.get("copy"):
+            observed.append((kwargs.get("device"), result.data_ptr() != tensor.data_ptr()))
+        return result
+
+    monkeypatch.setattr(wb.torch.Tensor, "to", tracked_to)
+    with wb._model_probe_guard(model, "rollout", 0):
+        pass
+    assert observed == [("cpu", True)]
+
+
 def test_factory_state_is_lazy_and_recallable():
     calls = []
     def factory():

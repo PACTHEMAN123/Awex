@@ -92,13 +92,16 @@ def _model_probe_guard(model, role, rank):
     independent reference from before probing, outside publication timing, so
     a wrong mapping cannot become the reference for subsequent update checks.
     """
-    expected = {name: value.clone() for name, value in _parameter_views(model, include_buffers=True).items()}
+    # Initialization validation must not leave a full model in the CUDA cache:
+    # memory-profile baselines are captured before this independent check.
+    expected = {name: value.detach().to(device="cpu", copy=True)
+                for name, value in _parameter_views(model, include_buffers=True).items()}
     yield
     actual = _parameter_views(model, include_buffers=True)
     bad = sorted(set(actual) ^ set(expected))
     for name in expected.keys() & actual.keys():
         a, b = actual[name], expected[name]
-        if a.shape != b.shape or a.dtype != b.dtype or not torch.equal(a, b):
+        if a.shape != b.shape or a.dtype != b.dtype or not torch.equal(a.detach().cpu(), b):
             bad.append(name)
     if bad:
         raise RuntimeError(f"WeightBridge probe changed checkpoint parameters: {sorted(bad)[:20]} (total={len(bad)})")
