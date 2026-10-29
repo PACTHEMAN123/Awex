@@ -56,3 +56,21 @@ def test_native_publication_collects_all_dp_results_and_invalidates_caches():
     adapter._rpc._call_engine_async = lambda method: events.append(method)
     assert adapter.update(2) == [{"worker_rank": 0}, {"worker_rank": 1}]
     assert events == ["reset_prefix_cache"]
+
+
+def test_model_profile_returns_all_eight_dp_cores_without_transport_setup():
+    from shardstream.integrations.publication.vllm import PublicationVLLMServerAdapter
+
+    calls = []
+
+    def utility(kind, method, timeout, args, kwargs, *, engine):
+        calls.append(engine)
+        assert kind == "collective_rpc" and method == "shardstream_execute"
+        return [{"dp_rank": engine, "verified": engine != 7}]
+
+    core = SimpleNamespace(core_engines=list(range(8)), _call_utility_async=utility)
+    adapter = PublicationVLLMServerAdapter(SimpleNamespace(engine_core=core), None, 120)
+    results = adapter.execute_task_in_model_worker(test_model_profile_returns_all_eight_dp_cores_without_transport_setup)
+    assert adapter.mechanism is None
+    assert calls == list(range(8))
+    assert len(results) == 8 and not results[-1]["verified"]

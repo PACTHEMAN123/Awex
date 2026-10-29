@@ -705,13 +705,21 @@ class MultiVLLMWeightsExchangeIT:
             return results
 
     def model_profile(self, operation, version, endpoints=None):
-        return self.endpoint_command(
+        results = self.endpoint_command(
             "areal_shardstream_model_profile",
             {"operation": operation, "version": version,
              "marker_mode": getattr(self, "marker_mode", "constant"),
              "marker_period": getattr(self, "marker_period", None)},
             endpoints,
         )
+        expected = self.inference_config["tp_size"] * self.inference_config.get("dp_size", 1)
+        for engine, workers in results.items():
+            if len(workers) != expected:
+                raise RuntimeError(
+                    f"Engine {engine} model profile returned {len(workers)} workers; "
+                    f"expected all {expected} TP/DP workers"
+                )
+        return results
 
     def resize_rollout_models(self, epoch, target):
         from shardstream.profiling.compute import (

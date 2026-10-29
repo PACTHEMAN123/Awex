@@ -163,6 +163,22 @@ class NodeProcesses:
                        UCX_MAX_RNDV_RAILS="4", UCX_MAX_EAGER_RAILS="4",
                        UCX_RNDV_SCHEME="get_zcopy", UCX_IB_GID_INDEX="3",
                        UCX_MAX_HCA_PER_GPU="inf", UCX_SINGLE_NET_DEVICE="n")
+        if environment.get("SHARDSTREAM_BENCH_AWEX_RDMA") == "1":
+            import socket
+
+            env["AWEX_MOONCAKE_HOST"] = socket.gethostbyname(socket.gethostname())
+            env["MC_GID_INDEX"] = "3"
+            # Full-model Awex registers thousands of native tensor slices.
+            # Their P2P MR metadata exceeds Mooncake's default 1 MiB limit.
+            # This changes the control-message limit, not a transfer buffer.
+            env["MC_HANDSHAKE_MAX_LENGTH"] = "67108864"
+            env["AWEX_MOONCAKE_DEVICE"] = ",".join(port.split(":")[0] for port in ports)
+        if environment.get("SHARDSTREAM_BENCH_AWEX_ASTATE") == "1":
+            import socket
+
+            env["POD_IP"] = socket.gethostbyname(socket.gethostname())
+            env["SHARDSTREAM_ASTATE_MANIFEST"] = "/tmp/figure11-1025/astate-artifact.json"
+            env["TRANSFER_ENGINE_SKIP_RDMA_EXCEPTION"] = "false"
         command = [str(self.runtime / "bin/python"), *arguments]
         if env.get("SHARDSTREAM_TIMELINE") == "1":
             self.profiled = True
@@ -285,6 +301,10 @@ def main():
     parser.add_argument("--nccl-net-chunk-bytes", type=int)
     parser.add_argument("--weight-format", choices=("bf16", "fp8"), default="bf16",
                         help="FP8 uses fused BF16-to-FP8 transport and a full checkpoint oracle")
+    parser.add_argument("--fp8-execution", choices=("fused", "staged"), default="fused",
+                        help="Same-wire FP8 fusion ablation; staged materializes source records before transfer")
+    parser.add_argument("--rollout-gpu-memory-utilization", type=float,
+                        help="Override vLLM KV reservation, e.g. to leave room for a full FP8 checkpoint oracle")
     parser.add_argument("--disable-prefix-caching", action="store_true",
                         help="Use the same uncached prefill for before/repeat/after generation checks")
     parser.add_argument("--extra-python-path", default="")
@@ -301,6 +321,12 @@ def main():
         "--nccl-lib", default="/tmp/shardstream-prepare-nccl2312/nccl/lib"
     )
     args = parser.parse_args()
+    if args.rollout_gpu_memory_utilization is not None and not 0 < args.rollout_gpu_memory_utilization < 1:
+        parser.error("Rollout GPU memory utilization must be between zero and one")
+    if args.fp8_execution == "staged" and (
+        args.weight_format != "fp8" or args.publication_mechanism != "shardstream"
+    ):
+        parser.error("Staged FP8 execution requires --weight-format fp8 and ShardStream")
     if args.awex_nonbatch and args.publication_mechanism != "awex_native_nccl":
         parser.error("--awex-nonbatch requires awex_native_nccl")
     try:
@@ -339,6 +365,7 @@ def main():
         SHARDSTREAM_COMM_MEMORY_PROFILE="1" if args.communication_memory_profile else "0",
         SHARDSTREAM_PROFILE_FIFO_LAYOUT="1" if args.fifo_layout_profile else "0",
         SHARDSTREAM_FP8_BLOCKWISE="1" if args.weight_format == "fp8" else "0",
+        SHARDSTREAM_FP8_EXECUTION=args.fp8_execution,
         SHARDSTREAM_BENCH_MODEL_PATH=args.model_path,
         SHARDSTREAM_DP_SOURCE_POLICY=args.dp_source_policy,
         SHARDSTREAM_REPLICA_ROUTING=args.replica_routing,
@@ -387,6 +414,7 @@ def main():
         "rollout": recipe.rollout,
         "pinned_rollout": pinned_recipe.rollout,
         "rollout_replicas_override": args.rollout_replicas,
+        "rollout_gpu_memory_utilization_override": args.rollout_gpu_memory_utilization,
         "training_hosts": args.training_hosts,
         "rollout_hosts": args.rollout_hosts,
         "run_dir": run_dir,
@@ -398,6 +426,7 @@ def main():
         "warmup_updates": args.warmup_updates,
         "nccl_lib": args.nccl_lib,
         "publication_mechanism": args.publication_mechanism,
+        "awex_nonbatch": args.awex_nonbatch,
         "publication_bucket_mb": args.publication_bucket_mb,
         "model_weight_profile": args.model_weight_profile,
         "weight_format": args.weight_format,
@@ -410,15 +439,20 @@ def main():
             "VERL_VLLM_FP8_QUANT_ENABLED": "1" if (
                 args.weight_format == "fp8" and args.publication_mechanism == "verl_native_nccl"
             ) else "0",
-            "SHARDSTREAM_BENCH_ENABLE_AWEX": "1" if args.publication_mechanism == "awex_native_nccl" else "0",
+            "SHARDSTREAM_BENCH_ENABLE_AWEX": "1" if args.publication_mechanism in ("awex_native_nccl", "awex_native_rdma", "awex_native_astate") else "0",
             "SHARDSTREAM_BENCH_NATIVE_MULTIRAIL": "1" if args.publication_mechanism in (
-                "awex_native_nccl", "verl_native_nccl", "verl_native_nixl", "verl_native_mooncake"
+                "awex_native_nccl", "awex_native_rdma", "awex_native_astate", "verl_native_nccl", "verl_native_nixl", "verl_native_mooncake"
             ) else "0",
             "SHARDSTREAM_BENCH_EXTRA_PYTHONPATH": args.extra_python_path,
             "SHARDSTREAM_BENCH_EXTRA_LIBRARY_PATH": args.extra_library_path,
             "SHARDSTREAM_BENCH_WARMUP": str(args.warmup_updates),
             "SHARDSTREAM_BENCH_RAY_ADDRESS": args.ray_address,
         }
+        if args.publication_mechanism == "awex_native_rdma":
+            environment["SHARDSTREAM_BENCH_AWEX_RDMA"] = "1"
+            environment["AWEX_MOONCAKE_PROTOCOL"] = "rdma"
+        if args.publication_mechanism == "awex_native_astate":
+            environment["SHARDSTREAM_BENCH_AWEX_ASTATE"] = "1"
         if args.awex_nonbatch:
             environment["AWEX_USE_BATCH_SEND_RECV"] = "0"
         rollout_counts = rollout_host_counts(recipe.rollout["instances"], len(args.rollout_hosts))
@@ -473,6 +507,8 @@ def main():
                 )
                 # Indices address the GPUs reserved for this actor, not arbitrary GPUs.
                 rollout_arguments = recipe.rollout_arguments(args.model_path, host, port)
+                if args.rollout_gpu_memory_utilization is not None:
+                    rollout_arguments[rollout_arguments.index("--gpu-memory-utilization") + 1] = str(args.rollout_gpu_memory_utilization)
                 if args.weight_format == "fp8":
                     from shardstream_benchmarks.fp8_config import fp8_server_args
 

@@ -579,6 +579,26 @@
         "instances": 1,
         "world_size": 8
       }
+    },
+    {
+      "id": "qwen30-tp2-cp2-ep8-r8tp2",
+      "model": "qwen3-30b-a3b",
+      "training": {
+        "world_size": 16,
+        "tp": 2,
+        "pp": 1,
+        "cp": 2,
+        "ep": 8,
+        "etp": 1
+      },
+      "rollout": {
+        "tp": 2,
+        "dp": 1,
+        "attention_dp": 1,
+        "ep": 1,
+        "instances": 8,
+        "world_size": 16
+      }
     }
   ]
 }

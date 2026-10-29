@@ -24,6 +24,7 @@ namespace transport {
 
 cudaError_t launch(const KernelArgs& args, cudaStream_t stream);
 cudaError_t launchReset(const KernelArgs& args, cudaStream_t stream);
+cudaError_t launchQuantize(const Fragment* jobs, std::uint32_t job_count, cudaStream_t stream);
 
 }  // namespace transport
 }  // namespace shardstream

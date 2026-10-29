@@ -382,6 +382,13 @@ __device__ __forceinline__ void copyFragmentsToContiguous(const KernelArgs& args
     const std::uint64_t end = fragment_end < copy_end ? fragment_end : copy_end;
     const auto* tensor = reinterpret_cast<const std::uint8_t*>(fragment.tensor_ptr);
     if (fragment.block_rows != 0) {
+      if (fragment.staged_ptr != 0) {
+        copyContiguous(destination + begin - work_offset,
+          reinterpret_cast<const std::uint8_t*>(fragment.staged_ptr) +
+            fragment.tensor_offset + begin - fragment.work_offset,
+          end - begin, tid, nthreads);
+        continue;
+      }
       quantizeToFifo(fragment, destination + begin - work_offset,
                        fragment.tensor_offset + begin - fragment.work_offset,
                        end - begin, tid, nthreads);

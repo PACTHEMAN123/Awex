@@ -564,6 +564,12 @@ def register_shardstream_plugin() -> None:
     _patch_shardstream_worker()
     _ensure_router_attached()
     if os.environ.get("SHARDSTREAM_BENCH_ENABLE_AWEX") == "1":
+        if os.environ.get("SHARDSTREAM_BENCH_AWEX_ASTATE") == "1":
+            from shardstream.integrations.publication.awex_astate import enable_astate_audit
+            enable_astate_audit()
+        if os.environ.get("SHARDSTREAM_BENCH_AWEX_RDMA") == "1":
+            from shardstream.integrations.publication.awex_rdma import enable_rdma_audit
+            enable_rdma_audit()
         from awex.vllm_plugin import register_awex_plugin
         register_awex_plugin()
 
@@ -576,6 +582,18 @@ def register_shardstream_plugin() -> None:
             raw_request.app.state.engine_client, asyncio.get_running_loop(), 120)
         results = await asyncio.to_thread(
             adapter.execute_task_in_model_worker, memory_task, empty_cache=True)
+        return JSONResponse(content={"ranks": results})
+
+    @router.post("/awex_benchmark_close")
+    async def awex_benchmark_close(raw_request: Request):
+        from shardstream.integrations.publication.awex_native import close_awex_nccl_worker
+
+        adapter = PublicationVLLMServerAdapter(
+            raw_request.app.state.engine_client, asyncio.get_running_loop(), 120
+        )
+        results = await asyncio.to_thread(
+            adapter.execute_task_in_model_worker, close_awex_nccl_worker
+        )
         return JSONResponse(content={"ranks": results})
 
     @router.post("/areal_shardstream_init")
@@ -638,11 +656,11 @@ def register_shardstream_plugin() -> None:
                 raise ValueError("Unsupported model profile command")
             from shardstream.profiling.model import model_profile_task
 
-            adapter = getattr(raw_request.app.state, "shardstream_adapter", None)
-            if adapter is None:
-                adapter = getattr(raw_request.app.state, "awex_adapter", None)
-            if adapter is None:
-                adapter = _get_publication_adapter(raw_request)
+            # Profiling must collect every DP core, independently of the
+            # publication backend's update RPC return-value convention.
+            adapter = PublicationVLLMServerAdapter(
+                raw_request.app.state.engine_client, asyncio.get_running_loop(), 120
+            )
             results = await asyncio.to_thread(
                 adapter.execute_task_in_model_worker,
                 model_profile_task,
