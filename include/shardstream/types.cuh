@@ -97,6 +97,8 @@ struct alignas(16) Fragment {
   std::uint64_t scale_row_stride = 0;
   std::uint32_t block_rows = 0;
   std::uint32_t block_cols = 0;
+  // Experimental unfused control: base of the pre-materialized wire records.
+  std::uintptr_t staged_ptr = 0;
 };
 
 struct alignas(16) Work {

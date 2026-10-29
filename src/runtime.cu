@@ -26,6 +26,8 @@
 #include <cstdlib>
 #include <limits>
 #include <memory>
+#include <map>
+#include <tuple>
 #include <stdexcept>
 #include <vector>
 namespace impl = shardstream::transport;
@@ -42,9 +44,17 @@ struct LaunchBuffers {
   std::uint32_t* channel_ids = nullptr;
   std::uint32_t* active_peers = nullptr;
   impl::KernelProfile* profiles = nullptr;
+  std::uint8_t* fp8_staging = nullptr;
+  impl::Fragment* quantize_jobs = nullptr;
+  std::uint32_t quantize_job_count = 0;
+  std::size_t fp8_staging_bytes = 0;
+  cudaEvent_t quantize_start = nullptr;
+  cudaEvent_t quantize_end = nullptr;
+  cudaEvent_t transfer_end = nullptr;
 };
 
 struct DeviceState {
+  bool staged_fp8 = false;
   std::vector<std::pair<std::string, double>> preparation_phases;
   ncclComm_t comm = nullptr;
   ncclWindow_t window = nullptr;
@@ -166,6 +176,12 @@ std::unique_ptr<DeviceState> make_state(const std::string& unique_id_bytes, int 
     throw std::runtime_error("transport transport chunk_bytes must be zero or at least its step_bytes");
   }
   auto state = std::make_unique<DeviceState>();
+  const char* fp8_execution = std::getenv("SHARDSTREAM_FP8_EXECUTION");
+  if (fp8_execution && std::strcmp(fp8_execution, "fused") != 0 &&
+      std::strcmp(fp8_execution, "staged") != 0) {
+    throw std::runtime_error("SHARDSTREAM_FP8_EXECUTION must be fused or staged");
+  }
+  state->staged_fp8 = fp8_execution && std::strcmp(fp8_execution, "staged") == 0;
   state->logical_rank = rank;
   state->world_size = world_size;
   if (!logical_to_communicator.empty() && logical_to_communicator.size() != static_cast<std::size_t>(world_size)) {
@@ -273,6 +289,14 @@ void destroy_state(DeviceState* state) {
 }
 
 void release_buffers(LaunchBuffers* buffers) {
+  if (buffers->quantize_start) cudaEventDestroy(buffers->quantize_start);
+  if (buffers->quantize_end) cudaEventDestroy(buffers->quantize_end);
+  if (buffers->transfer_end) cudaEventDestroy(buffers->transfer_end);
+  buffers->quantize_start = buffers->quantize_end = buffers->transfer_end = nullptr;
+  if (buffers->quantize_jobs) SHARDSTREAM_CUDA_CHECK(cudaFree(buffers->quantize_jobs));
+  if (buffers->fp8_staging) SHARDSTREAM_CUDA_CHECK(cudaFree(buffers->fp8_staging));
+  buffers->quantize_jobs = nullptr;
+  buffers->fp8_staging = nullptr;
   if (buffers->works != nullptr) {
     SHARDSTREAM_CUDA_CHECK(cudaFree(buffers->works));
     buffers->works = nullptr;
@@ -305,6 +329,9 @@ void release_buffers(LaunchBuffers* buffers) {
 
 void allocate_buffers(const impl::Schedule& schedule, std::size_t active_peer_count, LaunchBuffers* buffers) {
   try {
+    SHARDSTREAM_CUDA_CHECK(cudaEventCreate(&buffers->quantize_start));
+    SHARDSTREAM_CUDA_CHECK(cudaEventCreate(&buffers->quantize_end));
+    SHARDSTREAM_CUDA_CHECK(cudaEventCreate(&buffers->transfer_end));
     if (!schedule.works.empty()) {
       SHARDSTREAM_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&buffers->works),
                                     schedule.works.size() * sizeof(impl::Work)));
@@ -338,6 +365,56 @@ void allocate_buffers(const impl::Schedule& schedule, std::size_t active_peer_co
     release_buffers(buffers);
     throw;
   }
+}
+
+// Deduplicate whole source views across peers and channel fragments. Transport
+// retains its original wire offsets, routes and FIFO schedule. Allocation and
+// metadata uploads happen once at prepare, never during a steady-state update.
+void prepare_fp8_staging(impl::Schedule* schedule, LaunchBuffers* buffers, cudaStream_t stream) {
+  using Key = std::tuple<std::uintptr_t, std::uint64_t, std::uint64_t, std::uint32_t, std::uint32_t>;
+  auto key = [](const impl::Fragment& f) {
+    return Key{f.tensor_ptr, f.tensor_row_bytes, f.tensor_row_stride, f.block_rows, f.block_cols};
+  };
+  struct View { impl::Fragment source{}; std::size_t bytes = 0; std::size_t offset = 0; };
+  std::map<Key, View> views;
+  for (const auto& f : schedule->fragments) {
+    if (!f.block_rows) continue;
+    auto& view = views[key(f)];
+    view.source = f;
+    view.bytes = std::max(view.bytes, static_cast<std::size_t>(f.tensor_offset + f.nbytes));
+  }
+  for (auto& entry : views) {
+    auto& view = entry.second;
+    view.offset = buffers->fp8_staging_bytes;
+    buffers->fp8_staging_bytes += (view.bytes + 15) / 16 * 16;
+  }
+  if (!buffers->fp8_staging_bytes) return;
+  SHARDSTREAM_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&buffers->fp8_staging), buffers->fp8_staging_bytes));
+  std::vector<impl::Fragment> jobs;
+  for (auto& entry : views) {
+    auto& view = entry.second;
+    const std::size_t record = view.source.block_rows * view.source.block_cols + 16;
+    // Eight warps process eight blocks per CTA, giving the separate quantizer
+    // enough independent CTAs to use the whole GPU on large source matrices.
+    const std::size_t job_bytes = 8 * record;
+    for (std::size_t offset = 0; offset < view.bytes; offset += job_bytes) {
+      auto job = view.source;
+      job.staged_ptr = reinterpret_cast<std::uintptr_t>(buffers->fp8_staging + view.offset);
+      job.tensor_offset = offset;
+      job.nbytes = std::min(job_bytes, view.bytes - offset);
+      jobs.push_back(job);
+    }
+  }
+  for (auto& f : schedule->fragments) {
+    if (f.block_rows) f.staged_ptr = reinterpret_cast<std::uintptr_t>(buffers->fp8_staging + views.at(key(f)).offset);
+  }
+  if (jobs.size() > std::numeric_limits<std::uint32_t>::max()) throw std::runtime_error("too many FP8 quantize jobs");
+  buffers->quantize_job_count = static_cast<std::uint32_t>(jobs.size());
+  SHARDSTREAM_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&buffers->quantize_jobs), jobs.size() * sizeof(impl::Fragment)));
+  SHARDSTREAM_CUDA_CHECK(cudaMemcpyAsync(buffers->quantize_jobs, jobs.data(), jobs.size() * sizeof(impl::Fragment),
+                                       cudaMemcpyHostToDevice, stream));
+  // jobs is temporary pageable metadata; complete its upload before returning.
+  SHARDSTREAM_CUDA_CHECK(cudaStreamSynchronize(stream));
 }
 
 void upload_buffers(const impl::Schedule& schedule, const std::vector<std::uint32_t>& active_peers,
@@ -882,6 +959,7 @@ Metrics launch(int64_t handle, const std::vector<TensorView>& tensors, const std
     try {
       const auto metadata_start = Clock::now();
       allocate_buffers(schedule, active_peers.size(), &buffers);
+      if (sender && state->staged_fp8) prepare_fp8_staging(&schedule, &buffers, stream);
       upload_buffers(schedule, active_peers, &buffers, stream);
       metadata_upload_time_ms = std::chrono::duration<double, std::milli>(Clock::now() - metadata_start).count();
       state->tasks = tasks;
@@ -904,6 +982,9 @@ Metrics launch(int64_t handle, const std::vector<TensorView>& tensors, const std
   const auto& cached_peers = state->active_peers;
 
   Metrics metrics;
+  metrics["fp8_execution_staged"] = bool(state->staged_fp8);
+  metrics["fp8_staging_bytes"] = std::int64_t(state->buffers.fp8_staging_bytes);
+  metrics["fp8_quantize_job_count"] = std::int64_t(state->buffers.quantize_job_count);
   if (prepare_only) {
     std::map<std::string, double> phases;
     for (const auto& phase : state->preparation_phases) phases[phase.first] = phase.second;
@@ -1068,9 +1149,19 @@ Metrics launch(int64_t handle, const std::vector<TensorView>& tensors, const std
   }
   const auto kernel_start = Clock::now();
   SHARDSTREAM_CUDA_CHECK(impl::launchReset(args, stream));
+  SHARDSTREAM_CUDA_CHECK(cudaEventRecord(state->buffers.quantize_start, stream));
+  SHARDSTREAM_CUDA_CHECK(impl::launchQuantize(state->buffers.quantize_jobs,
+                                            state->buffers.quantize_job_count, stream));
+  SHARDSTREAM_CUDA_CHECK(cudaEventRecord(state->buffers.quantize_end, stream));
   SHARDSTREAM_CUDA_CHECK(impl::launch(args, stream));
+  SHARDSTREAM_CUDA_CHECK(cudaEventRecord(state->buffers.transfer_end, stream));
   SHARDSTREAM_CUDA_CHECK(cudaStreamSynchronize(stream));
   metrics["kernel_transfer_time_ms"] = std::chrono::duration<double, std::milli>(Clock::now() - kernel_start).count();
+  float quantize_ms = 0, transfer_ms = 0;
+  SHARDSTREAM_CUDA_CHECK(cudaEventElapsedTime(&quantize_ms, state->buffers.quantize_start, state->buffers.quantize_end));
+  SHARDSTREAM_CUDA_CHECK(cudaEventElapsedTime(&transfer_ms, state->buffers.quantize_end, state->buffers.transfer_end));
+  metrics["fp8_materialization_time_ms"] = double(state->buffers.quantize_job_count ? quantize_ms : 0);
+  metrics["transport_device_time_ms"] = double(transfer_ms);
 
   std::vector<impl::KernelProfile> profiles(profile_count);
   if (profile_count != 0) {

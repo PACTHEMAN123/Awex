@@ -21,6 +21,20 @@
 namespace shardstream {
 namespace transport {
 
+// Each job covers whole records of a unique source view. A single launch
+// materializes every quantized view before any transport CTA can read it.
+__global__ void materializeFp8Kernel(const Fragment* jobs) {
+  const Fragment& job = jobs[blockIdx.x];
+  quantizeToFifo(job, reinterpret_cast<std::uint8_t*>(job.staged_ptr) + job.tensor_offset,
+                job.tensor_offset, job.nbytes, threadIdx.x, blockDim.x);
+}
+
+cudaError_t launchQuantize(const Fragment* jobs, std::uint32_t job_count, cudaStream_t stream) {
+  if (job_count == 0) return cudaSuccess;
+  materializeFp8Kernel<<<job_count, 256, 0, stream>>>(jobs);
+  return cudaGetLastError();
+}
+
 cudaError_t launchReset(const KernelArgs& args, cudaStream_t stream) {
   if (args.gin_enabled == 0) return cudaSuccess;
 #if SHARDSTREAM_HAS_GIN

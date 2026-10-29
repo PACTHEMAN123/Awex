@@ -290,6 +290,8 @@ def main():
     parser.add_argument("--nccl-net-chunk-bytes", type=int)
     parser.add_argument("--weight-format", choices=("bf16", "fp8"), default="bf16",
                         help="FP8 uses fused BF16-to-FP8 transport and a full checkpoint oracle")
+    parser.add_argument("--fp8-execution", choices=("fused", "staged"), default="fused",
+                        help="Same-wire FP8 fusion ablation; staged materializes source records before transfer")
     parser.add_argument("--disable-prefix-caching", action="store_true",
                         help="Use the same uncached prefill for before/repeat/after generation checks")
     parser.add_argument("--extra-python-path", default="")
@@ -306,6 +308,10 @@ def main():
         "--nccl-lib", default="/tmp/shardstream-prepare-nccl2312/nccl/lib"
     )
     args = parser.parse_args()
+    if args.fp8_execution == "staged" and (
+        args.weight_format != "fp8" or args.publication_mechanism != "shardstream"
+    ):
+        parser.error("Staged FP8 execution requires --weight-format fp8 and ShardStream")
     if args.awex_nonbatch and args.publication_mechanism != "awex_native_nccl":
         parser.error("--awex-nonbatch requires awex_native_nccl")
     try:
@@ -341,6 +347,7 @@ def main():
         SHARDSTREAM_COMM_MEMORY_PROFILE="1" if args.communication_memory_profile else "0",
         SHARDSTREAM_PROFILE_FIFO_LAYOUT="1" if args.fifo_layout_profile else "0",
         SHARDSTREAM_FP8_BLOCKWISE="1" if args.weight_format == "fp8" else "0",
+        SHARDSTREAM_FP8_EXECUTION=args.fp8_execution,
         SHARDSTREAM_BENCH_MODEL_PATH=args.model_path,
         SHARDSTREAM_DP_SOURCE_POLICY=args.dp_source_policy,
         SHARDSTREAM_REPLICA_ROUTING=args.replica_routing,
