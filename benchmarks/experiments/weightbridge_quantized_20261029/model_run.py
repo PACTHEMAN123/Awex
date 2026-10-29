@@ -59,12 +59,13 @@ def collect(run_dir):
     stream = io.BytesIO()
     # Repeated full-model pointer catalogs exceed gzip's history window.
     # A larger lossless dictionary substantially reduces evidence download time.
-    with tarfile.open(fileobj=stream, mode='w:xz', filters=[
-            {'id': lzma.FILTER_LZMA2, 'preset': 1, 'dict_size': 64 * 1024**2}]) as archive:
-        if path.exists():
-            for p in sorted(path.rglob('*')):
-                if p.is_file():
-                    archive.add(p, arcname=str(p.relative_to(path)))
+    with lzma.LZMAFile(stream, mode='w', filters=[
+            {'id': lzma.FILTER_LZMA2, 'preset': 1, 'dict_size': 64 * 1024**2}]) as compressed:
+        with tarfile.open(fileobj=compressed, mode='w') as archive:
+            if path.exists():
+                for p in sorted(path.rglob('*')):
+                    if p.is_file():
+                        archive.add(p, arcname=str(p.relative_to(path)))
     return dict(ip=ray.util.get_node_ip_address(), data=stream.getvalue(),
                 gpu_processes=subprocess.check_output(['nvidia-smi', '--query-compute-apps=pid,used_memory',
                     '--format=csv,noheader'], text=True))
@@ -82,18 +83,42 @@ def calls(fn, arguments):
         ray.shutdown()
 
 
+def collect_results(root):
+    outcome = json.loads((root / 'outcome.json').read_text())
+    manifest = []
+    for row in calls(collect, (outcome['run_dir'],)):
+        data = row.pop('data')
+        filename = row['ip'] + '.tar.xz'
+        (root / filename).write_bytes(data)
+        manifest.append(dict(row, file=filename, sha256=hashlib.sha256(data).hexdigest()))
+    save(root / 'manifest.json', manifest)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--label', required=True)
     parser.add_argument('--updates', type=int, default=3)
     parser.add_argument('--warmup', type=int, default=1)
     parser.add_argument('--preparation', choices=['eager', 'pipeline'], default='pipeline')
+    parser.add_argument('--collect-only', action='store_true')
     args = parser.parse_args()
     root = BASE / 'model-results' / args.label
-    root.mkdir(parents=True, exist_ok=False)
+    if not args.collect_only:
+        root.mkdir(parents=True, exist_ok=False)
     lock = open('/mnt/fuse/verl-e2e/runs/five-model-baselines-20261012/matrix/active.lock', 'a+')
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     try:
+        if args.collect_only:
+            assert (root / 'exit_code').read_text().strip() == '0'
+            assert json.loads((root / 'outcome.json').read_text())['passed']
+            save(root / 'collection-recovery.json', dict(
+                previous_state=json.loads((root / 'active.json').read_text()),
+                collector_revision=subprocess.check_output(
+                    ['git', '-C', str(SOURCE), 'rev-parse', 'HEAD'], text=True).strip()))
+            collect_results(root)
+            save(root / 'active.json', dict(state='complete', finished=time.time(),
+                                           recovered_collection=True))
+            return
         revision = subprocess.check_output(['git', '-C', str(SOURCE), 'rev-parse', 'HEAD'], text=True).strip()
         stream = io.BytesIO()
         with tarfile.open(fileobj=stream, mode='w:gz') as archive:
@@ -143,14 +168,7 @@ def main():
                     code = process.wait()
         (root / 'exit_code').write_text(str(code) + '\n')
         if (root / 'outcome.json').exists():
-            outcome = json.loads((root / 'outcome.json').read_text())
-            manifest = []
-            for row in calls(collect, (outcome['run_dir'],)):
-                data = row.pop('data')
-                filename = row['ip'] + '.tar.xz'
-                (root / filename).write_bytes(data)
-                manifest.append(dict(row, file=filename, sha256=hashlib.sha256(data).hexdigest()))
-            save(root / 'manifest.json', manifest)
+            collect_results(root)
         assert code == 0, ('real-model recipe failed', code)
         save(root / 'active.json', dict(state='complete', finished=time.time()))
     except BaseException:
