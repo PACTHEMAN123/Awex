@@ -4,6 +4,7 @@ from pathlib import Path
 import ray
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from evidence import analyze,audit_affinity,cleanup_shm
+cleanup_shm=ray.remote(num_cpus=0)(cleanup_shm)
 BASE=Path('/tmp/fp8-fusion-resume-1029');ROOT=BASE/'results'
 ASSETS=Path('/tmp/fp8-fusion-1029');SOURCE=ASSETS/'source';STAGE=ASSETS/'stage'
 IPS=['11.18.56.89','11.18.50.220','11.18.50.148','11.17.132.185']

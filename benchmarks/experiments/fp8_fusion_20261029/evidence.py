@@ -1,14 +1,13 @@
 import hashlib,json,math,os,re,statistics,tarfile,time,subprocess
 from pathlib import Path
-import ray
 ROOT=Path("/tmp/fp8-fusion-resume-1029/results")
 
 def save(path,value):
  path.write_text(json.dumps(value,indent=2)+"\n")
 
 
-@ray.remote(num_cpus=0)
 def cleanup_shm(inventory):
+    import ray
     # The global experiment lock is held. Only names absent before this exact
     # launch are candidates; never reclaim another experiment's old segments.
     processes=subprocess.check_output(['nvidia-smi','--query-compute-apps=pid','--format=csv,noheader'],text=True).strip()
@@ -62,6 +61,14 @@ def percentile(values, q):
 def analyze(directory):
     outcome=json.loads((directory/'outcome.json').read_text())
     case=json.loads((directory/'case.json').read_text())
+    assert (directory/'exit_code').read_text().strip()=='0'
+    assert outcome['num_updates']==20 and outcome['warmup_updates']==5
+    assert outcome['training']['world_size']==16
+    assert outcome['rollout']['instances']==4 and outcome['rollout']['tp']==2
+    assert outcome['rollout']['dp']==1 and outcome['rollout']['world_size']==8
+    assert case['revision']=='67c9cfeebc5f593fbd0e8f63001c2d64e766872a'
+    assert all(not r['processes'] for name in ['inventory.json','final-inventory.json']
+               for r in json.loads((directory/name).read_text()))
     publication=None
     profiles=[]
     layouts={}
@@ -72,6 +79,7 @@ def analyze(directory):
     decoder=json.JSONDecoder()
     for item in json.loads((directory/'manifest.json').read_text()):
         path=directory/item['file']
+        assert path.stat().st_size==item['bytes']
         assert hashlib.sha256(path.read_bytes()).hexdigest()==item['sha256']
         with tarfile.open(path) as archive:
             if 'training-publications.json' in archive.getnames():
