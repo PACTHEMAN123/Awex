@@ -63,10 +63,12 @@ def _configure(round_bytes):
     from shardstream.profiling.timeline import instrument_weightbridge
     instrument_weightbridge()
     from wbridge.backend.router import RECEIVER_ROUND_CAP_BYTES
+    from wbridge.utils.data import logical_tensor_cap_bytes
     if RECEIVER_ROUND_CAP_BYTES != int(round_bytes):
         raise RuntimeError(f"WeightBridge imported with round cap {RECEIVER_ROUND_CAP_BYTES}; requested {round_bytes}")
     print("WB_ROUND_CAP " + json.dumps({"pid": os.getpid(), "requested_bytes": int(round_bytes),
-                                      "effective_bytes": RECEIVER_ROUND_CAP_BYTES}), flush=True)
+                                      "effective_bytes": RECEIVER_ROUND_CAP_BYTES,
+                                      "logical_tensor_cap_bytes": logical_tensor_cap_bytes()}), flush=True)
 
 
 def _parameter_views(model, *, include_buffers=False):

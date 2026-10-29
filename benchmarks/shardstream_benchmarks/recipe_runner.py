@@ -39,6 +39,16 @@ def nccl_buffer_environment(buffer_bytes=None, net_chunk_bytes=None):
     return environment
 
 
+def weightbridge_buffer_environment(mechanism, logical_tensor_cap_mb=None):
+    if logical_tensor_cap_mb is None:
+        return {}
+    if mechanism != "weightbridge_native":
+        raise ValueError("Logical tensor cap requires weightbridge_native")
+    if logical_tensor_cap_mb <= 0:
+        raise ValueError("Logical tensor cap must be positive")
+    return {"WBRIDGE_LOGICAL_TENSOR_CAP_BYTES": str(logical_tensor_cap_mb * 2**20)}
+
+
 class NodeProcesses:
     """Own only the process groups launched by this recipe invocation."""
 
@@ -265,6 +275,7 @@ def main():
     parser.add_argument("--publication-mechanism", default="shardstream")
     parser.add_argument("--layout")
     parser.add_argument("--publication-bucket-mb", type=int, default=256)
+    parser.add_argument("--weightbridge-logical-tensor-cap-mb", type=int)
     parser.add_argument("--model-weight-profile", action="store_true")
     parser.add_argument("--communication-memory-profile", action="store_true")
     parser.add_argument("--fifo-layout-profile", action="store_true")
@@ -294,6 +305,8 @@ def main():
         parser.error("--awex-nonbatch requires awex_native_nccl")
     try:
         nccl_environment = nccl_buffer_environment(args.nccl_buffer_bytes, args.nccl_net_chunk_bytes)
+        weightbridge_environment = weightbridge_buffer_environment(
+            args.publication_mechanism, args.weightbridge_logical_tensor_cap_mb)
     except ValueError as error:
         parser.error(str(error))
     if not 0 <= args.warmup_updates < args.num_updates:
@@ -320,6 +333,7 @@ def main():
             parser.error("Compact FIFO applies only to ShardStream")
         transport_environment["SHARDSTREAM_COMPACT_FIFO"] = "1"
     transport_environment.update(nccl_environment)
+    transport_environment.update(weightbridge_environment)
     transport_environment.update(
         SHARDSTREAM_TIMELINE="1" if args.nsys else "0",
         SHARDSTREAM_COMM_MEMORY_PROFILE="1" if args.communication_memory_profile else "0",
