@@ -123,7 +123,7 @@ class Worker:
                                     rank=rank, world_size=2, timeout=timedelta(seconds=180),
                                     device_id=self.device)
             if mode != 'bf16':
-                from verl.utils.kernel.fp8_kernel import scaled_fp8_blockwise_triton
+                from verl_fp8_kernel import scaled_fp8_blockwise_triton
                 self.frontend = GatherBeforeQuantize(self.source, self.parts, scaled_fp8_blockwise_triton)
                 self.frontend.prepare()
                 self.payload = self.frontend.payload
@@ -249,7 +249,7 @@ def main():
     root.mkdir(parents=True, exist_ok=False)
     lock = open('/mnt/fuse/verl-e2e/runs/five-model-baselines-20261012/matrix/active.lock', 'a+')
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    env = dict(PYTHONPATH=os.environ['PYTHONPATH'], LD_LIBRARY_PATH=os.environ['LD_LIBRARY_PATH'],
+    env = dict(PYTHONPATH=str(BASE) + ':' + os.environ['PYTHONPATH'], LD_LIBRARY_PATH=os.environ['LD_LIBRARY_PATH'],
                LD_PRELOAD=os.environ['LD_PRELOAD'], NCCL_SOCKET_IFNAME='eth0', GLOO_SOCKET_IFNAME='eth0',
                NCCL_IB_DISABLE='0', NCCL_IB_GID_INDEX='3', NCCL_DEBUG='INFO', NCCL_DEBUG_SUBSYS='INIT,NET,ENV',
                NCCL_CUMEM_ENABLE='1', TORCHELASTIC_USE_AGENT_STORE='False',

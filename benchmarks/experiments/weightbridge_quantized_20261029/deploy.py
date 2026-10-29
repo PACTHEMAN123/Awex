@@ -13,7 +13,7 @@ IPS = ['11.18.56.89', '11.18.50.220', '11.18.50.148', '11.17.132.185']
 
 
 @ray.remote(num_cpus=0)
-def prepare(bundle, revision):
+def prepare(bundle, revision, kernel_data):
     BASE.mkdir(exist_ok=True)
     assert not subprocess.check_output(['nvidia-smi', '--query-compute-apps=pid', '--format=csv,noheader'], text=True).strip()
     (BASE / 'source.bundle').write_bytes(bundle)
@@ -27,7 +27,8 @@ def prepare(bundle, revision):
     subprocess.run(['git', '-C', str(source), 'fetch', str(BASE / 'source.bundle'), 'HEAD'], check=True)
     subprocess.run(['git', '-C', str(source), 'checkout', '--detach', 'FETCH_HEAD'], check=True)
     assert subprocess.check_output(['git', '-C', str(source), 'rev-parse', 'HEAD'], text=True).strip() == revision
-    kernel = Path('/tmp/verl-nccl-1020-verl/verl/utils/kernel/fp8_kernel.py')
+    kernel = BASE / 'verl_fp8_kernel.py'
+    kernel.write_bytes(kernel_data)
     return dict(ip=ray.util.get_node_ip_address(), revision=revision,
                 quantizer_sha256=hashlib.sha256(kernel.read_bytes()).hexdigest(),
                 source_bundle_sha256=hashlib.sha256(bundle).hexdigest(),
@@ -40,8 +41,9 @@ if __name__ == '__main__':
     try:
         nodes = {n['NodeManagerAddress']: n['NodeID'] for n in ray.nodes() if n['Alive']}
         bundle = (BASE / 'source.bundle').read_bytes()
+        kernel_data = Path('/tmp/verl-nccl-1020-verl/verl/utils/kernel/fp8_kernel.py').read_bytes()
         pending = [prepare.options(scheduling_strategy=NodeAffinitySchedulingStrategy(
-            nodes[ip], soft=False)).remote(bundle, sys.argv[1]) for ip in IPS]
+            nodes[ip], soft=False)).remote(bundle, sys.argv[1], kernel_data) for ip in IPS]
         rows, errors = [], []
         for task in pending:
             try:
