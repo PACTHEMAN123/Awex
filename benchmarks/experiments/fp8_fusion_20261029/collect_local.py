@@ -13,7 +13,8 @@ import evidence
 
 REMOTE = '/tmp/fp8-fusion-resume-1029'
 SSH = ['ssh', '-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=30',
-       '-o', 'ControlPath=/tmp/wbfig10-1029-ssh-%C', 'hole-11.18.56.89']
+       '-o', 'ControlMaster=auto', '-o', 'ControlPersist=600',
+       '-o', 'ControlPath=/tmp/fp8-resume-1029-ssh-%C', 'hole-11.18.56.89']
 
 
 def load(path):
@@ -93,7 +94,7 @@ def main():
                 archive = root / 'case-archives' / (label + '.tar.gz')
                 with archive.with_suffix('.partial').open('wb') as stream:
                     subprocess.run(SSH + ['tar -cz -C ' + REMOTE + '/results ' + shlex.quote(label)],
-                                   stdout=stream, check=True, timeout=300)
+                                   stdout=stream, check=True, timeout=900)
                 archive.with_suffix('.partial').replace(archive)
                 with tarfile.open(archive) as bundle:
                     for member in bundle.getmembers():
