@@ -1,10 +1,12 @@
 """Prepare isolated, version-pinned copies on the four selected Hole nodes."""
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
 import shutil
 import subprocess
+import tarfile
 
 import ray
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
@@ -20,16 +22,14 @@ def output(*cmd):
 
 
 @ray.remote(num_cpus=0)
-def prepare(bundle):
+def prepare(bundle, stage_archive, wb_archive):
     assert not output('nvidia-smi', '--query-compute-apps=pid', '--format=csv,noheader')
     BASE.mkdir(exist_ok=True)
     source = BASE / 'source'
     if not source.exists():
-        subprocess.run(['git', 'clone', '--no-hardlinks', '-q',
-                        '/tmp/weightbridge-fig9-1022/source', str(source)], check=True)
         (BASE / 'source.bundle').write_bytes(bundle)
-        subprocess.run(['git', '-C', str(source), 'fetch', str(BASE / 'source.bundle'),
-                        'codex/weightbridge-small-memory-20261029'], check=True,
+        subprocess.run(['git', 'clone', '-q', '-b', 'codex/weightbridge-small-memory-20261029',
+                        str(BASE / 'source.bundle'), str(source)], check=True,
                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         subprocess.run(['git', '-C', str(source), 'checkout', '--detach', REV], check=True,
                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
@@ -37,16 +37,15 @@ def prepare(bundle):
     assert revision.startswith(REV)
     assert not output('git', '-C', str(source), 'status', '--porcelain')
     stage = BASE / 'stage'
-    if not stage.exists():
-        shutil.copytree('/tmp/weightbridge-fig9-1022/stage', stage,
+    with tarfile.open(fileobj=io.BytesIO(stage_archive)) as archive:
+        archive.extractall(stage, filter='data')
+    for relative, package in [('python/shardstream', 'shardstream'),
+                              ('benchmarks/shardstream_benchmarks', 'shardstream_benchmarks')]:
+        shutil.copytree(source / relative, stage / package, dirs_exist_ok=True,
                         ignore=shutil.ignore_patterns('__pycache__'))
-        for relative, package in [('python/shardstream', 'shardstream'),
-                                  ('benchmarks/shardstream_benchmarks', 'shardstream_benchmarks')]:
-            shutil.copytree(source / relative, stage / package, dirs_exist_ok=True,
-                            ignore=shutil.ignore_patterns('__pycache__'))
-    wb = Path('/tmp/weightbridge-fig9-1022/weightbridge')
-    assert output('git', '-C', str(wb), 'rev-parse', 'HEAD') == WB_REV
-    assert not output('git', '-C', str(wb), 'status', '--porcelain')
+    wb = BASE / 'weightbridge'
+    with tarfile.open(fileobj=io.BytesIO(wb_archive)) as archive:
+        archive.extractall(wb, filter='data')
     nccl = BASE / 'nccl/lib'
     nccl.mkdir(parents=True, exist_ok=True)
     target = nccl / 'libnccl.so.2'
@@ -81,8 +80,19 @@ if __name__ == '__main__':
         nodes = {n['NodeManagerAddress']: n['NodeID'] for n in ray.nodes() if n['Alive']}
         assert set(IPS) <= set(nodes), nodes
         bundle = (BASE / 'source.bundle').read_bytes()
+        wb_source = '/tmp/weightbridge-fig9-1022/weightbridge'
+        assert output('git', '-C', wb_source, 'rev-parse', 'HEAD') == WB_REV
+        assert not output('git', '-C', wb_source, 'status', '--porcelain')
+        wb_archive = subprocess.check_output(['git', '-C', wb_source, 'archive', 'HEAD'])
+        stream = io.BytesIO()
+        stage_source = Path('/tmp/weightbridge-fig9-1022/stage')
+        with tarfile.open(fileobj=stream, mode='w:gz') as archive:
+            for path in sorted(stage_source.rglob('*')):
+                if path.is_file() and '__pycache__' not in path.parts:
+                    archive.add(path, arcname=str(path.relative_to(stage_source)))
+        stage_archive = stream.getvalue()
         rows = ray.get([prepare.options(scheduling_strategy=NodeAffinitySchedulingStrategy(
-            nodes[ip], soft=False)).remote(bundle) for ip in IPS])
+            nodes[ip], soft=False)).remote(bundle, stage_archive, wb_archive) for ip in IPS])
         for key in ['revision', 'native_sha256', 'nccl_sha256', 'model_config_sha256',
                     'weightbridge_python_sha256', 'versions']:
             assert len({json.dumps(r[key], sort_keys=True) for r in rows}) == 1, key

@@ -22,7 +22,7 @@ BASE = Path('/tmp/weightbridge-memory-1029')
 ROOT = BASE / 'results'
 SOURCE, STAGE = BASE / 'source', BASE / 'stage'
 IPS = ['11.18.56.89', '11.18.50.220', '11.18.50.148', '11.17.132.185']
-DEPS = '/tmp/verl-nccl-1020-deps:/tmp/verl-nccl-1020-verl:/tmp/weightbridge-fig9-1022/weightbridge:/tmp/comm-memory-1021-mooncake'
+DEPS = '/tmp/verl-nccl-1020-deps:/tmp/weightbridge-memory-1029/weightbridge:/tmp/comm-memory-1021-mooncake'
 DURABLE = Path('/mnt/fuse/verl-e2e/runs/weightbridge-memory-20261029')
 PAIRS = {'a': (IPS[:2], [128, 64, 256, 512]), 'b': (IPS[2:], [32, 16, 8, 256])}
 
