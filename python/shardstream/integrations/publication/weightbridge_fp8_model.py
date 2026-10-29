@@ -22,7 +22,10 @@ from shardstream.integrations.publication.weightbridge_native import (
 
 
 def is_quantized(name):
-    return name.endswith(('_proj.weight',)) and ('.self_attn.' in name or '.mlp.experts.' in name)
+    # Match the existing fusion experiment's actual vLLM layout. Its wildcard
+    # router exclusion is not expanded by vLLM, so routers are FP8 as well.
+    return (name.endswith('.mlp.gate.weight') or
+            (name.endswith('_proj.weight') and ('.self_attn.' in name or '.mlp.experts.' in name)))
 
 
 def quantize(tensor):
@@ -211,6 +214,9 @@ class WeightBridgeFP8Receiver(WeightBridgeReceiver):
         model = self.model_runner.model
         if model.config.architectures != ['Qwen3MoeForCausalLM']:
             raise ValueError('Experimental WeightBridge FP8 currently supports Qwen3-MoE only')
+        for name, parameter in model.named_parameters():
+            if name.endswith('.mlp.gate.weight') and parameter.dtype != torch.float8_e4m3fn:
+                raise ValueError(f'Router dtype differs from the matched FP8 reference: {name}: {parameter.dtype}')
         port = self.config['server_port']
         ipc = coordinator_ipc(port)
         if self.worker_rank == 0:

@@ -11,7 +11,7 @@ from shardstream.integrations.publication import weightbridge_fp8_model as wb
     ('model.layers.0.self_attn.q_proj.weight', True),
     ('model.layers.0.mlp.experts.17.down_proj.weight', True),
     ('model.layers.0.self_attn.q_norm.weight', False),
-    ('model.layers.0.mlp.gate.weight', False),
+    ('model.layers.0.mlp.gate.weight', True),
     ('model.embed_tokens.weight', False), ('lm_head.weight', False),
     ('model.layers.0.self_attn.q_proj.weight_scale_inv', False),
 ])
