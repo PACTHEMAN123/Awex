@@ -45,6 +45,18 @@ def test_unsupported_catalog_fails_without_silent_local_quantization():
         wb.quantized_catalog({name: lambda: None}, {name: (129, 128)})
 
 
+def test_staging_views_preserve_bounded_matrix_rows_and_alias_storage():
+    payload = {'embedding': torch.arange(24).flatten()}
+    specs = {'embedding': SimpleNamespace(entries={'embedding': [
+        [(0, 2, 8), (0, 4, 4)], [(4, 8, 8), (0, 4, 4)],
+    ]})}
+    views = wb.staging_views(payload, specs)
+    assert [tuple(v.shape) for v in views.values()] == [(2, 4), (4, 4)]
+    assert views['embedding::wb_stage[0]'].data_ptr() == payload['embedding'].data_ptr()
+    views['embedding::wb_stage[1]'].fill_(7)
+    assert torch.equal(payload['embedding'][8:], torch.full((16,), 7))
+
+
 def test_vllm_loader_reinterprets_fp8_bytes_without_requantizing(monkeypatch):
     events = []
     module = SimpleNamespace(

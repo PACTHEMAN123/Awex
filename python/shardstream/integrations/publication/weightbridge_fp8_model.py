@@ -5,6 +5,7 @@ Native specgen discovers the real Megatron and vLLM correspondences. Source
 staging is eager per publication; no overlap with native RDMA rounds is claimed.
 """
 import json
+import math
 import os
 import time
 
@@ -56,6 +57,21 @@ def canonical_boxes(shape, shards):
             raise ValueError(f'Cannot normalize source shard {shard} to {shape}')
         result.append([(lo, hi, width) for _, _, lo, hi, width in aligned])
     return result
+
+
+def staging_views(payload, specs):
+    """Preserve each matrix's columns so native specgen can bound row tiles."""
+    views = {}
+    for name, value in payload.items():
+        offset = 0
+        for index, box in enumerate(specs[name].entries[name]):
+            shape = tuple(hi - lo for lo, hi, _ in box)
+            count = math.prod(shape)
+            views[f'{name}::wb_stage[{index}]'] = value.narrow(0, offset, count).view(shape)
+            offset += count
+        if offset != value.numel():
+            raise ValueError(f'Staging spec does not cover its storage: {name}')
+    return views
 
 
 class ModelGatherQuantizer:
@@ -117,7 +133,7 @@ class ModelGatherQuantizer:
         if any(n != names[0] for n in names):
             raise ValueError('Native TP ranks disagree on full-tensor gather order')
         self.factories, self.shapes = quantized_catalog(ctx.hf_weights, ctx.hf_shapes)
-        self.views = {name: value.view(1, -1) for name, value in self.payload.items()}
+        self.views = staging_views(self.payload, self.specs)
 
     def load_payload(self, factories):
         from wbridge.utils.data import BoundShardSpec, ShardSpec
