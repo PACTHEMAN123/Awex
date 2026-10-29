@@ -98,6 +98,7 @@ def main():
         deployment = calls(prepare, (stream.getvalue(), revision))
         save(root / 'deployment.json', deployment)
         env = dict(os.environ, PYTHONPATH=str(STAGE) + ':' + DEPS,
+                   SHARDSTREAM_RECIPE_REPOSITORY=str(SOURCE),
                    LD_PRELOAD='/tmp/fp8-fusion-1029/nccl/lib/libnccl.so.2',
                    LD_LIBRARY_PATH='/tmp/fp8-fusion-1029/nccl/lib:/tmp/verl-nccl-1020-deps/nvidia/cuda_runtime/lib')
         test_env = dict(env, PYTHONPATH=env['PYTHONPATH'] + ':/tmp/fp8-fusion-1029/build-deps')
