@@ -226,12 +226,15 @@ class Worker:
 
 @ray.remote(num_cpus=0)
 def inventory():
-    revision = subprocess.check_output(['git', '-C', str(WB), 'rev-parse', 'HEAD'], text=True).strip()
+    prepared = json.loads((WB.parent / 'prepared.json').read_text())
+    revision = prepared['weightbridge_revision']
     assert revision == WB_REVISION
-    assert not subprocess.check_output(['git', '-C', str(WB), 'status', '--porcelain'], text=True).strip()
+    for path, digest in prepared['weightbridge_python_sha256'].items():
+        assert hashlib.sha256((WB / path).read_bytes()).hexdigest() == digest, path
     return dict(ip=ray.util.get_node_ip_address(), hostname=subprocess.check_output(['hostname'], text=True).strip(),
                 gpu_processes=subprocess.check_output(['nvidia-smi', '--query-compute-apps=pid,used_memory', '--format=csv,noheader'], text=True),
                 wb_revision=revision,
+                wb_python_sha256=prepared['weightbridge_python_sha256'],
                 revision=subprocess.check_output(['git', '-C', str(BASE / 'source'), 'rev-parse', 'HEAD'], text=True).strip())
 
 
