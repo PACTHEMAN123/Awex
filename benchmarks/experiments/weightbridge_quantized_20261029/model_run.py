@@ -4,6 +4,7 @@ import fcntl
 import hashlib
 import io
 import json
+import lzma
 import os
 from pathlib import Path
 import shutil
@@ -56,7 +57,10 @@ def collect(run_dir):
     path = Path(run_dir)
     assert path.is_relative_to(BASE / 'model-runs')
     stream = io.BytesIO()
-    with tarfile.open(fileobj=stream, mode='w:gz') as archive:
+    # Repeated full-model pointer catalogs exceed gzip's history window.
+    # A larger lossless dictionary substantially reduces evidence download time.
+    with tarfile.open(fileobj=stream, mode='w:xz', filters=[
+            {'id': lzma.FILTER_LZMA2, 'preset': 1, 'dict_size': 64 * 1024**2}]) as archive:
         if path.exists():
             for p in sorted(path.rglob('*')):
                 if p.is_file():
@@ -143,7 +147,7 @@ def main():
             manifest = []
             for row in calls(collect, (outcome['run_dir'],)):
                 data = row.pop('data')
-                filename = row['ip'] + '.tar.gz'
+                filename = row['ip'] + '.tar.xz'
                 (root / filename).write_bytes(data)
                 manifest.append(dict(row, file=filename, sha256=hashlib.sha256(data).hexdigest()))
             save(root / 'manifest.json', manifest)
