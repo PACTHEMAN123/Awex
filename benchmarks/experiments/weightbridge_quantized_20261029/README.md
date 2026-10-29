@@ -1,5 +1,9 @@
 # WeightBridge Gather-Before-Quantize Prototype
 
+This document describes the initial matrix microbenchmark. The separate real
+Qwen3/Megatron/vLLM extension and matched end-to-end protocol are documented in
+[REAL_MODEL.md](REAL_MODEL.md).
+
 This is our experimental extension, not an upstream WeightBridge feature.
 It implements pre-transfer quantization of **current trainer weights**:
 
