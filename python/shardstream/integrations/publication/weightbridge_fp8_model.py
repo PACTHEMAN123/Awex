@@ -1,8 +1,8 @@
 """Experimental real-model gather/quantize frontend over native WeightBridge.
 
 Qwen3-MoE, block-aligned TP partitions and Triton FP8 inference layouts only.
-Native specgen discovers the real Megatron and vLLM correspondences. Source
-staging is eager per publication; no overlap with native RDMA rounds is claimed.
+Native specgen discovers the real Megatron and vLLM correspondences. Preparation
+can be eager or interleaved with native double-buffered RDMA rounds.
 """
 import json
 import math
@@ -150,14 +150,9 @@ class ModelGatherQuantizer:
         return AdapterContext(self.factories, self.shapes, lambda: self.views, self.load_payload, rank)
 
     @torch.no_grad()
-    def prepare(self):
+    def prepare_names(self, names):
         from wbridge.utils.data import BoundShardSpec, ShardSpec
-        started = time.perf_counter()
-        self.extract.run()
-        count = 0
-        for name in sorted(self.source):
-            if not is_quantized(name):
-                continue
+        for name in names:
             shape = self.ctx.hf_shapes[name]
             if name in self.gathers:
                 gathered, full, reconstruct = self.gathers[name]
@@ -169,9 +164,15 @@ class ModelGatherQuantizer:
             for key, tensor in [(name, q.view(torch.uint8)), (name + '_scale_inv', scale)]:
                 spec = ShardSpec({key: [full_box(self.shapes[key])]})
                 BoundShardSpec.slice_copy(spec({key: tensor.flatten()}), self.specs[key]({key: self.payload[key]}))
-            count += 1
+
+    @torch.no_grad()
+    def prepare(self):
+        started = time.perf_counter()
+        self.extract.run()
+        names = sorted(name for name in self.source if is_quantized(name))
+        self.prepare_names(names)
         torch.cuda.synchronize()
-        return dict(full_tensor_quantizations=count, gathered_tensors=len(self.gathers),
+        return dict(full_tensor_quantizations=len(names), gathered_tensors=len(self.gathers),
                     logical_trainer_gather_egress_bytes=self.extra_bytes,
                     prepare_ms=(time.perf_counter() - started) * 1000)
 
@@ -261,12 +262,29 @@ class WeightBridgeFP8Publication(WeightBridgePublication):
             [f'tcp://{host}:{coordinator_tcp_port(p)}' for _, host, p in publication_endpoints(harness)],
             os.environ['MASTER_ADDR'], port[0], protocol='rdma')
         self.adapter = SenderAdapter(self.quantizer.context(harness.rank), args)
+        self.preparation_mode = os.environ.get('SHARDSTREAM_WB_FP8_PREPARATION', 'pipeline')
+        if self.preparation_mode not in ('eager', 'pipeline'):
+            raise ValueError(f'Unknown FP8 preparation mode: {self.preparation_mode}')
+        self.round_pipeline = None
         # Wrap only the frontend callback. Native send, routing and RDMA stay unchanged.
         native_send = self.adapter.send_weights
         def prepare_and_send():
+            if self.preparation_mode == 'pipeline':
+                from shardstream.integrations.publication.weightbridge_fp8_pipeline import RoundPreparation
+                if self.round_pipeline is None:
+                    self.round_pipeline = RoundPreparation(self.quantizer, self.adapter.sender)
+                self.round_pipeline.begin(int(harness.megatron_engine.global_step))
+                event = native_send()
+                self.round_pipeline.finish_enqueue()
+                return event
             metrics = self.quantizer.prepare()
             print('WB_FP8_PREPARE ' + json.dumps(dict(rank=harness.rank,
                   step=int(harness.megatron_engine.global_step), **metrics)), flush=True)
             return native_send()
         self.adapter.send_weights = prepare_and_send
         torch.cuda.synchronize()
+
+    def publish(self):
+        super().publish()
+        if self.round_pipeline is not None:
+            print('WB_FP8_PREPARE ' + json.dumps(self.round_pipeline.report()), flush=True)

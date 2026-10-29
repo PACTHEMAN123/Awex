@@ -18,11 +18,22 @@ The actual reference vLLM layout quantizes router weights too: its
 matches that actual layout, including routers, instead of changing the baseline
 configuration. Embedding, head and normalization parameters remain mixed dtype.
 
-This first implementation materializes all local quantized payloads before
+The original eager implementation materializes all local quantized payloads before
 native sending, not one tensor group per internal RDMA round. Full-tensor
 quantization is per physical tensor, without batching Python launches. It is
 an eager prototype, not a claim about the best optimized WeightBridge latency
 or a memory-bounded implementation of the proposed extension.
+
+The pipeline mode prepares each physical tensor at the first native global
+round requiring either its FP8 bytes or scales. It preserves eager's work and
+gather volume, including replicated tensors. TP ranks validate identical
+collective order and visit skipped local rounds before their next pack or at
+send completion. Native pack-ready events and parity-slot lifetime gates remain
+unchanged; native background RDMA can overlap later preparation. Full local
+FP8 staging is still persistent, so this is not a bounded source-memory design.
+Use `model_run.py --preparation eager` to retain the original mode; the default
+is now `pipeline`. Per-round host preparation and native RDMA envelopes are
+recorded for independent overlap checks, not kernel-utilization claims.
 
 The shared harness publishes actual live model weights with changing norm
 version markers; it does not run optimizer steps. One checkpoint bootstrap is

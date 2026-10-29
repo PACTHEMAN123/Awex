@@ -83,6 +83,7 @@ def main():
     parser.add_argument('--label', required=True)
     parser.add_argument('--updates', type=int, default=3)
     parser.add_argument('--warmup', type=int, default=1)
+    parser.add_argument('--preparation', choices=['eager', 'pipeline'], default='pipeline')
     args = parser.parse_args()
     root = BASE / 'model-results' / args.label
     root.mkdir(parents=True, exist_ok=False)
@@ -98,11 +99,12 @@ def main():
         deployment = calls(prepare, (stream.getvalue(), revision))
         save(root / 'deployment.json', deployment)
         env = dict(os.environ, PYTHONPATH=str(STAGE) + ':' + DEPS,
+                   SHARDSTREAM_WB_FP8_PREPARATION=args.preparation,
                    SHARDSTREAM_RECIPE_REPOSITORY=str(SOURCE),
                    LD_PRELOAD='/tmp/fp8-fusion-1029/nccl/lib/libnccl.so.2',
                    LD_LIBRARY_PATH='/tmp/fp8-fusion-1029/nccl/lib:/tmp/verl-nccl-1020-deps/nvidia/cuda_runtime/lib')
         test_env = dict(env, PYTHONPATH=env['PYTHONPATH'] + ':/tmp/fp8-fusion-1029/build-deps')
-        tests = [str(SOURCE / 'tests' / name) for name in ['test_weightbridge_fp8_model.py',
+        tests = [str(SOURCE / 'tests' / name) for name in ['test_weightbridge_fp8_model.py', 'test_weightbridge_fp8_pipeline.py',
             'test_weightbridge_quantized.py', 'test_weightbridge_native.py', 'test_fp8_model_profile.py']]
         with (root / 'tests.log').open('w') as log:
             tested = subprocess.run([sys.executable, '-m', 'pytest', '-q', *tests], env=test_env,
@@ -121,6 +123,7 @@ def main():
             '--num-updates', str(args.updates), '--warmup-updates', str(args.warmup), '--timeout', '3600',
             '--dp-source-policy', 'stream', '--dp-source-ring-order', 'source-node', '--replica-routing', 'logical']
         save(root / 'case.json', dict(command=command, revision=revision,
+             preparation_mode=args.preparation,
              matched_reference='/tmp/fp8-fusion-resume-1029/results', native_sha256=NATIVE_SHA))
         save(root / 'active.json', dict(state='running', started=time.time(), pid=os.getpid()))
         with (root / 'controller.log').open('w') as log:

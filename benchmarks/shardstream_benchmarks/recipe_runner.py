@@ -436,6 +436,7 @@ def main():
     try:
         environment = {
             **transport_environment,
+            "SHARDSTREAM_WB_FP8_PREPARATION": os.environ.get("SHARDSTREAM_WB_FP8_PREPARATION", "pipeline"),
             "VERL_VLLM_FP8_QUANT_ENABLED": "1" if (
                 args.weight_format == "fp8" and args.publication_mechanism in ("verl_native_nccl", "weightbridge_gather_fp8")
             ) else "0",
