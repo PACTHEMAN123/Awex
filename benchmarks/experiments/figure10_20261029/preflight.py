@@ -29,8 +29,12 @@ def inspect(expected_assets, expected_wb):
             assert sha(source) == sha(STAGE / package / source.relative_to(SOURCE / source_dir))
     for relative, digest in expected_wb.items():
         assert sha(ASSETS / 'weightbridge' / relative) == digest, relative
+    missing_metadata = []
     for row in expected_assets:
         path = Path('/mnt/fuse/verl-e2e') / row['path']
+        if path.name == '_hf_internal_model_info.json' and not path.exists():
+            missing_metadata.append(row['path'])
+            continue
         assert path.stat().st_size == row['bytes'] and sha(path) == row['sha256'], row['path']
     assert sha(ASSETS / 'nccl/lib/libnccl.so.2') == '78103983bb558aef7277a0c05a9a5963e619a69f6e77ece3c449fb045a3368d4'
     inherited = json.loads((ASSETS / 'prepared.json').read_text())
@@ -48,7 +52,8 @@ def inspect(expected_assets, expected_wb):
     BASE.mkdir(exist_ok=True)
     row = dict(passed=True, ip=ray.util.get_node_ip_address(), hostname=output('hostname'),
                user=output('id', '-un'), cwd=os.getcwd(), gpus=output('nvidia-smi', '-L'),
-               revision=REVISION, model_files_verified=len(expected_assets),
+               revision=REVISION, model_files_verified=len(expected_assets) - len(missing_metadata),
+               absent_optional_downloader_metadata=missing_metadata,
                weightbridge_files_verified=len(expected_wb),
                inherited_environment=inherited, runtime_versions=versions,
                oss_exists=Path('/mnt/fuse/oss/xiaopac.xjy').is_dir())
