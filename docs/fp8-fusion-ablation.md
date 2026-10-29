@@ -27,7 +27,7 @@ Validate exact wire equivalence (all four block shapes, strided sources,
 unaligned record splits, zero inputs, repeated versions):
 
 ```
-nvcc -std=c++17 -arch=sm_90 -DNCCL_OS_LINUX -Iinclude -I$SHARDSTREAM_NCCL_ROOT/include tests/fp8_staged.cu -o /tmp/fp8_staged
+nvcc --expt-extended-lambda --expt-relaxed-constexpr -std=c++17 -arch=sm_90 -DNCCL_OS_LINUX -Iinclude -I$SHARDSTREAM_NCCL_ROOT/include tests/fp8_staged.cu -o /tmp/fp8_staged
 /tmp/fp8_staged
 ```
 
@@ -35,3 +35,8 @@ Model experiments must additionally pass the independent full checkpoint
 FP8/scales/BF16 oracle and generation checks. Use 20 updates per launch,
 discard the first 5 and measure the remaining 15. Rerun a fresh fused control
 alongside staged; historical FP8/BF16 payload scaling is not a fusion control.
+
+Plain TP2 consumers may need `--rollout-gpu-memory-utilization 0.35` to
+reserve enough space for the independent checkpoint oracle. Set the same KV
+reservation for both modes. Oracle construction and verification remain
+outside update timing; never disable them to obtain a performance point.

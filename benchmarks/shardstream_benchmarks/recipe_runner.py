@@ -292,6 +292,8 @@ def main():
                         help="FP8 uses fused BF16-to-FP8 transport and a full checkpoint oracle")
     parser.add_argument("--fp8-execution", choices=("fused", "staged"), default="fused",
                         help="Same-wire FP8 fusion ablation; staged materializes source records before transfer")
+    parser.add_argument("--rollout-gpu-memory-utilization", type=float,
+                        help="Override vLLM KV reservation, e.g. to leave room for a full FP8 checkpoint oracle")
     parser.add_argument("--disable-prefix-caching", action="store_true",
                         help="Use the same uncached prefill for before/repeat/after generation checks")
     parser.add_argument("--extra-python-path", default="")
@@ -308,6 +310,8 @@ def main():
         "--nccl-lib", default="/tmp/shardstream-prepare-nccl2312/nccl/lib"
     )
     args = parser.parse_args()
+    if args.rollout_gpu_memory_utilization is not None and not 0 < args.rollout_gpu_memory_utilization < 1:
+        parser.error("Rollout GPU memory utilization must be between zero and one")
     if args.fp8_execution == "staged" and (
         args.weight_format != "fp8" or args.publication_mechanism != "shardstream"
     ):
@@ -396,6 +400,7 @@ def main():
         "rollout": recipe.rollout,
         "pinned_rollout": pinned_recipe.rollout,
         "rollout_replicas_override": args.rollout_replicas,
+        "rollout_gpu_memory_utilization_override": args.rollout_gpu_memory_utilization,
         "training_hosts": args.training_hosts,
         "rollout_hosts": args.rollout_hosts,
         "run_dir": run_dir,
@@ -488,6 +493,8 @@ def main():
                 )
                 # Indices address the GPUs reserved for this actor, not arbitrary GPUs.
                 rollout_arguments = recipe.rollout_arguments(args.model_path, host, port)
+                if args.rollout_gpu_memory_utilization is not None:
+                    rollout_arguments[rollout_arguments.index("--gpu-memory-utilization") + 1] = str(args.rollout_gpu_memory_utilization)
                 if args.weight_format == "fp8":
                     from shardstream_benchmarks.fp8_config import fp8_server_args
 
