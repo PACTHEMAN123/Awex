@@ -7,6 +7,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tarfile
+import time
 
 import ray
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
@@ -26,6 +27,9 @@ def prepare(bundle, stage_archive, wb_archive):
     assert not output('nvidia-smi', '--query-compute-apps=pid', '--format=csv,noheader')
     BASE.mkdir(exist_ok=True)
     source = BASE / 'source'
+    if source.exists() and subprocess.run(['git', '-C', str(source), 'rev-parse', 'HEAD'],
+                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode:
+        source.rename(BASE / f'incomplete-source-{time.time_ns()}')
     if not source.exists():
         (BASE / 'source.bundle').write_bytes(bundle)
         subprocess.run(['git', 'clone', '-q', '-b', 'codex/weightbridge-small-memory-20261029',
@@ -49,8 +53,9 @@ def prepare(bundle, stage_archive, wb_archive):
     nccl = BASE / 'nccl/lib'
     nccl.mkdir(parents=True, exist_ok=True)
     target = nccl / 'libnccl.so.2'
-    if not target.exists():
-        shutil.copy2('/tmp/fp8-fusion-1029/nccl/lib/libnccl.so.2', target)
+    temporary = nccl / 'libnccl.so.2.partial'
+    shutil.copy2('/tmp/fp8-fusion-1029/nccl/lib/libnccl.so.2', temporary)
+    temporary.replace(target)
     env = dict(os.environ, LD_PRELOAD=str(target), PYTHONPATH=str(stage) +
                ':/tmp/verl-nccl-1020-deps:' + str(wb))
     versions = json.loads(output('/usr/bin/env', *[f'{k}={v}' for k, v in
@@ -91,8 +96,15 @@ if __name__ == '__main__':
                 if path.is_file() and '__pycache__' not in path.parts:
                     archive.add(path, arcname=str(path.relative_to(stage_source)))
         stage_archive = stream.getvalue()
-        rows = ray.get([prepare.options(scheduling_strategy=NodeAffinitySchedulingStrategy(
-            nodes[ip], soft=False)).remote(bundle, stage_archive, wb_archive) for ip in IPS])
+        futures = [prepare.options(scheduling_strategy=NodeAffinitySchedulingStrategy(
+            nodes[ip], soft=False)).remote(bundle, stage_archive, wb_archive) for ip in IPS]
+        rows, errors = [], []
+        for future in futures:
+            try:
+                rows.append(ray.get(future))
+            except Exception as error:
+                errors.append(str(error))
+        assert not errors, errors
         for key in ['revision', 'native_sha256', 'nccl_sha256', 'model_config_sha256',
                     'weightbridge_python_sha256', 'versions']:
             assert len({json.dumps(r[key], sort_keys=True) for r in rows}) == 1, key
