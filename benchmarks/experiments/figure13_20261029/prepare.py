@@ -61,8 +61,11 @@ def prepare(bundle, stage_archive, wb_archive):
     versions = json.loads(output('/usr/bin/env', *[f'{k}={v}' for k, v in
         {'LD_PRELOAD': env['LD_PRELOAD'], 'PYTHONPATH': env['PYTHONPATH']}.items()],
         '/tmp/verl-nccl-1020-runtime/bin/python', '-c',
-        'import json,torch,ray,wbridge; print(json.dumps(dict(torch=torch.__version__,nccl=torch.cuda.nccl.version(),ray=ray.__version__)))'))
-    assert versions['nccl'] == [2, 31, 2], versions
+        'import ctypes,json,os,torch,ray,wbridge; v=ctypes.c_int(); '
+        'rc=ctypes.CDLL(os.environ["LD_PRELOAD"]).ncclGetVersion(ctypes.byref(v)); '
+        'assert rc==0; print(json.dumps(dict(torch=torch.__version__,nccl=v.value,'
+        'torch_build_nccl=torch.cuda.nccl.version(),ray=ray.__version__)))'))
+    assert versions['nccl'] == 23102, versions
     sha = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()
     row = dict(ip=ray.util.get_node_ip_address(), hostname=output('hostname'),
                cwd=os.getcwd(), user=output('id', '-un'), gpus=output('nvidia-smi', '-L'),
